@@ -1,0 +1,50 @@
+name: Task
+description: A delegatable unit of work (human or AI agent)
+title: "<area>: <short summary>"
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Keep the issue a **pointer + state**. Put the detailed spec in
+        `specs/<id>-<slug>.md` and link it below. Apply routing labels:
+        `agent:*`, `area:*`, `tier:*`, and `loc:local` if it needs the piano.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: One or two sentences — what and why.
+    validations:
+      required: true
+  - type: input
+    id: spec
+    attributes:
+      label: Spec
+      description: Path or link to the detailed spec.
+      placeholder: specs/M0-echo.md
+  - type: dropdown
+    id: location
+    attributes:
+      label: Execution location
+      description: Does it need the physical piano?
+      options:
+        - "Remote OK (sandbox-safe)"
+        - "Local-only (needs piano / hardware)"
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope boundaries
+      description: What the implementer must NOT touch (files, deps, signatures).
+    validations:
+      required: true
+  - type: checkboxes
+    id: acceptance
+    attributes:
+      label: Acceptance
+      options:
+        - label: "cargo fmt --all --check clean"
+        - label: "cargo clippy --workspace --all-targets clean (warnings = errors)"
+        - label: "cargo test --workspace green"
+        - label: "PR opened against main, Closes this issue"

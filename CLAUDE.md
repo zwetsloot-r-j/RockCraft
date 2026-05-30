@@ -46,6 +46,9 @@ Invariants:
   `vibe/*`. Keep PRs scoped to one branch.
 - Prefer expanding the typed `core` model over stringly-typed shortcuts. The
   compiler is the first reviewer.
+- Task tracking: GitHub Issues are the control plane; detailed specs live in
+  `specs/*.md` and travel in the clone. A PR closes its issue (`Closes #N`).
+  See `docs/WORKFLOW.md`. Work to the spec; don't exceed its scope boundaries.
 
 ## What is local-only (cannot run in a cloud sandbox)
 
