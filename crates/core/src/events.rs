@@ -43,6 +43,18 @@ impl Velocity {
     pub const fn value(self) -> u8 {
         self.0
     }
+
+    /// Returns true if the velocity value is 0.
+    /// In MIDI, a note-on with velocity 0 is equivalent to a note-off.
+    pub const fn is_note_off(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Returns the velocity normalized to the range 0.0..=1.0.
+    /// Maps linearly from 0..=127 to 0.0..=1.0.
+    pub fn normalized(self) -> f32 {
+        self.0 as f32 / 127.0
+    }
 }
 
 /// Whether a note started or stopped sounding.
@@ -102,5 +114,26 @@ mod tests {
         assert_eq!(ev.note.value(), 60);
         assert_eq!(ev.timestamp_us, 1_000);
         assert_eq!(ev.kind, NoteEventKind::On { velocity: vel });
+    }
+
+    #[test]
+    fn velocity_is_note_off() {
+        let zero = Velocity::new(0).unwrap();
+        let one = Velocity::new(1).unwrap();
+        let max = Velocity::new(127).unwrap();
+
+        assert!(zero.is_note_off());
+        assert!(!one.is_note_off());
+        assert!(!max.is_note_off());
+    }
+
+    #[test]
+    fn velocity_normalized() {
+        let zero = Velocity::new(0).unwrap();
+        let max = Velocity::new(127).unwrap();
+        let epsilon = 1e-6;
+
+        assert!((zero.normalized() - 0.0).abs() < epsilon);
+        assert!((max.normalized() - 1.0).abs() < epsilon);
     }
 }
