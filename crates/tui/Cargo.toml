@@ -1,0 +1,18 @@
+[package]
+name = "rockcraft-tui"
+description = "Terminal frontend (MVP view layer). Swappable for Tauri/Godot later."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "rockcraft"
+path = "src/main.rs"
+
+[dependencies]
+rockcraft-core.workspace = true
+rockcraft-midi.workspace = true
+rockcraft-audio.workspace = true
+# ratatui + crossterm added at M0.

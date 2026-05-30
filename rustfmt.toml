@@ -1,0 +1,3 @@
+# Keep formatting deterministic across humans and agents so `cargo fmt --check`
+# in CI never fails for stylistic reasons.
+edition = "2021"

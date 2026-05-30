@@ -1,0 +1,12 @@
+[package]
+name = "rockcraft-audio"
+description = "Audio playback, metronome, and MIDI synthesis. Wraps cpal/rodio/rustysynth (later)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+rockcraft-core.workspace = true
+# cpal / rodio / rustysynth added when audio work begins.

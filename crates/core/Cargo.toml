@@ -1,0 +1,13 @@
+[package]
+name = "rockcraft-core"
+description = "UI- and I/O-agnostic domain engine: song model, timing clock, scoring."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+# core stays dependency-light on purpose. It must remain headless-testable
+# (no MIDI device, no audio, no terminal) so remote/cloud agents can develop
+# and verify it against recorded fixtures.
