@@ -1,0 +1,5 @@
+# Pin the toolchain so local dev, CI, and every remote/cloud agent build
+# against the same compiler — no "works on my machine" drift between vendors.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/midi",
+    "crates/audio",
+    "crates/tui",
+]
+
+# Shared metadata + dependency versions for every crate in the workspace.
+# Individual crates inherit these with `x.workspace = true`.
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["RockCraft contributors"]
+repository = "https://github.com/zwetsloot-r-j/RockCraft"
+
+[workspace.dependencies]
+# Internal crates
+rockcraft-core = { path = "crates/core" }
+rockcraft-midi = { path = "crates/midi" }
+rockcraft-audio = { path = "crates/audio" }
+
+# Third-party deps are intentionally NOT added yet. They arrive at M0:
+#   midir   - live MIDI input  (crates/midi)
+#   midly   - MIDI file parse/write (crates/midi)
+#   ratatui + crossterm - TUI (crates/tui)
+#   cpal / rodio / rustysynth - audio (crates/audio)
+# Keeping them out means the whole workspace builds offline today.
+
+# Faster, slimmer release builds (relevant once we ship a desktop binary).
+[profile.release]
+lto = "thin"
+strip = true
