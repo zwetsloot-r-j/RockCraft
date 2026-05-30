@@ -24,6 +24,17 @@ impl MidiNote {
     pub const fn value(self) -> u8 {
         self.0
     }
+
+    /// Scientific pitch notation using sharps (e.g. 60 → "C4", 69 → "A4", 61 → "C#4").
+    pub fn name(self) -> String {
+        const NAMES: [&str; 12] = [
+            "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+        ];
+        let v = self.0 as i32;
+        let pitch_class = (v % 12) as usize;
+        let octave = (v / 12) - 1;
+        format!("{}{}", NAMES[pitch_class], octave)
+    }
 }
 
 /// Note-on velocity, 0..=127. A note-on with velocity 0 is, by MIDI
@@ -103,6 +114,31 @@ mod tests {
     fn midi_note_rejects_out_of_range() {
         assert!(MidiNote::new(127).is_some());
         assert!(MidiNote::new(128).is_none());
+    }
+
+    #[test]
+    fn midi_note_name_middle_c() {
+        assert_eq!(MidiNote::new(60).unwrap().name(), "C4");
+    }
+
+    #[test]
+    fn midi_note_name_a4() {
+        assert_eq!(MidiNote::new(69).unwrap().name(), "A4");
+    }
+
+    #[test]
+    fn midi_note_name_c_sharp_4() {
+        assert_eq!(MidiNote::new(61).unwrap().name(), "C#4");
+    }
+
+    #[test]
+    fn midi_note_name_lowest() {
+        assert_eq!(MidiNote::new(0).unwrap().name(), "C-1");
+    }
+
+    #[test]
+    fn midi_note_name_highest() {
+        assert_eq!(MidiNote::new(127).unwrap().name(), "G9");
     }
 
     #[test]
