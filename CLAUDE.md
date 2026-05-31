@@ -50,6 +50,38 @@ Invariants:
   `specs/*.md` and travel in the clone. A PR closes its issue (`Closes #N`).
   See `docs/WORKFLOW.md`. Work to the spec; don't exceed its scope boundaries.
 
+## Picking up work (delegation protocol)
+
+You may be told either **a specific issue** ("work on issue #6") or **a queue**
+("work on issues labeled `tier:cheap`" / "`agent:vibe`"). In both cases:
+
+**1. Resolve the task.**
+- Specific issue: read that issue.
+- Queue: list open issues with the given label, e.g.
+  `gh issue list --state open --label "<label>" --json number,title,labels`.
+  **Exclude** any issue labeled `loc:local` (needs the physical piano — you
+  cannot do these in a sandbox) or `status:in-progress` (already claimed).
+  From what remains, pick the **lowest-numbered** issue and do that one.
+  If nothing remains, stop and report "no available issues in `<label>`".
+
+**2. Read before coding.** The issue body links a spec at `specs/<file>.md` —
+read it, and read this guide. The spec is the source of truth; the issue is just
+the pointer. If the issue has no spec link, implement from the issue body but
+keep scope minimal and say so in the PR.
+
+**3. Claim it** so parallel agents don't collide: add the `status:in-progress`
+label and a brief comment, e.g.
+`gh issue edit <N> --add-label status:in-progress` then
+`gh issue comment <N> --body "Starting — <your agent name>, branch <branch>"`.
+
+**4. Do the work** on the correct branch prefix (Claude `claude/*`, Vibe
+`vibe/*`), within the spec's scope boundaries.
+
+**5. Finish.** Ensure the gate passes locally, open ONE PR against `main` whose
+description contains `Closes #N`. Do not self-merge — a human reviews.
+
+Take **one** issue per run unless explicitly told to batch.
+
 ## What is local-only (cannot run in a cloud sandbox)
 
 Anything needing the physical piano: live MIDI capture, latency/feel, audio
