@@ -9,4 +9,7 @@ repository.workspace = true
 
 [dependencies]
 rockcraft-core.workspace = true
-# midir + midly added at M0.
+midly = "0.5"
+
+[dev-dependencies]
+tempfile = "3"
