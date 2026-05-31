@@ -1,40 +1,51 @@
 //! MIDI file I/O using midly.
 //!
-//! Provides serialization of `core::NoteEvent` sequences to `.mid` files
-//! and deserialization back to `NoteEvent`s.
+//! Provides serialization of `core::NoteEvent` sequences to Standard MIDI File
+//! bytes and deserialization back to `NoteEvent`s.
 
 use midly::{
     num::{u15, u28, u4, u7},
     Header, MidiMessage, Smf, Timing, Track, TrackEvent, TrackEventKind,
 };
 use rockcraft_core::{MidiNote, NoteEvent, NoteEventKind, Velocity};
-use std::path::Path;
 
 /// A division value for MIDI files (ticks per quarter note).
 /// Using 480 as a common default that provides good resolution.
+/// TODO: real tempo mapping — currently 1 tick = 1 microsecond for round-trip
+/// fidelity, which is inconsistent with this header value.
 fn ticks_per_quarter() -> u15 {
     u15::from(480u16)
 }
 
-/// Write a sequence of note events to a MIDI file.
-///
-/// # Arguments
-/// * `events` - Slice of note events to write
-/// * `output_path` - Path to write the MIDI file to
-///
-/// # Returns
-/// `Ok(())` on success, or an error if writing fails.
-pub fn write_midi_file(
-    events: &[NoteEvent],
-    output_path: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Convert microseconds to ticks
-    // We use a simple conversion: 1 microsecond = 1 tick for simplicity
-    // This means timestamp_us directly maps to delta ticks
-    // Note: This is a simplification. A more sophisticated approach would
-    // use the tempo map, but for round-trip testing with synthetic fixtures,
-    // this direct mapping works.
+/// Error type for MIDI file operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MidiFileError {
+    /// Failed to parse MIDI bytes.
+    ParseError(String),
+}
 
+impl std::fmt::Display for MidiFileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MidiFileError::ParseError(msg) => write!(f, "MIDI parse error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for MidiFileError {}
+
+impl From<midly::Error> for MidiFileError {
+    fn from(err: midly::Error) -> Self {
+        MidiFileError::ParseError(format!("{:?}", err))
+    }
+}
+
+/// Serialize a sequence of note events to Standard MIDI File bytes.
+///
+/// Uses a single track, channel 0, with a fixed ticks-per-quarter resolution.
+/// Timestamps are mapped directly to MIDI ticks (1 tick = 1 microsecond) for
+/// round-trip fidelity.
+pub fn events_to_smf_bytes(events: &[NoteEvent]) -> Vec<u8> {
     let mut track = Track::new();
 
     // Sort events by timestamp
@@ -50,24 +61,20 @@ pub fn write_midi_file(
         prev_timestamp = event.timestamp_us;
 
         let track_event_kind = match event.kind {
-            NoteEventKind::On { velocity } => {
-                TrackEventKind::Midi {
-                    channel: u4::from(0u8), // Use channel 0 for simplicity
-                    message: MidiMessage::NoteOn {
-                        key: u7::from(event.note.value()),
-                        vel: u7::from(velocity.value()),
-                    },
-                }
-            }
-            NoteEventKind::Off => {
-                TrackEventKind::Midi {
-                    channel: u4::from(0u8),
-                    message: MidiMessage::NoteOff {
-                        key: u7::from(event.note.value()),
-                        vel: u7::from(0u8), // Note-off velocity is typically 0
-                    },
-                }
-            }
+            NoteEventKind::On { velocity } => TrackEventKind::Midi {
+                channel: u4::from(0u8), // Use channel 0 for simplicity
+                message: MidiMessage::NoteOn {
+                    key: u7::from(event.note.value()),
+                    vel: u7::from(velocity.value()),
+                },
+            },
+            NoteEventKind::Off => TrackEventKind::Midi {
+                channel: u4::from(0u8),
+                message: MidiMessage::NoteOff {
+                    key: u7::from(event.note.value()),
+                    vel: u7::from(0u8), // Note-off velocity is typically 0
+                },
+            },
         };
 
         track.push(TrackEvent {
@@ -85,24 +92,17 @@ pub fn write_midi_file(
         tracks: vec![track],
     };
 
-    // Write to file using std::fs
+    // Write to bytes
     let mut bytes = Vec::new();
-    smf.write_std(&mut bytes)?;
-    std::fs::write(output_path, bytes)?;
-
-    Ok(())
+    smf.write_std(&mut bytes).unwrap();
+    bytes
 }
 
-/// Read a MIDI file and parse it into note events.
+/// Parse Standard MIDI File bytes into a vector of note events.
 ///
-/// # Arguments
-/// * `input_path` - Path to the MIDI file to read
-///
-/// # Returns
-/// A vector of `NoteEvent`s parsed from the file, or an error.
-pub fn read_midi_file(input_path: &Path) -> Result<Vec<NoteEvent>, Box<dyn std::error::Error>> {
-    let bytes = std::fs::read(input_path)?;
-    let smf = Smf::parse(&bytes)?;
+/// Assumes the file uses the same timing as `events_to_smf_bytes` (1 tick = 1 microsecond).
+pub fn smf_bytes_to_events(bytes: &[u8]) -> Result<Vec<NoteEvent>, MidiFileError> {
+    let smf = Smf::parse(bytes)?;
 
     let mut events = Vec::new();
     let mut absolute_time_us: u64 = 0;
@@ -164,7 +164,6 @@ pub fn read_midi_file(input_path: &Path) -> Result<Vec<NoteEvent>, Box<dyn std::
 mod tests {
     use super::*;
     use rockcraft_core::{MidiNote, NoteEvent, NoteEventKind, Velocity};
-    use tempfile::NamedTempFile;
 
     #[test]
     fn test_roundtrip_simple() {
@@ -180,14 +179,11 @@ mod tests {
             NoteEvent::off(a4, 4000),
         ];
 
-        // Write to a temp file
-        let temp_file = NamedTempFile::new().unwrap();
-        let path = temp_file.path();
+        // Serialize to bytes
+        let bytes = events_to_smf_bytes(&events);
 
-        write_midi_file(&events, path).unwrap();
-
-        // Read back
-        let read_events = read_midi_file(path).unwrap();
+        // Deserialize back
+        let read_events = smf_bytes_to_events(&bytes).unwrap();
 
         // Compare
         assert_eq!(events.len(), read_events.len());
@@ -216,11 +212,8 @@ mod tests {
             NoteEvent::off(g4, 700),
         ];
 
-        let temp_file = NamedTempFile::new().unwrap();
-        let path = temp_file.path();
-
-        write_midi_file(&events, path).unwrap();
-        let read_events = read_midi_file(path).unwrap();
+        let bytes = events_to_smf_bytes(&events);
+        let read_events = smf_bytes_to_events(&bytes).unwrap();
 
         assert_eq!(events.len(), read_events.len());
 
@@ -243,11 +236,8 @@ mod tests {
             NoteEvent::on(c4, zero_vel, 2000), // This should be treated as note-off
         ];
 
-        let temp_file = NamedTempFile::new().unwrap();
-        let path = temp_file.path();
-
-        write_midi_file(&events, path).unwrap();
-        let read_events = read_midi_file(path).unwrap();
+        let bytes = events_to_smf_bytes(&events);
+        let read_events = smf_bytes_to_events(&bytes).unwrap();
 
         // The second event should be read back as NoteOff
         assert_eq!(read_events.len(), 2);

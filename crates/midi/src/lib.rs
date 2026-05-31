@@ -11,3 +11,4 @@
 pub use rockcraft_core as core;
 
 pub mod file;
+pub use file::{events_to_smf_bytes, smf_bytes_to_events, MidiFileError};
