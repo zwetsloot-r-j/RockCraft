@@ -60,6 +60,12 @@ impl EventBuffer {
         self.events.clear();
     }
 
+    /// Total duration of the recorded session: the timestamp of the last event,
+    /// or 0 if the buffer is empty.
+    pub fn duration_us(&self) -> u64 {
+        self.events.last().map_or(0, |e| e.timestamp_us)
+    }
+
     /// Drain all events out of the buffer in time order, leaving it empty.
     pub fn drain(&mut self) -> Vec<NoteEvent> {
         std::mem::take(&mut self.events)
@@ -178,5 +184,19 @@ mod tests {
         buf.push(on(60, 1_000));
         buf.push(on(64, 1_000)); // chord: same timestamp
         assert_eq!(buf.len(), 2);
+    }
+
+    #[test]
+    fn duration_us_empty_is_zero() {
+        assert_eq!(EventBuffer::new().duration_us(), 0);
+    }
+
+    #[test]
+    fn duration_us_returns_max_timestamp() {
+        let mut buf = EventBuffer::new();
+        buf.push(on(60, 1_000));
+        buf.push(off(60, 5_000));
+        buf.push(on(62, 3_000));
+        assert_eq!(buf.duration_us(), 5_000);
     }
 }
