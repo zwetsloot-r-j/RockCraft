@@ -11,6 +11,8 @@
 
 pub mod buffer;
 pub mod events;
+pub mod wait;
 
 pub use buffer::EventBuffer;
 pub use events::{MidiNote, NoteEvent, NoteEventKind, Velocity};
+pub use wait::{Step, WaitTracker};
