@@ -1,219 +1,209 @@
-//! The ratatui view: a bottom keyboard that lights up held keys, plus a live
-//! event log above it. Rendering and the input loop live here; the geometry and
-//! state are in `keyboard.rs` (pure, tested).
+//! The app shell: owns the live MIDI connection and switches between screens
+//! (Menu / Record / Play). Each screen handles its own rendering; the shell
+//! drains MIDI once per frame and routes events to the active screen.
 
-use std::collections::VecDeque;
 use std::io;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
-    style::{Color, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    style::{Color, Modifier, Style},
+    text::Line,
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
     Frame, Terminal,
 };
-use rockcraft_core::{NoteEvent, NoteEventKind};
 use rockcraft_midi::LiveInput;
 
-use crate::keyboard::{
-    black_key_col, is_black_key, white_key_slots, HeldNotes, Scale, HIGHEST_MIDI, LOWEST_MIDI,
-};
+use crate::play::PlayScreen;
+use crate::record::RecordScreen;
 
-/// How many recent events to keep in the scrolling log.
-const LOG_CAPACITY: usize = 200;
+/// Which screen is active.
+enum Screen {
+    Menu,
+    Record(RecordScreen),
+    Play(PlayScreen),
+}
 
-/// Held-key highlight colour and the resting key colours.
-const HELD_COLOR: Color = Color::Cyan;
-const WHITE_KEY: Color = Color::White;
-const BLACK_KEY: Color = Color::DarkGray;
+/// The menu entries, in order.
+const MENU_ITEMS: &[&str] = &["Record", "Play last recording", "Quit"];
 
-/// Application state: everything the renderer needs.
-pub struct App {
-    held: HeldNotes,
-    log: VecDeque<String>,
-    port_name: String,
+pub struct Shell {
+    input: LiveInput,
+    screen: Screen,
+    menu_state: ListState,
+    status: String,
     should_quit: bool,
 }
 
-impl App {
-    pub fn new(port_name: String) -> Self {
+impl Shell {
+    pub fn new(input: LiveInput) -> Self {
+        let mut menu_state = ListState::default();
+        menu_state.select(Some(0));
         Self {
-            held: HeldNotes::new(),
-            log: VecDeque::with_capacity(LOG_CAPACITY),
-            port_name,
+            input,
+            screen: Screen::Menu,
+            menu_state,
+            status: String::new(),
             should_quit: false,
         }
     }
 
-    /// Fold one note event into the state (held set + log line).
-    pub fn ingest(&mut self, ev: NoteEvent) {
-        self.held.apply(&ev);
-        let name = ev.note.name();
-        let line = match ev.kind {
-            NoteEventKind::On { velocity } if velocity.value() > 0 => {
-                format!(
-                    "{:>10}us  ON   {:<4} vel {}",
-                    ev.timestamp_us,
-                    name,
-                    velocity.value()
-                )
-            }
-            _ => format!("{:>10}us  OFF  {}", ev.timestamp_us, name),
-        };
-        if self.log.len() == LOG_CAPACITY {
-            self.log.pop_front();
+    fn menu_move(&mut self, delta: isize) {
+        let n = MENU_ITEMS.len() as isize;
+        let cur = self.menu_state.selected().unwrap_or(0) as isize;
+        let next = (cur + delta).rem_euclid(n) as usize;
+        self.menu_state.select(Some(next));
+    }
+
+    /// Act on the highlighted menu item.
+    fn menu_activate(&mut self) {
+        match self.menu_state.selected() {
+            Some(0) => self.screen = Screen::Record(RecordScreen::new()),
+            Some(1) => match latest_recording() {
+                Some(path) => match std::fs::read(&path) {
+                    Ok(bytes) => {
+                        let title = path
+                            .file_name()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "song".into());
+                        match PlayScreen::from_smf_bytes(title, &bytes) {
+                            Ok(p) => self.screen = Screen::Play(p),
+                            Err(e) => self.status = format!("load failed: {e}"),
+                        }
+                    }
+                    Err(e) => self.status = format!("read failed: {e}"),
+                },
+                None => self.status = "no recordings yet — record one first".into(),
+            },
+            _ => self.should_quit = true,
         }
-        self.log.push_back(line);
+    }
+
+    /// Handle a key press; returns to the menu on Tab from a screen.
+    fn on_key(&mut self, code: KeyCode) {
+        match &mut self.screen {
+            Screen::Menu => match code {
+                KeyCode::Up | KeyCode::Char('k') => self.menu_move(-1),
+                KeyCode::Down | KeyCode::Char('j') => self.menu_move(1),
+                KeyCode::Enter => self.menu_activate(),
+                KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
+                _ => {}
+            },
+            Screen::Record(rec) => match code {
+                KeyCode::Tab | KeyCode::Esc => self.screen = Screen::Menu,
+                KeyCode::Char('s') => match rec.save() {
+                    Ok(p) => self.status = format!("saved {}", p.display()),
+                    Err(e) => self.status = format!("save failed: {e}"),
+                },
+                _ => {}
+            },
+            Screen::Play(play) => match code {
+                KeyCode::Tab | KeyCode::Esc => self.screen = Screen::Menu,
+                KeyCode::Char('r') => play.restart(),
+                _ => {}
+            },
+        }
     }
 }
 
-/// Run the TUI against a connected `LiveInput` until the user quits (q / Esc).
-pub fn run(mut input: LiveInput) -> io::Result<()> {
+/// Run the app shell until the user quits.
+pub fn run(input: LiveInput) -> io::Result<()> {
     let mut terminal = ratatui::init();
-    let port = input.port_name().to_string();
-    let mut app = App::new(port);
-
-    let res = run_loop(&mut terminal, &mut app, &mut input);
+    let mut shell = Shell::new(input);
+    let res = run_loop(&mut terminal, &mut shell);
     ratatui::restore();
     res
 }
 
 fn run_loop<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
-    app: &mut App,
-    input: &mut LiveInput,
+    shell: &mut Shell,
 ) -> io::Result<()> {
     loop {
-        // Drain everything the MIDI thread queued since last frame.
-        for ev in input.events() {
-            app.ingest(ev);
+        // Drain MIDI and route to the active screen.
+        let events: Vec<_> = shell.input.events().collect();
+        for ev in events {
+            match &mut shell.screen {
+                Screen::Record(rec) => rec.ingest(ev),
+                Screen::Play(play) => play.ingest(ev),
+                Screen::Menu => {}
+            }
         }
 
-        terminal.draw(|f| draw(f, app))?;
+        // A finished song returns to the menu on its own.
+        if let Screen::Play(play) = &shell.screen {
+            if play.is_finished() {
+                shell.status = "song finished".into();
+                shell.screen = Screen::Menu;
+            }
+        }
 
-        // Poll keyboard at the frame cadence; rendering is decoupled from MIDI
-        // timing (which is carried by NoteEvent::timestamp_us, not frames).
+        terminal.draw(|f| draw(f, shell))?;
+
         if event::poll(Duration::from_millis(16))? {
             if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press
-                    && matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
-                {
-                    app.should_quit = true;
+                if key.kind == KeyEventKind::Press {
+                    shell.on_key(key.code);
                 }
             }
         }
-        if app.should_quit {
+        if shell.should_quit {
             return Ok(());
         }
     }
 }
 
-fn draw(f: &mut Frame, app: &App) {
-    // Header (1) | event log (fill) | keyboard (4).
+fn draw(f: &mut Frame, shell: &Shell) {
+    match &shell.screen {
+        Screen::Menu => draw_menu(f, f.area(), shell),
+        Screen::Record(rec) => rec.draw(f, f.area()),
+        Screen::Play(play) => play.draw(f, f.area()),
+    }
+}
+
+fn draw_menu(f: &mut Frame, area: Rect, shell: &Shell) {
     let chunks = Layout::vertical([
-        Constraint::Length(1),
+        Constraint::Length(2),
         Constraint::Min(3),
-        Constraint::Length(4),
+        Constraint::Length(1),
     ])
-    .split(f.area());
+    .split(area);
 
-    draw_header(f, chunks[0], app);
-    draw_log(f, chunks[1], app);
-    draw_keyboard(f, chunks[2], app);
+    let title = Line::from(format!(
+        "RockCraft — {}  (↑/↓ select, Enter, q quit)",
+        shell.input.port_name()
+    ));
+    f.render_widget(Paragraph::new(title), chunks[0]);
+
+    let items: Vec<ListItem> = MENU_ITEMS.iter().map(|s| ListItem::new(*s)).collect();
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(" mode "))
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+    let mut state = shell.menu_state.clone();
+    f.render_stateful_widget(list, chunks[1], &mut state);
+
+    f.render_widget(
+        Paragraph::new(Line::from(shell.status.as_str())).style(Style::default().fg(Color::Yellow)),
+        chunks[2],
+    );
 }
 
-fn draw_header(f: &mut Frame, area: Rect, app: &App) {
-    let held_text = if app.held.is_empty() {
-        "—".to_string()
-    } else {
-        app.held
-            .iter()
-            .filter_map(|n| rockcraft_core::MidiNote::new(n).map(|m| m.name()))
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
-    let line = Line::from(vec![
-        Span::styled(
-            format!(" {} ", app.port_name),
-            Style::default().fg(Color::Black).bg(HELD_COLOR),
-        ),
-        Span::raw(format!("  held: {:<2}  ", app.held.len())),
-        Span::styled(held_text, Style::default().fg(HELD_COLOR)),
-        Span::raw("   (q to quit)"),
-    ]);
-    f.render_widget(Paragraph::new(line), area);
-}
-
-fn draw_log(f: &mut Frame, area: Rect, app: &App) {
-    // Show the most recent lines that fit.
-    let inner_height = area.height.saturating_sub(2) as usize; // borders
-    let lines: Vec<Line> = app
-        .log
-        .iter()
-        .rev()
-        .take(inner_height)
-        .rev()
-        .map(|s| Line::from(s.clone()))
+/// Find the most recent `take-*.mid` under `recordings/`, if any.
+fn latest_recording() -> Option<std::path::PathBuf> {
+    let dir = std::path::Path::new("recordings");
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().map(|x| x == "mid").unwrap_or(false))
         .collect();
-    let block = Block::default().borders(Borders::ALL).title(" events ");
-    f.render_widget(Paragraph::new(lines).block(block), area);
-}
-
-fn draw_keyboard(f: &mut Frame, area: Rect, app: &App) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" keyboard (88) ");
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    let scale = match Scale::best_for_width(inner.width) {
-        Some(s) => s,
-        None => {
-            let msg = format!(
-                "Widen terminal to ≥{} columns to show the keyboard",
-                Scale::Compact.total_width()
-            );
-            f.render_widget(Paragraph::new(msg), inner);
-            return;
-        }
-    };
-
-    // Center the board within the available width.
-    let board_w = scale.total_width();
-    let x0 = inner.x + (inner.width.saturating_sub(board_w)) / 2;
-    let body_y = inner.y;
-    let body_h = inner.height;
-
-    // 1) White keys as the base row(s).
-    for slot in white_key_slots(scale) {
-        let held = app.held.is_held(slot.note);
-        let color = if held { HELD_COLOR } else { WHITE_KEY };
-        let cell = "█".repeat(slot.width as usize);
-        for dy in 0..body_h {
-            let rect = Rect::new(x0 + slot.col, body_y + dy, slot.width, 1);
-            f.render_widget(
-                Paragraph::new(cell.clone()).style(Style::default().fg(color)),
-                rect,
-            );
-        }
-    }
-
-    // 2) Black keys overlaid on the upper portion, between whites.
-    let black_h = body_h.saturating_sub(1).max(1);
-    for note in LOWEST_MIDI..=HIGHEST_MIDI {
-        if !is_black_key(note) {
-            continue;
-        }
-        let Some(col) = black_key_col(note, scale) else {
-            continue;
-        };
-        let held = app.held.is_held(note);
-        let color = if held { HELD_COLOR } else { BLACK_KEY };
-        for dy in 0..black_h {
-            let rect = Rect::new(x0 + col, body_y + dy, 1, 1);
-            f.render_widget(Paragraph::new("▐").style(Style::default().fg(color)), rect);
-        }
-    }
+    entries.sort();
+    entries.pop()
 }
