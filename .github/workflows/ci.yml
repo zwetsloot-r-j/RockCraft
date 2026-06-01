@@ -23,6 +23,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # midir's Linux backend links ALSA via alsa-sys; the headers aren't on
+      # ubuntu-latest by default. (No-op on the Windows build path.)
+      - name: Install ALSA dev headers (for midir)
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
