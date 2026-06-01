@@ -74,8 +74,16 @@ label and a brief comment, e.g.
 `gh issue edit <N> --add-label status:in-progress` then
 `gh issue comment <N> --body "Starting — <your agent name>, branch <branch>"`.
 
-**4. Do the work** on the correct branch prefix (Claude `claude/*`, Vibe
-`vibe/*`), within the spec's scope boundaries.
+**4. Do the work.**
+- **If the issue names an existing branch** (e.g. "Branch: `vibe/foo` (seeded)"),
+  check it OUT — do not create a new one: `git fetch origin && git checkout <branch>`.
+  It may already contain **seeded acceptance tests that fail to compile/pass** —
+  that's intentional. Implement until the gate is green. **Do NOT modify, weaken,
+  or delete any test files already present on the branch**; only add the
+  implementation (and your own *additional* tests if useful).
+- **Otherwise** create a branch with the correct prefix (Claude `claude/*`,
+  Vibe `vibe/*`).
+- Stay within the spec's scope boundaries either way.
 
 **5. Finish.** Ensure the gate passes locally, open ONE PR against `main` whose
 description contains `Closes #N`. Do not self-merge — a human reviews.
