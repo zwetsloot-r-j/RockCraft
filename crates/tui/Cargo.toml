@@ -15,4 +15,5 @@ path = "src/main.rs"
 rockcraft-core.workspace = true
 rockcraft-midi.workspace = true
 rockcraft-audio.workspace = true
-# ratatui + crossterm added at M0.
+ratatui = "0.29"
+crossterm = "0.28"
