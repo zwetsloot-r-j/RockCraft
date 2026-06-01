@@ -9,3 +9,7 @@
 
 // Re-exported so downstream crates have a single import surface.
 pub use rockcraft_core as core;
+
+pub mod live;
+
+pub use live::{parse_note_message, LiveInput, LiveInputError};
