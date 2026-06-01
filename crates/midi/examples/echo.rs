@@ -10,18 +10,20 @@
 //! Press keys on the piano; each note-on/off prints. Ctrl-C to quit.
 //!
 //! Each line shows, for diagnosis:
-//!   - `ts`    : the event timestamp from midir, set AT INPUT TIME (authoritative)
-//!   - `+dt`   : delta vs the previous event's timestamp (your real playing rhythm)
-//!   - `lag`   : wall-clock at print MINUS event timestamp = input→display latency.
-//!             If `lag` stays small, timestamps are accurate and any perceived lag
-//!             is purely console rendering. If `lag` grows during fast play, the
-//!             DISPLAY is falling behind — but `ts`/`+dt` remain correct.
+//! - `ts`  : the event timestamp from midir, set AT INPUT TIME (authoritative)
+//! - `+dt` : delta vs the previous event's timestamp (your real playing rhythm)
+//! - `lag` : wall-clock at print MINUS event timestamp = input→display latency.
+//!   If `lag` stays small, timestamps are accurate and any perceived lag is
+//!   purely console rendering. If `lag` grows during fast play, the DISPLAY is
+//!   falling behind — but `ts`/`+dt` remain correct.
 
 use rockcraft_midi::{core::NoteEventKind, LiveInput};
 use std::time::{Duration, Instant};
 
 fn main() {
-    let filter = std::env::args().nth(1).unwrap_or_else(|| "casio".to_string());
+    let filter = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "casio".to_string());
 
     let input = match LiveInput::connect(&filter) {
         Ok(i) => i,
