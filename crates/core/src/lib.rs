@@ -9,6 +9,8 @@
 //! Godot) and I/O crates (`midi`, `audio`) depend *on* these types, never the
 //! other way around.
 
+pub mod buffer;
 pub mod events;
 
+pub use buffer::EventBuffer;
 pub use events::{MidiNote, NoteEvent, NoteEventKind, Velocity};

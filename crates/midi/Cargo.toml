@@ -9,4 +9,9 @@ repository.workspace = true
 
 [dependencies]
 rockcraft-core.workspace = true
+midir = "0.10"
 midly = "0.5"
+
+[[example]]
+name = "echo"
+path = "examples/echo.rs"
