@@ -10,7 +10,7 @@ repository.workspace = true
 [dependencies]
 rockcraft-core.workspace = true
 midir = "0.10"
-# midly added with the file round-trip task (#6).
+midly = "0.5"
 
 [[example]]
 name = "echo"
