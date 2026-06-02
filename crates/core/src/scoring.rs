@@ -78,10 +78,70 @@ pub struct ScoreReport {
 /// note-ons, consuming each played note at most once (nearest-in-time match
 /// within the good window wins).
 pub fn score(expected: &[ExpectedNote], played: &[NoteEvent], config: ScoreConfig) -> ScoreReport {
-    // Seeded stub — replace with the real implementation.
-    let _ = (expected, played, config);
-    let _ = |e: &NoteEvent| matches!(e.kind, NoteEventKind::On { .. });
-    todo!("implement scoring per the seeded tests")
+    // Collect the real note-ons (a note-on with velocity 0 is a note-off by
+    // MIDI convention, and explicit note-offs never count as a strike). Track
+    // which ones get consumed so each played note matches at most one expected
+    // note and the leftovers can be reported as extras.
+    let candidates: Vec<&NoteEvent> = played
+        .iter()
+        .filter(|e| match e.kind {
+            NoteEventKind::On { velocity } => !velocity.is_note_off(),
+            NoteEventKind::Off => false,
+        })
+        .collect();
+    let mut consumed = vec![false; candidates.len()];
+
+    let mut judgments = Vec::with_capacity(expected.len());
+    let mut hits = 0usize;
+    let mut misses = 0usize;
+
+    for exp in expected {
+        // Among unconsumed note-ons of the same pitch within the good window,
+        // prefer the nearest in time.
+        let mut best: Option<(usize, u64)> = None; // (index, abs error)
+        for (i, ev) in candidates.iter().enumerate() {
+            if consumed[i] || ev.note != exp.note {
+                continue;
+            }
+            let abs_err = ev.timestamp_us.abs_diff(exp.time_us);
+            if abs_err > config.good_us {
+                continue;
+            }
+            match best {
+                Some((_, best_err)) if abs_err >= best_err => {}
+                _ => best = Some((i, abs_err)),
+            }
+        }
+
+        match best {
+            Some((i, abs_err)) => {
+                consumed[i] = true;
+                let error_us = candidates[i].timestamp_us as i64 - exp.time_us as i64;
+                let timing = if abs_err <= config.perfect_us {
+                    Timing::Perfect
+                } else if error_us < 0 {
+                    Timing::Early
+                } else {
+                    Timing::Late
+                };
+                judgments.push(NoteJudgment::Hit { timing, error_us });
+                hits += 1;
+            }
+            None => {
+                judgments.push(NoteJudgment::Miss);
+                misses += 1;
+            }
+        }
+    }
+
+    let extras = consumed.iter().filter(|&&c| !c).count();
+
+    ScoreReport {
+        judgments,
+        hits,
+        misses,
+        extras,
+    }
 }
 
 #[cfg(test)]
@@ -215,7 +275,11 @@ mod tests {
     fn chord_all_hit() {
         let cfg = ScoreConfig::default();
         let exp = [expect(60, 0), expect(64, 0), expect(67, 0)];
-        let play = [played_on(67, 10_000), played_on(60, 0), played_on(64, 20_000)];
+        let play = [
+            played_on(67, 10_000),
+            played_on(60, 0),
+            played_on(64, 20_000),
+        ];
         let r = score(&exp, &play, cfg);
         assert_eq!(r.hits, 3);
         assert_eq!(r.misses, 0);
