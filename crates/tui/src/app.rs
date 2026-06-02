@@ -13,6 +13,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
     Frame, Terminal,
 };
+use rockcraft_audio::SynthHandle;
 use rockcraft_midi::LiveInput;
 
 use crate::play::PlayScreen;
@@ -30,6 +31,8 @@ const MENU_ITEMS: &[&str] = &["Record", "Play last recording", "Quit"];
 
 pub struct Shell {
     input: LiveInput,
+    /// Piano synth, if audio started. `None` runs silently.
+    synth: Option<SynthHandle>,
     screen: Screen,
     menu_state: ListState,
     status: String,
@@ -37,11 +40,12 @@ pub struct Shell {
 }
 
 impl Shell {
-    pub fn new(input: LiveInput) -> Self {
+    pub fn new(input: LiveInput, synth: Option<SynthHandle>) -> Self {
         let mut menu_state = ListState::default();
         menu_state.select(Some(0));
         Self {
             input,
+            synth,
             screen: Screen::Menu,
             menu_state,
             status: String::new(),
@@ -91,7 +95,13 @@ impl Shell {
                 _ => {}
             },
             Screen::Record(rec) => match code {
-                KeyCode::Tab | KeyCode::Esc => self.screen = Screen::Menu,
+                KeyCode::Tab | KeyCode::Esc => {
+                    // Release anything still sounding before leaving the screen.
+                    if let Some(s) = &self.synth {
+                        s.all_off();
+                    }
+                    self.screen = Screen::Menu;
+                }
                 KeyCode::Char('s') => match rec.save() {
                     Ok(p) => self.status = format!("saved {}", p.display()),
                     Err(e) => self.status = format!("save failed: {e}"),
@@ -108,9 +118,9 @@ impl Shell {
 }
 
 /// Run the app shell until the user quits.
-pub fn run(input: LiveInput) -> io::Result<()> {
+pub fn run(input: LiveInput, synth: Option<SynthHandle>) -> io::Result<()> {
     let mut terminal = ratatui::init();
-    let mut shell = Shell::new(input);
+    let mut shell = Shell::new(input, synth);
     let res = run_loop(&mut terminal, &mut shell);
     ratatui::restore();
     res
@@ -121,11 +131,19 @@ fn run_loop<B: ratatui::backend::Backend>(
     shell: &mut Shell,
 ) -> io::Result<()> {
     loop {
-        // Drain MIDI and route to the active screen.
+        // Drain MIDI and route to the active screen. Clone the synth handle out
+        // first so we don't hold a borrow of `shell` across the screen match.
+        let synth = shell.synth.clone();
         let events: Vec<_> = shell.input.events().collect();
         for ev in events {
             match &mut shell.screen {
-                Screen::Record(rec) => rec.ingest(ev),
+                Screen::Record(rec) => {
+                    rec.ingest(ev);
+                    // Sound the keys you play while recording.
+                    if let Some(s) = &synth {
+                        s.apply(&ev);
+                    }
+                }
                 Screen::Play(play) => play.ingest(ev),
                 Screen::Menu => {}
             }

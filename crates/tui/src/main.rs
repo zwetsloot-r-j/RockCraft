@@ -22,6 +22,7 @@ mod play;
 mod record;
 mod render;
 
+use rockcraft_audio::AudioOut;
 use rockcraft_midi::LiveInput;
 
 fn main() {
@@ -38,7 +39,18 @@ fn main() {
         }
     };
 
-    if let Err(e) = app::run(input) {
+    // Audio is optional: if there's no SoundFont / output device, run silently.
+    // `audio` is bound for the whole run so the output stream stays open.
+    let audio = match AudioOut::new() {
+        Ok(a) => Some(a),
+        Err(e) => {
+            eprintln!("Audio disabled: {e}");
+            None
+        }
+    };
+    let synth = audio.as_ref().map(AudioOut::synth);
+
+    if let Err(e) = app::run(input, synth) {
         eprintln!("TUI error: {e}");
         std::process::exit(1);
     }
