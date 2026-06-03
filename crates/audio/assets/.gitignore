@@ -1,0 +1,3 @@
+# SoundFonts are large binaries with their own licenses — keep them out of git.
+# Drop your piano.sf2 here (see NOTICE.md); only the NOTICE is tracked.
+*.sf2

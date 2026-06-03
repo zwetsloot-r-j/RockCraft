@@ -1,6 +1,111 @@
 //! Audio for RockCraft: playback, metronome, and MIDI synthesis.
 //!
-//! Empty for now. Gains `cpal`/`rodio` for output and `rustysynth` for turning
-//! a loaded song's MIDI into sound when audio work begins.
+//! [`AudioOut`] opens the default output device and plays a SoundFont piano
+//! synth; hand its [`SynthHandle`] the `NoteEvent`s coming off the piano and you
+//! hear what you play. The synth machinery lives in [`synth`].
+
+pub mod synth;
 
 pub use rockcraft_core as core;
+pub use synth::{synth_from_sf2_bytes, SynthError, SynthHandle, SynthSource};
+
+use std::path::PathBuf;
+
+use rodio::OutputStream;
+
+/// Output sample rate the synth renders at. rodio resamples to the device rate
+/// if it differs.
+const SAMPLE_RATE: u32 = 44_100;
+
+/// Environment variable overriding the SoundFont path.
+const SF2_ENV: &str = "ROCKCRAFT_SF2";
+/// Default SoundFont location, relative to the workspace root (the usual
+/// working directory when running `cargo run -p rockcraft-tui`).
+const DEFAULT_SF2_PATH: &str = "crates/audio/assets/piano.sf2";
+
+/// Errors starting audio output.
+#[derive(Debug)]
+pub enum AudioError {
+    /// The SoundFont file was not found. Drop a piano `.sf2` at the path (or set
+    /// `ROCKCRAFT_SF2`); see `crates/audio/assets/NOTICE.md`.
+    SoundFontMissing(PathBuf),
+    /// Reading the SoundFont file failed.
+    Io(std::io::Error),
+    /// No usable output device / stream.
+    Device(String),
+    /// The synth could not be built from the SoundFont bytes.
+    Synth(SynthError),
+    /// rodio refused to start playing the source.
+    Play(String),
+}
+
+impl std::fmt::Display for AudioError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AudioError::SoundFontMissing(p) => write!(
+                f,
+                "SoundFont not found at {} (set {SF2_ENV} to override)",
+                p.display()
+            ),
+            AudioError::Io(e) => write!(f, "reading SoundFont failed: {e}"),
+            AudioError::Device(e) => write!(f, "no audio output device: {e}"),
+            AudioError::Synth(e) => write!(f, "{e}"),
+            AudioError::Play(e) => write!(f, "could not start playback: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for AudioError {}
+
+/// A running audio output: holds the device stream open and the synth feeding
+/// it. Drop it to stop audio. Clone [`AudioOut::synth`] to drive notes.
+pub struct AudioOut {
+    // Keeps the device stream (and thus the synth source) alive; dropping it
+    // stops all audio.
+    _stream: OutputStream,
+    handle: SynthHandle,
+}
+
+impl AudioOut {
+    /// Open the default output device and start the piano synth, loading the
+    /// SoundFont from `$ROCKCRAFT_SF2` or [`DEFAULT_SF2_PATH`].
+    pub fn new() -> Result<Self, AudioError> {
+        let path = sf2_path();
+        let bytes = std::fs::read(&path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                AudioError::SoundFontMissing(path.clone())
+            } else {
+                AudioError::Io(e)
+            }
+        })?;
+        Self::from_sf2_bytes(&bytes)
+    }
+
+    /// Open the default output device and start the synth from in-memory
+    /// SoundFont bytes (asset-source-agnostic; handy for tests / embedding).
+    pub fn from_sf2_bytes(bytes: &[u8]) -> Result<Self, AudioError> {
+        let (stream, stream_handle) =
+            OutputStream::try_default().map_err(|e| AudioError::Device(e.to_string()))?;
+        let (source, handle) =
+            synth_from_sf2_bytes(bytes, SAMPLE_RATE).map_err(AudioError::Synth)?;
+        stream_handle
+            .play_raw(source)
+            .map_err(|e| AudioError::Play(e.to_string()))?;
+        Ok(Self {
+            _stream: stream,
+            handle,
+        })
+    }
+
+    /// A cloneable handle for sounding notes from the app thread.
+    pub fn synth(&self) -> SynthHandle {
+        self.handle.clone()
+    }
+}
+
+/// Resolve the SoundFont path: `$ROCKCRAFT_SF2` if set, else the default.
+fn sf2_path() -> PathBuf {
+    std::env::var_os(SF2_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_SF2_PATH))
+}
