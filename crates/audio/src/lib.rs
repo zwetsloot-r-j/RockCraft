@@ -3,6 +3,9 @@
 //! [`AudioOut`] opens the default output device and plays a SoundFont piano
 //! synth; hand its [`SynthHandle`] the `NoteEvent`s coming off the piano and you
 //! hear what you play. The synth machinery lives in [`synth`].
+//!
+//! [`play_file`] plays a decoded audio file (wav/mp3/ogg/flac) on a separate
+//! output stream, returning a [`BackingHandle`] to stop it.
 
 pub mod synth;
 
@@ -37,6 +40,8 @@ pub enum AudioError {
     Synth(SynthError),
     /// rodio refused to start playing the source.
     Play(String),
+    /// The audio file could not be decoded (unsupported format or corrupt data).
+    Decode(String),
 }
 
 impl std::fmt::Display for AudioError {
@@ -51,6 +56,7 @@ impl std::fmt::Display for AudioError {
             AudioError::Device(e) => write!(f, "no audio output device: {e}"),
             AudioError::Synth(e) => write!(f, "{e}"),
             AudioError::Play(e) => write!(f, "could not start playback: {e}"),
+            AudioError::Decode(e) => write!(f, "audio decode failed: {e}"),
         }
     }
 }
@@ -108,4 +114,39 @@ fn sf2_path() -> PathBuf {
     std::env::var_os(SF2_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_SF2_PATH))
+}
+
+/// A playing backing-track audio file.
+///
+/// Drop (or call [`BackingHandle::stop`]) to stop playback; the device stream
+/// is released on drop.
+pub struct BackingHandle {
+    // Keeps the device stream alive for the duration of playback.
+    _stream: OutputStream,
+    sink: rodio::Sink,
+}
+
+impl BackingHandle {
+    /// Stop playback immediately (also happens on drop).
+    pub fn stop(&self) {
+        self.sink.stop();
+    }
+}
+
+/// Decode and start playing `path` on the default output device.
+///
+/// Returns immediately; playback runs on the rodio audio thread. Supports
+/// wav, mp3, ogg, and flac via rodio/symphonia.
+pub fn play_file(path: &std::path::Path) -> Result<BackingHandle, AudioError> {
+    let (stream, stream_handle) =
+        OutputStream::try_default().map_err(|e| AudioError::Device(e.to_string()))?;
+    let sink = rodio::Sink::try_new(&stream_handle).map_err(|e| AudioError::Play(e.to_string()))?;
+    let file = std::fs::File::open(path).map_err(AudioError::Io)?;
+    let source = rodio::Decoder::new(std::io::BufReader::new(file))
+        .map_err(|e| AudioError::Decode(e.to_string()))?;
+    sink.append(source);
+    Ok(BackingHandle {
+        _stream: stream,
+        sink,
+    })
 }
