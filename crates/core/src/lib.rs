@@ -11,6 +11,10 @@
 
 pub mod buffer;
 pub mod events;
+pub mod scoring;
+pub mod wait;
 
 pub use buffer::EventBuffer;
 pub use events::{MidiNote, NoteEvent, NoteEventKind, Velocity};
+pub use scoring::{score, ExpectedNote, NoteJudgment, ScoreConfig, ScoreReport, Timing};
+pub use wait::{Step, WaitTracker};
