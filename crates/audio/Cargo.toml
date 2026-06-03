@@ -9,4 +9,7 @@ repository.workspace = true
 
 [dependencies]
 rockcraft-core.workspace = true
-# cpal / rodio / rustysynth added when audio work begins.
+# Audio output + decoding + mixing (wraps cpal). rustysynth: pure-Rust
+# SoundFont synthesizer for turning MIDI notes into piano sound.
+rodio = "0.20"
+rustysynth = "1.3"
