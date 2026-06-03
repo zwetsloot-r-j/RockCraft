@@ -29,6 +29,9 @@ fn main() {
     let filter = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "casio".to_string());
+    // Optional second arg: path to a backing audio file (wav/mp3/ogg/flac).
+    // When provided, entering Record plays it alongside your performance.
+    let backing_path = std::env::args().nth(2).map(std::path::PathBuf::from);
 
     let input = match LiveInput::connect(&filter) {
         Ok(i) => i,
@@ -50,7 +53,7 @@ fn main() {
     };
     let synth = audio.as_ref().map(AudioOut::synth);
 
-    if let Err(e) = app::run(input, synth) {
+    if let Err(e) = app::run(input, synth, backing_path) {
         eprintln!("TUI error: {e}");
         std::process::exit(1);
     }

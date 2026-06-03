@@ -3,6 +3,7 @@
 //! drains MIDI once per frame and routes events to the active screen.
 
 use std::io;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -37,10 +38,16 @@ pub struct Shell {
     menu_state: ListState,
     status: String,
     should_quit: bool,
+    /// Optional backing track path forwarded to each new `RecordScreen`.
+    backing_path: Option<PathBuf>,
 }
 
 impl Shell {
-    pub fn new(input: LiveInput, synth: Option<SynthHandle>) -> Self {
+    pub fn new(
+        input: LiveInput,
+        synth: Option<SynthHandle>,
+        backing_path: Option<PathBuf>,
+    ) -> Self {
         let mut menu_state = ListState::default();
         menu_state.select(Some(0));
         Self {
@@ -50,6 +57,7 @@ impl Shell {
             menu_state,
             status: String::new(),
             should_quit: false,
+            backing_path,
         }
     }
 
@@ -63,7 +71,9 @@ impl Shell {
     /// Act on the highlighted menu item.
     fn menu_activate(&mut self) {
         match self.menu_state.selected() {
-            Some(0) => self.screen = Screen::Record(RecordScreen::new()),
+            Some(0) => {
+                self.screen = Screen::Record(RecordScreen::with_backing(self.backing_path.clone()));
+            }
             Some(1) => match latest_recording() {
                 Some(path) => match std::fs::read(&path) {
                     Ok(bytes) => {
@@ -100,6 +110,7 @@ impl Shell {
                     if let Some(s) = &self.synth {
                         s.all_off();
                     }
+                    rec.stop_backing();
                     self.screen = Screen::Menu;
                 }
                 KeyCode::Char('s') => match rec.save() {
@@ -122,9 +133,13 @@ impl Shell {
 }
 
 /// Run the app shell until the user quits.
-pub fn run(input: LiveInput, synth: Option<SynthHandle>) -> io::Result<()> {
+pub fn run(
+    input: LiveInput,
+    synth: Option<SynthHandle>,
+    backing_path: Option<PathBuf>,
+) -> io::Result<()> {
     let mut terminal = ratatui::init();
-    let mut shell = Shell::new(input, synth);
+    let mut shell = Shell::new(input, synth, backing_path);
     let res = run_loop(&mut terminal, &mut shell);
     ratatui::restore();
     res
@@ -222,15 +237,22 @@ fn draw_menu(f: &mut Frame, area: Rect, shell: &Shell) {
     );
 }
 
-/// Find the most recent `take-*.mid` under `recordings/`, if any.
+/// Find `song.mid` inside the most recent `take-*/` bundle under `recordings/`.
 fn latest_recording() -> Option<std::path::PathBuf> {
     let dir = std::path::Path::new("recordings");
-    let mut entries: Vec<_> = std::fs::read_dir(dir)
+    let mut bundles: Vec<_> = std::fs::read_dir(dir)
         .ok()?
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.extension().map(|x| x == "mid").unwrap_or(false))
+        .filter(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .map(|n| n.to_string_lossy().starts_with("take-"))
+                    .unwrap_or(false)
+        })
         .collect();
-    entries.sort();
-    entries.pop()
+    bundles.sort();
+    let latest = bundles.pop()?;
+    let midi = latest.join("song.mid");
+    midi.exists().then_some(midi)
 }
