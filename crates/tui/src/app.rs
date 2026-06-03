@@ -62,6 +62,11 @@ impl Shell {
         }
     }
 
+    /// Render the current state into a frame. Useful for headless tests.
+    pub fn render(&self, f: &mut ratatui::Frame) {
+        draw(f, self);
+    }
+
     fn menu_move(&mut self, delta: isize) {
         let n = MENU_ITEMS.len() as isize;
         let cur = self.menu_state.selected().unwrap_or(0) as isize;

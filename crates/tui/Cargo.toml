@@ -11,6 +11,10 @@ repository.workspace = true
 name = "rockcraft"
 path = "src/main.rs"
 
+[lib]
+name = "rockcraft_tui"
+path = "src/lib.rs"
+
 [dependencies]
 rockcraft-core.workspace = true
 rockcraft-midi.workspace = true
