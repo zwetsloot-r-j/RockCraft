@@ -71,7 +71,7 @@ impl Shell {
                             .file_name()
                             .map(|s| s.to_string_lossy().into_owned())
                             .unwrap_or_else(|| "song".into());
-                        match PlayScreen::from_smf_bytes(title, &bytes) {
+                        match PlayScreen::from_smf_bytes(title, &bytes, self.synth.clone()) {
                             Ok(p) => self.screen = Screen::Play(p),
                             Err(e) => self.status = format!("load failed: {e}"),
                         }
@@ -109,8 +109,12 @@ impl Shell {
                 _ => {}
             },
             Screen::Play(play) => match code {
-                KeyCode::Tab | KeyCode::Esc => self.screen = Screen::Menu,
+                KeyCode::Tab | KeyCode::Esc => {
+                    play.leave();
+                    self.screen = Screen::Menu;
+                }
                 KeyCode::Char('r') => play.restart(),
+                KeyCode::Char('m') => play.toggle_hear_song(),
                 _ => {}
             },
         }
@@ -147,6 +151,11 @@ fn run_loop<B: ratatui::backend::Backend>(
                 Screen::Play(play) => play.ingest(ev),
                 Screen::Menu => {}
             }
+        }
+
+        // Tick song-synth triggers (clock-driven, not frame-rate-driven).
+        if let Screen::Play(play) = &mut shell.screen {
+            play.tick_song_synth();
         }
 
         // A finished song returns to the menu on its own.
