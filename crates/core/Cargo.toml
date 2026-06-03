@@ -11,3 +11,5 @@ repository.workspace = true
 # core stays dependency-light on purpose. It must remain headless-testable
 # (no MIDI device, no audio, no terminal) so remote/cloud agents can develop
 # and verify it against recorded fixtures.
+serde = { workspace = true }
+serde_json = { workspace = true }
