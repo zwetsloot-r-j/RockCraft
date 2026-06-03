@@ -14,7 +14,7 @@ use ratatui::{
     Frame, Terminal,
 };
 use rockcraft_audio::SynthHandle;
-use rockcraft_midi::LiveInput;
+use rockcraft_midi::NoteSource;
 
 use crate::play::PlayScreen;
 use crate::record::RecordScreen;
@@ -30,7 +30,8 @@ enum Screen {
 const MENU_ITEMS: &[&str] = &["Record", "Play last recording", "Quit"];
 
 pub struct Shell {
-    input: LiveInput,
+    /// The swappable event source: real piano (`LiveInput`) or `MockKeyboard`.
+    input: Box<dyn NoteSource>,
     /// Piano synth, if audio started. `None` runs silently.
     synth: Option<SynthHandle>,
     screen: Screen,
@@ -40,7 +41,7 @@ pub struct Shell {
 }
 
 impl Shell {
-    pub fn new(input: LiveInput, synth: Option<SynthHandle>) -> Self {
+    pub fn new(input: Box<dyn NoteSource>, synth: Option<SynthHandle>) -> Self {
         let mut menu_state = ListState::default();
         menu_state.select(Some(0));
         Self {
@@ -94,6 +95,10 @@ impl Shell {
                 KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
                 _ => {}
             },
+            // Note-key precedence inside a screen: navigation keys (Tab/Esc/
+            // Enter/arrows) and the screen's own letter controls (`s` save here)
+            // are handled first; any *other* letter is forwarded to the source
+            // as a note key (a no-op on a real piano, a `press` on the mock).
             Screen::Record(rec) => match code {
                 KeyCode::Tab | KeyCode::Esc => {
                     // Release anything still sounding before leaving the screen.
@@ -106,8 +111,13 @@ impl Shell {
                     Ok(p) => self.status = format!("saved {}", p.display()),
                     Err(e) => self.status = format!("save failed: {e}"),
                 },
+                KeyCode::Char(c) => {
+                    self.input.forward_key(c);
+                }
                 _ => {}
             },
+            // Same precedence as Record: `r`/`m` are reserved controls, other
+            // letters become note presses on the mock.
             Screen::Play(play) => match code {
                 KeyCode::Tab | KeyCode::Esc => {
                     play.leave();
@@ -115,6 +125,9 @@ impl Shell {
                 }
                 KeyCode::Char('r') => play.restart(),
                 KeyCode::Char('m') => play.toggle_hear_song(),
+                KeyCode::Char(c) => {
+                    self.input.forward_key(c);
+                }
                 _ => {}
             },
         }
@@ -122,7 +135,7 @@ impl Shell {
 }
 
 /// Run the app shell until the user quits.
-pub fn run(input: LiveInput, synth: Option<SynthHandle>) -> io::Result<()> {
+pub fn run(input: Box<dyn NoteSource>, synth: Option<SynthHandle>) -> io::Result<()> {
     let mut terminal = ratatui::init();
     let mut shell = Shell::new(input, synth);
     let res = run_loop(&mut terminal, &mut shell);
@@ -138,7 +151,7 @@ fn run_loop<B: ratatui::backend::Backend>(
         // Drain MIDI and route to the active screen. Clone the synth handle out
         // first so we don't hold a borrow of `shell` across the screen match.
         let synth = shell.synth.clone();
-        let events: Vec<_> = shell.input.events().collect();
+        let events = shell.input.events();
         for ev in events {
             match &mut shell.screen {
                 Screen::Record(rec) => {

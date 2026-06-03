@@ -23,19 +23,33 @@ mod record;
 mod render;
 
 use rockcraft_audio::AudioOut;
-use rockcraft_midi::LiveInput;
+use rockcraft_midi::{LiveInput, MockKeyboard, NoteSource};
 
 fn main() {
-    let filter = std::env::args()
-        .nth(1)
+    // Args: `--mock` forces the keyboard mock; the first non-flag arg is the
+    // MIDI port-name substring (default "casio").
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let force_mock = args.iter().any(|a| a == "--mock");
+    let filter = args
+        .iter()
+        .find(|a| !a.starts_with("--"))
+        .cloned()
         .unwrap_or_else(|| "casio".to_string());
 
-    let input = match LiveInput::connect(&filter) {
-        Ok(i) => i,
-        Err(e) => {
-            eprintln!("Could not open MIDI input: {e}");
-            eprintln!("(Is the piano connected? Try passing a port-name substring.)");
-            std::process::exit(1);
+    // Source selection: explicit `--mock`, otherwise the live piano — and when
+    // no port matches, fall back to the mock so the app always launches.
+    let input: Box<dyn NoteSource> = if force_mock {
+        eprintln!("Using MockKeyboard (--mock): type the home/QWERTY rows to play notes.");
+        Box::new(MockKeyboard::new())
+    } else {
+        match LiveInput::connect(&filter) {
+            Ok(i) => Box::new(i),
+            Err(e) => {
+                eprintln!(
+                    "No MIDI input ({e}); falling back to MockKeyboard — type to play notes."
+                );
+                Box::new(MockKeyboard::new())
+            }
         }
     };
 

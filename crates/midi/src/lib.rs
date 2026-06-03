@@ -12,6 +12,10 @@ pub use rockcraft_core as core;
 
 pub mod file;
 pub mod live;
+pub mod mock;
+pub mod source;
 
 pub use file::{events_to_smf_bytes, smf_bytes_to_events, MidiFileError};
 pub use live::{parse_note_message, LiveInput, LiveInputError};
+pub use mock::MockKeyboard;
+pub use source::NoteSource;
