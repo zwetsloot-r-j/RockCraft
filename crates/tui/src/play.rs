@@ -2,6 +2,7 @@
 //! scrolls its notes down to the keyboard line on a playback clock, and lights
 //! the player's live keys over it (play-along; scoring is a later task).
 
+use std::collections::HashSet;
 use std::time::Instant;
 
 use ratatui::{
@@ -11,7 +12,8 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
-use rockcraft_core::NoteEvent;
+use rockcraft_audio::SynthHandle;
+use rockcraft_core::{MidiNote, NoteEvent, Velocity};
 use rockcraft_midi::smf_bytes_to_events;
 
 use crate::highway::{build_spans, project, song_duration_us, NoteSpan};
@@ -27,6 +29,9 @@ const LEAD_US: u64 = 2_000_000;
 /// first note reaches the keyboard is `PRE_ROLL_US + LEAD_US`.
 const PRE_ROLL_US: u64 = 1_500_000;
 
+/// Velocity used when the hear-the-song feature synthesizes recorded notes.
+const HEAR_VELOCITY: u8 = 80;
+
 pub struct PlayScreen {
     spans: Vec<NoteSpan>,
     duration_us: u64,
@@ -34,11 +39,22 @@ pub struct PlayScreen {
     started: Instant,
     title: String,
     finished_pause_us: u64,
+    synth: Option<SynthHandle>,
+    /// Whether the "hear the song" feature is active.
+    hear_song: bool,
+    /// Span indices for which we have already sent note_on to the song synth.
+    song_on_fired: HashSet<usize>,
+    /// Span indices for which we have already sent note_off to the song synth.
+    song_off_fired: HashSet<usize>,
 }
 
 impl PlayScreen {
     /// Load a song from `.mid` bytes.
-    pub fn from_smf_bytes(title: String, bytes: &[u8]) -> Result<Self, String> {
+    pub fn from_smf_bytes(
+        title: String,
+        bytes: &[u8],
+        synth: Option<SynthHandle>,
+    ) -> Result<Self, String> {
         let events = smf_bytes_to_events(bytes).map_err(|e| e.to_string())?;
         let raw = build_spans(&events);
 
@@ -65,18 +81,80 @@ impl PlayScreen {
             held: HeldNotes::new(),
             started: Instant::now(),
             title,
-            // keep scrolling a little past the end so the last notes land
             finished_pause_us: LEAD_US,
+            synth,
+            hear_song: false,
+            song_on_fired: HashSet::new(),
+            song_off_fired: HashSet::new(),
         })
     }
 
-    /// Restart playback from the top.
+    /// Restart playback from the top; resets synth state.
     pub fn restart(&mut self) {
         self.started = Instant::now();
+        self.song_on_fired.clear();
+        self.song_off_fired.clear();
+        if let Some(s) = &self.synth {
+            s.all_off();
+        }
     }
 
+    /// Forward a live `NoteEvent` to both the held-key tracker and the synth.
     pub fn ingest(&mut self, ev: NoteEvent) {
         self.held.apply(&ev);
+        if let Some(s) = &self.synth {
+            s.apply(&ev);
+        }
+    }
+
+    /// Toggle the "hear the song" feature. Turning it off silences any playing
+    /// song notes and resets the trigger bookkeeping.
+    pub fn toggle_hear_song(&mut self) {
+        self.hear_song = !self.hear_song;
+        if !self.hear_song {
+            self.song_on_fired.clear();
+            self.song_off_fired.clear();
+            if let Some(s) = &self.synth {
+                s.all_off();
+            }
+        }
+    }
+
+    /// Check the playback clock and fire synth note_on / note_off commands for
+    /// any song spans whose boundaries we've crossed since the last call.
+    /// Call this once per event-loop iteration (not per render frame) to keep
+    /// audio timing driven by the clock rather than the frame rate.
+    pub fn tick_song_synth(&mut self) {
+        if !self.hear_song {
+            return;
+        }
+        let now = self.now_us();
+        let (need_on, need_off) =
+            pending_triggers(&self.spans, now, &self.song_on_fired, &self.song_off_fired);
+        let velocity = Velocity::new(HEAR_VELOCITY).unwrap();
+        for i in need_on {
+            if let Some(note) = MidiNote::new(self.spans[i].note) {
+                if let Some(s) = &self.synth {
+                    s.note_on(note, velocity);
+                }
+            }
+            self.song_on_fired.insert(i);
+        }
+        for i in need_off {
+            if let Some(note) = MidiNote::new(self.spans[i].note) {
+                if let Some(s) = &self.synth {
+                    s.note_off(note);
+                }
+            }
+            self.song_off_fired.insert(i);
+        }
+    }
+
+    /// Silence all notes — call when leaving the screen.
+    pub fn leave(&self) {
+        if let Some(s) = &self.synth {
+            s.all_off();
+        }
     }
 
     /// Current playback time in microseconds since entering the screen.
@@ -144,10 +222,16 @@ impl PlayScreen {
     fn draw_status(&self, f: &mut Frame, area: Rect, now: u64) {
         let secs = now as f64 / 1_000_000.0;
         let total = self.duration_us as f64 / 1_000_000.0;
+        let music_color = if self.hear_song {
+            Color::Green
+        } else {
+            Color::DarkGray
+        };
         let line = Line::from(vec![
             Span::styled(" PLAY ", Style::default().fg(Color::Black).bg(TARGET_COLOR)),
             Span::raw(format!("  {:.1}s / {:.1}s  ", secs, total)),
             Span::raw("[r] restart  [Tab] menu  "),
+            Span::styled("[m] music  ", Style::default().fg(music_color)),
             Span::styled("● target ", Style::default().fg(TARGET_COLOR)),
             Span::styled("● you ", Style::default().fg(HELD_COLOR)),
             Span::styled("● match", Style::default().fg(MATCH_COLOR)),
@@ -198,5 +282,129 @@ impl PlayScreen {
                 );
             }
         }
+    }
+}
+
+/// Returns `(need_on, need_off)`: indices into `spans` where note_on / note_off
+/// should fire at `now_us` but haven't yet. Pure; suitable for unit testing.
+fn pending_triggers(
+    spans: &[NoteSpan],
+    now_us: u64,
+    on_fired: &HashSet<usize>,
+    off_fired: &HashSet<usize>,
+) -> (Vec<usize>, Vec<usize>) {
+    let mut need_on = Vec::new();
+    let mut need_off = Vec::new();
+    for (i, span) in spans.iter().enumerate() {
+        if now_us >= span.start_us && !on_fired.contains(&i) {
+            need_on.push(i);
+        }
+        if now_us >= span.end_us && !off_fired.contains(&i) {
+            need_off.push(i);
+        }
+    }
+    (need_on, need_off)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn span(start_us: u64, end_us: u64) -> NoteSpan {
+        NoteSpan {
+            note: 60,
+            start_us,
+            end_us,
+        }
+    }
+
+    fn empty() -> HashSet<usize> {
+        HashSet::new()
+    }
+
+    #[test]
+    fn no_triggers_before_any_span_starts() {
+        let spans = vec![span(1000, 2000), span(3000, 4000)];
+        let (on, off) = pending_triggers(&spans, 500, &empty(), &empty());
+        assert!(on.is_empty());
+        assert!(off.is_empty());
+    }
+
+    #[test]
+    fn note_on_fires_when_clock_reaches_start() {
+        let spans = vec![span(1000, 2000)];
+        let (on, off) = pending_triggers(&spans, 1000, &empty(), &empty());
+        assert_eq!(on, vec![0]);
+        assert!(off.is_empty());
+    }
+
+    #[test]
+    fn note_off_fires_when_clock_reaches_end() {
+        let spans = vec![span(1000, 2000)];
+        let mut on_fired = HashSet::new();
+        on_fired.insert(0);
+        let (on, off) = pending_triggers(&spans, 2000, &on_fired, &empty());
+        assert!(on.is_empty(), "on should not fire twice");
+        assert_eq!(off, vec![0]);
+    }
+
+    #[test]
+    fn each_fires_exactly_once() {
+        let spans = vec![span(1000, 2000)];
+        let mut on_fired = HashSet::new();
+        let mut off_fired = HashSet::new();
+
+        // Before start: nothing
+        let (on, off) = pending_triggers(&spans, 999, &on_fired, &off_fired);
+        assert!(on.is_empty() && off.is_empty());
+
+        // At start: note_on
+        let (on, off) = pending_triggers(&spans, 1000, &on_fired, &off_fired);
+        assert_eq!(on, vec![0]);
+        assert!(off.is_empty());
+        on_fired.insert(0);
+
+        // Between start and end: nothing new
+        let (on, off) = pending_triggers(&spans, 1500, &on_fired, &off_fired);
+        assert!(on.is_empty() && off.is_empty());
+
+        // At end: note_off
+        let (on, off) = pending_triggers(&spans, 2000, &on_fired, &off_fired);
+        assert!(on.is_empty());
+        assert_eq!(off, vec![0]);
+        off_fired.insert(0);
+
+        // After end: nothing new
+        let (on, off) = pending_triggers(&spans, 3000, &on_fired, &off_fired);
+        assert!(on.is_empty() && off.is_empty());
+    }
+
+    #[test]
+    fn multiple_spans_fire_independently() {
+        let spans = vec![span(1000, 2000), span(1500, 3000)];
+        let (on, off) = pending_triggers(&spans, 1500, &empty(), &empty());
+        // Both have started; neither has ended yet.
+        assert_eq!(on, vec![0, 1]);
+        assert!(off.is_empty());
+    }
+
+    #[test]
+    fn restart_clears_state_so_triggers_refire() {
+        let spans = vec![span(1000, 2000)];
+        let mut on_fired = HashSet::new();
+        let mut off_fired = HashSet::new();
+        on_fired.insert(0);
+        off_fired.insert(0);
+
+        // With fired state present, nothing fires again.
+        let (on, off) = pending_triggers(&spans, 2000, &on_fired, &off_fired);
+        assert!(on.is_empty() && off.is_empty());
+
+        // After clearing (simulating restart), both fire again.
+        on_fired.clear();
+        off_fired.clear();
+        let (on, off) = pending_triggers(&spans, 2000, &on_fired, &off_fired);
+        assert_eq!(on, vec![0]);
+        assert_eq!(off, vec![0]);
     }
 }
