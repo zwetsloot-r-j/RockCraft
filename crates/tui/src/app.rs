@@ -201,9 +201,11 @@ impl Shell {
                 _ => {}
             },
             // The composer editor: Tab/Esc leave to the menu; `s` saves the
-            // timeline to a bundle (matching the Record screen's convention);
-            // every other key is routed into the screen's own keymap.
+            // timeline bundle (matching Record's convention); every other key is
+            // routed into the screen's own keymap. Exception: while the chord
+            // selector is active, Esc cancels the chord instead of leaving.
             Screen::Edit(edit) => match code {
+                KeyCode::Esc if edit.in_chord_mode() => edit.on_key(KeyCode::Esc),
                 KeyCode::Tab | KeyCode::Esc => {
                     edit.leave();
                     self.screen = Screen::Menu;
