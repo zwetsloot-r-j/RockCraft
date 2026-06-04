@@ -4,6 +4,7 @@
 //! `RecordingMeta` struct mirrors the `meta.json` inside a bundle directory;
 //! serialization is in-memory only (callers in `tui`/`audio` do the fs work).
 
+use crate::{Grid, Key};
 use serde::{Deserialize, Serialize};
 
 /// Describes the backing audio track inside a recording bundle.
@@ -26,6 +27,12 @@ pub struct RecordingMeta {
     /// Optional backing audio description. `None` means MIDI-only recording.
     #[serde(default)]
     pub backing: Option<BackingTrack>,
+    /// Composer grid (tempo/time-sig/snap). `None` for legacy/piano recordings.
+    #[serde(default)]
+    pub grid: Option<Grid>,
+    /// Composer key signature. `None` for legacy/piano recordings.
+    #[serde(default)]
+    pub key: Option<Key>,
     /// Schema version; always written as `1`. Kept for forward-compat.
     #[serde(default = "default_version")]
     pub version: u32,
@@ -53,6 +60,8 @@ impl RecordingMeta {
         Self {
             midi_file: midi_file.into(),
             backing: None,
+            grid: None,
+            key: None,
             version: 1,
         }
     }
@@ -110,6 +119,26 @@ mod tests {
                 file: "backing.mp3".into(),
                 audio_start_us: 250_000,
             }),
+            grid: None,
+            key: None,
+            version: 1,
+        };
+        let json = meta.to_json();
+        let back = RecordingMeta::from_json(&json).unwrap();
+        assert_eq!(meta, back);
+    }
+
+    #[test]
+    fn with_grid_and_key_roundtrip() {
+        use crate::{Grid, Key, Scale};
+        let meta = RecordingMeta {
+            midi_file: "song.mid".into(),
+            backing: None,
+            grid: Some(Grid::default_120()),
+            key: Some(Key {
+                root_pc: 7,
+                scale: Scale::NaturalMinor,
+            }),
             version: 1,
         };
         let json = meta.to_json();
@@ -126,11 +155,21 @@ mod tests {
 
     #[test]
     fn minimal_legacy_json_deserializes() {
-        // An older meta.json that only has `midi_file`; `backing` should default to None.
+        // An older meta.json that only has `midi_file`; optional fields default to None.
         let minimal = r#"{"midi_file":"song.mid"}"#;
         let meta = RecordingMeta::from_json(minimal).unwrap();
         assert_eq!(meta.midi_file, "song.mid");
         assert!(meta.backing.is_none());
+        assert!(meta.grid.is_none());
+        assert!(meta.key.is_none());
+
+        // Legacy with backing but no grid/key.
+        let with_backing =
+            r#"{"midi_file":"song.mid","backing":{"file":"b.mp3","audio_start_us":0}}"#;
+        let meta2 = RecordingMeta::from_json(with_backing).unwrap();
+        assert!(meta2.backing.is_some());
+        assert!(meta2.grid.is_none());
+        assert!(meta2.key.is_none());
     }
 
     // ── song_shift_us ────────────────────────────────────────────────────────

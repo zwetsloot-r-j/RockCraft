@@ -154,6 +154,8 @@ impl RecordScreen {
         let meta = RecordingMeta {
             midi_file: "song.mid".to_string(),
             backing: backing_meta,
+            grid: None,
+            key: None,
             version: 1,
         };
         std::fs::write(bundle_dir.join("meta.json"), meta.to_json())?;
@@ -313,6 +315,8 @@ mod tests {
                 file: filename,
                 audio_start_us: 0,
             }),
+            grid: None,
+            key: None,
             version: 1,
         };
         let back = RecordingMeta::from_json(&meta.to_json()).unwrap();
