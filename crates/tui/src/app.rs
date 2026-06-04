@@ -327,6 +327,11 @@ pub fn run_loop<B: ratatui::backend::Backend>(
             play.tick_song_synth();
         }
 
+        // Tick editor transport audition (clock-driven).
+        if let Screen::Edit(edit) = &mut shell.screen {
+            edit.tick_audition();
+        }
+
         // A finished song returns to the menu on its own.
         if let Screen::Play(play) = &shell.screen {
             if play.is_finished() {

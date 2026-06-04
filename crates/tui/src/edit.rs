@@ -10,7 +10,9 @@
 //! Nothing here touches a device or the disk, so the whole screen is
 //! headless-testable via the existing `TestBackend` harness.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use crossterm::event::KeyCode;
 use ratatui::{
@@ -63,6 +65,8 @@ const REC_COLOR: Color = Color::Red;
 const NOTE_COLOR: Color = Color::Indexed(33);
 /// Faint colour for beat/bar gridlines.
 const GRID_COLOR: Color = Color::DarkGray;
+/// Transport playhead line colour.
+const PLAYHEAD_COLOR: Color = Color::Green;
 
 /// A `(pitch, step)` editing cursor.
 ///
@@ -88,6 +92,19 @@ pub enum InputMode {
     DirectEdit,
     StepRecord,
     LiveRecord,
+}
+
+/// Transport state: stopped or playing from a song position.
+enum Transport {
+    Stopped,
+    Playing {
+        /// Song µs where playback began.
+        song_start_us: u64,
+        /// Wall-clock reference; reset by `advance()` to absorb injected time.
+        wall_ref: Instant,
+        /// Accumulated microseconds injected via `advance()` (for headless tests).
+        extra_us: u64,
+    },
 }
 
 /// Live state of the key-aware chord selector (`c`).
@@ -130,12 +147,20 @@ pub struct EditScreen {
     last_committed: Vec<MidiNote>,
     /// How played MIDI is consumed: direct-edit (ignore) vs step/live record.
     input_mode: InputMode,
-    /// Playhead position for `LiveRecord`. A seam the transport (#59) will drive;
+    /// Playhead position for `LiveRecord`. A seam the transport drives;
     /// tests advance it via `set_playhead_us`.
-    playhead_us: u64,
+    live_playhead_us: u64,
     /// Note-ons awaiting their off during `LiveRecord`: `(pitch, snapped start µs,
     /// velocity)`. Closed and inserted as a `Note` when the matching off arrives.
     live_pending: Vec<(MidiNote, u64, Velocity)>,
+    /// Transport state: stopped or playing.
+    transport: Transport,
+    /// Spans cached from the timeline at the moment playback was started.
+    audition_spans: Vec<NoteSpan>,
+    /// Span indices for which note_on has been sent during this playback.
+    audition_on_fired: HashSet<usize>,
+    /// Span indices for which note_off has been sent during this playback.
+    audition_off_fired: HashSet<usize>,
 }
 
 impl EditScreen {
@@ -170,8 +195,12 @@ impl EditScreen {
             chord: None,
             last_committed: Vec::new(),
             input_mode: InputMode::DirectEdit,
-            playhead_us: 0,
+            live_playhead_us: 0,
             live_pending: Vec::new(),
+            transport: Transport::Stopped,
+            audition_spans: Vec::new(),
+            audition_on_fired: HashSet::new(),
+            audition_off_fired: HashSet::new(),
         }
     }
 
@@ -191,9 +220,13 @@ impl EditScreen {
     /// cancelled (its notes removed) so leaving never strands a ghost chord.
     pub fn leave(&mut self) {
         self.cancel_chord();
+        self.transport = Transport::Stopped;
         let prev = self.auditioning.take();
-        if let (Some(synth), Some(p)) = (&self.synth, prev) {
-            synth.note_off(p);
+        if let Some(synth) = &self.synth {
+            if let Some(p) = prev {
+                synth.note_off(p);
+            }
+            synth.all_off();
         }
     }
 
@@ -259,9 +292,72 @@ impl EditScreen {
     }
 
     /// Set the `LiveRecord` playhead position. This is the seam the transport
-    /// (#59) drives; tests advance it manually to place recorded notes.
+    /// drives; tests advance it manually to place recorded notes.
     pub fn set_playhead_us(&mut self, us: u64) {
-        self.playhead_us = us;
+        self.live_playhead_us = us;
+    }
+
+    /// Whether the transport is currently playing.
+    pub fn is_playing(&self) -> bool {
+        matches!(self.transport, Transport::Playing { .. })
+    }
+
+    /// Current playhead position in song microseconds.
+    /// Returns `cursor_us` when stopped.
+    pub fn playhead_us(&self) -> u64 {
+        match &self.transport {
+            Transport::Stopped => self.cursor_us(),
+            Transport::Playing {
+                song_start_us,
+                wall_ref,
+                extra_us,
+            } => song_start_us + wall_ref.elapsed().as_micros() as u64 + extra_us,
+        }
+    }
+
+    /// Advance the playhead by `dt_us` microseconds (for headless tests).
+    /// No-op when stopped.
+    pub fn advance(&mut self, dt_us: u64) {
+        if let Transport::Playing {
+            wall_ref, extra_us, ..
+        } = &mut self.transport
+        {
+            *extra_us += wall_ref.elapsed().as_micros() as u64 + dt_us;
+            *wall_ref = Instant::now();
+        }
+    }
+
+    /// Fire synth note_on / note_off for any spans whose boundaries the
+    /// playhead has crossed since the last call. Call once per event-loop
+    /// iteration from the shell's run loop, like `tick_song_synth`.
+    pub fn tick_audition(&mut self) {
+        if !self.is_playing() {
+            return;
+        }
+        let now = self.playhead_us();
+        let (need_on, need_off) = audition_pending_triggers(
+            &self.audition_spans,
+            now,
+            &self.audition_on_fired,
+            &self.audition_off_fired,
+        );
+        let velocity = Velocity::new(DEFAULT_NOTE_VEL).expect("80 is always valid");
+        for i in need_on {
+            if let Some(note) = MidiNote::new(self.audition_spans[i].note) {
+                if let Some(s) = &self.synth {
+                    s.note_on(note, velocity);
+                }
+            }
+            self.audition_on_fired.insert(i);
+        }
+        for i in need_off {
+            if let Some(note) = MidiNote::new(self.audition_spans[i].note) {
+                if let Some(s) = &self.synth {
+                    s.note_off(note);
+                }
+            }
+            self.audition_off_fired.insert(i);
+        }
     }
 
     /// The pitches of the chord currently being previewed, or `None` when not in
@@ -409,6 +505,17 @@ impl EditScreen {
                 self.toggle_record_flavour();
             }
 
+            // Transport: Space toggles play-from-cursor / stop (not in grab mode).
+            KeyCode::Char(' ') => {
+                if self.grabbed.is_none() {
+                    self.toggle_play_cursor();
+                }
+            }
+            // Transport: `p` plays the whole song from position 0.
+            KeyCode::Char('p') => {
+                self.start_play(0);
+            }
+
             _ => {}
         }
     }
@@ -479,7 +586,7 @@ impl EditScreen {
     /// pending span; the matching note-off closes it into a `Note` (minimum one
     /// grid step so a zero-length tap is still audible/visible).
     fn ingest_live(&mut self, ev: NoteEvent) {
-        let at = self.grid.snap(self.playhead_us);
+        let at = self.grid.snap(self.live_playhead_us);
         match ev.kind {
             NoteEventKind::On { velocity } if !velocity.is_note_off() => {
                 self.live_pending.push((ev.note, at, velocity));
@@ -786,6 +893,50 @@ impl EditScreen {
         self.grid.step_index(end_us)
     }
 
+    // ── transport helpers ─────────────────────────────────────────────────
+
+    /// Toggle play-from-cursor / stop.
+    fn toggle_play_cursor(&mut self) {
+        if self.is_playing() {
+            self.stop_play();
+        } else {
+            let from = self.cursor_us();
+            self.start_play(from);
+        }
+    }
+
+    /// Begin playback from `from_us` in song time, caching spans and
+    /// pre-marking notes that already ended before the start position.
+    fn start_play(&mut self, from_us: u64) {
+        if let Some(synth) = &self.synth {
+            synth.all_off();
+        }
+        self.auditioning = None;
+        self.audition_spans = build_spans(&self.timeline.to_events());
+        self.audition_on_fired.clear();
+        self.audition_off_fired.clear();
+        // Skip spans that ended before the start position.
+        for (i, span) in self.audition_spans.iter().enumerate() {
+            if span.end_us <= from_us {
+                self.audition_on_fired.insert(i);
+                self.audition_off_fired.insert(i);
+            }
+        }
+        self.transport = Transport::Playing {
+            song_start_us: from_us,
+            wall_ref: Instant::now(),
+            extra_us: 0,
+        };
+    }
+
+    /// Stop playback and silence all notes.
+    fn stop_play(&mut self) {
+        self.transport = Transport::Stopped;
+        if let Some(synth) = &self.synth {
+            synth.all_off();
+        }
+    }
+
     // ── time-axis viewport ────────────────────────────────────────────────
 
     /// Microsecond position of the cursor on the time axis.
@@ -799,11 +950,16 @@ impl EditScreen {
     }
 
     /// The time at the bottom (keyboard line) of the highway, scrolled so the
-    /// cursor stays anchored a quarter of the way up the visible window.
+    /// cursor (or playhead during playback) stays anchored a quarter of the way
+    /// up the visible window.
     fn view_now_us(&self) -> u64 {
         let lead = self.lead_us();
-        self.cursor_us()
-            .saturating_sub(lead * CURSOR_ANCHOR_NUM / CURSOR_ANCHOR_DEN)
+        let anchor_us = if self.is_playing() {
+            self.playhead_us()
+        } else {
+            self.cursor_us()
+        };
+        anchor_us.saturating_sub(lead * CURSOR_ANCHOR_NUM / CURSOR_ANCHOR_DEN)
     }
 
     // ── rendering ─────────────────────────────────────────────────────────
@@ -923,6 +1079,7 @@ impl EditScreen {
 
         // Beat/bar gridlines first, so notes and the cursor paint over them.
         self.draw_gridlines(f, area, now, lead);
+        self.draw_playhead(f, area, now, lead);
 
         // Timeline notes.
         for span in build_spans(&self.timeline.to_events()) {
@@ -974,6 +1131,28 @@ impl EditScreen {
         }
     }
 
+    /// Horizontal playhead line at the current transport position.
+    fn draw_playhead(&self, f: &mut Frame, area: Rect, now: u64, lead: u64) {
+        if !self.is_playing() {
+            return;
+        }
+        let ph = self.playhead_us();
+        let marker = NoteSpan {
+            note: LOWEST_MIDI,
+            start_us: ph,
+            end_us: ph + 1,
+        };
+        let Some(rs) = project(&marker, now, lead, area.height) else {
+            return;
+        };
+        let line = "─".repeat(area.width as usize);
+        let rect = Rect::new(area.x, area.y + rs.bottom_row, area.width, 1);
+        f.render_widget(
+            Paragraph::new(line).style(Style::default().fg(PLAYHEAD_COLOR)),
+            rect,
+        );
+    }
+
     /// Faint horizontal lines at bar boundaries within the visible window.
     fn draw_gridlines(&self, f: &mut Frame, area: Rect, now: u64, lead: u64) {
         let bar = self.grid.bar_us();
@@ -1006,6 +1185,27 @@ impl Default for EditScreen {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Returns `(need_on, need_off)`: span indices whose note_on / note_off should
+/// fire at `now_us` but haven't yet. Mirrors the same helper in `play.rs`.
+fn audition_pending_triggers(
+    spans: &[NoteSpan],
+    now_us: u64,
+    on_fired: &HashSet<usize>,
+    off_fired: &HashSet<usize>,
+) -> (Vec<usize>, Vec<usize>) {
+    let mut need_on = Vec::new();
+    let mut need_off = Vec::new();
+    for (i, span) in spans.iter().enumerate() {
+        if now_us >= span.start_us && !on_fired.contains(&i) {
+            need_on.push(i);
+        }
+        if now_us >= span.end_us && !off_fired.contains(&i) {
+            need_off.push(i);
+        }
+    }
+    (need_on, need_off)
 }
 
 #[cfg(test)]
@@ -1820,5 +2020,175 @@ mod tests {
         let n = e.get_note(id).unwrap();
         assert_eq!(n.start_us, step, "start snapped to grid");
         assert_eq!(n.dur_us, step, "zero-length tap floored to one step");
+    }
+
+    // ── transport tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn space_starts_play_from_cursor_and_second_space_stops() {
+        let mut e = EditScreen::new();
+        // Move cursor to step 4 → some non-zero µs.
+        for _ in 0..4 {
+            e.on_key(KeyCode::Char('l'));
+        }
+        let cursor_us = e.cursor_us();
+        assert!(!e.is_playing());
+
+        e.on_key(KeyCode::Char(' '));
+        assert!(e.is_playing());
+        // Playhead starts at cursor position.
+        assert_eq!(e.playhead_us(), cursor_us);
+
+        // Second Space stops.
+        e.on_key(KeyCode::Char(' '));
+        assert!(!e.is_playing());
+    }
+
+    #[test]
+    fn p_plays_whole_song_from_zero() {
+        let mut e = EditScreen::new();
+        for _ in 0..8 {
+            e.on_key(KeyCode::Char('l'));
+        }
+        assert!(e.cursor_us() > 0);
+
+        e.on_key(KeyCode::Char('p'));
+        assert!(e.is_playing());
+        assert_eq!(e.playhead_us(), 0);
+    }
+
+    #[test]
+    fn advance_moves_playhead_forward() {
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char(' ')); // start from cursor (step 0 → 0 µs)
+        assert!(e.is_playing());
+
+        e.advance(500_000);
+        let ph = e.playhead_us();
+        // playhead_us >= 500_000 (wall-clock adds a tiny amount; extra_us = 500_000)
+        assert!(
+            ph >= 500_000,
+            "playhead must have advanced at least 500_000 µs, got {ph}"
+        );
+
+        e.advance(500_000);
+        let ph2 = e.playhead_us();
+        assert!(
+            ph2 >= 1_000_000,
+            "playhead must have advanced at least 1_000_000 µs total, got {ph2}"
+        );
+    }
+
+    #[test]
+    fn advance_is_noop_when_stopped() {
+        let mut e = EditScreen::new();
+        assert!(!e.is_playing());
+        e.advance(1_000_000); // must not panic or start playing
+        assert!(!e.is_playing());
+    }
+
+    #[test]
+    fn note_on_fires_exactly_once_as_playhead_passes_start() {
+        let mut tl = Timeline::new();
+        // Note at 500_000 µs, duration 200_000 µs.
+        tl.insert(note(60, 500_000, 200_000));
+        let mut e = EditScreen::from_timeline(tl, Grid::default_120());
+
+        // Play from 0.
+        e.on_key(KeyCode::Char('p'));
+        assert!(e.is_playing());
+
+        // Before start_us: no on-fired.
+        assert_eq!(e.audition_on_fired.len(), 0);
+
+        // Advance to just before the note.
+        e.advance(499_000);
+        e.tick_audition();
+        assert_eq!(
+            e.audition_on_fired.len(),
+            0,
+            "note_on should not fire before start_us"
+        );
+
+        // Advance past start_us.
+        e.advance(2_000);
+        e.tick_audition();
+        assert_eq!(
+            e.audition_on_fired.len(),
+            1,
+            "note_on should fire exactly once"
+        );
+
+        // Advance again — still only fired once.
+        e.advance(10_000);
+        e.tick_audition();
+        assert_eq!(e.audition_on_fired.len(), 1, "note_on fires only once");
+    }
+
+    #[test]
+    fn note_off_fires_after_duration() {
+        let mut tl = Timeline::new();
+        tl.insert(note(60, 0, 200_000));
+        let mut e = EditScreen::from_timeline(tl, Grid::default_120());
+
+        e.on_key(KeyCode::Char('p'));
+
+        // Advance past start (0); note_on fires.
+        e.advance(1_000);
+        e.tick_audition();
+        assert_eq!(e.audition_on_fired.len(), 1);
+        assert_eq!(e.audition_off_fired.len(), 0);
+
+        // Advance past end (200_000); note_off fires.
+        e.advance(200_000);
+        e.tick_audition();
+        assert_eq!(
+            e.audition_off_fired.len(),
+            1,
+            "note_off should fire after dur_us"
+        );
+    }
+
+    #[test]
+    fn stop_resets_to_stopped() {
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('p'));
+        assert!(e.is_playing());
+
+        e.on_key(KeyCode::Char(' ')); // Space stops
+        assert!(!e.is_playing());
+    }
+
+    #[test]
+    fn play_from_cursor_sets_playhead_to_cursor_us() {
+        let mut e = EditScreen::new();
+        // Move cursor to step 16 (one bar at default grid).
+        for _ in 0..16 {
+            e.on_key(KeyCode::Char('l'));
+        }
+        let cursor_before = e.cursor_us();
+
+        e.on_key(KeyCode::Char(' '));
+        assert_eq!(e.playhead_us(), cursor_before);
+    }
+
+    #[test]
+    fn notes_before_play_start_are_skipped() {
+        let mut tl = Timeline::new();
+        // Note entirely before cursor.
+        tl.insert(note(60, 0, 100_000));
+        let mut e = EditScreen::from_timeline(tl, Grid::default_120());
+
+        // Move cursor past the note and start playing.
+        for _ in 0..4 {
+            e.on_key(KeyCode::Char('l'));
+        }
+        e.on_key(KeyCode::Char(' ')); // play from cursor_us > 100_000
+
+        // Span at index 0 should be pre-marked as fired since end_us <= from_us.
+        assert!(
+            e.audition_on_fired.contains(&0),
+            "note ending before play start should be pre-skipped"
+        );
     }
 }
