@@ -15,7 +15,7 @@ use ratatui::{
     Frame, Terminal,
 };
 use rockcraft_audio::SynthHandle;
-use rockcraft_core::{Grid, Timeline};
+use rockcraft_core::{Grid, Key, RecordingMeta, Scale, Timeline};
 use rockcraft_midi::{smf_bytes_to_events, NoteSource};
 
 use crate::edit::EditScreen;
@@ -138,7 +138,10 @@ impl Shell {
                     Ok(bytes) => match smf_bytes_to_events(&bytes) {
                         Ok(events) => {
                             let timeline = Timeline::from_events(&events);
-                            let mut edit = EditScreen::from_timeline(timeline, Grid::default_120());
+                            let bundle_dir = path.parent().unwrap_or(&path);
+                            let (grid, key) = load_meta_grid_key(bundle_dir);
+                            let mut edit = EditScreen::from_timeline(timeline, grid);
+                            edit.set_key(key);
                             if let Some(s) = &self.synth {
                                 edit.attach_synth(s.clone());
                             }
@@ -362,6 +365,24 @@ fn draw_menu(f: &mut Frame, area: Rect, shell: &Shell) {
     );
 }
 
+/// Read `meta.json` from a bundle dir; return `(Grid, Key)`, falling back to defaults.
+fn load_meta_grid_key(bundle_dir: &std::path::Path) -> (Grid, Key) {
+    let default_key = Key {
+        root_pc: 0,
+        scale: Scale::Major,
+    };
+    let Ok(json) = std::fs::read_to_string(bundle_dir.join("meta.json")) else {
+        return (Grid::default_120(), default_key);
+    };
+    let Ok(meta) = RecordingMeta::from_json(&json) else {
+        return (Grid::default_120(), default_key);
+    };
+    (
+        meta.grid.unwrap_or_else(Grid::default_120),
+        meta.key.unwrap_or(default_key),
+    )
+}
+
 /// Find `song.mid` inside the most recent `take-*/` bundle under `recordings/`.
 fn latest_recording() -> Option<std::path::PathBuf> {
     latest_recording_from(std::path::Path::new("recordings"))
@@ -390,7 +411,7 @@ pub(crate) fn latest_recording_from(base: &std::path::Path) -> Option<std::path:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rockcraft_core::{Grid, MidiNote, Note, Timeline, Velocity};
+    use rockcraft_core::{Grid, Key, MidiNote, Note, Scale, Timeline, Velocity};
     use rockcraft_midi::ScriptedSource;
 
     fn make_note(pitch: u8, start: u64, dur: u64) -> Note {
@@ -458,5 +479,43 @@ mod tests {
             expected_count,
             "editor is pre-populated with the saved notes"
         );
+    }
+
+    /// Saving a composition with a custom grid and key, then loading it via
+    /// `load_meta_grid_key`, restores the same grid bpm/subdivision and key.
+    #[test]
+    fn save_load_restores_grid_and_key() {
+        use rockcraft_core::{Subdivision, TimeSig};
+
+        let grid = Grid {
+            bpm: 140,
+            time_sig: TimeSig {
+                beats_per_bar: 3,
+                beat_unit: 4,
+            },
+            subdivision: Subdivision::Eighth,
+        };
+        let key = Key {
+            root_pc: 2,
+            scale: Scale::NaturalMinor,
+        };
+
+        let base = std::env::temp_dir().join(format!(
+            "rockcraft_grid_key_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        let mut edit = EditScreen::from_timeline(Timeline::new(), grid);
+        edit.set_key(key);
+        let bundle_dir = edit.save_bundle(&base).expect("save failed");
+
+        let (loaded_grid, loaded_key) = load_meta_grid_key(&bundle_dir);
+
+        std::fs::remove_dir_all(&base).ok();
+
+        assert_eq!(loaded_grid, grid, "grid must round-trip through meta.json");
+        assert_eq!(loaded_key, key, "key must round-trip through meta.json");
     }
 }

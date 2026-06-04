@@ -214,7 +214,13 @@ impl EditScreen {
         std::fs::create_dir_all(&bundle_dir)?;
         let bytes = events_to_smf_bytes(&self.timeline.to_events());
         std::fs::write(bundle_dir.join("song.mid"), bytes)?;
-        let meta = RecordingMeta::new_midi_only("song.mid");
+        let meta = RecordingMeta {
+            midi_file: "song.mid".into(),
+            backing: None,
+            grid: Some(self.grid),
+            key: Some(self.key),
+            version: 1,
+        };
         std::fs::write(bundle_dir.join("meta.json"), meta.to_json())?;
         Ok(bundle_dir)
     }
