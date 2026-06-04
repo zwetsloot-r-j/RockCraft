@@ -24,7 +24,7 @@ use ratatui::{
 };
 use rockcraft_audio::SynthHandle;
 use rockcraft_core::{
-    ChordKind, Grid, Key, MidiNote, Note, NoteEvent, NoteEventKind, NoteId, RecordingMeta,
+    ChordKind, Grid, History, Key, MidiNote, Note, NoteEvent, NoteEventKind, NoteId, RecordingMeta,
     Scale as MusicScale, Timeline, Velocity,
 };
 use rockcraft_midi::events_to_smf_bytes;
@@ -49,6 +49,10 @@ const DEFAULT_CURSOR_PITCH: u8 = 60;
 
 /// Default velocity for newly added notes.
 const DEFAULT_NOTE_VEL: u8 = 80;
+
+/// Maximum entries in the undo stack. Oldest checkpoints are dropped when
+/// this limit is exceeded.
+const HISTORY_CAPACITY: usize = 100;
 
 /// Velocity step for `+`/`-` adjustments.
 const VEL_STEP: u8 = 8;
@@ -127,7 +131,7 @@ struct ChordMode {
 /// The composer edit screen: a timeline rendered on the highway with a navigable
 /// cursor.  Supports vim-style navigation (#52) and note-mutation ops (#53).
 pub struct EditScreen {
-    timeline: Timeline,
+    history: History,
     grid: Grid,
     cursor: Cursor,
     /// The note currently held in grab mode; `None` when not grabbing.
@@ -178,7 +182,7 @@ impl EditScreen {
 
     fn from_parts(timeline: Timeline, grid: Grid, synth: Option<SynthHandle>) -> Self {
         Self {
-            timeline,
+            history: History::new(timeline, HISTORY_CAPACITY),
             grid,
             cursor: Cursor {
                 pitch: DEFAULT_CURSOR_PITCH,
@@ -245,7 +249,7 @@ impl EditScreen {
             .unwrap_or(0);
         let bundle_dir = base.join(format!("take-{stamp}"));
         std::fs::create_dir_all(&bundle_dir)?;
-        let bytes = events_to_smf_bytes(&self.timeline.to_events());
+        let bytes = events_to_smf_bytes(&self.history.current().to_events());
         std::fs::write(bundle_dir.join("song.mid"), bytes)?;
         let meta = RecordingMeta {
             midi_file: "song.mid".into(),
@@ -267,18 +271,20 @@ impl EditScreen {
 
     /// Total number of notes in the timeline.
     pub fn note_count(&self) -> usize {
-        self.timeline.len()
+        self.history.current().len()
     }
 
     /// The id of the note whose span `[start, start+dur)` covers the cursor's
     /// current `(pitch, step)`, if any.
     pub fn note_under_cursor(&self) -> Option<NoteId> {
-        self.timeline.find_at(self.cursor.pitch, self.cursor_us())
+        self.history
+            .current()
+            .find_at(self.cursor.pitch, self.cursor_us())
     }
 
     /// Look up note data by id (convenience for tests and status display).
     pub fn get_note(&self, id: NoteId) -> Option<Note> {
-        self.timeline.get(id).copied()
+        self.history.current().get(id).copied()
     }
 
     /// Whether the chord selector is currently active.
@@ -398,8 +404,11 @@ impl EditScreen {
             // the cursor; the cursor tracks along with the note.
             KeyCode::Char('h') | KeyCode::Left => {
                 if let Some(id) = self.grabbed {
+                    self.history.checkpoint();
                     let new_step = self.cursor.step.saturating_sub(1);
-                    self.timeline.set_start(id, self.grid.us_of_step(new_step));
+                    self.history
+                        .current_mut()
+                        .set_start(id, self.grid.us_of_step(new_step));
                     self.cursor.step = new_step;
                     self.audition_note(id);
                 } else {
@@ -408,8 +417,11 @@ impl EditScreen {
             }
             KeyCode::Char('l') | KeyCode::Right => {
                 if let Some(id) = self.grabbed {
+                    self.history.checkpoint();
                     let new_step = self.cursor.step + 1;
-                    self.timeline.set_start(id, self.grid.us_of_step(new_step));
+                    self.history
+                        .current_mut()
+                        .set_start(id, self.grid.us_of_step(new_step));
                     self.cursor.step = new_step;
                     self.audition_note(id);
                 } else {
@@ -420,7 +432,8 @@ impl EditScreen {
             // In grab mode, j/k transpose the grabbed note; cursor tracks.
             KeyCode::Char('j') | KeyCode::Down => {
                 if let Some(id) = self.grabbed {
-                    if self.timeline.transpose(id, -1) {
+                    self.history.checkpoint();
+                    if self.history.current_mut().transpose(id, -1) {
                         self.cursor.pitch = self.cursor.pitch.saturating_sub(1).max(LOWEST_MIDI);
                     }
                     self.audition_note(id);
@@ -430,7 +443,8 @@ impl EditScreen {
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 if let Some(id) = self.grabbed {
-                    if self.timeline.transpose(id, 1) {
+                    self.history.checkpoint();
+                    if self.history.current_mut().transpose(id, 1) {
                         self.cursor.pitch = (self.cursor.pitch + 1).min(HIGHEST_MIDI);
                     }
                     self.audition_note(id);
@@ -516,6 +530,23 @@ impl EditScreen {
                 self.start_play(0);
             }
 
+            // Undo / redo. `u` = undo; `U` = redo.
+            // `R` is reserved for record-arm (#57), so redo uses `U` (shift-u).
+            KeyCode::Char('u') => {
+                self.stop_play();
+                if self.history.undo() {
+                    self.grabbed = None;
+                    self.live_pending.clear();
+                }
+            }
+            KeyCode::Char('U') => {
+                self.stop_play();
+                if self.history.redo() {
+                    self.grabbed = None;
+                    self.live_pending.clear();
+                }
+            }
+
             _ => {}
         }
     }
@@ -565,18 +596,25 @@ impl EditScreen {
         if velocity.is_note_off() {
             return; // running-status note-off
         }
+        self.history.checkpoint();
         // Replace semantics, matching `add_note`: a played pitch already in this
         // cell is overwritten rather than stacked.
-        if let Some(id) = self.timeline.find_at(ev.note.value(), self.cursor_us()) {
-            self.timeline.remove(id);
+        let existing = self
+            .history
+            .current()
+            .find_at(ev.note.value(), self.cursor_us());
+        if let Some(id) = existing {
+            self.history.current_mut().remove(id);
             if self.grabbed == Some(id) {
                 self.grabbed = None;
             }
         }
-        self.timeline.insert(Note {
+        let start_us = self.cursor_us();
+        let dur_us = self.grid.step_us();
+        self.history.current_mut().insert(Note {
             pitch: ev.note,
-            start_us: self.cursor_us(),
-            dur_us: self.grid.step_us(),
+            start_us,
+            dur_us,
             velocity,
         });
         self.cursor.step += 1;
@@ -596,7 +634,8 @@ impl EditScreen {
                 if let Some(pos) = self.live_pending.iter().position(|(p, _, _)| *p == ev.note) {
                     let (pitch, start, velocity) = self.live_pending.remove(pos);
                     let end = at.max(start + self.grid.step_us());
-                    self.timeline.insert(Note {
+                    self.history.checkpoint();
+                    self.history.current_mut().insert(Note {
                         pitch,
                         start_us: start,
                         dur_us: end - start,
@@ -630,8 +669,9 @@ impl EditScreen {
     /// removed first (replace semantics: the new note wins, velocity resets to
     /// the default 80, duration resets to one step).
     fn add_note(&mut self) {
+        self.history.checkpoint();
         if let Some(id) = self.note_under_cursor() {
-            self.timeline.remove(id);
+            self.history.current_mut().remove(id);
             if self.grabbed == Some(id) {
                 self.grabbed = None;
             }
@@ -644,17 +684,19 @@ impl EditScreen {
             dur_us: self.grid.step_us(),
             velocity,
         };
-        self.timeline.insert(note);
+        self.history.current_mut().insert(note);
         self.audition(pitch, velocity);
     }
 
     /// Delete the note under the cursor. No-op if the cell is empty.
     fn delete_note(&mut self) {
-        if let Some(id) = self.note_under_cursor() {
-            self.timeline.remove(id);
-            if self.grabbed == Some(id) {
-                self.grabbed = None;
-            }
+        let Some(id) = self.note_under_cursor() else {
+            return;
+        };
+        self.history.checkpoint();
+        self.history.current_mut().remove(id);
+        if self.grabbed == Some(id) {
+            self.grabbed = None;
         }
     }
 
@@ -664,9 +706,10 @@ impl EditScreen {
         let Some(id) = self.note_under_cursor() else {
             return;
         };
-        let Some(note) = self.timeline.get(id).copied() else {
+        let Some(note) = self.history.current().get(id).copied() else {
             return;
         };
+        self.history.checkpoint();
         let step = self.grid.step_us();
         let new_dur = if delta_steps >= 0 {
             note.dur_us.saturating_add(step * delta_steps as u64)
@@ -675,7 +718,7 @@ impl EditScreen {
                 .saturating_sub(step * (-delta_steps) as u64)
                 .max(step)
         };
-        self.timeline.resize(id, new_dur);
+        self.history.current_mut().resize(id, new_dur);
     }
 
     /// Adjust velocity on the note under the cursor by `delta`, clamped to
@@ -685,16 +728,17 @@ impl EditScreen {
         let Some(id) = self.note_under_cursor() else {
             return;
         };
-        let Some(note) = self.timeline.get(id).copied() else {
+        let Some(note) = self.history.current().get(id).copied() else {
             return;
         };
+        self.history.checkpoint();
         let new_vel = (note.velocity.value() as i16 + delta).clamp(1, 127) as u8;
         let new_note = Note {
             velocity: Velocity::new(new_vel).expect("clamped to 1..=127"),
             ..note
         };
-        self.timeline.remove(id);
-        let new_id = self.timeline.insert(new_note);
+        self.history.current_mut().remove(id);
+        let new_id = self.history.current_mut().insert(new_note);
         if self.grabbed == Some(id) {
             self.grabbed = Some(new_id);
         }
@@ -706,9 +750,12 @@ impl EditScreen {
     fn toggle_grab(&mut self) {
         if self.grabbed.is_some() {
             self.grabbed = None;
-        } else if let Some(id) = self.note_under_cursor() {
-            self.grabbed = Some(id);
-            self.audition_note(id);
+        } else {
+            let id = self.note_under_cursor();
+            if let Some(id) = id {
+                self.grabbed = Some(id);
+                self.audition_note(id);
+            }
         }
     }
 
@@ -720,6 +767,10 @@ impl EditScreen {
         if self.chord.is_some() {
             return;
         }
+        // Checkpoint the clean state before any preview notes are inserted so
+        // that commit leaves the undo history with one step, and cancel can
+        // rollback to here without affecting the redo stack.
+        self.history.checkpoint();
         self.chord = Some(ChordMode {
             degree: 1,
             kind: ChordKind::Triad,
@@ -769,7 +820,7 @@ impl EditScreen {
         let old_ids = chord.preview_ids.clone();
 
         for id in old_ids {
-            self.timeline.remove(id);
+            self.history.current_mut().remove(id);
         }
 
         let root = MidiNote::new(self.cursor.pitch).expect("cursor pitch is always valid");
@@ -781,7 +832,7 @@ impl EditScreen {
         let ids: Vec<NoteId> = pitches
             .iter()
             .map(|&pitch| {
-                self.timeline.insert(Note {
+                self.history.current_mut().insert(Note {
                     pitch,
                     start_us: start,
                     dur_us: dur,
@@ -807,13 +858,12 @@ impl EditScreen {
         self.stop_chord_audition();
     }
 
-    /// Cancel the previewed chord: its notes are removed and chord mode ends.
-    /// A no-op if not in chord mode.
+    /// Cancel the previewed chord: all preview mutations are discarded by
+    /// rolling back to the checkpoint saved at `enter_chord_mode`. Chord mode
+    /// ends. A no-op if not in chord mode.
     fn cancel_chord(&mut self) {
-        if let Some(chord) = self.chord.take() {
-            for id in chord.preview_ids {
-                self.timeline.remove(id);
-            }
+        if self.chord.take().is_some() {
+            self.history.rollback();
         }
         self.stop_chord_audition();
     }
@@ -823,7 +873,7 @@ impl EditScreen {
     /// Audition the note identified by `id`: stops the previous audition first,
     /// then plays a note-on. No-op when no synth is attached.
     fn audition_note(&mut self, id: NoteId) {
-        let Some(note) = self.timeline.get(id).copied() else {
+        let Some(note) = self.history.current().get(id).copied() else {
             return;
         };
         self.audition(note.pitch, note.velocity);
@@ -885,7 +935,8 @@ impl EditScreen {
     /// Grid step of the last note's end (0 for an empty timeline) — the `$` jump.
     fn last_step(&self) -> u64 {
         let end_us = self
-            .timeline
+            .history
+            .current()
             .notes()
             .map(|(_, n)| n.start_us + n.dur_us)
             .max()
@@ -912,7 +963,7 @@ impl EditScreen {
             synth.all_off();
         }
         self.auditioning = None;
-        self.audition_spans = build_spans(&self.timeline.to_events());
+        self.audition_spans = build_spans(&self.history.current().to_events());
         self.audition_on_fired.clear();
         self.audition_off_fired.clear();
         // Skip spans that ended before the start position.
@@ -1051,7 +1102,7 @@ impl EditScreen {
                 Style::default().fg(CURSOR_COLOR),
             ),
             Span::styled(
-                "[a/x] add/del  []/[] size  [+/-] vel  [m] grab  [c] chord  [R] rec  [t] step/live  [hjkl] move  [HJKL] bar/oct  [0/$] ends  [s] save  [Tab] menu",
+                "[a/x] add/del  []/[] size  [+/-] vel  [m] grab  [c] chord  [u/U] undo/redo  [R] rec  [t] step/live  [hjkl] move  [HJKL] bar/oct  [0/$] ends  [s] save  [Tab] menu",
                 Style::default().fg(Color::DarkGray),
             ),
         ]);
@@ -1082,7 +1133,7 @@ impl EditScreen {
         self.draw_playhead(f, area, now, lead);
 
         // Timeline notes.
-        for span in build_spans(&self.timeline.to_events()) {
+        for span in build_spans(&self.history.current().to_events()) {
             let Some(rs) = project(&span, now, lead, area.height) else {
                 continue;
             };
@@ -1690,7 +1741,8 @@ mod tests {
         let step = e.grid.step_us();
         for &p in &[60u8, 64, 67] {
             let id = e
-                .timeline
+                .history
+                .current()
                 .find_at(p, e.cursor_us())
                 .expect("preview note present");
             let n = e.get_note(id).unwrap();
@@ -1920,7 +1972,8 @@ mod tests {
         let step = e.grid.step_us();
         for (i, &p) in [60u8, 62, 64].iter().enumerate() {
             let id = e
-                .timeline
+                .history
+                .current()
                 .find_at(p, e.grid.us_of_step(i as u64))
                 .expect("note at consecutive step");
             let n = e.get_note(id).unwrap();
@@ -1990,7 +2043,8 @@ mod tests {
 
         assert_eq!(e.note_count(), 1);
         let id = e
-            .timeline
+            .history
+            .current()
             .find_at(60, 0)
             .expect("note recorded at playhead");
         let n = e.get_note(id).unwrap();
@@ -2016,7 +2070,11 @@ mod tests {
         e.ingest(NoteEvent::off(pitch, 0));
 
         assert_eq!(e.note_count(), 1);
-        let id = e.timeline.find_at(67, step).expect("snapped to the step");
+        let id = e
+            .history
+            .current()
+            .find_at(67, step)
+            .expect("snapped to the step");
         let n = e.get_note(id).unwrap();
         assert_eq!(n.start_us, step, "start snapped to grid");
         assert_eq!(n.dur_us, step, "zero-length tap floored to one step");
@@ -2190,5 +2248,103 @@ mod tests {
             e.audition_on_fired.contains(&0),
             "note ending before play start should be pre-skipped"
         );
+    }
+
+    // ── undo / redo tests ────────────────────────────────────────────────
+
+    /// `u` undoes the most recent edit; `U` redoes it.
+    #[test]
+    fn u_undoes_and_shift_u_redoes() {
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('a')); // add note → 1 note
+        e.on_key(KeyCode::Char('l')); // step right (no checkpoint)
+        e.on_key(KeyCode::Char('a')); // add second note → 2 notes
+
+        assert_eq!(e.note_count(), 2);
+
+        e.on_key(KeyCode::Char('u')); // undo second add
+        assert_eq!(e.note_count(), 1, "undo removed the second note");
+
+        e.on_key(KeyCode::Char('u')); // undo first add
+        assert_eq!(e.note_count(), 0, "undo removed the first note");
+
+        e.on_key(KeyCode::Char('U')); // redo first add
+        assert_eq!(e.note_count(), 1, "redo restored first note");
+
+        e.on_key(KeyCode::Char('U')); // redo second add
+        assert_eq!(e.note_count(), 2, "redo restored second note");
+
+        e.on_key(KeyCode::Char('U')); // nothing to redo — should be a no-op
+        assert_eq!(e.note_count(), 2, "extra redo is a no-op");
+    }
+
+    /// A new edit after undo clears the redo stack.
+    #[test]
+    fn new_edit_after_undo_clears_redo_in_edit_screen() {
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('a')); // note at step 0
+        e.on_key(KeyCode::Char('l')); // cursor → step 1
+        e.on_key(KeyCode::Char('a')); // note at step 1
+        assert_eq!(e.note_count(), 2);
+
+        e.on_key(KeyCode::Char('u')); // undo second add; cursor still at step 1
+        assert_eq!(e.note_count(), 1);
+
+        // A new edit clears redo: move back and delete the remaining note.
+        e.on_key(KeyCode::Char('h')); // cursor → step 0
+        e.on_key(KeyCode::Char('x')); // delete the note at step 0
+        assert_eq!(e.note_count(), 0);
+        e.on_key(KeyCode::Char('U')); // redo is gone
+        assert_eq!(e.note_count(), 0, "redo cleared by the delete");
+    }
+
+    /// `u` on a fresh editor (no edits) is a no-op.
+    #[test]
+    fn undo_on_empty_history_is_noop() {
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('u'));
+        assert_eq!(e.note_count(), 0);
+        assert_eq!(
+            e.cursor(),
+            Cursor {
+                pitch: DEFAULT_CURSOR_PITCH,
+                step: 0
+            }
+        );
+    }
+
+    /// A committed chord (multiple notes) undoes as a single step.
+    #[test]
+    fn committed_chord_undoes_as_one_step() {
+        let mut e = EditScreen::new();
+
+        // Enter chord mode and commit a triad.
+        e.on_key(KeyCode::Char('c'));
+        e.on_key(KeyCode::Char('1')); // tonic triad C-E-G
+        e.on_key(KeyCode::Enter); // commit
+        assert_eq!(e.note_count(), 3, "three notes committed");
+
+        e.on_key(KeyCode::Char('u')); // undo the chord commit
+        assert_eq!(e.note_count(), 0, "all three notes removed in one undo");
+
+        e.on_key(KeyCode::Char('U')); // redo the chord commit
+        assert_eq!(e.note_count(), 3, "all three notes restored in one redo");
+    }
+
+    /// Cancelling a chord (Esc) leaves the pre-chord state intact and does NOT
+    /// add anything to the redo stack.
+    #[test]
+    fn cancelled_chord_leaves_state_and_no_redo() {
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('a')); // permanent note at cursor
+        assert_eq!(e.note_count(), 1);
+
+        e.on_key(KeyCode::Char('c')); // enter chord mode (3 preview notes added)
+        assert_eq!(e.note_count(), 4); // 1 permanent + 3 preview
+        e.on_key(KeyCode::Esc); // cancel — preview rolled back
+
+        assert_eq!(e.note_count(), 1, "back to just the permanent note");
+        e.on_key(KeyCode::Char('U')); // should be a no-op
+        assert_eq!(e.note_count(), 1, "no redo after chord cancel");
     }
 }
