@@ -104,7 +104,13 @@ impl Shell {
                 },
                 None => self.status = "no recordings yet — record one first".into(),
             },
-            Some(2) => self.screen = Screen::Edit(EditScreen::new()),
+            Some(2) => {
+                let mut edit = EditScreen::new();
+                if let Some(s) = &self.synth {
+                    edit.attach_synth(s.clone());
+                }
+                self.screen = Screen::Edit(edit);
+            }
             _ => self.should_quit = true,
         }
     }
@@ -159,6 +165,7 @@ impl Shell {
             // navigation routed into the screen's own keymap.
             Screen::Edit(edit) => match code {
                 KeyCode::Tab | KeyCode::Esc => {
+                    edit.leave();
                     self.screen = Screen::Menu;
                 }
                 other => edit.on_key(other),
