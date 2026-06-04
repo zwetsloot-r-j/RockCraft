@@ -35,6 +35,9 @@ fn main() {
         .find(|a| !a.starts_with("--"))
         .cloned()
         .unwrap_or_else(|| "casio".to_string());
+    // Optional second arg: path to a backing audio file (wav/mp3/ogg/flac).
+    // When provided, entering Record plays it alongside your performance.
+    let backing_path = std::env::args().nth(2).map(std::path::PathBuf::from);
 
     // Source selection: explicit `--mock`, otherwise the live piano — and when
     // no port matches, fall back to the mock so the app always launches.
@@ -64,7 +67,7 @@ fn main() {
     };
     let synth = audio.as_ref().map(AudioOut::synth);
 
-    if let Err(e) = app::run(input, synth) {
+    if let Err(e) = app::run(input, synth, backing_path) {
         eprintln!("TUI error: {e}");
         std::process::exit(1);
     }
