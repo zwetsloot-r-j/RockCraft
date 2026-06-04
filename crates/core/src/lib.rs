@@ -14,6 +14,7 @@ pub mod events;
 pub mod scoring;
 pub mod song;
 pub mod stats;
+pub mod timeline;
 pub mod wait;
 
 pub use buffer::EventBuffer;
@@ -21,4 +22,5 @@ pub use events::{MidiNote, NoteEvent, NoteEventKind, Velocity};
 pub use scoring::{score, ExpectedNote, NoteJudgment, ScoreConfig, ScoreReport, Timing};
 pub use song::{backing_position_us, song_shift_us, BackingTrack, MetaError, RecordingMeta};
 pub use stats::Summary;
+pub use timeline::{Note, NoteId, Timeline};
 pub use wait::{Step, WaitTracker};
