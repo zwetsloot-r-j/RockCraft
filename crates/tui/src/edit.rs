@@ -22,8 +22,8 @@ use ratatui::{
 };
 use rockcraft_audio::SynthHandle;
 use rockcraft_core::{
-    ChordKind, Grid, Key, MidiNote, Note, NoteId, RecordingMeta, Scale as MusicScale, Timeline,
-    Velocity,
+    ChordKind, Grid, Key, MidiNote, Note, NoteEvent, NoteEventKind, NoteId, RecordingMeta,
+    Scale as MusicScale, Timeline, Velocity,
 };
 use rockcraft_midi::events_to_smf_bytes;
 
@@ -57,6 +57,8 @@ const CURSOR_COLOR: Color = Color::Magenta;
 const GRAB_COLOR: Color = Color::Yellow;
 /// Chord-mode badge colour.
 const CHORD_COLOR: Color = Color::Cyan;
+/// Record-armed badge colour (step / live record).
+const REC_COLOR: Color = Color::Red;
 /// Resting colour for timeline notes on the highway.
 const NOTE_COLOR: Color = Color::Indexed(33);
 /// Faint colour for beat/bar gridlines.
@@ -71,6 +73,21 @@ const GRID_COLOR: Color = Color::DarkGray;
 pub struct Cursor {
     pub pitch: u8,
     pub step: u64,
+}
+
+/// How notes get into the editor.
+///
+/// - `DirectEdit`: cursor + keys place notes (`a`/`c`/…); played MIDI is ignored.
+/// - `StepRecord`: each played note-on lands at the cursor (with the *played*
+///   pitch) and the cursor steps forward one grid step — no transport needed.
+/// - `LiveRecord`: played on/off events are written into the timeline at the
+///   current playhead µs (snapped to grid), pairing on→off into a `Note`. Needs
+///   the transport (#59) to advance the playhead; tests drive `set_playhead_us`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputMode {
+    DirectEdit,
+    StepRecord,
+    LiveRecord,
 }
 
 /// Live state of the key-aware chord selector (`c`).
@@ -111,6 +128,14 @@ pub struct EditScreen {
     chord: Option<ChordMode>,
     /// Pitches of the most recently committed chord, exposed for tests.
     last_committed: Vec<MidiNote>,
+    /// How played MIDI is consumed: direct-edit (ignore) vs step/live record.
+    input_mode: InputMode,
+    /// Playhead position for `LiveRecord`. A seam the transport (#59) will drive;
+    /// tests advance it via `set_playhead_us`.
+    playhead_us: u64,
+    /// Note-ons awaiting their off during `LiveRecord`: `(pitch, snapped start µs,
+    /// velocity)`. Closed and inserted as a `Note` when the matching off arrives.
+    live_pending: Vec<(MidiNote, u64, Velocity)>,
 }
 
 impl EditScreen {
@@ -144,6 +169,9 @@ impl EditScreen {
             },
             chord: None,
             last_committed: Vec::new(),
+            input_mode: InputMode::DirectEdit,
+            playhead_us: 0,
+            live_pending: Vec::new(),
         }
     }
 
@@ -219,6 +247,17 @@ impl EditScreen {
         self.chord.is_some()
     }
 
+    /// The current input mode (direct-edit vs step / live record).
+    pub fn input_mode(&self) -> InputMode {
+        self.input_mode
+    }
+
+    /// Set the `LiveRecord` playhead position. This is the seam the transport
+    /// (#59) drives; tests advance it manually to place recorded notes.
+    pub fn set_playhead_us(&mut self, us: u64) {
+        self.playhead_us = us;
+    }
+
     /// The pitches of the chord currently being previewed, or `None` when not in
     /// chord mode.
     pub fn previewed_chord(&self) -> Option<Vec<MidiNote>> {
@@ -235,6 +274,14 @@ impl EditScreen {
 
     /// Route a key press through the full keymap. Tab/Esc are handled by the
     /// shell, not here.
+    ///
+    /// Mode-key precedence (mirrors the routing comment in `app.rs`): chord mode
+    /// takes the whole keymap when active; otherwise *all* navigation and edit
+    /// keys are handled here in **every** input mode (direct-edit / step / live),
+    /// so navigation never changes with the mode. Played MIDI note events arrive
+    /// separately through [`EditScreen::ingest`] and only place notes in a record
+    /// mode. `R` arms/disarms record (direct-edit ↔ step-record); while armed `t`
+    /// flips step ↔ live.
     pub fn on_key(&mut self, code: KeyCode) {
         // In chord mode the keymap is taken over by the selector (digits pick a
         // degree, `[`/`]` cycle it, `s` toggles quality, Enter/Esc commit/cancel).
@@ -346,7 +393,104 @@ impl EditScreen {
                 self.enter_chord_mode();
             }
 
+            // ── input mode ───────────────────────────────────────────────
+            // Arm / disarm record (direct-edit ↔ step-record).
+            KeyCode::Char('R') => {
+                self.toggle_record_arm();
+            }
+            // While armed, flip step ↔ live; a no-op in direct-edit.
+            KeyCode::Char('t') => {
+                self.toggle_record_flavour();
+            }
+
             _ => {}
+        }
+    }
+
+    // ── input mode ──────────────────────────────────────────────────────────
+
+    /// Toggle the record arm: direct-edit ↔ step-record. Disarming from either
+    /// record flavour returns to direct-edit.
+    fn toggle_record_arm(&mut self) {
+        self.input_mode = match self.input_mode {
+            InputMode::DirectEdit => InputMode::StepRecord,
+            InputMode::StepRecord | InputMode::LiveRecord => InputMode::DirectEdit,
+        };
+    }
+
+    /// Flip the record flavour step ↔ live. A no-op while disarmed (direct-edit).
+    fn toggle_record_flavour(&mut self) {
+        self.input_mode = match self.input_mode {
+            InputMode::StepRecord => InputMode::LiveRecord,
+            InputMode::LiveRecord => InputMode::StepRecord,
+            InputMode::DirectEdit => InputMode::DirectEdit,
+        };
+    }
+
+    /// Consume a played MIDI event from the input source (piano / mock keyboard).
+    /// Behaviour depends on the input mode:
+    /// - `DirectEdit`: ignored (the editor is cursor-driven).
+    /// - `StepRecord`: a note-on inserts a one-step note at the cursor step using
+    ///   the *played* pitch, then advances the cursor one step. Note-offs are
+    ///   ignored — v1 fixes every step-recorded note to a single grid step.
+    /// - `LiveRecord`: on/off events are written at the snapped playhead, pairing
+    ///   on→off into a `Note` (like `Timeline::from_events`).
+    pub fn ingest(&mut self, ev: NoteEvent) {
+        match self.input_mode {
+            InputMode::DirectEdit => {}
+            InputMode::StepRecord => self.ingest_step(ev),
+            InputMode::LiveRecord => self.ingest_live(ev),
+        }
+    }
+
+    /// Step-record a single event: only note-ons place a note (fixed one-step
+    /// duration), replacing any note already in the cursor cell, then step on.
+    fn ingest_step(&mut self, ev: NoteEvent) {
+        let NoteEventKind::On { velocity } = ev.kind else {
+            return;
+        };
+        if velocity.is_note_off() {
+            return; // running-status note-off
+        }
+        // Replace semantics, matching `add_note`: a played pitch already in this
+        // cell is overwritten rather than stacked.
+        if let Some(id) = self.timeline.find_at(ev.note.value(), self.cursor_us()) {
+            self.timeline.remove(id);
+            if self.grabbed == Some(id) {
+                self.grabbed = None;
+            }
+        }
+        self.timeline.insert(Note {
+            pitch: ev.note,
+            start_us: self.cursor_us(),
+            dur_us: self.grid.step_us(),
+            velocity,
+        });
+        self.cursor.step += 1;
+    }
+
+    /// Live-record a single event at the snapped playhead. A note-on opens a
+    /// pending span; the matching note-off closes it into a `Note` (minimum one
+    /// grid step so a zero-length tap is still audible/visible).
+    fn ingest_live(&mut self, ev: NoteEvent) {
+        let at = self.grid.snap(self.playhead_us);
+        match ev.kind {
+            NoteEventKind::On { velocity } if !velocity.is_note_off() => {
+                self.live_pending.push((ev.note, at, velocity));
+            }
+            // Note-off (or a zero-velocity note-on): close the matching pending on.
+            _ => {
+                if let Some(pos) = self.live_pending.iter().position(|(p, _, _)| *p == ev.note) {
+                    let (pitch, start, velocity) = self.live_pending.remove(pos);
+                    let end = at.max(start + self.grid.step_us());
+                    self.timeline.insert(Note {
+                        pitch,
+                        start_us: start,
+                        dur_us: end - start,
+                        velocity,
+                    });
+                }
+            }
         }
     }
 
@@ -717,10 +861,23 @@ impl EditScreen {
             return;
         }
 
+        // Grab mode wins the badge; otherwise the badge reflects the input mode.
         let (badge_text, badge_style) = if self.grabbed.is_some() {
             (" GRAB ", Style::default().fg(Color::Black).bg(GRAB_COLOR))
         } else {
-            (" EDIT ", Style::default().fg(Color::Black).bg(CURSOR_COLOR))
+            match self.input_mode {
+                InputMode::DirectEdit => {
+                    (" EDIT ", Style::default().fg(Color::Black).bg(CURSOR_COLOR))
+                }
+                InputMode::StepRecord => (
+                    " STEP-REC ",
+                    Style::default().fg(Color::Black).bg(REC_COLOR),
+                ),
+                InputMode::LiveRecord => (
+                    " LIVE-REC ",
+                    Style::default().fg(Color::Black).bg(REC_COLOR),
+                ),
+            }
         };
 
         let line = Line::from(vec![
@@ -732,7 +889,7 @@ impl EditScreen {
                 Style::default().fg(CURSOR_COLOR),
             ),
             Span::styled(
-                "[a/x] add/del  []/[] size  [+/-] vel  [m] grab  [c] chord  [hjkl] move  [HJKL] bar/oct  [0/$] ends  [s] save  [Tab] menu",
+                "[a/x] add/del  []/[] size  [+/-] vel  [m] grab  [c] chord  [R] rec  [t] step/live  [hjkl] move  [HJKL] bar/oct  [0/$] ends  [s] save  [Tab] menu",
                 Style::default().fg(Color::DarkGray),
             ),
         ]);
@@ -1490,5 +1647,172 @@ mod tests {
         e.on_key(KeyCode::Char('a')); // ignored in chord mode
         assert_eq!(e.note_count(), before, "add is inert in chord mode");
         assert!(e.in_chord_mode());
+    }
+
+    // ── input-mode / record tests ─────────────────────────────────────────
+
+    fn on_ev(pitch: u8) -> NoteEvent {
+        NoteEvent::on(MidiNote::new(pitch).unwrap(), Velocity::new(80).unwrap(), 0)
+    }
+
+    /// A fresh editor is in direct-edit; `R` arms step-record and disarms again.
+    #[test]
+    fn r_arms_and_disarms_step_record() {
+        let mut e = EditScreen::new();
+        assert_eq!(e.input_mode(), InputMode::DirectEdit);
+        e.on_key(KeyCode::Char('R'));
+        assert_eq!(e.input_mode(), InputMode::StepRecord);
+        e.on_key(KeyCode::Char('R'));
+        assert_eq!(e.input_mode(), InputMode::DirectEdit);
+    }
+
+    /// `t` flips step ↔ live only while armed; it is a no-op in direct-edit.
+    #[test]
+    fn t_toggles_step_and_live_when_armed() {
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('t')); // not armed → no-op
+        assert_eq!(e.input_mode(), InputMode::DirectEdit);
+
+        e.on_key(KeyCode::Char('R')); // arm → step
+        e.on_key(KeyCode::Char('t')); // → live
+        assert_eq!(e.input_mode(), InputMode::LiveRecord);
+        e.on_key(KeyCode::Char('t')); // → step
+        assert_eq!(e.input_mode(), InputMode::StepRecord);
+
+        // Disarming from live also returns to direct-edit.
+        e.on_key(KeyCode::Char('t')); // → live
+        e.on_key(KeyCode::Char('R')); // disarm
+        assert_eq!(e.input_mode(), InputMode::DirectEdit);
+    }
+
+    /// Navigation keys behave identically regardless of input mode.
+    #[test]
+    fn navigation_unaffected_by_mode() {
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('R')); // step-record armed
+        e.on_key(KeyCode::Char('t')); // live-record
+        e.on_key(KeyCode::Char('l'));
+        e.on_key(KeyCode::Char('k'));
+        assert_eq!(e.cursor().step, 1);
+        assert_eq!(e.cursor().pitch, DEFAULT_CURSOR_PITCH + 1);
+    }
+
+    /// StepRecord: three played note-ons land at consecutive steps with their
+    /// *played* pitches; the cursor advances three steps.
+    #[test]
+    fn step_record_inserts_played_pitches_at_consecutive_steps() {
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('R')); // arm step-record
+
+        for &p in &[60u8, 62, 64] {
+            e.ingest(on_ev(p));
+        }
+
+        assert_eq!(e.note_count(), 3);
+        assert_eq!(e.cursor().step, 3, "cursor advanced three steps");
+
+        let step = e.grid.step_us();
+        for (i, &p) in [60u8, 62, 64].iter().enumerate() {
+            let id = e
+                .timeline
+                .find_at(p, e.grid.us_of_step(i as u64))
+                .expect("note at consecutive step");
+            let n = e.get_note(id).unwrap();
+            assert_eq!(n.pitch.value(), p, "played pitch is used, not cursor pitch");
+            assert_eq!(n.dur_us, step, "fixed one-step duration");
+        }
+    }
+
+    /// StepRecord ignores note-offs (v1 uses a fixed one-step length).
+    #[test]
+    fn step_record_ignores_note_offs() {
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('R'));
+        e.ingest(NoteEvent::off(MidiNote::new(60).unwrap(), 0));
+        assert_eq!(e.note_count(), 0);
+        assert_eq!(e.cursor().step, 0, "an off neither places a note nor steps");
+    }
+
+    /// DirectEdit ignores played input for placement; cursor keys still edit.
+    #[test]
+    fn direct_edit_ignores_ingest() {
+        let mut e = EditScreen::new();
+        e.ingest(on_ev(64));
+        assert_eq!(e.note_count(), 0, "direct-edit ignores played notes");
+
+        e.on_key(KeyCode::Char('a')); // cursor editing still works
+        assert_eq!(e.note_count(), 1);
+    }
+
+    /// End-to-end through the real `MockKeyboard`: typing three mapped keys and
+    /// draining the source feeds three note-ons into step-record.
+    #[test]
+    fn step_record_via_mock_keyboard_forward_key() {
+        use rockcraft_midi::{MockKeyboard, NoteSource};
+
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('R')); // arm step-record
+
+        let mut kb = MockKeyboard::new();
+        kb.forward_key('a'); // C4 = 60
+        kb.forward_key('s'); // D4 = 62
+        kb.forward_key('d'); // E4 = 64
+        for ev in kb.events() {
+            e.ingest(ev);
+        }
+
+        assert_eq!(e.note_count(), 3, "three mapped keys → three notes");
+        assert_eq!(e.cursor().step, 3);
+    }
+
+    /// LiveRecord pairs an on/off across an advancing playhead into one `Note`
+    /// at the snapped start, lasting the held span.
+    #[test]
+    fn live_record_pairs_on_off_at_playhead() {
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('R')); // step
+        e.on_key(KeyCode::Char('t')); // live
+        let step = e.grid.step_us();
+        let pitch = MidiNote::new(60).unwrap();
+
+        e.set_playhead_us(0);
+        e.ingest(NoteEvent::on(pitch, Velocity::new(80).unwrap(), 0));
+        assert_eq!(e.note_count(), 0, "nothing written until the off pairs it");
+
+        e.set_playhead_us(step * 2); // held two steps
+        e.ingest(NoteEvent::off(pitch, 0));
+
+        assert_eq!(e.note_count(), 1);
+        let id = e
+            .timeline
+            .find_at(60, 0)
+            .expect("note recorded at playhead");
+        let n = e.get_note(id).unwrap();
+        assert_eq!(n.start_us, 0);
+        assert_eq!(n.dur_us, step * 2, "duration spans the held playhead range");
+    }
+
+    /// LiveRecord snaps an off-grid playhead to the grid and floors a tap at one
+    /// step so a zero-length note is still placed.
+    #[test]
+    fn live_record_snaps_and_floors_one_step() {
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('R'));
+        e.on_key(KeyCode::Char('t'));
+        let step = e.grid.step_us();
+        let pitch = MidiNote::new(67).unwrap();
+
+        // On just past a step boundary snaps back to that step; off at the same
+        // spot would be zero-length, so it floors to one step.
+        e.set_playhead_us(step + 10);
+        e.ingest(NoteEvent::on(pitch, Velocity::new(80).unwrap(), 0));
+        e.set_playhead_us(step + 10);
+        e.ingest(NoteEvent::off(pitch, 0));
+
+        assert_eq!(e.note_count(), 1);
+        let id = e.timeline.find_at(67, step).expect("snapped to the step");
+        let n = e.get_note(id).unwrap();
+        assert_eq!(n.start_us, step, "start snapped to grid");
+        assert_eq!(n.dur_us, step, "zero-length tap floored to one step");
     }
 }
