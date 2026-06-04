@@ -19,7 +19,9 @@ use ratatui::{
     Frame,
 };
 use rockcraft_audio::SynthHandle;
-use rockcraft_core::{Grid, MidiNote, Note, NoteId, Timeline, Velocity};
+use rockcraft_core::{
+    ChordKind, Grid, Key, MidiNote, Note, NoteId, Scale as MusicScale, Timeline, Velocity,
+};
 
 use crate::highway::{build_spans, project, NoteSpan};
 use crate::keyboard::{black_key_col, is_black_key, white_index, Scale, HIGHEST_MIDI, LOWEST_MIDI};
@@ -46,6 +48,8 @@ const VEL_STEP: u8 = 8;
 const CURSOR_COLOR: Color = Color::Magenta;
 /// Grab-mode badge colour.
 const GRAB_COLOR: Color = Color::Yellow;
+/// Chord-mode badge colour.
+const CHORD_COLOR: Color = Color::Cyan;
 /// Resting colour for timeline notes on the highway.
 const NOTE_COLOR: Color = Color::Indexed(33);
 /// Faint colour for beat/bar gridlines.
@@ -62,6 +66,23 @@ pub struct Cursor {
     pub step: u64,
 }
 
+/// Live state of the key-aware chord selector (`c`).
+///
+/// While active, the screen keeps a *preview* chord inserted in the timeline so
+/// it renders as a ghost and auditions through the synth. Cycling the degree or
+/// quality replaces that preview in place (it never piles up). `Enter` commits
+/// the preview (it becomes permanent); `Esc` removes it.
+struct ChordMode {
+    /// Scale degree `1..=7` of the chord under construction.
+    degree: u8,
+    /// Triad (3 notes) or Seventh (4 notes).
+    kind: ChordKind,
+    /// Ids of the notes currently previewing this chord in the timeline.
+    preview_ids: Vec<NoteId>,
+    /// The pitches of the current preview (ascending), exposed for tests.
+    pitches: Vec<MidiNote>,
+}
+
 /// The composer edit screen: a timeline rendered on the highway with a navigable
 /// cursor.  Supports vim-style navigation (#52) and note-mutation ops (#53).
 pub struct EditScreen {
@@ -74,6 +95,15 @@ pub struct EditScreen {
     synth: Option<SynthHandle>,
     /// The pitch currently sounding from an audition; stopped before the next one.
     auditioning: Option<MidiNote>,
+    /// Pitches currently sounding from a chord audition; stopped before the next.
+    auditioning_chord: Vec<MidiNote>,
+    /// The piece's key, used to voice diatonic chords. Default C major (later
+    /// persisted by #56 and made editable by a follow-up).
+    key: Key,
+    /// Live chord-selector state; `None` when not in chord mode.
+    chord: Option<ChordMode>,
+    /// Pitches of the most recently committed chord, exposed for tests.
+    last_committed: Vec<MidiNote>,
 }
 
 impl EditScreen {
@@ -100,7 +130,19 @@ impl EditScreen {
             grabbed: None,
             synth,
             auditioning: None,
+            auditioning_chord: Vec::new(),
+            key: Key {
+                root_pc: 0,
+                scale: MusicScale::Major,
+            },
+            chord: None,
+            last_committed: Vec::new(),
         }
+    }
+
+    /// Set the key used to voice diatonic chords. (No UI yet — #56 persists it.)
+    pub fn set_key(&mut self, key: Key) {
+        self.key = key;
     }
 
     /// Attach a synth handle so edits are auditioned. Called by the shell after
@@ -110,8 +152,10 @@ impl EditScreen {
     }
 
     /// Stop any in-progress audition. Call this before navigating away from the
-    /// screen so held notes don't linger.
+    /// screen so held notes don't linger. An uncommitted chord preview is
+    /// cancelled (its notes removed) so leaving never strands a ghost chord.
     pub fn leave(&mut self) {
+        self.cancel_chord();
         let prev = self.auditioning.take();
         if let (Some(synth), Some(p)) = (&self.synth, prev) {
             synth.note_off(p);
@@ -141,11 +185,34 @@ impl EditScreen {
         self.timeline.get(id).copied()
     }
 
+    /// Whether the chord selector is currently active.
+    pub fn in_chord_mode(&self) -> bool {
+        self.chord.is_some()
+    }
+
+    /// The pitches of the chord currently being previewed, or `None` when not in
+    /// chord mode.
+    pub fn previewed_chord(&self) -> Option<Vec<MidiNote>> {
+        self.chord.as_ref().map(|c| c.pitches.clone())
+    }
+
+    /// The pitches of the most recently committed chord (empty before the first
+    /// commit).
+    pub fn last_committed_pitches(&self) -> &[MidiNote] {
+        &self.last_committed
+    }
+
     // ── key routing ───────────────────────────────────────────────────────
 
     /// Route a key press through the full keymap. Tab/Esc are handled by the
     /// shell, not here.
     pub fn on_key(&mut self, code: KeyCode) {
+        // In chord mode the keymap is taken over by the selector (digits pick a
+        // degree, `[`/`]` cycle it, `s` toggles quality, Enter/Esc commit/cancel).
+        if self.chord.is_some() {
+            self.on_chord_key(code);
+            return;
+        }
         match code {
             // ── navigation ──────────────────────────────────────────────
             // Step left / right (clamp left at 0; right is unbounded).
@@ -245,7 +312,28 @@ impl EditScreen {
             KeyCode::Char('m') => {
                 self.toggle_grab();
             }
+            // Enter the key-aware chord selector at the cursor.
+            KeyCode::Char('c') => {
+                self.enter_chord_mode();
+            }
 
+            _ => {}
+        }
+    }
+
+    /// Route a key while the chord selector is active.
+    fn on_chord_key(&mut self, code: KeyCode) {
+        match code {
+            // Choose a scale degree directly and place its diatonic chord.
+            KeyCode::Char(c @ '1'..='7') => self.set_chord_degree(c as u8 - b'0'),
+            // Cycle the degree up / down through the 7 fitting chords.
+            KeyCode::Char(']') => self.cycle_chord_degree(1),
+            KeyCode::Char('[') => self.cycle_chord_degree(-1),
+            // Toggle Triad ↔ Seventh for the placed chord.
+            KeyCode::Char('s') => self.toggle_chord_kind(),
+            // Commit the preview / cancel and remove it.
+            KeyCode::Enter => self.commit_chord(),
+            KeyCode::Esc => self.cancel_chord(),
             _ => {}
         }
     }
@@ -338,6 +426,112 @@ impl EditScreen {
         }
     }
 
+    // ── chord selector ─────────────────────────────────────────────────────
+
+    /// Enter chord mode and immediately preview the tonic (degree 1) triad
+    /// voiced from the cursor. A no-op if already in chord mode.
+    fn enter_chord_mode(&mut self) {
+        if self.chord.is_some() {
+            return;
+        }
+        self.chord = Some(ChordMode {
+            degree: 1,
+            kind: ChordKind::Triad,
+            preview_ids: Vec::new(),
+            pitches: Vec::new(),
+        });
+        self.refresh_preview();
+    }
+
+    /// Set the chord degree directly (1..=7) and re-preview.
+    fn set_chord_degree(&mut self, degree: u8) {
+        if let Some(chord) = self.chord.as_mut() {
+            chord.degree = degree;
+        }
+        self.refresh_preview();
+    }
+
+    /// Cycle the degree by `delta`, wrapping within `1..=7`, and re-preview.
+    fn cycle_chord_degree(&mut self, delta: i8) {
+        if let Some(chord) = self.chord.as_mut() {
+            let zero_based = (chord.degree as i8 - 1 + delta).rem_euclid(7);
+            chord.degree = zero_based as u8 + 1;
+        }
+        self.refresh_preview();
+    }
+
+    /// Toggle the chord quality (Triad ↔ Seventh) and re-preview.
+    fn toggle_chord_kind(&mut self) {
+        if let Some(chord) = self.chord.as_mut() {
+            chord.kind = match chord.kind {
+                ChordKind::Triad => ChordKind::Seventh,
+                ChordKind::Seventh => ChordKind::Triad,
+            };
+        }
+        self.refresh_preview();
+    }
+
+    /// Replace the preview with the chord for the current degree/quality, voiced
+    /// from the cursor pitch as the root octave. Removes the previous preview
+    /// notes first so cycling never accumulates, then auditions the new chord.
+    fn refresh_preview(&mut self) {
+        let Some(chord) = self.chord.as_ref() else {
+            return;
+        };
+        let degree = chord.degree;
+        let kind = chord.kind;
+        let old_ids = chord.preview_ids.clone();
+
+        for id in old_ids {
+            self.timeline.remove(id);
+        }
+
+        let root = MidiNote::new(self.cursor.pitch).expect("cursor pitch is always valid");
+        let pitches = self.key.diatonic_chord(degree, kind, root);
+        let start = self.cursor_us();
+        let dur = self.grid.step_us();
+        let velocity = Velocity::new(DEFAULT_NOTE_VEL).expect("80 is always valid");
+
+        let ids: Vec<NoteId> = pitches
+            .iter()
+            .map(|&pitch| {
+                self.timeline.insert(Note {
+                    pitch,
+                    start_us: start,
+                    dur_us: dur,
+                    velocity,
+                })
+            })
+            .collect();
+
+        self.audition_chord(&pitches);
+
+        if let Some(chord) = self.chord.as_mut() {
+            chord.preview_ids = ids;
+            chord.pitches = pitches;
+        }
+    }
+
+    /// Commit the previewed chord: its notes stay in the timeline permanently
+    /// and chord mode ends. A no-op if not in chord mode.
+    fn commit_chord(&mut self) {
+        if let Some(chord) = self.chord.take() {
+            self.last_committed = chord.pitches;
+        }
+        self.stop_chord_audition();
+    }
+
+    /// Cancel the previewed chord: its notes are removed and chord mode ends.
+    /// A no-op if not in chord mode.
+    fn cancel_chord(&mut self) {
+        if let Some(chord) = self.chord.take() {
+            for id in chord.preview_ids {
+                self.timeline.remove(id);
+            }
+        }
+        self.stop_chord_audition();
+    }
+
     // ── audition ─────────────────────────────────────────────────────────
 
     /// Audition the note identified by `id`: stops the previous audition first,
@@ -362,6 +556,37 @@ impl EditScreen {
         }
         synth.note_on(pitch, velocity);
         self.auditioning = Some(pitch);
+    }
+
+    /// Audition a whole chord: stop any prior single-note and chord auditions,
+    /// then sound every pitch. No-op when no synth is attached.
+    fn audition_chord(&mut self, pitches: &[MidiNote]) {
+        let prev_single = self.auditioning.take();
+        let prev_chord = std::mem::take(&mut self.auditioning_chord);
+        let Some(synth) = self.synth.clone() else {
+            return;
+        };
+        if let Some(p) = prev_single {
+            synth.note_off(p);
+        }
+        for p in prev_chord {
+            synth.note_off(p);
+        }
+        let velocity = Velocity::new(DEFAULT_NOTE_VEL).expect("80 is always valid");
+        for &p in pitches {
+            synth.note_on(p, velocity);
+        }
+        self.auditioning_chord = pitches.to_vec();
+    }
+
+    /// Silence a chord audition (on commit / cancel / leave).
+    fn stop_chord_audition(&mut self) {
+        let prev = std::mem::take(&mut self.auditioning_chord);
+        if let Some(synth) = self.synth.clone() {
+            for p in prev {
+                synth.note_off(p);
+            }
+        }
     }
 
     // ── navigation helpers ────────────────────────────────────────────────
@@ -441,6 +666,28 @@ impl EditScreen {
             .map(|n| n.name())
             .unwrap_or_default();
 
+        // In chord mode the badge and hint switch to the selector controls.
+        if let Some(chord) = &self.chord {
+            let quality = match chord.kind {
+                ChordKind::Triad => "triad",
+                ChordKind::Seventh => "7th",
+            };
+            let line = Line::from(vec![
+                Span::styled(" CHORD ", Style::default().fg(Color::Black).bg(CHORD_COLOR)),
+                Span::raw(format!("  degree {} ({quality})  ", chord.degree)),
+                Span::styled(
+                    format!("♪ {pitch_name}  "),
+                    Style::default().fg(CHORD_COLOR),
+                ),
+                Span::styled(
+                    "[1-7] degree  [ [ / ] ] cycle  [s] 7th  [Enter] commit  [Esc] cancel",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]);
+            f.render_widget(Paragraph::new(line), area);
+            return;
+        }
+
         let (badge_text, badge_style) = if self.grabbed.is_some() {
             (" GRAB ", Style::default().fg(Color::Black).bg(GRAB_COLOR))
         } else {
@@ -456,7 +703,7 @@ impl EditScreen {
                 Style::default().fg(CURSOR_COLOR),
             ),
             Span::styled(
-                "[a/x] add/del  []/[] size  [+/-] vel  [m] grab  [hjkl] move  [HJKL] bar/oct  [0/$] ends  [Tab] menu",
+                "[a/x] add/del  []/[] size  [+/-] vel  [m] grab  [c] chord  [hjkl] move  [HJKL] bar/oct  [0/$] ends  [Tab] menu",
                 Style::default().fg(Color::DarkGray),
             ),
         ]);
@@ -976,5 +1223,194 @@ mod tests {
         e.on_key(KeyCode::Char('l'));
         assert_eq!(e.cursor().step, 1);
         assert_eq!(e.note_count(), 0);
+    }
+
+    // ── chord-selector tests ──────────────────────────────────────────────
+
+    fn pitch_values(notes: &[MidiNote]) -> Vec<u8> {
+        notes.iter().map(|n| n.value()).collect()
+    }
+
+    /// `c` enters chord mode and previews the tonic triad voiced from the cursor
+    /// (middle C → {C,E,G}); degree `5` places {G,B,D}. All notes share the
+    /// cursor's start and a one-step duration.
+    #[test]
+    fn degree_one_then_five_in_c_major() {
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('c'));
+        assert!(e.in_chord_mode());
+
+        e.on_key(KeyCode::Char('1'));
+        let preview = e.previewed_chord().expect("preview while in chord mode");
+        assert_eq!(pitch_values(&preview), vec![60, 64, 67], "C major tonic");
+        assert_eq!(e.note_count(), 3, "three preview notes");
+
+        // Each preview note starts at the cursor and lasts one step.
+        let step = e.grid.step_us();
+        for &p in &[60u8, 64, 67] {
+            let id = e
+                .timeline
+                .find_at(p, e.cursor_us())
+                .expect("preview note present");
+            let n = e.get_note(id).unwrap();
+            assert_eq!(n.start_us, e.cursor_us());
+            assert_eq!(n.dur_us, step);
+        }
+
+        e.on_key(KeyCode::Char('5'));
+        let preview = e.previewed_chord().unwrap();
+        assert_eq!(
+            pitch_values(&preview),
+            vec![67, 71, 74],
+            "dominant {{G,B,D}}"
+        );
+        assert_eq!(e.note_count(), 3, "still three — preview replaced");
+    }
+
+    /// `s` toggles the dominant triad to its seventh: {G,B,D} → {G,B,D,F}.
+    #[test]
+    fn seventh_toggle_on_degree_five() {
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('c'));
+        e.on_key(KeyCode::Char('5'));
+        assert_eq!(
+            pitch_values(&e.previewed_chord().unwrap()),
+            vec![67, 71, 74]
+        );
+
+        e.on_key(KeyCode::Char('s'));
+        assert_eq!(
+            pitch_values(&e.previewed_chord().unwrap()),
+            vec![67, 71, 74, 77],
+            "G7 = {{G,B,D,F}}"
+        );
+        assert_eq!(e.note_count(), 4, "four preview notes after toggle");
+
+        // Toggle back to a triad.
+        e.on_key(KeyCode::Char('s'));
+        assert_eq!(e.note_count(), 3);
+    }
+
+    /// `[`/`]` cycle the degree, replacing the preview each time (count stays at
+    /// the chord size, never accumulating).
+    #[test]
+    fn cycling_replaces_preview_without_accumulating() {
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('c')); // preview degree 1
+        assert_eq!(e.note_count(), 3);
+
+        e.on_key(KeyCode::Char(']')); // → degree 2
+        assert_eq!(e.note_count(), 3, "still 3 after cycling up");
+        e.on_key(KeyCode::Char(']')); // → degree 3
+        assert_eq!(e.note_count(), 3);
+        e.on_key(KeyCode::Char('[')); // → degree 2
+        e.on_key(KeyCode::Char('[')); // → degree 1
+        assert_eq!(e.note_count(), 3, "still 3 after cycling back");
+        assert_eq!(
+            pitch_values(&e.previewed_chord().unwrap()),
+            vec![60, 64, 67]
+        );
+    }
+
+    /// `[` wraps from degree 1 down to degree 7; `]` wraps from 7 up to 1.
+    #[test]
+    fn degree_cycle_wraps() {
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('c')); // degree 1
+        e.on_key(KeyCode::Char('[')); // wrap to degree 7 → {B,D,F}
+        assert_eq!(
+            pitch_values(&e.previewed_chord().unwrap()),
+            vec![71, 74, 77]
+        );
+        e.on_key(KeyCode::Char(']')); // wrap back to degree 1
+        assert_eq!(
+            pitch_values(&e.previewed_chord().unwrap()),
+            vec![60, 64, 67]
+        );
+    }
+
+    /// `Enter` commits: notes stay, chord mode ends, and `last_committed_pitches`
+    /// reports them.
+    #[test]
+    fn commit_keeps_preview_notes() {
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('c'));
+        e.on_key(KeyCode::Char('1'));
+        assert_eq!(e.note_count(), 3);
+
+        e.on_key(KeyCode::Enter);
+        assert!(!e.in_chord_mode(), "chord mode ends on commit");
+        assert!(e.previewed_chord().is_none());
+        assert_eq!(e.note_count(), 3, "committed notes remain");
+        assert_eq!(
+            pitch_values(e.last_committed_pitches()),
+            vec![60, 64, 67],
+            "committed pitches reported"
+        );
+    }
+
+    /// `Esc` cancels: the preview notes are removed and chord mode ends.
+    #[test]
+    fn cancel_removes_preview_notes() {
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('c'));
+        e.on_key(KeyCode::Char('1'));
+        assert_eq!(e.note_count(), 3);
+
+        e.on_key(KeyCode::Esc);
+        assert!(!e.in_chord_mode(), "chord mode ends on cancel");
+        assert_eq!(e.note_count(), 0, "preview removed");
+        assert!(e.last_committed_pitches().is_empty());
+    }
+
+    /// Leaving the screen mid-chord cancels the uncommitted preview.
+    #[test]
+    fn leave_cancels_uncommitted_chord() {
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('c'));
+        assert_eq!(e.note_count(), 3);
+        e.leave();
+        assert!(!e.in_chord_mode());
+        assert_eq!(e.note_count(), 0);
+    }
+
+    /// A seventh chord voiced near the top of the keyboard drops the pitches that
+    /// would exceed the MIDI range (delegated to `core`); every kept pitch stays
+    /// valid.
+    #[test]
+    fn chord_at_top_of_keyboard_drops_out_of_range() {
+        let mut e = EditScreen::new();
+        // Climb to the top of the 88-key range (C8 = 108).
+        for _ in 0..20 {
+            e.on_key(KeyCode::Char('K'));
+        }
+        assert_eq!(e.cursor().pitch, HIGHEST_MIDI);
+
+        e.on_key(KeyCode::Char('c'));
+        e.on_key(KeyCode::Char('7')); // leading-tone degree, highest voicing
+        e.on_key(KeyCode::Char('s')); // seventh → fourth tone runs past 127
+
+        let preview = e.previewed_chord().unwrap();
+        assert!(preview.len() < 4, "an out-of-range tone is dropped");
+        assert_eq!(
+            e.note_count(),
+            preview.len(),
+            "note count matches the kept pitches"
+        );
+        for n in &preview {
+            assert!(n.value() <= 127);
+        }
+    }
+
+    /// Chord-mode keys do not leak into normal edit ops, and normal ops are
+    /// suspended while in chord mode: `a` (add) is inert during chord mode.
+    #[test]
+    fn edit_ops_suspended_during_chord_mode() {
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('c'));
+        let before = e.note_count(); // 3 preview notes
+        e.on_key(KeyCode::Char('a')); // ignored in chord mode
+        assert_eq!(e.note_count(), before, "add is inert in chord mode");
+        assert!(e.in_chord_mode());
     }
 }

@@ -162,8 +162,11 @@ impl Shell {
                 _ => {}
             },
             // The composer editor: Tab/Esc leave to the menu; every other key is
-            // navigation routed into the screen's own keymap.
+            // navigation routed into the screen's own keymap. Exception: while
+            // the chord selector is active, Esc cancels the chord (handled by
+            // the screen) instead of leaving.
             Screen::Edit(edit) => match code {
+                KeyCode::Esc if edit.in_chord_mode() => edit.on_key(KeyCode::Esc),
                 KeyCode::Tab | KeyCode::Esc => {
                     edit.leave();
                     self.screen = Screen::Menu;
