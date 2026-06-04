@@ -18,6 +18,7 @@ use rockcraft_audio::SynthHandle;
 use rockcraft_core::{Grid, Key, RecordingMeta, Scale, Timeline};
 use rockcraft_midi::{smf_bytes_to_events, NoteSource};
 
+use crate::backing::{BackingPicker, PickerOutcome};
 use crate::edit::EditScreen;
 use crate::key_source::{CrosstermKeys, KeySource};
 use crate::play::PlayScreen;
@@ -33,6 +34,7 @@ pub(crate) enum Screen {
     Record(RecordScreen),
     Play(PlayScreen),
     Edit(EditScreen),
+    BackingPicker(BackingPicker),
 }
 
 /// The menu entries, in order.
@@ -41,6 +43,7 @@ const MENU_ITEMS: &[&str] = &[
     "Play last recording",
     "Compose (new)",
     "Edit last recording",
+    "Choose backing track",
     "Quit",
 ];
 
@@ -153,6 +156,11 @@ impl Shell {
                 },
                 None => self.status = "no recordings yet — record one first".into(),
             },
+            Some(4) => {
+                // Choose backing track: open the in-app file picker.
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                self.screen = Screen::BackingPicker(BackingPicker::new(cwd));
+            }
             _ => self.should_quit = true,
         }
     }
@@ -219,6 +227,20 @@ impl Shell {
                 },
                 other => edit.on_key(other),
             },
+            Screen::BackingPicker(picker) => {
+                let outcome = picker.on_key(code).clone();
+                match outcome {
+                    PickerOutcome::Selected(path) => {
+                        self.status = format!("backing: {}", path.display());
+                        self.backing_path = Some(path);
+                        self.screen = Screen::Menu;
+                    }
+                    PickerOutcome::Cancelled => {
+                        self.screen = Screen::Menu;
+                    }
+                    PickerOutcome::Pending => {}
+                }
+            }
         }
     }
 
@@ -229,6 +251,7 @@ impl Shell {
             Screen::Record(_) => "record",
             Screen::Play(_) => "play",
             Screen::Edit(_) => "edit",
+            Screen::BackingPicker(_) => "backing_picker",
         }
     }
 
@@ -285,8 +308,8 @@ pub fn run_loop<B: ratatui::backend::Backend>(
                     }
                 }
                 Screen::Play(play) => play.ingest(ev),
-                // The editor is piano-free: it ignores live MIDI input.
-                Screen::Menu | Screen::Edit(_) => {}
+                // These screens ignore live MIDI input.
+                Screen::Menu | Screen::Edit(_) | Screen::BackingPicker(_) => {}
             }
         }
 
@@ -321,6 +344,7 @@ fn draw(f: &mut Frame, shell: &Shell) {
         Screen::Record(rec) => rec.draw(f, f.area()),
         Screen::Play(play) => play.draw(f, f.area()),
         Screen::Edit(edit) => edit.draw(f, f.area()),
+        Screen::BackingPicker(picker) => picker.draw(f, f.area()),
     }
 }
 
