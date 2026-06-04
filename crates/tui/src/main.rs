@@ -1,29 +1,11 @@
-//! RockCraft terminal frontend (MVP).
+//! RockCraft terminal frontend entry point.
 //!
-//! The swappable view layer — the same `core` engine will later drive a Tauri
-//! desktop app and a Godot visual frontend. This build connects to the piano
-//! and presents a menu to switch between modes:
-//!   - **Record**: keyboard + live event log; save the take to a `.mid`.
-//!   - **Play**: a falling-note highway from a recorded `.mid`, with your live
-//!     keys lit over it (play-along).
-//!
-//! Run on Windows (where the CASIO USB-MIDI device is visible):
-//!
-//! ```text
-//! cargo run -p rockcraft-tui
-//! ```
-//!
-//! Optional argument: a substring of the MIDI port name (default "casio").
-
-mod app;
-mod highway;
-mod keyboard;
-mod play;
-mod record;
-mod render;
+//! Thin binary wrapper — the app logic lives in `lib.rs` (the library target
+//! of this crate) so integration tests in `tests/` can access it.
 
 use rockcraft_audio::AudioOut;
 use rockcraft_midi::{LiveInput, MockKeyboard, NoteSource};
+use rockcraft_tui::app;
 
 fn main() {
     // Args: `--mock` forces the keyboard mock; the first non-flag arg is the

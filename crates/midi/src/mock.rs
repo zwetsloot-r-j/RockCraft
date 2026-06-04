@@ -1,18 +1,18 @@
-//! A piano-free [`NoteSource`](crate::NoteSource): typed computer-keyboard keys
-//! become [`NoteEvent`]s, so the TUI runs and is developed without hardware.
+//! Piano-free [`NoteSource`](crate::NoteSource) implementations for development
+//! and testing.
 //!
-//! Terminals don't reliably deliver key **release**, so we can't mirror the
-//! piano's on/off pairing directly. Instead every [`press`](MockKeyboard::press)
-//! enqueues a note-on *now* and a matching note-off `SUSTAIN_MS` later;
-//! [`events`](MockKeyboard::events) only releases events whose timestamp has
-//! arrived. A held or auto-repeating key therefore produces clean on/off pairs
-//! and scoring stays deterministic — judged off timestamps, never frame rate.
+//! - [`MockKeyboard`]: typed computer-keyboard keys become [`NoteEvent`]s, so
+//!   the TUI runs without hardware attached.
+//! - [`ScriptedSource`]: replays a fixed `NoteEvent` timeline against a fake
+//!   clock, for deterministic headless tests.
 
 use std::time::Instant;
 
 use rockcraft_core::{MidiNote, NoteEvent, Velocity};
 
 use crate::NoteSource;
+
+// ── MockKeyboard ─────────────────────────────────────────────────────────────
 
 /// How long a mock note sustains before its note-off, in milliseconds.
 const SUSTAIN_MS: u64 = 120;
@@ -145,10 +145,67 @@ impl NoteSource for MockKeyboard {
     }
 }
 
+// ── ScriptedSource ────────────────────────────────────────────────────────────
+
+/// A controllable event source that replays a pre-loaded timeline.
+///
+/// Events are released in timestamp order as [`advance`](ScriptedSource::advance)
+/// moves the cursor forward; nothing is emitted ahead of its time. This keeps
+/// the source's contract identical to live input while being fully controllable
+/// in headless tests.
+pub struct ScriptedSource {
+    /// Events sorted ascending by `timestamp_us`; drained from the front.
+    pending: Vec<NoteEvent>,
+    /// Current fake-clock position in microseconds.
+    cursor_us: u64,
+}
+
+impl ScriptedSource {
+    /// Create a new source from `events`. They need not be sorted; the
+    /// constructor sorts them by `timestamp_us` so `advance` can drain in order.
+    pub fn new(mut events: Vec<NoteEvent>) -> Self {
+        events.sort_by_key(|e| e.timestamp_us);
+        Self {
+            pending: events,
+            cursor_us: 0,
+        }
+    }
+
+    /// Advance the fake clock by `dt_us` microseconds. Subsequent calls to
+    /// [`NoteSource::events`] will return any events whose `timestamp_us` is
+    /// now ≤ the cursor.
+    pub fn advance(&mut self, dt_us: u64) {
+        self.cursor_us = self.cursor_us.saturating_add(dt_us);
+    }
+
+    /// Current fake-clock position (microseconds since creation).
+    pub fn cursor_us(&self) -> u64 {
+        self.cursor_us
+    }
+}
+
+impl NoteSource for ScriptedSource {
+    /// Drains and returns all events whose `timestamp_us` ≤ the current cursor.
+    fn events(&mut self) -> Vec<NoteEvent> {
+        let n = self
+            .pending
+            .partition_point(|e| e.timestamp_us <= self.cursor_us);
+        self.pending.drain(..n).collect()
+    }
+
+    fn port_name(&self) -> &str {
+        "scripted"
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rockcraft_core::NoteEventKind;
+    use rockcraft_core::{MidiNote, NoteEventKind, Velocity};
+
+    // -- MockKeyboard tests ---------------------------------------------------
 
     #[test]
     fn press_a_is_middle_c() {
@@ -237,5 +294,115 @@ mod tests {
     fn port_name_is_descriptive() {
         let kb = MockKeyboard::new();
         assert!(!kb.port_name().is_empty());
+    }
+
+    // -- ScriptedSource tests -------------------------------------------------
+
+    fn note(n: u8) -> MidiNote {
+        MidiNote::new(n).unwrap()
+    }
+    fn vel(v: u8) -> Velocity {
+        Velocity::new(v).unwrap()
+    }
+    fn on(n: u8, ts: u64) -> NoteEvent {
+        NoteEvent::on(note(n), vel(80), ts)
+    }
+    fn off(n: u8, ts: u64) -> NoteEvent {
+        NoteEvent::off(note(n), ts)
+    }
+
+    #[test]
+    fn no_events_before_advance() {
+        let mut src = ScriptedSource::new(vec![on(60, 1_000)]);
+        assert!(src.events().is_empty());
+    }
+
+    #[test]
+    fn events_release_when_cursor_reaches_timestamp() {
+        let mut src = ScriptedSource::new(vec![on(60, 1_000)]);
+        src.advance(1_000);
+        let evs = src.events();
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].note.value(), 60);
+        assert_eq!(evs[0].timestamp_us, 1_000);
+    }
+
+    #[test]
+    fn events_drain_exactly_once() {
+        let mut src = ScriptedSource::new(vec![on(60, 500)]);
+        src.advance(1_000);
+        assert_eq!(src.events().len(), 1);
+        // Second drain returns nothing.
+        assert!(src.events().is_empty());
+    }
+
+    #[test]
+    fn events_released_in_timestamp_order() {
+        // Supply out-of-order; expect them back in order.
+        let evs = vec![on(64, 3_000), on(60, 1_000), on(62, 2_000)];
+        let mut src = ScriptedSource::new(evs);
+        src.advance(5_000);
+        let out = src.events();
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].timestamp_us, 1_000);
+        assert_eq!(out[1].timestamp_us, 2_000);
+        assert_eq!(out[2].timestamp_us, 3_000);
+    }
+
+    #[test]
+    fn only_due_events_released_each_advance() {
+        let mut src = ScriptedSource::new(vec![on(60, 1_000), on(62, 3_000), on(64, 5_000)]);
+
+        src.advance(2_000);
+        let batch1 = src.events();
+        assert_eq!(batch1.len(), 1);
+        assert_eq!(batch1[0].note.value(), 60);
+
+        src.advance(2_000); // cursor now at 4_000
+        let batch2 = src.events();
+        assert_eq!(batch2.len(), 1);
+        assert_eq!(batch2[0].note.value(), 62);
+
+        // Nothing at 4_000 < 5_000
+        assert!(src.events().is_empty());
+
+        src.advance(2_000); // cursor at 6_000
+        let batch3 = src.events();
+        assert_eq!(batch3.len(), 1);
+        assert_eq!(batch3[0].note.value(), 64);
+
+        // Queue exhausted.
+        src.advance(100_000);
+        assert!(src.events().is_empty());
+    }
+
+    #[test]
+    fn port_name_is_scripted() {
+        let src = ScriptedSource::new(vec![]);
+        assert_eq!(src.port_name(), "scripted");
+    }
+
+    #[test]
+    fn events_at_exact_cursor_are_released() {
+        let mut src = ScriptedSource::new(vec![on(60, 500)]);
+        src.advance(500);
+        assert_eq!(src.events().len(), 1);
+    }
+
+    #[test]
+    fn empty_timeline_stays_empty() {
+        let mut src = ScriptedSource::new(vec![]);
+        src.advance(1_000_000);
+        assert!(src.events().is_empty());
+    }
+
+    #[test]
+    fn on_off_pair_released_in_order() {
+        let mut src = ScriptedSource::new(vec![on(60, 0), off(60, 500_000)]);
+        src.advance(600_000);
+        let evs = src.events();
+        assert_eq!(evs.len(), 2);
+        assert!(matches!(evs[0].kind, NoteEventKind::On { .. }));
+        assert_eq!(evs[1].kind, NoteEventKind::Off);
     }
 }

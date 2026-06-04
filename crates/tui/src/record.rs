@@ -119,6 +119,11 @@ impl RecordScreen {
         self.log.push_back(line);
     }
 
+    /// All events captured so far, in timestamp order.
+    pub fn recorded_events(&self) -> &[rockcraft_core::NoteEvent] {
+        self.buffer.events()
+    }
+
     /// Save the captured session as a bundle under `recordings/take-<stamp>/`.
     /// Returns the bundle directory path.
     pub fn save(&mut self) -> std::io::Result<PathBuf> {
