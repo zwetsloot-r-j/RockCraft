@@ -10,6 +10,7 @@
 //! other way around.
 
 pub mod buffer;
+pub mod chord;
 pub mod events;
 pub mod grid;
 pub mod scoring;
@@ -19,6 +20,7 @@ pub mod timeline;
 pub mod wait;
 
 pub use buffer::EventBuffer;
+pub use chord::{ChordKind, Key, Scale};
 pub use events::{MidiNote, NoteEvent, NoteEventKind, Velocity};
 pub use grid::{Grid, Subdivision, TimeSig};
 pub use scoring::{score, ExpectedNote, NoteJudgment, ScoreConfig, ScoreReport, Timing};
