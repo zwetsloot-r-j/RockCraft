@@ -4,6 +4,7 @@
 //! `tests/` access screens and the shell through this public surface.
 
 pub mod app;
+pub mod edit;
 pub mod highway;
 pub mod key_source;
 pub mod keyboard;
