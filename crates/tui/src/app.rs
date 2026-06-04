@@ -15,7 +15,8 @@ use ratatui::{
     Frame, Terminal,
 };
 use rockcraft_audio::SynthHandle;
-use rockcraft_midi::NoteSource;
+use rockcraft_core::{Grid, Timeline};
+use rockcraft_midi::{smf_bytes_to_events, NoteSource};
 
 use crate::edit::EditScreen;
 use crate::key_source::{CrosstermKeys, KeySource};
@@ -34,9 +35,14 @@ pub(crate) enum Screen {
     Edit(EditScreen),
 }
 
-/// The menu entries, in order. "Compose" is a temporary entry into the editor
-/// until the proper launcher lands (#55).
-const MENU_ITEMS: &[&str] = &["Record", "Play last recording", "Compose", "Quit"];
+/// The menu entries, in order.
+const MENU_ITEMS: &[&str] = &[
+    "Record",
+    "Play last recording",
+    "Compose (new)",
+    "Edit last recording",
+    "Quit",
+];
 
 pub struct Shell {
     /// The swappable event source: real piano (`LiveInput`) or `MockKeyboard`.
@@ -82,6 +88,24 @@ impl Shell {
         self.menu_state.select(Some(next));
     }
 
+    /// Transition immediately into the composer with an empty timeline.
+    pub(crate) fn activate_edit(&mut self) {
+        let mut edit = EditScreen::new();
+        if let Some(s) = &self.synth {
+            edit.attach_synth(s.clone());
+        }
+        self.screen = Screen::Edit(edit);
+    }
+
+    /// Number of notes in the edit screen; `None` if not in edit mode.
+    pub fn edit_note_count(&self) -> Option<usize> {
+        if let Screen::Edit(e) = &self.screen {
+            Some(e.note_count())
+        } else {
+            None
+        }
+    }
+
     /// Act on the highlighted menu item.
     fn menu_activate(&mut self) {
         match self.menu_state.selected() {
@@ -105,12 +129,27 @@ impl Shell {
                 None => self.status = "no recordings yet — record one first".into(),
             },
             Some(2) => {
-                let mut edit = EditScreen::new();
-                if let Some(s) = &self.synth {
-                    edit.attach_synth(s.clone());
-                }
-                self.screen = Screen::Edit(edit);
+                // Compose (new): blank timeline.
+                self.activate_edit();
             }
+            Some(3) => match latest_recording() {
+                // Edit last recording: load the latest take into the editor.
+                Some(path) => match std::fs::read(&path) {
+                    Ok(bytes) => match smf_bytes_to_events(&bytes) {
+                        Ok(events) => {
+                            let timeline = Timeline::from_events(&events);
+                            let mut edit = EditScreen::from_timeline(timeline, Grid::default_120());
+                            if let Some(s) = &self.synth {
+                                edit.attach_synth(s.clone());
+                            }
+                            self.screen = Screen::Edit(edit);
+                        }
+                        Err(e) => self.status = format!("parse failed: {e}"),
+                    },
+                    Err(e) => self.status = format!("read failed: {e}"),
+                },
+                None => self.status = "no recordings yet — record one first".into(),
+            },
             _ => self.should_quit = true,
         }
     }
@@ -161,16 +200,20 @@ impl Shell {
                 }
                 _ => {}
             },
-            // The composer editor: Tab/Esc leave to the menu; every other key is
-            // navigation routed into the screen's own keymap. Exception: while
-            // the chord selector is active, Esc cancels the chord (handled by
-            // the screen) instead of leaving.
+            // The composer editor: Tab/Esc leave to the menu; `s` saves the
+            // timeline bundle (matching Record's convention); every other key is
+            // routed into the screen's own keymap. Exception: while the chord
+            // selector is active, Esc cancels the chord instead of leaving.
             Screen::Edit(edit) => match code {
                 KeyCode::Esc if edit.in_chord_mode() => edit.on_key(KeyCode::Esc),
                 KeyCode::Tab | KeyCode::Esc => {
                     edit.leave();
                     self.screen = Screen::Menu;
                 }
+                KeyCode::Char('s') => match edit.save() {
+                    Ok(p) => self.status = format!("saved {}", p.display()),
+                    Err(e) => self.status = format!("save failed: {e}"),
+                },
                 other => edit.on_key(other),
             },
         }
@@ -197,13 +240,20 @@ impl Shell {
 // ---------------------------------------------------------------------------
 
 /// Run the app shell until the user quits.
+///
+/// If `start_edit` is true the shell boots directly into the composer (the
+/// `--edit` flag in `main.rs`), bypassing the menu.
 pub fn run(
     input: Box<dyn NoteSource>,
     synth: Option<SynthHandle>,
     backing_path: Option<PathBuf>,
+    start_edit: bool,
 ) -> io::Result<()> {
     let mut terminal = ratatui::init();
     let mut shell = Shell::new(input, synth, backing_path);
+    if start_edit {
+        shell.activate_edit();
+    }
     let mut keys = CrosstermKeys;
     let res = run_loop(&mut terminal, &mut shell, &mut keys);
     ratatui::restore();
@@ -306,8 +356,13 @@ fn draw_menu(f: &mut Frame, area: Rect, shell: &Shell) {
 
 /// Find `song.mid` inside the most recent `take-*/` bundle under `recordings/`.
 fn latest_recording() -> Option<std::path::PathBuf> {
-    let dir = std::path::Path::new("recordings");
-    let mut bundles: Vec<_> = std::fs::read_dir(dir)
+    latest_recording_from(std::path::Path::new("recordings"))
+}
+
+/// Find `song.mid` inside the most recent `take-*/` bundle under `base`.
+/// Extracted so tests can point at a temp directory.
+pub(crate) fn latest_recording_from(base: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut bundles: Vec<_> = std::fs::read_dir(base)
         .ok()?
         .flatten()
         .map(|e| e.path())
@@ -322,4 +377,78 @@ fn latest_recording() -> Option<std::path::PathBuf> {
     let latest = bundles.pop()?;
     let midi = latest.join("song.mid");
     midi.exists().then_some(midi)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rockcraft_core::{Grid, MidiNote, Note, Timeline, Velocity};
+    use rockcraft_midi::ScriptedSource;
+
+    fn make_note(pitch: u8, start: u64, dur: u64) -> Note {
+        Note {
+            pitch: MidiNote::new(pitch).unwrap(),
+            start_us: start,
+            dur_us: dur,
+            velocity: Velocity::new(80).unwrap(),
+        }
+    }
+
+    fn make_shell() -> Shell {
+        Shell::new(Box::new(ScriptedSource::new(vec![])), None, None)
+    }
+
+    /// "Compose (new)" (index 2) enters the editor with an empty timeline,
+    /// driven by the same key routing used in the live shell.
+    #[test]
+    fn compose_new_enters_empty_edit_screen() {
+        let mut shell = make_shell();
+
+        shell.on_key(KeyCode::Down); // → index 1 (Play last recording)
+        shell.on_key(KeyCode::Down); // → index 2 (Compose new)
+        shell.on_key(KeyCode::Enter); // enter the editor
+
+        assert_eq!(shell.screen_name(), "edit");
+        assert_eq!(
+            shell.edit_note_count(),
+            Some(0),
+            "new composition starts with an empty timeline"
+        );
+    }
+
+    /// Seeding a bundle then loading it via "Edit last recording" enters the
+    /// editor pre-populated with the saved notes.
+    #[test]
+    fn edit_last_recording_loads_seeded_bundle() {
+        let mut tl = Timeline::new();
+        tl.insert(make_note(60, 0, 500_000));
+        tl.insert(make_note(64, 500_000, 500_000));
+        let expected_count = tl.len();
+
+        // Save a bundle into a temp base dir using EditScreen's save_bundle.
+        let base = std::env::temp_dir().join(format!(
+            "rockcraft_edit_last_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        let edit_src = EditScreen::from_timeline(tl, Grid::default_120());
+        edit_src.save_bundle(&base).expect("seed save failed");
+
+        // Verify latest_recording_from finds the bundle's song.mid and that
+        // the loaded timeline has the expected number of notes.
+        let midi_path = latest_recording_from(&base).expect("recording not found");
+        let bytes = std::fs::read(&midi_path).expect("read midi failed");
+        let events = smf_bytes_to_events(&bytes).expect("parse failed");
+        let reloaded = Timeline::from_events(&events);
+
+        std::fs::remove_dir_all(&base).ok();
+
+        assert_eq!(
+            reloaded.len(),
+            expected_count,
+            "editor is pre-populated with the saved notes"
+        );
+    }
 }
