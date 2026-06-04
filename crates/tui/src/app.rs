@@ -6,7 +6,7 @@ use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::KeyCode;
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -17,11 +17,16 @@ use ratatui::{
 use rockcraft_audio::SynthHandle;
 use rockcraft_midi::NoteSource;
 
+use crate::key_source::{CrosstermKeys, KeySource};
 use crate::play::PlayScreen;
 use crate::record::RecordScreen;
 
+// ---------------------------------------------------------------------------
+// Shell
+// ---------------------------------------------------------------------------
+
 /// Which screen is active.
-enum Screen {
+pub(crate) enum Screen {
     Menu,
     Record(RecordScreen),
     Play(PlayScreen),
@@ -35,7 +40,7 @@ pub struct Shell {
     input: Box<dyn NoteSource>,
     /// Piano synth, if audio started. `None` runs silently.
     synth: Option<SynthHandle>,
-    screen: Screen,
+    pub(crate) screen: Screen,
     menu_state: ListState,
     status: String,
     should_quit: bool,
@@ -100,8 +105,8 @@ impl Shell {
         }
     }
 
-    /// Handle a key press; returns to the menu on Tab from a screen.
-    fn on_key(&mut self, code: KeyCode) {
+    /// Handle a key press; returns to the menu on Tab/Esc from a screen.
+    pub(crate) fn on_key(&mut self, code: KeyCode) {
         match &mut self.screen {
             Screen::Menu => match code {
                 KeyCode::Up | KeyCode::Char('k') => self.menu_move(-1),
@@ -148,7 +153,25 @@ impl Shell {
             },
         }
     }
+
+    /// Name of the currently active screen — for assertions in tests.
+    pub fn screen_name(&self) -> &'static str {
+        match &self.screen {
+            Screen::Menu => "menu",
+            Screen::Record(_) => "record",
+            Screen::Play(_) => "play",
+        }
+    }
+
+    /// Whether the shell has been asked to quit.
+    pub fn is_quit(&self) -> bool {
+        self.should_quit
+    }
 }
+
+// ---------------------------------------------------------------------------
+// Run loop
+// ---------------------------------------------------------------------------
 
 /// Run the app shell until the user quits.
 pub fn run(
@@ -158,14 +181,18 @@ pub fn run(
 ) -> io::Result<()> {
     let mut terminal = ratatui::init();
     let mut shell = Shell::new(input, synth, backing_path);
-    let res = run_loop(&mut terminal, &mut shell);
+    let mut keys = CrosstermKeys;
+    let res = run_loop(&mut terminal, &mut shell, &mut keys);
     ratatui::restore();
     res
 }
 
-fn run_loop<B: ratatui::backend::Backend>(
+/// The frame loop. Separated from `run` so tests can inject a `TestBackend`
+/// and a `ScriptedKeys` source without a real terminal or MIDI device.
+pub fn run_loop<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     shell: &mut Shell,
+    keys: &mut dyn KeySource,
 ) -> io::Result<()> {
     loop {
         // Drain MIDI and route to the active screen. Clone the synth handle out
@@ -201,13 +228,10 @@ fn run_loop<B: ratatui::backend::Backend>(
 
         terminal.draw(|f| draw(f, shell))?;
 
-        if event::poll(Duration::from_millis(16))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    shell.on_key(key.code);
-                }
-            }
+        if let Some(code) = keys.poll_key(Duration::from_millis(16))? {
+            shell.on_key(code);
         }
+
         if shell.should_quit {
             return Ok(());
         }

@@ -5,6 +5,7 @@
 
 pub mod app;
 pub mod highway;
+pub mod key_source;
 pub mod keyboard;
 pub mod play;
 pub mod record;
