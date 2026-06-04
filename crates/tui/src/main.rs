@@ -8,10 +8,12 @@ use rockcraft_midi::{LiveInput, MockKeyboard, NoteSource};
 use rockcraft_tui::app;
 
 fn main() {
-    // Args: `--mock` forces the keyboard mock; the first non-flag arg is the
-    // MIDI port-name substring (default "casio").
+    // Args: `--mock` forces the keyboard mock; `--edit` boots straight into the
+    // composer; the first non-flag arg is the MIDI port-name substring (default
+    // "casio").
     let args: Vec<String> = std::env::args().skip(1).collect();
     let force_mock = args.iter().any(|a| a == "--mock");
+    let start_edit = args.iter().any(|a| a == "--edit");
     let filter = args
         .iter()
         .find(|a| !a.starts_with("--"))
@@ -49,7 +51,7 @@ fn main() {
     };
     let synth = audio.as_ref().map(AudioOut::synth);
 
-    if let Err(e) = app::run(input, synth, backing_path) {
+    if let Err(e) = app::run(input, synth, backing_path, start_edit) {
         eprintln!("TUI error: {e}");
         std::process::exit(1);
     }

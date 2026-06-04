@@ -10,6 +10,8 @@
 //! Nothing here touches a device or the disk, so the whole screen is
 //! headless-testable via the existing `TestBackend` harness.
 
+use std::path::PathBuf;
+
 use crossterm::event::KeyCode;
 use ratatui::{
     layout::{Constraint, Layout, Rect},
@@ -19,11 +21,15 @@ use ratatui::{
     Frame,
 };
 use rockcraft_audio::SynthHandle;
-use rockcraft_core::{Grid, MidiNote, Note, NoteId, Timeline, Velocity};
+use rockcraft_core::{Grid, MidiNote, Note, NoteId, RecordingMeta, Timeline, Velocity};
+use rockcraft_midi::events_to_smf_bytes;
 
 use crate::highway::{build_spans, project, NoteSpan};
 use crate::keyboard::{black_key_col, is_black_key, white_index, Scale, HIGHEST_MIDI, LOWEST_MIDI};
 use crate::render::draw_keyboard;
+
+/// Base directory for saved bundles.
+const RECORDINGS_DIR: &str = "recordings";
 
 /// How many bars of time the highway shows from bottom (keyboard line) to top.
 const LEAD_BARS: u64 = 4;
@@ -116,6 +122,28 @@ impl EditScreen {
         if let (Some(synth), Some(p)) = (&self.synth, prev) {
             synth.note_off(p);
         }
+    }
+
+    /// Save the timeline as a `take-<stamp>` bundle under `recordings/`.
+    /// Returns the bundle directory. Mirrors `RecordScreen::save`.
+    pub fn save(&self) -> std::io::Result<PathBuf> {
+        self.save_bundle(std::path::Path::new(RECORDINGS_DIR))
+    }
+
+    /// Save the timeline as a `take-<stamp>` bundle inside `base`.
+    /// Useful for testing with an arbitrary temp directory.
+    pub fn save_bundle(&self, base: &std::path::Path) -> std::io::Result<PathBuf> {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let bundle_dir = base.join(format!("take-{stamp}"));
+        std::fs::create_dir_all(&bundle_dir)?;
+        let bytes = events_to_smf_bytes(&self.timeline.to_events());
+        std::fs::write(bundle_dir.join("song.mid"), bytes)?;
+        let meta = RecordingMeta::new_midi_only("song.mid");
+        std::fs::write(bundle_dir.join("meta.json"), meta.to_json())?;
+        Ok(bundle_dir)
     }
 
     // ── read-only accessors ───────────────────────────────────────────────
@@ -456,7 +484,7 @@ impl EditScreen {
                 Style::default().fg(CURSOR_COLOR),
             ),
             Span::styled(
-                "[a/x] add/del  []/[] size  [+/-] vel  [m] grab  [hjkl] move  [HJKL] bar/oct  [0/$] ends  [Tab] menu",
+                "[a/x] add/del  []/[] size  [+/-] vel  [m] grab  [hjkl] move  [HJKL] bar/oct  [0/$] ends  [s] save  [Tab] menu",
                 Style::default().fg(Color::DarkGray),
             ),
         ]);
@@ -976,5 +1004,54 @@ mod tests {
         e.on_key(KeyCode::Char('l'));
         assert_eq!(e.cursor().step, 1);
         assert_eq!(e.note_count(), 0);
+    }
+
+    // ── save round-trip ───────────────────────────────────────────────────
+
+    /// `save_bundle()` writes a bundle whose `song.mid` deserialises back to an
+    /// equal timeline (pitch, start, duration preserved for every note).
+    #[test]
+    fn save_bundle_round_trips_timeline() {
+        use rockcraft_midi::smf_bytes_to_events;
+
+        let mut tl = Timeline::new();
+        tl.insert(note(60, 0, 500_000));
+        tl.insert(note(64, 500_000, 500_000));
+        let expected_count = tl.len();
+
+        let edit = EditScreen::from_timeline(tl.clone(), Grid::default_120());
+
+        let base = std::env::temp_dir().join(format!(
+            "rockcraft_rt_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        let bundle = edit.save_bundle(&base).expect("save_bundle failed");
+
+        let midi_bytes = std::fs::read(bundle.join("song.mid")).expect("song.mid missing");
+        let events = smf_bytes_to_events(&midi_bytes).expect("smf parse failed");
+        let reloaded = Timeline::from_events(&events);
+
+        std::fs::remove_dir_all(&base).ok();
+
+        assert_eq!(
+            reloaded.len(),
+            expected_count,
+            "note count survives round-trip"
+        );
+
+        let mut orig: Vec<_> = tl
+            .notes()
+            .map(|(_, n)| (n.pitch.value(), n.start_us, n.dur_us))
+            .collect();
+        let mut got: Vec<_> = reloaded
+            .notes()
+            .map(|(_, n)| (n.pitch.value(), n.start_us, n.dur_us))
+            .collect();
+        orig.sort();
+        got.sort();
+        assert_eq!(orig, got, "note pitches/positions survive round-trip");
     }
 }
