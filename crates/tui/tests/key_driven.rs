@@ -152,6 +152,29 @@ fn unknown_keys_in_record_are_ignored() {
     assert_eq!(shell.screen_name(), "menu");
 }
 
+/// "Compose" (menu index 2) opens the editor; Tab returns to the Menu. Inside
+/// the editor, letter keys are navigation (not forwarded as notes) and don't
+/// escape the screen.
+#[test]
+fn compose_opens_editor_and_tab_returns_to_menu() {
+    let mut shell = make_shell(ScriptedNotes::empty());
+    let mut terminal = make_terminal();
+
+    let mut keys = ScriptedKeys::new([
+        KeyCode::Down,      // → index 1 (Play)
+        KeyCode::Down,      // → index 2 (Compose)
+        KeyCode::Enter,     // open the editor
+        KeyCode::Char('l'), // navigate (cursor right) — stays in editor
+        KeyCode::Char('k'), // navigate (cursor up) — stays in editor
+        KeyCode::Tab,       // ← back to Menu
+        KeyCode::Char('q'), // quit
+    ]);
+
+    run_loop(&mut terminal, &mut shell, &mut keys).unwrap();
+    assert!(shell.is_quit());
+    assert_eq!(shell.screen_name(), "menu");
+}
+
 /// Vim-style `j`/`k` keys navigate the menu just like arrow keys.
 #[test]
 fn vim_keys_navigate_menu() {

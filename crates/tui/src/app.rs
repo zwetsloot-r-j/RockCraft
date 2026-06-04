@@ -17,6 +17,7 @@ use ratatui::{
 use rockcraft_audio::SynthHandle;
 use rockcraft_midi::NoteSource;
 
+use crate::edit::EditScreen;
 use crate::key_source::{CrosstermKeys, KeySource};
 use crate::play::PlayScreen;
 use crate::record::RecordScreen;
@@ -30,10 +31,12 @@ pub(crate) enum Screen {
     Menu,
     Record(RecordScreen),
     Play(PlayScreen),
+    Edit(EditScreen),
 }
 
-/// The menu entries, in order.
-const MENU_ITEMS: &[&str] = &["Record", "Play last recording", "Quit"];
+/// The menu entries, in order. "Compose" is a temporary entry into the editor
+/// until the proper launcher lands (#55).
+const MENU_ITEMS: &[&str] = &["Record", "Play last recording", "Compose", "Quit"];
 
 pub struct Shell {
     /// The swappable event source: real piano (`LiveInput`) or `MockKeyboard`.
@@ -101,6 +104,7 @@ impl Shell {
                 },
                 None => self.status = "no recordings yet — record one first".into(),
             },
+            Some(2) => self.screen = Screen::Edit(EditScreen::new()),
             _ => self.should_quit = true,
         }
     }
@@ -151,6 +155,14 @@ impl Shell {
                 }
                 _ => {}
             },
+            // The composer editor: Tab/Esc leave to the menu; every other key is
+            // navigation routed into the screen's own keymap.
+            Screen::Edit(edit) => match code {
+                KeyCode::Tab | KeyCode::Esc => {
+                    self.screen = Screen::Menu;
+                }
+                other => edit.on_key(other),
+            },
         }
     }
 
@@ -160,6 +172,7 @@ impl Shell {
             Screen::Menu => "menu",
             Screen::Record(_) => "record",
             Screen::Play(_) => "play",
+            Screen::Edit(_) => "edit",
         }
     }
 
@@ -209,7 +222,8 @@ pub fn run_loop<B: ratatui::backend::Backend>(
                     }
                 }
                 Screen::Play(play) => play.ingest(ev),
-                Screen::Menu => {}
+                // The editor is piano-free: it ignores live MIDI input.
+                Screen::Menu | Screen::Edit(_) => {}
             }
         }
 
@@ -243,6 +257,7 @@ fn draw(f: &mut Frame, shell: &Shell) {
         Screen::Menu => draw_menu(f, f.area(), shell),
         Screen::Record(rec) => rec.draw(f, f.area()),
         Screen::Play(play) => play.draw(f, f.area()),
+        Screen::Edit(edit) => edit.draw(f, f.area()),
     }
 }
 
