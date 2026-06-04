@@ -308,8 +308,17 @@ pub fn run_loop<B: ratatui::backend::Backend>(
                     }
                 }
                 Screen::Play(play) => play.ingest(ev),
+                // In a record mode the editor consumes played notes (step / live
+                // record); in direct-edit `ingest` ignores them. Either way we
+                // sound the keys you play, as Record does.
+                Screen::Edit(edit) => {
+                    edit.ingest(ev);
+                    if let Some(s) = &synth {
+                        s.apply(&ev);
+                    }
+                }
                 // These screens ignore live MIDI input.
-                Screen::Menu | Screen::Edit(_) | Screen::BackingPicker(_) => {}
+                Screen::Menu | Screen::BackingPicker(_) => {}
             }
         }
 
