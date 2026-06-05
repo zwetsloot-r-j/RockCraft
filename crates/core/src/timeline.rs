@@ -169,6 +169,48 @@ impl Timeline {
         events
     }
 
+    /// Ids of notes whose start falls within the rectangle
+    /// `[pitch_lo..=pitch_hi] × [us_lo..us_hi)`.
+    pub fn notes_in_region(
+        &self,
+        pitch_lo: u8,
+        pitch_hi: u8,
+        us_lo: u64,
+        us_hi: u64,
+    ) -> Vec<NoteId> {
+        self.notes
+            .iter()
+            .filter(|(_, note)| {
+                let p = note.pitch.value();
+                p >= pitch_lo && p <= pitch_hi && note.start_us >= us_lo && note.start_us < us_hi
+            })
+            .map(|(&id, _)| NoteId(id))
+            .collect()
+    }
+
+    /// Insert clones of `notes` each shifted by `d_pitch` semitones and `d_us`
+    /// microseconds. Notes whose shifted pitch would leave `0..=127` are
+    /// dropped. Returns the new ids in insertion order.
+    pub fn insert_shifted(&mut self, notes: &[Note], d_pitch: i8, d_us: u64) -> Vec<NoteId> {
+        let mut ids = Vec::new();
+        for note in notes {
+            let shifted = note.pitch.value() as i16 + d_pitch as i16;
+            let Ok(raw) = u8::try_from(shifted) else {
+                continue;
+            };
+            let Some(pitch) = MidiNote::new(raw) else {
+                continue;
+            };
+            let new_note = Note {
+                pitch,
+                start_us: note.start_us.saturating_add(d_us),
+                ..*note
+            };
+            ids.push(self.insert(new_note));
+        }
+        ids
+    }
+
     /// Rebuild a timeline from an event stream, pairing each note-on with the
     /// next note-off (or note-on with velocity 0) of the same pitch — the same
     /// rule as `build_spans`. A re-press while a pitch is still open closes the
@@ -430,6 +472,84 @@ mod tests {
         let (_, note) = tl.notes().next().unwrap();
         assert_eq!(note.start_us, 500);
         assert!(note.dur_us >= 1);
+    }
+
+    #[test]
+    fn notes_in_region_covers_exactly_the_rectangle() {
+        let mut tl = Timeline::new();
+        let v = Velocity::new(80).unwrap();
+        let mk = |pitch: u8, start_us: u64| Note {
+            pitch: MidiNote::new(pitch).unwrap(),
+            start_us,
+            dur_us: 100,
+            velocity: v,
+        };
+        // Inside region [60..=64] × [1000..5000)
+        let a = tl.insert(mk(60, 1_000)); // pitch_lo, us_lo — inclusive
+        let b = tl.insert(mk(64, 4_999)); // pitch_hi, us_hi-1 — inclusive
+                                          // Outside: pitch below lo
+        tl.insert(mk(59, 2_000));
+        // Outside: pitch above hi
+        tl.insert(mk(65, 2_000));
+        // Outside: start before us_lo
+        tl.insert(mk(62, 999));
+        // Outside: start exactly at us_hi (exclusive)
+        tl.insert(mk(62, 5_000));
+
+        let mut ids = tl.notes_in_region(60, 64, 1_000, 5_000);
+        ids.sort();
+        assert_eq!(ids, [a, b]);
+    }
+
+    #[test]
+    fn insert_shifted_offsets_and_drops_out_of_range() {
+        let mut tl = Timeline::new();
+        let v = Velocity::new(80).unwrap();
+        let notes = [
+            Note {
+                pitch: MidiNote::new(0).unwrap(),
+                start_us: 0,
+                dur_us: 100,
+                velocity: v,
+            },
+            Note {
+                pitch: MidiNote::new(60).unwrap(),
+                start_us: 100,
+                dur_us: 100,
+                velocity: v,
+            },
+            Note {
+                pitch: MidiNote::new(127).unwrap(),
+                start_us: 200,
+                dur_us: 100,
+                velocity: v,
+            },
+        ];
+        // Shift +2 semitones, +1000 µs: 0→2, 60→62, 127→129 (out of range, dropped).
+        let ids = tl.insert_shifted(&notes, 2, 1_000);
+        assert_eq!(ids.len(), 2, "pitch 127+2=129 must be dropped");
+        let mut pitches: Vec<u8> = ids
+            .iter()
+            .filter_map(|&id| tl.get(id))
+            .map(|n| n.pitch.value())
+            .collect();
+        pitches.sort_unstable();
+        assert_eq!(pitches, [2, 62]);
+        for &id in &ids {
+            assert!(
+                tl.get(id).unwrap().start_us >= 1_000,
+                "start_us shifted by d_us"
+            );
+        }
+        // Shift -3: pitch 2→-1, out of range.
+        let low = Note {
+            pitch: MidiNote::new(2).unwrap(),
+            start_us: 0,
+            dur_us: 100,
+            velocity: v,
+        };
+        let ids2 = tl.insert_shifted(&[low], -3, 0);
+        assert_eq!(ids2.len(), 0, "pitch 2-3=-1 must be dropped");
     }
 
     #[test]

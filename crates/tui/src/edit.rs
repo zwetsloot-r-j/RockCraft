@@ -71,6 +71,8 @@ const NOTE_COLOR: Color = Color::Indexed(33);
 const GRID_COLOR: Color = Color::DarkGray;
 /// Transport playhead line colour.
 const PLAYHEAD_COLOR: Color = Color::Green;
+/// Selected-note highlight on the highway.
+const SELECT_COLOR: Color = Color::LightGreen;
 
 /// A `(pitch, step)` editing cursor.
 ///
@@ -167,6 +169,10 @@ pub struct EditScreen {
     audition_off_fired: HashSet<usize>,
     /// Whether the help overlay is currently visible.
     show_help: bool,
+    /// Where `v` was pressed to start a visual selection. `None` = no selection.
+    selection_anchor: Option<Cursor>,
+    /// In-editor clipboard: notes normalised to the selection's top-left (0, 0).
+    clipboard: Vec<Note>,
 }
 
 impl EditScreen {
@@ -208,6 +214,8 @@ impl EditScreen {
             audition_on_fired: HashSet::new(),
             audition_off_fired: HashSet::new(),
             show_help: false,
+            selection_anchor: None,
+            clipboard: Vec::new(),
         }
     }
 
@@ -227,6 +235,7 @@ impl EditScreen {
     /// cancelled (its notes removed) so leaving never strands a ghost chord.
     pub fn leave(&mut self) {
         self.cancel_chord();
+        self.selection_anchor = None;
         self.transport = Transport::Stopped;
         let prev = self.auditioning.take();
         if let Some(synth) = &self.synth {
@@ -295,6 +304,22 @@ impl EditScreen {
         self.history.current().get(id).copied()
     }
 
+    /// Ids of notes whose start falls inside the current visual selection rectangle.
+    /// Empty when there is no active selection.
+    pub fn selection_ids(&self) -> Vec<NoteId> {
+        let Some((pitch_lo, pitch_hi, us_lo, us_hi)) = self.selection_bounds() else {
+            return Vec::new();
+        };
+        self.history
+            .current()
+            .notes_in_region(pitch_lo, pitch_hi, us_lo, us_hi)
+    }
+
+    /// Number of notes currently held in the clipboard.
+    pub fn clipboard_len(&self) -> usize {
+        self.clipboard.len()
+    }
+
     /// Whether the chord selector is currently active.
     pub fn in_chord_mode(&self) -> bool {
         self.chord.is_some()
@@ -303,6 +328,12 @@ impl EditScreen {
     /// Whether the help overlay is currently visible.
     pub fn help_visible(&self) -> bool {
         self.show_help
+    }
+
+    /// Whether a visual selection is in progress (`v` was pressed and `Esc`
+    /// hasn't been received yet).
+    pub fn in_visual_mode(&self) -> bool {
+        self.selection_anchor.is_some()
     }
 
     /// The current input mode (direct-edit vs step / live record).
@@ -559,9 +590,31 @@ impl EditScreen {
                     self.toggle_play_cursor();
                 }
             }
-            // Transport: `p` plays the whole song from position 0.
-            KeyCode::Char('p') => {
+            // Transport: `P` plays the whole song from position 0.
+            KeyCode::Char('P') => {
                 self.start_play(0);
+            }
+
+            // ── region select (vim visual-mode style) ────────────────────
+            // `v` starts (or resets) the selection anchor at the cursor.
+            KeyCode::Char('v') => {
+                self.selection_anchor = Some(self.cursor);
+            }
+            // `y` yanks the selection into the clipboard (normalised to top-left).
+            KeyCode::Char('y') => {
+                self.yank_selection();
+            }
+            // `p` pastes the clipboard at the cursor; no-op when clipboard is empty.
+            KeyCode::Char('p') => {
+                self.paste_clipboard();
+            }
+            // `D` deletes all notes in the selection.
+            KeyCode::Char('D') => {
+                self.delete_selection();
+            }
+            // `Esc` clears the selection (visual mode off).
+            KeyCode::Esc => {
+                self.selection_anchor = None;
             }
 
             // Undo / redo. `u` = undo; `U` = redo.
@@ -571,6 +624,7 @@ impl EditScreen {
                 if self.history.undo() {
                     self.grabbed = None;
                     self.live_pending.clear();
+                    self.selection_anchor = None;
                 }
             }
             KeyCode::Char('U') => {
@@ -578,6 +632,7 @@ impl EditScreen {
                 if self.history.redo() {
                     self.grabbed = None;
                     self.live_pending.clear();
+                    self.selection_anchor = None;
                 }
             }
 
@@ -999,6 +1054,83 @@ impl EditScreen {
         self.cursor.step = self.grid.step_index(snapped_us);
     }
 
+    // ── region-select helpers ─────────────────────────────────────────────
+
+    /// Bounding rectangle of the active visual selection, or `None` when no
+    /// selection is active. Returns `(pitch_lo, pitch_hi, us_lo, us_hi)`.
+    fn selection_bounds(&self) -> Option<(u8, u8, u64, u64)> {
+        let anchor = self.selection_anchor?;
+        let pitch_lo = anchor.pitch.min(self.cursor.pitch);
+        let pitch_hi = anchor.pitch.max(self.cursor.pitch);
+        let step_lo = anchor.step.min(self.cursor.step);
+        let step_hi = anchor.step.max(self.cursor.step);
+        let us_lo = self.grid.us_of_step(step_lo);
+        // Include the whole last step so a single-step selection is non-empty.
+        let us_hi = self.grid.us_of_step(step_hi) + self.grid.step_us();
+        Some((pitch_lo, pitch_hi, us_lo, us_hi))
+    }
+
+    /// Copy the selected notes into the clipboard, normalised to the
+    /// selection's top-left `(pitch_lo, us_lo)`. Clears the selection on
+    /// success; no-op when the selection is empty or inactive.
+    fn yank_selection(&mut self) {
+        let Some((pitch_lo, _, us_lo, _)) = self.selection_bounds() else {
+            return;
+        };
+        let ids = self.selection_ids();
+        if ids.is_empty() {
+            return;
+        }
+        let notes: Vec<Note> = ids
+            .iter()
+            .filter_map(|&id| self.history.current().get(id).copied())
+            .collect();
+        self.clipboard = notes
+            .into_iter()
+            .map(|n| Note {
+                pitch: MidiNote::new(n.pitch.value().saturating_sub(pitch_lo))
+                    .expect("relative pitch always 0..=127"),
+                start_us: n.start_us.saturating_sub(us_lo),
+                ..n
+            })
+            .collect();
+        self.selection_anchor = None;
+    }
+
+    /// Paste the clipboard at the cursor: each note is shifted so the
+    /// clipboard's top-left lands at `(cursor.pitch, cursor_us)`. No-op when
+    /// the clipboard is empty.
+    fn paste_clipboard(&mut self) {
+        if self.clipboard.is_empty() {
+            return;
+        }
+        self.history.checkpoint();
+        let d_pitch = self.cursor.pitch as i8;
+        let d_us = self.cursor_us();
+        let clipboard = self.clipboard.clone();
+        self.history
+            .current_mut()
+            .insert_shifted(&clipboard, d_pitch, d_us);
+    }
+
+    /// Delete all notes in the current selection. Clears the selection.
+    /// No-op when the selection is inactive or contains no notes.
+    fn delete_selection(&mut self) {
+        let ids = self.selection_ids();
+        if ids.is_empty() {
+            self.selection_anchor = None;
+            return;
+        }
+        self.history.checkpoint();
+        for id in ids {
+            self.history.current_mut().remove(id);
+            if self.grabbed == Some(id) {
+                self.grabbed = None;
+            }
+        }
+        self.selection_anchor = None;
+    }
+
     // ── transport helpers ─────────────────────────────────────────────────
 
     /// Toggle play-from-cursor / stop.
@@ -1134,9 +1266,14 @@ impl EditScreen {
             return;
         }
 
-        // Grab mode wins the badge; otherwise the badge reflects the input mode.
+        // Badge priority: grab > visual selection > input mode.
         let (badge_text, badge_style) = if self.grabbed.is_some() {
             (" GRAB ", Style::default().fg(Color::Black).bg(GRAB_COLOR))
+        } else if self.selection_anchor.is_some() {
+            (
+                " VISUAL ",
+                Style::default().fg(Color::Black).bg(SELECT_COLOR),
+            )
         } else {
             match self.input_mode {
                 InputMode::DirectEdit => {
@@ -1162,7 +1299,7 @@ impl EditScreen {
                 Style::default().fg(CURSOR_COLOR),
             ),
             Span::styled(
-                "[a/x] add/del  []/[] size  [+/-] vel  [m] grab  [c] chord  [u/U] undo/redo  [R] rec  [t] step/live  [hjkl] move  [HJKL] bar/oct  [0/$] ends  [s] save  [Tab] menu",
+                "[a/x] add/del  []/[] size  [+/-] vel  [m] grab  [c] chord  [v] select  [y/p/D] yank/paste/del  [u/U] undo/redo  [R] rec  [t] step/live  [hjkl] move  [HJKL] bar/oct  [0/$] ends  [s] save  [Tab] menu",
                 Style::default().fg(Color::DarkGray),
             ),
         ]);
@@ -1192,6 +1329,9 @@ impl EditScreen {
         self.draw_gridlines(f, area, now, lead);
         self.draw_playhead(f, area, now, lead);
 
+        // Pre-compute selection bounds so we can highlight selected notes.
+        let sel = self.selection_bounds();
+
         // Timeline notes.
         for span in build_spans(&self.history.current().to_events()) {
             let Some(rs) = project(&span, now, lead, area.height) else {
@@ -1202,6 +1342,19 @@ impl EditScreen {
             };
             let cell_w = if is_black_key(span.note) { 1 } else { w };
             let glyph = "▓".repeat(cell_w as usize);
+            let note_color = if let Some((pitch_lo, pitch_hi, us_lo, us_hi)) = sel {
+                if span.note >= pitch_lo
+                    && span.note <= pitch_hi
+                    && span.start_us >= us_lo
+                    && span.start_us < us_hi
+                {
+                    SELECT_COLOR
+                } else {
+                    NOTE_COLOR
+                }
+            } else {
+                NOTE_COLOR
+            };
             for row in rs.top_row..=rs.bottom_row {
                 let y = area.y + row;
                 if y >= area.y + area.height {
@@ -1209,7 +1362,7 @@ impl EditScreen {
                 }
                 let rect = Rect::new(col, y, cell_w, 1);
                 f.render_widget(
-                    Paragraph::new(glyph.clone()).style(Style::default().fg(NOTE_COLOR)),
+                    Paragraph::new(glyph.clone()).style(Style::default().fg(note_color)),
                     rect,
                 );
             }
@@ -2266,14 +2419,14 @@ mod tests {
     }
 
     #[test]
-    fn p_plays_whole_song_from_zero() {
+    fn shift_p_plays_whole_song_from_zero() {
         let mut e = EditScreen::new();
         for _ in 0..8 {
             e.on_key(KeyCode::Char('l'));
         }
         assert!(e.cursor_us() > 0);
 
-        e.on_key(KeyCode::Char('p'));
+        e.on_key(KeyCode::Char('P'));
         assert!(e.is_playing());
         assert_eq!(e.playhead_us(), 0);
     }
@@ -2316,7 +2469,7 @@ mod tests {
         let mut e = EditScreen::from_timeline(tl, Grid::default_120());
 
         // Play from 0.
-        e.on_key(KeyCode::Char('p'));
+        e.on_key(KeyCode::Char('P'));
         assert!(e.is_playing());
 
         // Before start_us: no on-fired.
@@ -2352,7 +2505,7 @@ mod tests {
         tl.insert(note(60, 0, 200_000));
         let mut e = EditScreen::from_timeline(tl, Grid::default_120());
 
-        e.on_key(KeyCode::Char('p'));
+        e.on_key(KeyCode::Char('P'));
 
         // Advance past start (0); note_on fires.
         e.advance(1_000);
@@ -2373,7 +2526,7 @@ mod tests {
     #[test]
     fn stop_resets_to_stopped() {
         let mut e = EditScreen::new();
-        e.on_key(KeyCode::Char('p'));
+        e.on_key(KeyCode::Char('P'));
         assert!(e.is_playing());
 
         e.on_key(KeyCode::Char(' ')); // Space stops
@@ -2704,5 +2857,127 @@ mod tests {
         // Saturates at finest
         e.on_key(KeyCode::Char('>'));
         assert_eq!(e.current_subdivision(), Subdivision::SixteenthTriplet);
+    }
+
+    // ── region-select tests ───────────────────────────────────────────────
+
+    /// `v` + move + `y` yanks the right count; clipboard is normalised.
+    #[test]
+    fn v_move_y_copies_right_count() {
+        let mut e = EditScreen::new();
+        // Add two notes: one at cursor (step 0, pitch 60) and one two steps right.
+        e.on_key(KeyCode::Char('a')); // note at (60, step 0)
+        e.on_key(KeyCode::Char('l'));
+        e.on_key(KeyCode::Char('l'));
+        e.on_key(KeyCode::Char('k')); // pitch 61
+        e.on_key(KeyCode::Char('a')); // note at (61, step 2)
+        assert_eq!(e.note_count(), 2);
+
+        // Return to step 0 pitch 60 and start selection.
+        e.on_key(KeyCode::Char('h'));
+        e.on_key(KeyCode::Char('h'));
+        e.on_key(KeyCode::Char('j')); // back to pitch 60
+        e.on_key(KeyCode::Char('v')); // anchor at (60, step 0)
+
+        // Extend selection to cover both notes.
+        e.on_key(KeyCode::Char('l'));
+        e.on_key(KeyCode::Char('l')); // cursor at step 2
+        e.on_key(KeyCode::Char('k')); // cursor at pitch 61
+
+        // Both notes should be in the selection.
+        assert_eq!(e.selection_ids().len(), 2, "both notes in selection");
+
+        // Yank.
+        e.on_key(KeyCode::Char('y'));
+        assert_eq!(e.clipboard_len(), 2, "clipboard holds two notes");
+        // Selection cleared after yank.
+        assert!(e.selection_ids().is_empty(), "selection cleared after yank");
+    }
+
+    /// `p` at a new cursor inserts that many notes at the offset.
+    #[test]
+    fn p_at_new_cursor_inserts_clipboard_count() {
+        let mut e = EditScreen::new();
+        // Add a note at step 0, pitch 60.
+        e.on_key(KeyCode::Char('a'));
+        assert_eq!(e.note_count(), 1);
+
+        // Select and yank it.
+        e.on_key(KeyCode::Char('v'));
+        e.on_key(KeyCode::Char('y'));
+        assert_eq!(e.clipboard_len(), 1);
+
+        // Move cursor to a new position and paste.
+        e.on_key(KeyCode::Char('l'));
+        e.on_key(KeyCode::Char('l'));
+        e.on_key(KeyCode::Char('k')); // pitch 61, step 2
+        let count_before = e.note_count();
+        e.on_key(KeyCode::Char('p'));
+        assert_eq!(
+            e.note_count(),
+            count_before + 1,
+            "paste inserts one more note"
+        );
+    }
+
+    /// `D` removes all notes in the selection.
+    #[test]
+    fn shift_d_removes_selection() {
+        let mut e = EditScreen::new();
+        // Two notes side by side.
+        e.on_key(KeyCode::Char('a')); // step 0, pitch 60
+        e.on_key(KeyCode::Char('l'));
+        e.on_key(KeyCode::Char('a')); // step 1, pitch 60
+        assert_eq!(e.note_count(), 2);
+
+        // Select both.
+        e.on_key(KeyCode::Char('h')); // back to step 0
+        e.on_key(KeyCode::Char('v')); // anchor at step 0
+        e.on_key(KeyCode::Char('l')); // extend to step 1
+        assert_eq!(e.selection_ids().len(), 2);
+
+        // Delete.
+        e.on_key(KeyCode::Char('D'));
+        assert_eq!(e.note_count(), 0, "both notes removed");
+        assert!(
+            e.selection_ids().is_empty(),
+            "selection cleared after delete"
+        );
+    }
+
+    /// `Esc` clears the selection without modifying notes.
+    #[test]
+    fn esc_clears_selection() {
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('a'));
+        e.on_key(KeyCode::Char('v'));
+        assert!(!e.selection_ids().is_empty(), "note in selection after v");
+
+        e.on_key(KeyCode::Esc);
+        assert!(e.selection_ids().is_empty(), "selection gone after Esc");
+        assert_eq!(e.note_count(), 1, "note still present");
+    }
+
+    /// `p` on an empty clipboard is a no-op.
+    #[test]
+    fn paste_with_empty_clipboard_is_noop() {
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('a'));
+        assert_eq!(e.note_count(), 1);
+        assert_eq!(e.clipboard_len(), 0);
+
+        e.on_key(KeyCode::Char('p')); // nothing in clipboard
+        assert_eq!(e.note_count(), 1, "paste no-ops when clipboard empty");
+    }
+
+    /// `D` on an inactive selection is a no-op.
+    #[test]
+    fn shift_d_without_selection_is_noop() {
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('a'));
+        assert_eq!(e.note_count(), 1);
+
+        e.on_key(KeyCode::Char('D')); // no selection
+        assert_eq!(e.note_count(), 1, "D without selection is a no-op");
     }
 }
