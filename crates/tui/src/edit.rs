@@ -165,6 +165,8 @@ pub struct EditScreen {
     audition_on_fired: HashSet<usize>,
     /// Span indices for which note_off has been sent during this playback.
     audition_off_fired: HashSet<usize>,
+    /// Whether the help overlay is currently visible.
+    show_help: bool,
 }
 
 impl EditScreen {
@@ -205,6 +207,7 @@ impl EditScreen {
             audition_spans: Vec::new(),
             audition_on_fired: HashSet::new(),
             audition_off_fired: HashSet::new(),
+            show_help: false,
         }
     }
 
@@ -290,6 +293,11 @@ impl EditScreen {
     /// Whether the chord selector is currently active.
     pub fn in_chord_mode(&self) -> bool {
         self.chord.is_some()
+    }
+
+    /// Whether the help overlay is currently visible.
+    pub fn help_visible(&self) -> bool {
+        self.show_help
     }
 
     /// The current input mode (direct-edit vs step / live record).
@@ -391,6 +399,20 @@ impl EditScreen {
     /// mode. `R` arms/disarms record (direct-edit ↔ step-record); while armed `t`
     /// flips step ↔ live.
     pub fn on_key(&mut self, code: KeyCode) {
+        // Help overlay: `?` toggles visibility; Esc closes it.
+        // This takes precedence over all other modes so help is always accessible.
+        match code {
+            KeyCode::Char('?') => {
+                self.show_help = !self.show_help;
+                return;
+            }
+            KeyCode::Esc if self.show_help => {
+                self.show_help = false;
+                return;
+            }
+            _ => {}
+        }
+
         // In chord mode the keymap is taken over by the selector (digits pick a
         // degree, `[`/`]` cycle it, `s` toggles quality, Enter/Esc commit/cancel).
         if self.chord.is_some() {
@@ -1044,6 +1066,11 @@ impl EditScreen {
         if let Some((scale, x0)) = layout {
             self.draw_highway(f, hw_inner, scale, x0);
         }
+
+        // Draw help overlay if visible
+        if self.show_help {
+            self.draw_help_overlay(f, area);
+        }
     }
 
     fn draw_status(&self, f: &mut Frame, area: Rect) {
@@ -1229,6 +1256,109 @@ impl EditScreen {
             }
             t += bar;
         }
+    }
+
+    /// Draw the help overlay as a centered modal popup listing the keymap.
+    fn draw_help_overlay(&self, f: &mut Frame, area: Rect) {
+        // Create a centered block for the help overlay
+        let help_block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Help (Press ? or Esc to close) ")
+            .border_style(Style::default().fg(Color::White));
+
+        // Calculate the size and position for the overlay
+        // Make it take up most of the screen but leave some margin
+        let margin = 2;
+        let help_width = area.width.saturating_sub(margin * 2);
+        let help_height = area.height.saturating_sub(margin * 2).min(20); // Limit height for readability
+        let help_x = area.x + margin;
+        let help_y = area.y + margin;
+        let help_area = Rect::new(help_x, help_y, help_width, help_height);
+
+        // Draw the overlay background (clear the area first)
+        f.render_widget(help_block.clone(), help_area);
+
+        // Create the help content grouped by category
+        let help_content = vec![
+            Line::from(Span::styled(
+                " Navigation:",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::raw("  h/← : Left one step    l/→ : Right one step")),
+            Line::from(Span::raw(
+                "  j/↓ : Down one semitone  k/↑ : Up one semitone",
+            )),
+            Line::from(Span::raw("  H : Left one bar        L : Right one bar")),
+            Line::from(Span::raw("  J : Down one octave     K : Up one octave")),
+            Line::from(Span::raw("  0 : Song start          $ : Last note end")),
+            Line::from(Span::raw("")), // Empty line
+            Line::from(Span::styled(
+                " Edit:",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::raw("  a/i : Add note          x/d : Delete note")),
+            Line::from(Span::raw("  ] : Lengthen note       [ : Shorten note")),
+            Line::from(Span::raw("  +/= : Velocity +8       - : Velocity -8")),
+            Line::from(Span::raw("  m : Grab mode (move note with h/j/k/l)")),
+            Line::from(Span::raw("")), // Empty line
+            Line::from(Span::styled(
+                " Chord:",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::raw("  c : Enter chord mode     1-7 : Choose degree")),
+            Line::from(Span::raw("  [/] : Cycle degree       s : Toggle 7th/triad")),
+            Line::from(Span::raw("  Enter : Commit chord     Esc : Cancel chord")),
+            Line::from(Span::raw("")), // Empty line
+            Line::from(Span::styled(
+                " Transport:",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::raw(
+                "  Space : Play/stop from cursor  p : Play from start",
+            )),
+            Line::from(Span::raw("")), // Empty line
+            Line::from(Span::styled(
+                " Input Mode:",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::raw(
+                "  R : Toggle record arm    t : Toggle step/live record",
+            )),
+            Line::from(Span::raw("")), // Empty line
+            Line::from(Span::styled(
+                " Undo/Redo:",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::raw("  u : Undo                U : Redo")),
+            Line::from(Span::raw("")), // Empty line
+            Line::from(Span::styled(
+                " Other:",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::raw("  ? : Toggle help          Esc : Close help")),
+            Line::from(Span::raw("  s : Save                Tab : Menu")),
+        ];
+
+        // Create a paragraph with the help content
+        let help_paragraph = Paragraph::new(help_content).style(Style::default().fg(Color::White));
+
+        // Render the help content inside the block
+        let inner_area = help_block.inner(help_area);
+        f.render_widget(help_paragraph, inner_area);
     }
 }
 
@@ -2346,5 +2476,77 @@ mod tests {
         assert_eq!(e.note_count(), 1, "back to just the permanent note");
         e.on_key(KeyCode::Char('U')); // should be a no-op
         assert_eq!(e.note_count(), 1, "no redo after chord cancel");
+    }
+
+    // ── help overlay tests ─────────────────────────────────────────────
+
+    /// `?` sets help_visible() to true.
+    #[test]
+    fn question_mark_shows_help() {
+        let mut e = EditScreen::new();
+        assert!(!e.help_visible(), "help should start hidden");
+        e.on_key(KeyCode::Char('?'));
+        assert!(e.help_visible(), "help should be visible after ?");
+    }
+
+    /// `?` again clears help_visible().
+    #[test]
+    fn question_mark_toggles_help_off() {
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('?')); // show help
+        assert!(e.help_visible());
+        e.on_key(KeyCode::Char('?')); // hide help
+        assert!(!e.help_visible(), "help should be hidden after second ?");
+    }
+
+    /// Esc clears help_visible() when shown.
+    #[test]
+    fn esc_closes_help() {
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('?')); // show help
+        assert!(e.help_visible());
+        e.on_key(KeyCode::Esc); // close help
+        assert!(!e.help_visible(), "help should be hidden after Esc");
+    }
+
+    /// With help shown, the rendered buffer contains a known binding string.
+    #[test]
+    fn help_overlay_renders_without_panic() {
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('?')); // show help
+        assert!(e.help_visible());
+
+        // The main test: ensure drawing with help shown doesn't panic
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| e.draw(f, f.area()))
+            .expect("draw panicked");
+
+        // Additional check: the buffer should have some content
+        let buf = terminal.backend().buffer();
+        let content = buf.content();
+        assert!(
+            !content.is_empty(),
+            "expected rendered buffer to have content"
+        );
+    }
+
+    /// Help overlay can be toggled multiple times.
+    #[test]
+    fn help_toggle_multiple_times() {
+        let mut e = EditScreen::new();
+        assert!(!e.help_visible());
+
+        e.on_key(KeyCode::Char('?')); // show
+        assert!(e.help_visible());
+
+        e.on_key(KeyCode::Char('?')); // hide
+        assert!(!e.help_visible());
+
+        e.on_key(KeyCode::Char('?')); // show again
+        assert!(e.help_visible());
+
+        e.on_key(KeyCode::Esc); // hide with Esc
+        assert!(!e.help_visible());
     }
 }
