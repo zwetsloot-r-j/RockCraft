@@ -25,7 +25,7 @@ use ratatui::{
 use rockcraft_audio::SynthHandle;
 use rockcraft_core::{
     ChordKind, Grid, History, Key, MidiNote, Note, NoteEvent, NoteEventKind, NoteId, RecordingMeta,
-    Scale as MusicScale, Timeline, Velocity,
+    Scale as MusicScale, Subdivision, Timeline, Velocity,
 };
 use rockcraft_midi::events_to_smf_bytes;
 
@@ -79,6 +79,8 @@ const CLICK_DUR_US: u64 = 50_000;
 const CLICK_VEL_ACCENT: u8 = 110;
 /// Velocity for off-beat clicks.
 const CLICK_VEL_NORMAL: u8 = 80;
+/// Selected-note highlight on the highway.
+const SELECT_COLOR: Color = Color::LightGreen;
 
 /// A `(pitch, step)` editing cursor.
 ///
@@ -199,6 +201,14 @@ pub struct EditScreen {
     count_in_end_us: u64,
     /// Number of bars to count in before live recording (default 1).
     count_in_bars: u32,
+
+    // ── help / selection / clipboard ─────────────────────────────────────
+    /// Whether the help overlay is currently visible.
+    show_help: bool,
+    /// Where `v` was pressed to start a visual selection. `None` = no selection.
+    selection_anchor: Option<Cursor>,
+    /// In-editor clipboard: notes normalised to the selection's top-left (0, 0).
+    clipboard: Vec<Note>,
 }
 
 impl EditScreen {
@@ -249,6 +259,9 @@ impl EditScreen {
             counting_in: false,
             count_in_end_us: 0,
             count_in_bars: 1,
+            show_help: false,
+            selection_anchor: None,
+            clipboard: Vec::new(),
         }
     }
 
@@ -268,6 +281,7 @@ impl EditScreen {
     /// cancelled (its notes removed) so leaving never strands a ghost chord.
     pub fn leave(&mut self) {
         self.cancel_chord();
+        self.selection_anchor = None;
         self.transport = Transport::Stopped;
         self.counting_in = false;
         let prev = self.auditioning.take();
@@ -314,6 +328,11 @@ impl EditScreen {
         self.cursor
     }
 
+    /// The current subdivision (for tests and status display).
+    pub fn current_subdivision(&self) -> Subdivision {
+        self.grid.subdivision
+    }
+
     /// Total number of notes in the timeline.
     pub fn note_count(&self) -> usize {
         self.history.current().len()
@@ -332,9 +351,36 @@ impl EditScreen {
         self.history.current().get(id).copied()
     }
 
+    /// Ids of notes whose start falls inside the current visual selection rectangle.
+    /// Empty when there is no active selection.
+    pub fn selection_ids(&self) -> Vec<NoteId> {
+        let Some((pitch_lo, pitch_hi, us_lo, us_hi)) = self.selection_bounds() else {
+            return Vec::new();
+        };
+        self.history
+            .current()
+            .notes_in_region(pitch_lo, pitch_hi, us_lo, us_hi)
+    }
+
+    /// Number of notes currently held in the clipboard.
+    pub fn clipboard_len(&self) -> usize {
+        self.clipboard.len()
+    }
+
     /// Whether the chord selector is currently active.
     pub fn in_chord_mode(&self) -> bool {
         self.chord.is_some()
+    }
+
+    /// Whether the help overlay is currently visible.
+    pub fn help_visible(&self) -> bool {
+        self.show_help
+    }
+
+    /// Whether a visual selection is in progress (`v` was pressed and `Esc`
+    /// hasn't been received yet).
+    pub fn in_visual_mode(&self) -> bool {
+        self.selection_anchor.is_some()
     }
 
     /// The current input mode (direct-edit vs step / live record).
@@ -520,6 +566,20 @@ impl EditScreen {
     /// mode. `R` arms/disarms record (direct-edit ↔ step-record); while armed `t`
     /// flips step ↔ live.
     pub fn on_key(&mut self, code: KeyCode) {
+        // Help overlay: `?` toggles visibility; Esc closes it.
+        // This takes precedence over all other modes so help is always accessible.
+        match code {
+            KeyCode::Char('?') => {
+                self.show_help = !self.show_help;
+                return;
+            }
+            KeyCode::Esc if self.show_help => {
+                self.show_help = false;
+                return;
+            }
+            _ => {}
+        }
+
         // In chord mode the keymap is taken over by the selector (digits pick a
         // degree, `[`/`]` cycle it, `s` toggles quality, Enter/Esc commit/cancel).
         if self.chord.is_some() {
@@ -602,6 +662,13 @@ impl EditScreen {
             KeyCode::Char('$') => {
                 self.cursor.step = self.last_step();
             }
+            // Snap resolution: finer / coarser subdivision.
+            KeyCode::Char('>') => {
+                self.change_subdivision_finer();
+            }
+            KeyCode::Char('<') => {
+                self.change_subdivision_coarser();
+            }
 
             // ── edit operations ──────────────────────────────────────────
             // Add a note at cursor (pitch=cursor, start=cursor_us, dur=1 step,
@@ -654,8 +721,8 @@ impl EditScreen {
                     self.toggle_play_cursor();
                 }
             }
-            // Transport: `p` plays the whole song from position 0.
-            KeyCode::Char('p') => {
+            // Transport: `P` plays the whole song from position 0.
+            KeyCode::Char('P') => {
                 self.start_play(0);
             }
 
@@ -673,6 +740,28 @@ impl EditScreen {
                 self.start_count_in_record();
             }
 
+            // ── region select (vim visual-mode style) ────────────────────
+            // `v` starts (or resets) the selection anchor at the cursor.
+            KeyCode::Char('v') => {
+                self.selection_anchor = Some(self.cursor);
+            }
+            // `y` yanks the selection into the clipboard (normalised to top-left).
+            KeyCode::Char('y') => {
+                self.yank_selection();
+            }
+            // `p` pastes the clipboard at the cursor; no-op when clipboard is empty.
+            KeyCode::Char('p') => {
+                self.paste_clipboard();
+            }
+            // `D` deletes all notes in the selection.
+            KeyCode::Char('D') => {
+                self.delete_selection();
+            }
+            // `Esc` clears the selection (visual mode off).
+            KeyCode::Esc => {
+                self.selection_anchor = None;
+            }
+
             // Undo / redo. `u` = undo; `U` = redo.
             // `R` is reserved for record-arm (#57), so redo uses `U` (shift-u).
             KeyCode::Char('u') => {
@@ -680,6 +769,7 @@ impl EditScreen {
                 if self.history.undo() {
                     self.grabbed = None;
                     self.live_pending.clear();
+                    self.selection_anchor = None;
                 }
             }
             KeyCode::Char('U') => {
@@ -687,6 +777,7 @@ impl EditScreen {
                 if self.history.redo() {
                     self.grabbed = None;
                     self.live_pending.clear();
+                    self.selection_anchor = None;
                 }
             }
 
@@ -1091,6 +1182,104 @@ impl EditScreen {
         self.grid.step_index(end_us)
     }
 
+    /// Change to a finer subdivision, re-snapping the cursor to the new grid.
+    fn change_subdivision_finer(&mut self) {
+        let cursor_us = self.cursor_us(); // Calculate using current grid
+        self.grid.subdivision = self.grid.subdivision.finer();
+        self.resnap_cursor_from_us(cursor_us);
+    }
+
+    /// Change to a coarser subdivision, re-snapping the cursor to the new grid.
+    fn change_subdivision_coarser(&mut self) {
+        let cursor_us = self.cursor_us(); // Calculate using current grid
+        self.grid.subdivision = self.grid.subdivision.coarser();
+        self.resnap_cursor_from_us(cursor_us);
+    }
+
+    /// Re-snap the cursor to the nearest grid line of the current subdivision
+    /// given a microsecond position from the previous grid.
+    fn resnap_cursor_from_us(&mut self, cursor_us: u64) {
+        let snapped_us = self.grid.snap(cursor_us);
+        self.cursor.step = self.grid.step_index(snapped_us);
+    }
+
+    // ── region-select helpers ─────────────────────────────────────────────
+
+    /// Bounding rectangle of the active visual selection, or `None` when no
+    /// selection is active. Returns `(pitch_lo, pitch_hi, us_lo, us_hi)`.
+    fn selection_bounds(&self) -> Option<(u8, u8, u64, u64)> {
+        let anchor = self.selection_anchor?;
+        let pitch_lo = anchor.pitch.min(self.cursor.pitch);
+        let pitch_hi = anchor.pitch.max(self.cursor.pitch);
+        let step_lo = anchor.step.min(self.cursor.step);
+        let step_hi = anchor.step.max(self.cursor.step);
+        let us_lo = self.grid.us_of_step(step_lo);
+        // Include the whole last step so a single-step selection is non-empty.
+        let us_hi = self.grid.us_of_step(step_hi) + self.grid.step_us();
+        Some((pitch_lo, pitch_hi, us_lo, us_hi))
+    }
+
+    /// Copy the selected notes into the clipboard, normalised to the
+    /// selection's top-left `(pitch_lo, us_lo)`. Clears the selection on
+    /// success; no-op when the selection is empty or inactive.
+    fn yank_selection(&mut self) {
+        let Some((pitch_lo, _, us_lo, _)) = self.selection_bounds() else {
+            return;
+        };
+        let ids = self.selection_ids();
+        if ids.is_empty() {
+            return;
+        }
+        let notes: Vec<Note> = ids
+            .iter()
+            .filter_map(|&id| self.history.current().get(id).copied())
+            .collect();
+        self.clipboard = notes
+            .into_iter()
+            .map(|n| Note {
+                pitch: MidiNote::new(n.pitch.value().saturating_sub(pitch_lo))
+                    .expect("relative pitch always 0..=127"),
+                start_us: n.start_us.saturating_sub(us_lo),
+                ..n
+            })
+            .collect();
+        self.selection_anchor = None;
+    }
+
+    /// Paste the clipboard at the cursor: each note is shifted so the
+    /// clipboard's top-left lands at `(cursor.pitch, cursor_us)`. No-op when
+    /// the clipboard is empty.
+    fn paste_clipboard(&mut self) {
+        if self.clipboard.is_empty() {
+            return;
+        }
+        self.history.checkpoint();
+        let d_pitch = self.cursor.pitch as i8;
+        let d_us = self.cursor_us();
+        let clipboard = self.clipboard.clone();
+        self.history
+            .current_mut()
+            .insert_shifted(&clipboard, d_pitch, d_us);
+    }
+
+    /// Delete all notes in the current selection. Clears the selection.
+    /// No-op when the selection is inactive or contains no notes.
+    fn delete_selection(&mut self) {
+        let ids = self.selection_ids();
+        if ids.is_empty() {
+            self.selection_anchor = None;
+            return;
+        }
+        self.history.checkpoint();
+        for id in ids {
+            self.history.current_mut().remove(id);
+            if self.grabbed == Some(id) {
+                self.grabbed = None;
+            }
+        }
+        self.selection_anchor = None;
+    }
+
     // ── transport helpers ─────────────────────────────────────────────────
 
     /// Toggle play-from-cursor / stop.
@@ -1248,6 +1437,11 @@ impl EditScreen {
         if let Some((scale, x0)) = layout {
             self.draw_highway(f, hw_inner, scale, x0);
         }
+
+        // Draw help overlay if visible
+        if self.show_help {
+            self.draw_help_overlay(f, area);
+        }
     }
 
     fn draw_status(&self, f: &mut Frame, area: Rect) {
@@ -1278,9 +1472,14 @@ impl EditScreen {
             return;
         }
 
-        // Grab mode wins the badge; otherwise the badge reflects the input mode.
+        // Badge priority: grab > visual selection > input mode.
         let (badge_text, badge_style) = if self.grabbed.is_some() {
             (" GRAB ", Style::default().fg(Color::Black).bg(GRAB_COLOR))
+        } else if self.selection_anchor.is_some() {
+            (
+                " VISUAL ",
+                Style::default().fg(Color::Black).bg(SELECT_COLOR),
+            )
         } else {
             match self.input_mode {
                 InputMode::DirectEdit => {
@@ -1328,7 +1527,7 @@ impl EditScreen {
                 Style::default().fg(CURSOR_COLOR),
             ),
             Span::styled(
-                "[a/x] add/del  []/[] size  [+/-] vel  [m] grab  [c] chord  [u/U] undo/redo  [R] rec  [t] step/live  [C] count-in  [o] loop  [M] metro  [hjkl] move  [HJKL] bar/oct  [0/$] ends  [s] save  [Tab] menu",
+                "[a/x] add/del  []/[] size  [+/-] vel  [m] grab  [c] chord  [v] select  [y/p/D] yank/paste/del  [u/U] undo/redo  [R] rec  [t] step/live  [C] count-in  [o] loop  [M] metro  [hjkl] move  [HJKL] bar/oct  [0/$] ends  [s] save  [Tab] menu",
                 Style::default().fg(Color::DarkGray),
             ),
         ]);
@@ -1358,6 +1557,9 @@ impl EditScreen {
         self.draw_gridlines(f, area, now, lead);
         self.draw_playhead(f, area, now, lead);
 
+        // Pre-compute selection bounds so we can highlight selected notes.
+        let sel = self.selection_bounds();
+
         // Timeline notes.
         for span in build_spans(&self.history.current().to_events()) {
             let Some(rs) = project(&span, now, lead, area.height) else {
@@ -1368,6 +1570,19 @@ impl EditScreen {
             };
             let cell_w = if is_black_key(span.note) { 1 } else { w };
             let glyph = "▓".repeat(cell_w as usize);
+            let note_color = if let Some((pitch_lo, pitch_hi, us_lo, us_hi)) = sel {
+                if span.note >= pitch_lo
+                    && span.note <= pitch_hi
+                    && span.start_us >= us_lo
+                    && span.start_us < us_hi
+                {
+                    SELECT_COLOR
+                } else {
+                    NOTE_COLOR
+                }
+            } else {
+                NOTE_COLOR
+            };
             for row in rs.top_row..=rs.bottom_row {
                 let y = area.y + row;
                 if y >= area.y + area.height {
@@ -1375,7 +1590,7 @@ impl EditScreen {
                 }
                 let rect = Rect::new(col, y, cell_w, 1);
                 f.render_widget(
-                    Paragraph::new(glyph.clone()).style(Style::default().fg(NOTE_COLOR)),
+                    Paragraph::new(glyph.clone()).style(Style::default().fg(note_color)),
                     rect,
                 );
             }
@@ -1455,6 +1670,109 @@ impl EditScreen {
             }
             t += bar;
         }
+    }
+
+    /// Draw the help overlay as a centered modal popup listing the keymap.
+    fn draw_help_overlay(&self, f: &mut Frame, area: Rect) {
+        // Create a centered block for the help overlay
+        let help_block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Help (Press ? or Esc to close) ")
+            .border_style(Style::default().fg(Color::White));
+
+        // Calculate the size and position for the overlay
+        // Make it take up most of the screen but leave some margin
+        let margin = 2;
+        let help_width = area.width.saturating_sub(margin * 2);
+        let help_height = area.height.saturating_sub(margin * 2).min(20); // Limit height for readability
+        let help_x = area.x + margin;
+        let help_y = area.y + margin;
+        let help_area = Rect::new(help_x, help_y, help_width, help_height);
+
+        // Draw the overlay background (clear the area first)
+        f.render_widget(help_block.clone(), help_area);
+
+        // Create the help content grouped by category
+        let help_content = vec![
+            Line::from(Span::styled(
+                " Navigation:",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::raw("  h/← : Left one step    l/→ : Right one step")),
+            Line::from(Span::raw(
+                "  j/↓ : Down one semitone  k/↑ : Up one semitone",
+            )),
+            Line::from(Span::raw("  H : Left one bar        L : Right one bar")),
+            Line::from(Span::raw("  J : Down one octave     K : Up one octave")),
+            Line::from(Span::raw("  0 : Song start          $ : Last note end")),
+            Line::from(Span::raw("")), // Empty line
+            Line::from(Span::styled(
+                " Edit:",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::raw("  a/i : Add note          x/d : Delete note")),
+            Line::from(Span::raw("  ] : Lengthen note       [ : Shorten note")),
+            Line::from(Span::raw("  +/= : Velocity +8       - : Velocity -8")),
+            Line::from(Span::raw("  m : Grab mode (move note with h/j/k/l)")),
+            Line::from(Span::raw("")), // Empty line
+            Line::from(Span::styled(
+                " Chord:",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::raw("  c : Enter chord mode     1-7 : Choose degree")),
+            Line::from(Span::raw("  [/] : Cycle degree       s : Toggle 7th/triad")),
+            Line::from(Span::raw("  Enter : Commit chord     Esc : Cancel chord")),
+            Line::from(Span::raw("")), // Empty line
+            Line::from(Span::styled(
+                " Transport:",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::raw(
+                "  Space : Play/stop from cursor  p : Play from start",
+            )),
+            Line::from(Span::raw("")), // Empty line
+            Line::from(Span::styled(
+                " Input Mode:",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::raw(
+                "  R : Toggle record arm    t : Toggle step/live record",
+            )),
+            Line::from(Span::raw("")), // Empty line
+            Line::from(Span::styled(
+                " Undo/Redo:",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::raw("  u : Undo                U : Redo")),
+            Line::from(Span::raw("")), // Empty line
+            Line::from(Span::styled(
+                " Other:",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::raw("  ? : Toggle help          Esc : Close help")),
+            Line::from(Span::raw("  s : Save                Tab : Menu")),
+        ];
+
+        // Create a paragraph with the help content
+        let help_paragraph = Paragraph::new(help_content).style(Style::default().fg(Color::White));
+
+        // Render the help content inside the block
+        let inner_area = help_block.inner(help_area);
+        f.render_widget(help_paragraph, inner_area);
     }
 }
 
@@ -2329,14 +2647,14 @@ mod tests {
     }
 
     #[test]
-    fn p_plays_whole_song_from_zero() {
+    fn shift_p_plays_whole_song_from_zero() {
         let mut e = EditScreen::new();
         for _ in 0..8 {
             e.on_key(KeyCode::Char('l'));
         }
         assert!(e.cursor_us() > 0);
 
-        e.on_key(KeyCode::Char('p'));
+        e.on_key(KeyCode::Char('P'));
         assert!(e.is_playing());
         assert_eq!(e.playhead_us(), 0);
     }
@@ -2379,7 +2697,7 @@ mod tests {
         let mut e = EditScreen::from_timeline(tl, Grid::default_120());
 
         // Play from 0.
-        e.on_key(KeyCode::Char('p'));
+        e.on_key(KeyCode::Char('P'));
         assert!(e.is_playing());
 
         // Before start_us: no on-fired.
@@ -2415,7 +2733,7 @@ mod tests {
         tl.insert(note(60, 0, 200_000));
         let mut e = EditScreen::from_timeline(tl, Grid::default_120());
 
-        e.on_key(KeyCode::Char('p'));
+        e.on_key(KeyCode::Char('P'));
 
         // Advance past start (0); note_on fires.
         e.advance(1_000);
@@ -2436,7 +2754,7 @@ mod tests {
     #[test]
     fn stop_resets_to_stopped() {
         let mut e = EditScreen::new();
-        e.on_key(KeyCode::Char('p'));
+        e.on_key(KeyCode::Char('P'));
         assert!(e.is_playing());
 
         e.on_key(KeyCode::Char(' ')); // Space stops
@@ -2588,7 +2906,7 @@ mod tests {
         assert!(e.is_looping());
         assert_eq!(e.loop_bounds(), (0, bar_us));
 
-        e.on_key(KeyCode::Char('p')); // start from 0
+        e.on_key(KeyCode::Char('P')); // start from 0
         assert!(e.is_playing());
 
         // Advance past the loop end by a small overshoot.
@@ -2630,7 +2948,7 @@ mod tests {
         e.toggle_metronome();
         assert!(e.is_metronome_on());
 
-        e.on_key(KeyCode::Char('p')); // start from 0
+        e.on_key(KeyCode::Char('P')); // start from 0
         assert_eq!(e.metronome_click_count(), 0, "no clicks before advancing");
 
         // Advance one beat at a time for 4 beats.
@@ -2703,5 +3021,322 @@ mod tests {
         assert!(e.is_playing(), "C starts playback");
         assert!(e.is_counting_in(), "C triggers count-in phase");
         assert_eq!(e.input_mode(), InputMode::LiveRecord, "C arms live record");
+    }
+
+    // ── help overlay tests ─────────────────────────────────────────────
+
+    /// `?` sets help_visible() to true.
+    #[test]
+    fn question_mark_shows_help() {
+        let mut e = EditScreen::new();
+        assert!(!e.help_visible(), "help should start hidden");
+        e.on_key(KeyCode::Char('?'));
+        assert!(e.help_visible(), "help should be visible after ?");
+    }
+
+    /// `?` again clears help_visible().
+    #[test]
+    fn question_mark_toggles_help_off() {
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('?')); // show help
+        assert!(e.help_visible());
+        e.on_key(KeyCode::Char('?')); // hide help
+        assert!(!e.help_visible(), "help should be hidden after second ?");
+    }
+
+    /// Esc clears help_visible() when shown.
+    #[test]
+    fn esc_closes_help() {
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('?')); // show help
+        assert!(e.help_visible());
+        e.on_key(KeyCode::Esc); // close help
+        assert!(!e.help_visible(), "help should be hidden after Esc");
+    }
+
+    /// With help shown, the rendered buffer contains a known binding string.
+    #[test]
+    fn help_overlay_renders_without_panic() {
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('?')); // show help
+        assert!(e.help_visible());
+
+        // The main test: ensure drawing with help shown doesn't panic
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| e.draw(f, f.area()))
+            .expect("draw panicked");
+
+        // Additional check: the buffer should have some content
+        let buf = terminal.backend().buffer();
+        let content = buf.content();
+        assert!(
+            !content.is_empty(),
+            "expected rendered buffer to have content"
+        );
+    }
+
+    /// Help overlay can be toggled multiple times.
+    #[test]
+    fn help_toggle_multiple_times() {
+        let mut e = EditScreen::new();
+        assert!(!e.help_visible());
+
+        e.on_key(KeyCode::Char('?')); // show
+        assert!(e.help_visible());
+
+        e.on_key(KeyCode::Char('?')); // hide
+        assert!(!e.help_visible());
+
+        e.on_key(KeyCode::Char('?')); // show again
+        assert!(e.help_visible());
+
+        e.on_key(KeyCode::Esc); // hide with Esc
+        assert!(!e.help_visible());
+    }
+
+    // ── subdivision snap control tests ────────────────────────────────────
+
+    /// `>` walks the subdivision finer through `Subdivision::ALL` and saturates
+    /// at the finest (SixteenthTriplet).
+    #[test]
+    fn finer_snap_walks_all_and_saturates() {
+        let mut e = EditScreen::new();
+        // Start at default Sixteenth
+        assert_eq!(e.current_subdivision(), Subdivision::Sixteenth);
+
+        // Walk finer: Sixteenth → ThirtySecond → EighthTriplet → SixteenthTriplet
+        e.on_key(KeyCode::Char('>'));
+        assert_eq!(e.current_subdivision(), Subdivision::ThirtySecond);
+
+        e.on_key(KeyCode::Char('>'));
+        assert_eq!(e.current_subdivision(), Subdivision::EighthTriplet);
+
+        e.on_key(KeyCode::Char('>'));
+        assert_eq!(e.current_subdivision(), Subdivision::SixteenthTriplet);
+
+        // Saturates at finest
+        e.on_key(KeyCode::Char('>'));
+        assert_eq!(e.current_subdivision(), Subdivision::SixteenthTriplet);
+    }
+
+    /// `<` walks the subdivision coarser and saturates at Quarter.
+    #[test]
+    fn coarser_snap_walks_back_and_saturates() {
+        let mut e = EditScreen::new();
+        // Start at default Sixteenth
+        assert_eq!(e.current_subdivision(), Subdivision::Sixteenth);
+
+        // Walk coarser: Sixteenth → Eighth → Quarter
+        e.on_key(KeyCode::Char('<'));
+        assert_eq!(e.current_subdivision(), Subdivision::Eighth);
+
+        e.on_key(KeyCode::Char('<'));
+        assert_eq!(e.current_subdivision(), Subdivision::Quarter);
+
+        // Saturates at coarsest
+        e.on_key(KeyCode::Char('<'));
+        assert_eq!(e.current_subdivision(), Subdivision::Quarter);
+    }
+
+    /// After changing snap, the cursor's µs position stays on a valid grid line
+    /// of the new subdivision.
+    #[test]
+    fn cursor_stays_on_grid_line_after_snap_change() {
+        let mut e = EditScreen::new();
+        // Move cursor to a position that's valid in multiple subdivisions
+        // At 120 BPM: Quarter=500000, Eighth=250000, Sixteenth=125000
+        // Position at 250000 µs (2 steps in Sixteenth, 1 step in Eighth)
+        e.cursor.step = 2; // 2 * 125000 = 250000 µs
+
+        // Change to Eighth (250000 µs = 1 step in Eighth)
+        e.on_key(KeyCode::Char('<'));
+        assert_eq!(e.current_subdivision(), Subdivision::Eighth);
+        // Cursor should be re-snapped to 250000 µs = 1 step in Eighth
+        assert_eq!(e.cursor().step, 1);
+        assert_eq!(e.cursor_us(), 250_000);
+        // Verify it's on a grid line: grid.snap(cursor_us) == cursor_us
+        assert_eq!(e.grid.snap(e.cursor_us()), e.cursor_us());
+
+        // Change back to Sixteenth (250000 µs = 2 steps in Sixteenth)
+        e.on_key(KeyCode::Char('>'));
+        assert_eq!(e.current_subdivision(), Subdivision::Sixteenth);
+        assert_eq!(e.cursor().step, 2);
+        assert_eq!(e.cursor_us(), 250_000);
+        assert_eq!(e.grid.snap(e.cursor_us()), e.cursor_us());
+    }
+
+    /// Status line contains the active snap label.
+    #[test]
+    fn status_line_shows_snap_label() {
+        let mut e = EditScreen::new();
+        // Default is Sixteenth
+        assert_eq!(e.grid.subdivision.label(), "1/16");
+
+        // Change to Eighth
+        e.on_key(KeyCode::Char('<'));
+        assert_eq!(e.grid.subdivision.label(), "1/8");
+
+        // Change to Quarter
+        e.on_key(KeyCode::Char('<'));
+        assert_eq!(e.grid.subdivision.label(), "1/4");
+
+        // Change to ThirtySecond
+        e.on_key(KeyCode::Char('>'));
+        e.on_key(KeyCode::Char('>'));
+        e.on_key(KeyCode::Char('>'));
+        assert_eq!(e.grid.subdivision.label(), "1/32");
+    }
+
+    /// Test the full cycle through all subdivisions using finer.
+    #[test]
+    fn finer_cycles_through_all_subdivisions() {
+        let mut e = EditScreen::new();
+        // Start at default Sixteenth, go coarser to Quarter first
+        e.on_key(KeyCode::Char('<'));
+        e.on_key(KeyCode::Char('<'));
+        assert_eq!(e.current_subdivision(), Subdivision::Quarter);
+
+        // Now walk finer through all: Quarter → Eighth → Sixteenth → ThirtySecond → EighthTriplet → SixteenthTriplet
+        e.on_key(KeyCode::Char('>'));
+        assert_eq!(e.current_subdivision(), Subdivision::Eighth);
+
+        e.on_key(KeyCode::Char('>'));
+        assert_eq!(e.current_subdivision(), Subdivision::Sixteenth);
+
+        e.on_key(KeyCode::Char('>'));
+        assert_eq!(e.current_subdivision(), Subdivision::ThirtySecond);
+
+        e.on_key(KeyCode::Char('>'));
+        assert_eq!(e.current_subdivision(), Subdivision::EighthTriplet);
+
+        e.on_key(KeyCode::Char('>'));
+        assert_eq!(e.current_subdivision(), Subdivision::SixteenthTriplet);
+
+        // Saturates at finest
+        e.on_key(KeyCode::Char('>'));
+        assert_eq!(e.current_subdivision(), Subdivision::SixteenthTriplet);
+    }
+
+    // ── region-select tests ───────────────────────────────────────────────
+
+    /// `v` + move + `y` yanks the right count; clipboard is normalised.
+    #[test]
+    fn v_move_y_copies_right_count() {
+        let mut e = EditScreen::new();
+        // Add two notes: one at cursor (step 0, pitch 60) and one two steps right.
+        e.on_key(KeyCode::Char('a')); // note at (60, step 0)
+        e.on_key(KeyCode::Char('l'));
+        e.on_key(KeyCode::Char('l'));
+        e.on_key(KeyCode::Char('k')); // pitch 61
+        e.on_key(KeyCode::Char('a')); // note at (61, step 2)
+        assert_eq!(e.note_count(), 2);
+
+        // Return to step 0 pitch 60 and start selection.
+        e.on_key(KeyCode::Char('h'));
+        e.on_key(KeyCode::Char('h'));
+        e.on_key(KeyCode::Char('j')); // back to pitch 60
+        e.on_key(KeyCode::Char('v')); // anchor at (60, step 0)
+
+        // Extend selection to cover both notes.
+        e.on_key(KeyCode::Char('l'));
+        e.on_key(KeyCode::Char('l')); // cursor at step 2
+        e.on_key(KeyCode::Char('k')); // cursor at pitch 61
+
+        // Both notes should be in the selection.
+        assert_eq!(e.selection_ids().len(), 2, "both notes in selection");
+
+        // Yank.
+        e.on_key(KeyCode::Char('y'));
+        assert_eq!(e.clipboard_len(), 2, "clipboard holds two notes");
+        // Selection cleared after yank.
+        assert!(e.selection_ids().is_empty(), "selection cleared after yank");
+    }
+
+    /// `p` at a new cursor inserts that many notes at the offset.
+    #[test]
+    fn p_at_new_cursor_inserts_clipboard_count() {
+        let mut e = EditScreen::new();
+        // Add a note at step 0, pitch 60.
+        e.on_key(KeyCode::Char('a'));
+        assert_eq!(e.note_count(), 1);
+
+        // Select and yank it.
+        e.on_key(KeyCode::Char('v'));
+        e.on_key(KeyCode::Char('y'));
+        assert_eq!(e.clipboard_len(), 1);
+
+        // Move cursor to a new position and paste.
+        e.on_key(KeyCode::Char('l'));
+        e.on_key(KeyCode::Char('l'));
+        e.on_key(KeyCode::Char('k')); // pitch 61, step 2
+        let count_before = e.note_count();
+        e.on_key(KeyCode::Char('p'));
+        assert_eq!(
+            e.note_count(),
+            count_before + 1,
+            "paste inserts one more note"
+        );
+    }
+
+    /// `D` removes all notes in the selection.
+    #[test]
+    fn shift_d_removes_selection() {
+        let mut e = EditScreen::new();
+        // Two notes side by side.
+        e.on_key(KeyCode::Char('a')); // step 0, pitch 60
+        e.on_key(KeyCode::Char('l'));
+        e.on_key(KeyCode::Char('a')); // step 1, pitch 60
+        assert_eq!(e.note_count(), 2);
+
+        // Select both.
+        e.on_key(KeyCode::Char('h')); // back to step 0
+        e.on_key(KeyCode::Char('v')); // anchor at step 0
+        e.on_key(KeyCode::Char('l')); // extend to step 1
+        assert_eq!(e.selection_ids().len(), 2);
+
+        // Delete.
+        e.on_key(KeyCode::Char('D'));
+        assert_eq!(e.note_count(), 0, "both notes removed");
+        assert!(
+            e.selection_ids().is_empty(),
+            "selection cleared after delete"
+        );
+    }
+
+    /// `Esc` clears the selection without modifying notes.
+    #[test]
+    fn esc_clears_selection() {
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('a'));
+        e.on_key(KeyCode::Char('v'));
+        assert!(!e.selection_ids().is_empty(), "note in selection after v");
+
+        e.on_key(KeyCode::Esc);
+        assert!(e.selection_ids().is_empty(), "selection gone after Esc");
+        assert_eq!(e.note_count(), 1, "note still present");
+    }
+
+    /// `p` on an empty clipboard is a no-op.
+    #[test]
+    fn paste_with_empty_clipboard_is_noop() {
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('a'));
+        assert_eq!(e.note_count(), 1);
+        assert_eq!(e.clipboard_len(), 0);
+
+        e.on_key(KeyCode::Char('p')); // nothing in clipboard
+        assert_eq!(e.note_count(), 1, "paste no-ops when clipboard empty");
+    }
+
+    /// `D` on an inactive selection is a no-op.
+    #[test]
+    fn shift_d_without_selection_is_noop() {
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('a'));
+        assert_eq!(e.note_count(), 1);
+
+        e.on_key(KeyCode::Char('D')); // no selection
+        assert_eq!(e.note_count(), 1, "D without selection is a no-op");
     }
 }

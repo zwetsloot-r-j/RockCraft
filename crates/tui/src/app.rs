@@ -217,6 +217,8 @@ impl Shell {
             // selector is active, Esc cancels the chord instead of leaving.
             Screen::Edit(edit) => match code {
                 KeyCode::Esc if edit.in_chord_mode() => edit.on_key(KeyCode::Esc),
+                // Clear visual selection on Esc without leaving the editor.
+                KeyCode::Esc if edit.in_visual_mode() => edit.on_key(KeyCode::Esc),
                 KeyCode::Tab | KeyCode::Esc => {
                     edit.leave();
                     self.screen = Screen::Menu;
