@@ -25,7 +25,7 @@ use ratatui::{
 use rockcraft_audio::SynthHandle;
 use rockcraft_core::{
     ChordKind, Grid, History, Key, MidiNote, Note, NoteEvent, NoteEventKind, NoteId, RecordingMeta,
-    Scale as MusicScale, Timeline, Velocity,
+    Scale as MusicScale, Subdivision, Timeline, Velocity,
 };
 use rockcraft_midi::events_to_smf_bytes;
 
@@ -272,6 +272,11 @@ impl EditScreen {
         self.cursor
     }
 
+    /// The current subdivision (for tests and status display).
+    pub fn current_subdivision(&self) -> Subdivision {
+        self.grid.subdivision
+    }
+
     /// Total number of notes in the timeline.
     pub fn note_count(&self) -> usize {
         self.history.current().len()
@@ -494,6 +499,13 @@ impl EditScreen {
             }
             KeyCode::Char('$') => {
                 self.cursor.step = self.last_step();
+            }
+            // Snap resolution: finer / coarser subdivision.
+            KeyCode::Char('>') => {
+                self.change_subdivision_finer();
+            }
+            KeyCode::Char('<') => {
+                self.change_subdivision_coarser();
             }
 
             // ── edit operations ──────────────────────────────────────────
@@ -964,6 +976,27 @@ impl EditScreen {
             .max()
             .unwrap_or(0);
         self.grid.step_index(end_us)
+    }
+
+    /// Change to a finer subdivision, re-snapping the cursor to the new grid.
+    fn change_subdivision_finer(&mut self) {
+        let cursor_us = self.cursor_us(); // Calculate using current grid
+        self.grid.subdivision = self.grid.subdivision.finer();
+        self.resnap_cursor_from_us(cursor_us);
+    }
+
+    /// Change to a coarser subdivision, re-snapping the cursor to the new grid.
+    fn change_subdivision_coarser(&mut self) {
+        let cursor_us = self.cursor_us(); // Calculate using current grid
+        self.grid.subdivision = self.grid.subdivision.coarser();
+        self.resnap_cursor_from_us(cursor_us);
+    }
+
+    /// Re-snap the cursor to the nearest grid line of the current subdivision
+    /// given a microsecond position from the previous grid.
+    fn resnap_cursor_from_us(&mut self, cursor_us: u64) {
+        let snapped_us = self.grid.snap(cursor_us);
+        self.cursor.step = self.grid.step_index(snapped_us);
     }
 
     // ── transport helpers ─────────────────────────────────────────────────
@@ -2548,5 +2581,128 @@ mod tests {
 
         e.on_key(KeyCode::Esc); // hide with Esc
         assert!(!e.help_visible());
+    }
+
+    // ── subdivision snap control tests ────────────────────────────────────
+
+    /// `>` walks the subdivision finer through `Subdivision::ALL` and saturates
+    /// at the finest (SixteenthTriplet).
+    #[test]
+    fn finer_snap_walks_all_and_saturates() {
+        let mut e = EditScreen::new();
+        // Start at default Sixteenth
+        assert_eq!(e.current_subdivision(), Subdivision::Sixteenth);
+
+        // Walk finer: Sixteenth → ThirtySecond → EighthTriplet → SixteenthTriplet
+        e.on_key(KeyCode::Char('>'));
+        assert_eq!(e.current_subdivision(), Subdivision::ThirtySecond);
+
+        e.on_key(KeyCode::Char('>'));
+        assert_eq!(e.current_subdivision(), Subdivision::EighthTriplet);
+
+        e.on_key(KeyCode::Char('>'));
+        assert_eq!(e.current_subdivision(), Subdivision::SixteenthTriplet);
+
+        // Saturates at finest
+        e.on_key(KeyCode::Char('>'));
+        assert_eq!(e.current_subdivision(), Subdivision::SixteenthTriplet);
+    }
+
+    /// `<` walks the subdivision coarser and saturates at Quarter.
+    #[test]
+    fn coarser_snap_walks_back_and_saturates() {
+        let mut e = EditScreen::new();
+        // Start at default Sixteenth
+        assert_eq!(e.current_subdivision(), Subdivision::Sixteenth);
+
+        // Walk coarser: Sixteenth → Eighth → Quarter
+        e.on_key(KeyCode::Char('<'));
+        assert_eq!(e.current_subdivision(), Subdivision::Eighth);
+
+        e.on_key(KeyCode::Char('<'));
+        assert_eq!(e.current_subdivision(), Subdivision::Quarter);
+
+        // Saturates at coarsest
+        e.on_key(KeyCode::Char('<'));
+        assert_eq!(e.current_subdivision(), Subdivision::Quarter);
+    }
+
+    /// After changing snap, the cursor's µs position stays on a valid grid line
+    /// of the new subdivision.
+    #[test]
+    fn cursor_stays_on_grid_line_after_snap_change() {
+        let mut e = EditScreen::new();
+        // Move cursor to a position that's valid in multiple subdivisions
+        // At 120 BPM: Quarter=500000, Eighth=250000, Sixteenth=125000
+        // Position at 250000 µs (2 steps in Sixteenth, 1 step in Eighth)
+        e.cursor.step = 2; // 2 * 125000 = 250000 µs
+
+        // Change to Eighth (250000 µs = 1 step in Eighth)
+        e.on_key(KeyCode::Char('<'));
+        assert_eq!(e.current_subdivision(), Subdivision::Eighth);
+        // Cursor should be re-snapped to 250000 µs = 1 step in Eighth
+        assert_eq!(e.cursor().step, 1);
+        assert_eq!(e.cursor_us(), 250_000);
+        // Verify it's on a grid line: grid.snap(cursor_us) == cursor_us
+        assert_eq!(e.grid.snap(e.cursor_us()), e.cursor_us());
+
+        // Change back to Sixteenth (250000 µs = 2 steps in Sixteenth)
+        e.on_key(KeyCode::Char('>'));
+        assert_eq!(e.current_subdivision(), Subdivision::Sixteenth);
+        assert_eq!(e.cursor().step, 2);
+        assert_eq!(e.cursor_us(), 250_000);
+        assert_eq!(e.grid.snap(e.cursor_us()), e.cursor_us());
+    }
+
+    /// Status line contains the active snap label.
+    #[test]
+    fn status_line_shows_snap_label() {
+        let mut e = EditScreen::new();
+        // Default is Sixteenth
+        assert_eq!(e.grid.subdivision.label(), "1/16");
+
+        // Change to Eighth
+        e.on_key(KeyCode::Char('<'));
+        assert_eq!(e.grid.subdivision.label(), "1/8");
+
+        // Change to Quarter
+        e.on_key(KeyCode::Char('<'));
+        assert_eq!(e.grid.subdivision.label(), "1/4");
+
+        // Change to ThirtySecond
+        e.on_key(KeyCode::Char('>'));
+        e.on_key(KeyCode::Char('>'));
+        e.on_key(KeyCode::Char('>'));
+        assert_eq!(e.grid.subdivision.label(), "1/32");
+    }
+
+    /// Test the full cycle through all subdivisions using finer.
+    #[test]
+    fn finer_cycles_through_all_subdivisions() {
+        let mut e = EditScreen::new();
+        // Start at default Sixteenth, go coarser to Quarter first
+        e.on_key(KeyCode::Char('<'));
+        e.on_key(KeyCode::Char('<'));
+        assert_eq!(e.current_subdivision(), Subdivision::Quarter);
+
+        // Now walk finer through all: Quarter → Eighth → Sixteenth → ThirtySecond → EighthTriplet → SixteenthTriplet
+        e.on_key(KeyCode::Char('>'));
+        assert_eq!(e.current_subdivision(), Subdivision::Eighth);
+
+        e.on_key(KeyCode::Char('>'));
+        assert_eq!(e.current_subdivision(), Subdivision::Sixteenth);
+
+        e.on_key(KeyCode::Char('>'));
+        assert_eq!(e.current_subdivision(), Subdivision::ThirtySecond);
+
+        e.on_key(KeyCode::Char('>'));
+        assert_eq!(e.current_subdivision(), Subdivision::EighthTriplet);
+
+        e.on_key(KeyCode::Char('>'));
+        assert_eq!(e.current_subdivision(), Subdivision::SixteenthTriplet);
+
+        // Saturates at finest
+        e.on_key(KeyCode::Char('>'));
+        assert_eq!(e.current_subdivision(), Subdivision::SixteenthTriplet);
     }
 }
