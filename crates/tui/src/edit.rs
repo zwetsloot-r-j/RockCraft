@@ -71,6 +71,14 @@ const NOTE_COLOR: Color = Color::Indexed(33);
 const GRID_COLOR: Color = Color::DarkGray;
 /// Transport playhead line colour.
 const PLAYHEAD_COLOR: Color = Color::Green;
+/// MIDI note value used for metronome clicks (E5 — a bright piano tone).
+const CLICK_MIDI_VALUE: u8 = 76;
+/// Duration of each metronome click note in µs (50 ms).
+const CLICK_DUR_US: u64 = 50_000;
+/// Velocity for beat-1 accent clicks.
+const CLICK_VEL_ACCENT: u8 = 110;
+/// Velocity for off-beat clicks.
+const CLICK_VEL_NORMAL: u8 = 80;
 /// Selected-note highlight on the highway.
 const SELECT_COLOR: Color = Color::LightGreen;
 
@@ -167,6 +175,34 @@ pub struct EditScreen {
     audition_on_fired: HashSet<usize>,
     /// Span indices for which note_off has been sent during this playback.
     audition_off_fired: HashSet<usize>,
+
+    // ── loop region ──────────────────────────────────────────────────────
+    /// Whether the playhead should loop between `loop_start_us`/`loop_end_us`.
+    loop_enabled: bool,
+    /// Loop region start (inclusive) in song µs.
+    loop_start_us: u64,
+    /// Loop region end (exclusive) in song µs. Must be > `loop_start_us`.
+    loop_end_us: u64,
+
+    // ── metronome ────────────────────────────────────────────────────────
+    /// Whether the metronome click is armed during playback.
+    metronome_enabled: bool,
+    /// Beat index (`playhead_us / quarter_us`) of the last fired click.
+    last_click_beat: Option<u64>,
+    /// Playhead µs at which to fire the pending click note_off, if any.
+    click_pending_off: Option<u64>,
+    /// Click triggers fired since playback started — test seam.
+    click_count: usize,
+
+    // ── count-in ─────────────────────────────────────────────────────────
+    /// True during the pre-recording count-in phase; MIDI input is ignored.
+    counting_in: bool,
+    /// Playhead µs at which the count-in phase ends and recording begins.
+    count_in_end_us: u64,
+    /// Number of bars to count in before live recording (default 1).
+    count_in_bars: u32,
+
+    // ── help / selection / clipboard ─────────────────────────────────────
     /// Whether the help overlay is currently visible.
     show_help: bool,
     /// Where `v` was pressed to start a visual selection. `None` = no selection.
@@ -213,6 +249,16 @@ impl EditScreen {
             audition_spans: Vec::new(),
             audition_on_fired: HashSet::new(),
             audition_off_fired: HashSet::new(),
+            loop_enabled: false,
+            loop_start_us: 0,
+            loop_end_us: 0,
+            metronome_enabled: false,
+            last_click_beat: None,
+            click_pending_off: None,
+            click_count: 0,
+            counting_in: false,
+            count_in_end_us: 0,
+            count_in_bars: 1,
             show_help: false,
             selection_anchor: None,
             clipboard: Vec::new(),
@@ -237,6 +283,7 @@ impl EditScreen {
         self.cancel_chord();
         self.selection_anchor = None;
         self.transport = Transport::Stopped;
+        self.counting_in = false;
         let prev = self.auditioning.take();
         if let Some(synth) = &self.synth {
             if let Some(p) = prev {
@@ -377,6 +424,73 @@ impl EditScreen {
         }
     }
 
+    // ── loop / metronome / count-in accessors ────────────────────────────
+
+    /// Whether loop mode is currently active.
+    pub fn is_looping(&self) -> bool {
+        self.loop_enabled
+    }
+
+    /// The current loop region as `(start_us, end_us)`.
+    pub fn loop_bounds(&self) -> (u64, u64) {
+        (self.loop_start_us, self.loop_end_us)
+    }
+
+    /// Explicitly set the loop region (does not toggle looping on/off).
+    pub fn set_loop_bounds(&mut self, start_us: u64, end_us: u64) {
+        self.loop_start_us = start_us;
+        self.loop_end_us = end_us;
+    }
+
+    /// Toggle loop on/off. Turning on auto-sets bounds to the bar under the
+    /// cursor when no valid bounds have been set yet.
+    pub fn toggle_loop(&mut self) {
+        if self.loop_enabled {
+            self.loop_enabled = false;
+        } else {
+            if self.loop_end_us <= self.loop_start_us {
+                let (start, end) = self.current_bar_bounds();
+                self.loop_start_us = start;
+                self.loop_end_us = end;
+            }
+            self.loop_enabled = true;
+        }
+    }
+
+    /// Whether the metronome click is armed.
+    pub fn is_metronome_on(&self) -> bool {
+        self.metronome_enabled
+    }
+
+    /// Toggle the metronome click on/off.
+    pub fn toggle_metronome(&mut self) {
+        self.metronome_enabled = !self.metronome_enabled;
+    }
+
+    /// Number of metronome clicks fired since playback last started.
+    /// Reset to 0 each time `start_play` is called. Test seam.
+    pub fn metronome_click_count(&self) -> usize {
+        self.click_count
+    }
+
+    /// Whether a count-in phase is currently in progress.
+    pub fn is_counting_in(&self) -> bool {
+        self.counting_in
+    }
+
+    /// Start a count-in then begin live recording. Arms `LiveRecord`, plays
+    /// `count_in_bars` bars of metronome clicks with no note recording, then
+    /// recording begins automatically. Playback starts from the cursor position.
+    pub fn start_count_in_record(&mut self) {
+        let from = self.cursor_us();
+        let count_in_dur = self.grid.bar_us() * self.count_in_bars as u64;
+        let count_in_end = from + count_in_dur;
+        self.input_mode = InputMode::LiveRecord;
+        self.start_play(from); // resets counting_in → false; order matters
+        self.counting_in = true;
+        self.count_in_end_us = count_in_end;
+    }
+
     /// Fire synth note_on / note_off for any spans whose boundaries the
     /// playhead has crossed since the last call. Call once per event-loop
     /// iteration from the shell's run loop, like `tick_song_synth`.
@@ -385,6 +499,23 @@ impl EditScreen {
             return;
         }
         let now = self.playhead_us();
+
+        // Loop wrap: when the playhead crosses loop_end, restart from loop_start.
+        if self.loop_enabled && self.loop_end_us > self.loop_start_us && now >= self.loop_end_us {
+            self.start_play(self.loop_start_us);
+            return; // next tick fires notes from the new position
+        }
+
+        // Count-in expiry: switch from silent pre-roll to recording.
+        if self.counting_in && now >= self.count_in_end_us {
+            self.counting_in = false;
+        }
+
+        // Metronome / count-in clicks.
+        if self.metronome_enabled || self.counting_in {
+            self.tick_metronome_click(now);
+        }
+
         let (need_on, need_off) = audition_pending_triggers(
             &self.audition_spans,
             now,
@@ -595,6 +726,20 @@ impl EditScreen {
                 self.start_play(0);
             }
 
+            // Loop: `o` toggles the loop region on/off.
+            KeyCode::Char('o') => {
+                self.toggle_loop();
+            }
+            // Metronome: `M` toggles the click on/off.
+            KeyCode::Char('M') => {
+                self.toggle_metronome();
+            }
+            // Count-in live record: `C` arms live record and counts in N bars
+            // of metronome before recording starts.
+            KeyCode::Char('C') => {
+                self.start_count_in_record();
+            }
+
             // ── region select (vim visual-mode style) ────────────────────
             // `v` starts (or resets) the selection anchor at the cursor.
             KeyCode::Char('v') => {
@@ -712,7 +857,11 @@ impl EditScreen {
     /// Live-record a single event at the snapped playhead. A note-on opens a
     /// pending span; the matching note-off closes it into a `Note` (minimum one
     /// grid step so a zero-length tap is still audible/visible).
+    /// Events during the count-in phase are silently discarded.
     fn ingest_live(&mut self, ev: NoteEvent) {
+        if self.counting_in {
+            return;
+        }
         let at = self.grid.snap(self.live_playhead_us);
         match ev.kind {
             NoteEventKind::On { velocity } if !velocity.is_note_off() => {
@@ -1145,6 +1294,7 @@ impl EditScreen {
 
     /// Begin playback from `from_us` in song time, caching spans and
     /// pre-marking notes that already ended before the start position.
+    /// Resets click tracking and cancels any active count-in.
     fn start_play(&mut self, from_us: u64) {
         if let Some(synth) = &self.synth {
             synth.all_off();
@@ -1160,6 +1310,11 @@ impl EditScreen {
                 self.audition_off_fired.insert(i);
             }
         }
+        // Reset metronome / count-in state.
+        self.last_click_beat = None;
+        self.click_pending_off = None;
+        self.click_count = 0;
+        self.counting_in = false;
         self.transport = Transport::Playing {
             song_start_us: from_us,
             wall_ref: Instant::now(),
@@ -1167,15 +1322,66 @@ impl EditScreen {
         };
     }
 
-    /// Stop playback and silence all notes.
+    /// Stop playback and silence all notes. Cancels any active count-in.
     fn stop_play(&mut self) {
         self.transport = Transport::Stopped;
+        self.counting_in = false;
         if let Some(synth) = &self.synth {
             synth.all_off();
         }
     }
 
+    // ── metronome helper ──────────────────────────────────────────────────
+
+    /// Fire a metronome click when the beat index advances. Called from
+    /// `tick_audition` whenever the metronome or count-in is active.
+    fn tick_metronome_click(&mut self, now: u64) {
+        let beat_us = self.grid.quarter_us();
+        let current_beat = now / beat_us;
+
+        // Release pending click note_off if its time has come.
+        if let Some(off_at) = self.click_pending_off {
+            if now >= off_at {
+                if let Some(s) = &self.synth {
+                    if let Some(note) = MidiNote::new(CLICK_MIDI_VALUE) {
+                        s.note_off(note);
+                    }
+                }
+                self.click_pending_off = None;
+            }
+        }
+
+        // Fire note_on when a new beat starts.
+        if self.last_click_beat != Some(current_beat) {
+            let beats_per_bar = self.grid.time_sig.beats_per_bar as u64;
+            let is_accent = current_beat.is_multiple_of(beats_per_bar);
+            let vel_value = if is_accent {
+                CLICK_VEL_ACCENT
+            } else {
+                CLICK_VEL_NORMAL
+            };
+            if let Some(s) = &self.synth {
+                if let Some(note) = MidiNote::new(CLICK_MIDI_VALUE) {
+                    if let Some(vel) = Velocity::new(vel_value) {
+                        s.note_on(note, vel);
+                    }
+                }
+            }
+            self.click_pending_off = Some(now + CLICK_DUR_US);
+            self.last_click_beat = Some(current_beat);
+            self.click_count += 1;
+        }
+    }
+
     // ── time-axis viewport ────────────────────────────────────────────────
+
+    /// Bar bounds (start_us, end_us) for the bar containing the cursor.
+    fn current_bar_bounds(&self) -> (u64, u64) {
+        let bar_us = self.grid.bar_us();
+        let cursor_us = self.cursor_us();
+        let bar_start = cursor_us / bar_us * bar_us;
+        (bar_start, bar_start + bar_us)
+    }
 
     /// Microsecond position of the cursor on the time axis.
     fn cursor_us(&self) -> u64 {
@@ -1290,8 +1496,30 @@ impl EditScreen {
             }
         };
 
+        let loop_span = if self.loop_enabled {
+            Span::styled(" LOOP ", Style::default().fg(Color::Black).bg(Color::Green))
+        } else {
+            Span::raw("")
+        };
+        let metro_span = if self.metronome_enabled {
+            Span::styled(" METRO ", Style::default().fg(Color::Black).bg(Color::Cyan))
+        } else {
+            Span::raw("")
+        };
+        let count_in_span = if self.counting_in {
+            Span::styled(
+                " COUNT-IN ",
+                Style::default().fg(Color::Black).bg(REC_COLOR),
+            )
+        } else {
+            Span::raw("")
+        };
+
         let line = Line::from(vec![
             Span::styled(badge_text, badge_style),
+            loop_span,
+            metro_span,
+            count_in_span,
             Span::raw(format!("  bar {}:{}  ", bar + 1, beat + 1)),
             Span::raw(format!("snap {}  ", self.grid.subdivision.label())),
             Span::styled(
@@ -1299,7 +1527,7 @@ impl EditScreen {
                 Style::default().fg(CURSOR_COLOR),
             ),
             Span::styled(
-                "[a/x] add/del  []/[] size  [+/-] vel  [m] grab  [c] chord  [v] select  [y/p/D] yank/paste/del  [u/U] undo/redo  [R] rec  [t] step/live  [hjkl] move  [HJKL] bar/oct  [0/$] ends  [s] save  [Tab] menu",
+                "[a/x] add/del  []/[] size  [+/-] vel  [m] grab  [c] chord  [v] select  [y/p/D] yank/paste/del  [u/U] undo/redo  [R] rec  [t] step/live  [C] count-in  [o] loop  [M] metro  [hjkl] move  [HJKL] bar/oct  [0/$] ends  [s] save  [Tab] menu",
                 Style::default().fg(Color::DarkGray),
             ),
         ]);
@@ -2662,6 +2890,137 @@ mod tests {
         assert_eq!(e.note_count(), 1, "back to just the permanent note");
         e.on_key(KeyCode::Char('U')); // should be a no-op
         assert_eq!(e.note_count(), 1, "no redo after chord cancel");
+    }
+
+    // ── loop / metronome / count-in tests (#64) ──────────────────────────
+
+    /// Advancing past `loop_end_us` with looping on wraps the playhead back to
+    /// `loop_start_us` within the same tick — no overshoot beyond one step.
+    #[test]
+    fn loop_wraps_playhead_at_loop_end() {
+        let mut e = EditScreen::new();
+        let bar_us = e.grid.bar_us(); // 2_000_000 µs at 120 BPM 4/4
+
+        e.set_loop_bounds(0, bar_us);
+        e.toggle_loop();
+        assert!(e.is_looping());
+        assert_eq!(e.loop_bounds(), (0, bar_us));
+
+        e.on_key(KeyCode::Char('P')); // start from 0
+        assert!(e.is_playing());
+
+        // Advance past the loop end by a small overshoot.
+        e.advance(bar_us + 10_000);
+        e.tick_audition();
+
+        // Playhead must be back near loop_start, not past loop_end.
+        let ph = e.playhead_us();
+        assert!(
+            ph < bar_us,
+            "playhead should have wrapped to loop_start, got {ph}"
+        );
+    }
+
+    /// `o` key toggles loop on; default bounds are the bar under the cursor.
+    #[test]
+    fn o_key_toggles_loop_and_defaults_to_current_bar() {
+        let mut e = EditScreen::new();
+        let bar_us = e.grid.bar_us();
+
+        assert!(!e.is_looping());
+        e.on_key(KeyCode::Char('o'));
+        assert!(e.is_looping());
+        let (s, end) = e.loop_bounds();
+        assert_eq!(s, 0, "cursor at bar 0 → loop starts at 0");
+        assert_eq!(end, bar_us, "loop ends one bar later");
+
+        // Toggle off.
+        e.on_key(KeyCode::Char('o'));
+        assert!(!e.is_looping());
+    }
+
+    /// Metronome fires exactly once per beat over a 4-beat span at 120 BPM 4/4.
+    #[test]
+    fn metronome_fires_once_per_beat_over_four_beats() {
+        let mut e = EditScreen::new();
+        let quarter_us = e.grid.quarter_us(); // 500_000 at 120 BPM
+
+        e.toggle_metronome();
+        assert!(e.is_metronome_on());
+
+        e.on_key(KeyCode::Char('P')); // start from 0
+        assert_eq!(e.metronome_click_count(), 0, "no clicks before advancing");
+
+        // Advance one beat at a time for 4 beats.
+        for _ in 0..4 {
+            e.advance(quarter_us);
+            e.tick_audition();
+        }
+
+        assert_eq!(
+            e.metronome_click_count(),
+            4,
+            "exactly one click per beat over 4 beats"
+        );
+    }
+
+    /// `M` key toggles the metronome.
+    #[test]
+    fn m_key_toggles_metronome() {
+        let mut e = EditScreen::new();
+        assert!(!e.is_metronome_on());
+        e.on_key(KeyCode::Char('M'));
+        assert!(e.is_metronome_on());
+        e.on_key(KeyCode::Char('M'));
+        assert!(!e.is_metronome_on());
+    }
+
+    /// Count-in delays the first recorded note by N bars: notes played during
+    /// the pre-roll are discarded; notes after the count-in are captured.
+    #[test]
+    fn count_in_delays_first_recorded_note_by_n_bars() {
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('R')); // arm step-record
+        e.on_key(KeyCode::Char('t')); // → live-record
+
+        let bar_us = e.grid.bar_us();
+        let pitch = MidiNote::new(60).unwrap();
+        let vel = Velocity::new(80).unwrap();
+
+        // Start count-in (default 1 bar).
+        e.start_count_in_record();
+        assert!(e.is_playing());
+        assert!(e.is_counting_in(), "should be in count-in phase");
+
+        // Inject a note during the count-in — must NOT be recorded.
+        e.ingest(NoteEvent::on(pitch, vel, 0));
+        e.ingest(NoteEvent::off(pitch, 0));
+        assert_eq!(e.note_count(), 0, "note during count-in is discarded");
+
+        // Advance past the count-in period and tick to expire it.
+        e.advance(bar_us + 10_000);
+        e.tick_audition();
+        assert!(!e.is_counting_in(), "count-in phase should have ended");
+
+        // Inject a note after count-in — must be recorded.
+        e.ingest(NoteEvent::on(pitch, vel, 0));
+        e.advance(e.grid.step_us());
+        e.tick_audition();
+        e.ingest(NoteEvent::off(pitch, 0));
+
+        assert_eq!(e.note_count(), 1, "note after count-in is captured");
+    }
+
+    /// `C` key starts count-in live record without requiring prior arming.
+    #[test]
+    fn c_key_starts_count_in_record() {
+        let mut e = EditScreen::new();
+        assert_eq!(e.input_mode(), InputMode::DirectEdit);
+
+        e.on_key(KeyCode::Char('C'));
+        assert!(e.is_playing(), "C starts playback");
+        assert!(e.is_counting_in(), "C triggers count-in phase");
+        assert_eq!(e.input_mode(), InputMode::LiveRecord, "C arms live record");
     }
 
     // ── help overlay tests ─────────────────────────────────────────────
