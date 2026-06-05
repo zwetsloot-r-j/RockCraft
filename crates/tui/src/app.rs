@@ -33,7 +33,7 @@ pub(crate) enum Screen {
     Menu,
     Record(RecordScreen),
     Play(PlayScreen),
-    Edit(EditScreen),
+    Edit(Box<EditScreen>),
     BackingPicker(BackingPicker),
 }
 
@@ -97,7 +97,7 @@ impl Shell {
         if let Some(s) = &self.synth {
             edit.attach_synth(s.clone());
         }
-        self.screen = Screen::Edit(edit);
+        self.screen = Screen::Edit(Box::new(edit));
     }
 
     /// Number of notes in the edit screen; `None` if not in edit mode.
@@ -148,7 +148,7 @@ impl Shell {
                             if let Some(s) = &self.synth {
                                 edit.attach_synth(s.clone());
                             }
-                            self.screen = Screen::Edit(edit);
+                            self.screen = Screen::Edit(Box::new(edit));
                         }
                         Err(e) => self.status = format!("parse failed: {e}"),
                     },
@@ -217,6 +217,8 @@ impl Shell {
             // selector is active, Esc cancels the chord instead of leaving.
             Screen::Edit(edit) => match code {
                 KeyCode::Esc if edit.in_chord_mode() => edit.on_key(KeyCode::Esc),
+                // Clear visual selection on Esc without leaving the editor.
+                KeyCode::Esc if edit.in_visual_mode() => edit.on_key(KeyCode::Esc),
                 KeyCode::Tab | KeyCode::Esc => {
                     edit.leave();
                     self.screen = Screen::Menu;
