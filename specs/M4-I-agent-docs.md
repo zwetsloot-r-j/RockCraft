@@ -1,6 +1,6 @@
 # M4-I — docs: agent control protocol guide + example client
 
-> Milestone: M4 — Agent Interface · Issue: #93 · Suggested tier: cheap
+> Milestone: M4 — Agent Interface · Issue: #94 · Suggested tier: cheap
 > Branch: `claude/m4-agent-docs`
 
 ## Goal
@@ -12,7 +12,7 @@ this, the interface exists but isn't discoverable.
 ## Context
 
 - `docs/AGENT-CONTROL.md` (new), referenced from `CLAUDE.md`'s status section and
-  `docs/WORKFLOW.md`. Builds on M4-D…G (#88–#91): the protocol, the server flag,
+  `docs/WORKFLOW.md`. Builds on M4-D…G (#89–#92): the protocol, the server flag,
   the state/render queries.
 - The action vocabulary is `core::action_names()` — the doc should point at that
   as the live source of truth rather than hand-maintaining a divergent list.
@@ -51,4 +51,4 @@ this, the interface exists but isn't discoverable.
 - [ ] `cargo fmt --all --check` clean
 - [ ] `cargo clippy --workspace --all-targets` clean (warnings = errors)
 - [ ] `cargo test --workspace` green (`cargo build --examples` covers the example)
-- [ ] PR against `main` from `claude/m4-agent-docs`, `Closes #93`
+- [ ] PR against `main` from `claude/m4-agent-docs`, `Closes #94`

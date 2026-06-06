@@ -1,6 +1,6 @@
 # M4-H — infra: real pixel screenshot via headless PTY (stretch)
 
-> Milestone: M4 — Agent Interface · Issue: #92 · Suggested tier: sonnet
+> Milestone: M4 — Agent Interface · Issue: #93 · Suggested tier: sonnet
 > Branch: `claude/m4-pty-screenshot`
 
 ## Goal
@@ -14,7 +14,7 @@ frontends arrive.
 ## Context
 
 - Mostly `crates/control` (a small capture utility / example) + `area:infra`.
-  Builds on M4-F/M4-G (#90/#91): the agent drives edits over the socket, then
+  Builds on M4-F/M4-G (#91/#92): the agent drives edits over the socket, then
   asks for a screenshot.
 - This is a **stretch** task — land M4-A…G first. It is *not* `loc:local`: a PTY
   runs fine in CI; no piano needed.
@@ -52,4 +52,4 @@ frontends arrive.
 - [ ] `cargo fmt --all --check` clean
 - [ ] `cargo clippy --workspace --all-targets` clean (warnings = errors)
 - [ ] `cargo test --workspace` green (screenshot smoke test feature-gated)
-- [ ] PR against `main` from `claude/m4-pty-screenshot`, `Closes #92`
+- [ ] PR against `main` from `claude/m4-pty-screenshot`, `Closes #93`

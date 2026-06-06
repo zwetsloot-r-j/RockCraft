@@ -1,6 +1,6 @@
 # M4-F — tui: wire the running app to the control server
 
-> Milestone: M4 — Agent Interface · Issue: #90 · Suggested tier: opus
+> Milestone: M4 — Agent Interface · Issue: #91 · Suggested tier: opus
 > Branch: `claude/m4-app-control-wiring`
 
 ## Goal
@@ -12,7 +12,7 @@ the app owns; each surface sees the other's edits.
 
 ## Context
 
-- Crates: `crates/tui` (the app shell / run loop) + `crates/control` (#89).
+- Crates: `crates/tui` (the app shell / run loop) + `crates/control` (#90).
 - The TUI owns the `Composer` (inside `EditScreen`, post M4-C). The control
   server runs on a tokio task. They communicate over a **channel**, not a shared
   lock on the app's composer — the render loop must never await on the socket and
@@ -65,4 +65,4 @@ the app owns; each surface sees the other's edits.
 - [ ] `cargo fmt --all --check` clean
 - [ ] `cargo clippy --workspace --all-targets` clean (warnings = errors)
 - [ ] `cargo test --workspace` green
-- [ ] PR against `main` from `claude/m4-app-control-wiring`, `Closes #90`
+- [ ] PR against `main` from `claude/m4-app-control-wiring`, `Closes #91`

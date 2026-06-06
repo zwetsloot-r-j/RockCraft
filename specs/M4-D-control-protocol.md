@@ -1,6 +1,6 @@
 # M4-D — control: JSON protocol types + generic `run_action`
 
-> Milestone: M4 — Agent Interface · Issue: #88 · Suggested tier: sonnet
+> Milestone: M4 — Agent Interface · Issue: #89 · Suggested tier: sonnet
 > Branch: `claude/m4-control-protocol`
 
 ## Goal
@@ -86,4 +86,4 @@ pub fn handle_run_action(c: &mut Composer, id: Option<u64>,
 - [ ] `cargo fmt --all --check` clean
 - [ ] `cargo clippy --workspace --all-targets` clean (warnings = errors)
 - [ ] `cargo test --workspace` green
-- [ ] PR against `main` from `claude/m4-control-protocol`, `Closes #88`
+- [ ] PR against `main` from `claude/m4-control-protocol`, `Closes #89`

@@ -1,6 +1,6 @@
 # M4-A — core: Action / Effect model + generic name dispatch
 
-> Milestone: M4 — Agent Interface · Issue: #85 · Suggested tier: opus
+> Milestone: M4 — Agent Interface · Issue: #86 · Suggested tier: opus
 > Branch: `claude/m4-action-model`
 
 ## Goal
@@ -124,4 +124,4 @@ pub fn action_names() -> &'static [&'static str];
 - [ ] `cargo fmt --all --check` clean
 - [ ] `cargo clippy --workspace --all-targets` clean (warnings = errors)
 - [ ] `cargo test --workspace` green
-- [ ] PR against `main` from `claude/m4-action-model`, `Closes #85`
+- [ ] PR against `main` from `claude/m4-action-model`, `Closes #86`
