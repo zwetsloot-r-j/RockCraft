@@ -1,6 +1,6 @@
 # M4-C — tui: `EditScreen` delegates to `core::Composer`
 
-> Milestone: M4 — Agent Interface · Issue: #87 · Suggested tier: opus
+> Milestone: M4 — Agent Interface · Issue: #88 · Suggested tier: opus
 > Branch: `claude/m4-tui-action-refactor`
 
 ## Goal
@@ -14,7 +14,7 @@ makes key-rebinding a table edit instead of a code change.
 ## Context
 
 - Crate: `crates/tui`, rewrites `edit.rs` internals. Builds on `Composer`,
-  `Action`, `Effect` from M4-A/M4-B (#85/#86).
+  `Action`, `Effect` from M4-A/M4-B (#86/#87).
 - **No behaviour change.** The existing tests in `crates/tui` (and
   `tests/key_driven.rs`, `tests/headless.rs`) are the contract. Do **not**
   modify, weaken, or delete them — they must pass unchanged. Keep the public
@@ -67,4 +67,4 @@ makes key-rebinding a table edit instead of a code change.
 - [ ] `cargo fmt --all --check` clean
 - [ ] `cargo clippy --workspace --all-targets` clean (warnings = errors)
 - [ ] `cargo test --workspace` green (including unchanged TUI tests)
-- [ ] PR against `main` from `claude/m4-tui-action-refactor`, `Closes #87`
+- [ ] PR against `main` from `claude/m4-tui-action-refactor`, `Closes #88`

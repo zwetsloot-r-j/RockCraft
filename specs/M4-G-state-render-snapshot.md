@@ -1,6 +1,6 @@
 # M4-G — tui+control: state + render-buffer snapshots for verification
 
-> Milestone: M4 — Agent Interface · Issue: #91 · Suggested tier: sonnet
+> Milestone: M4 — Agent Interface · Issue: #92 · Suggested tier: sonnet
 > Branch: `claude/m4-state-render-snapshot`
 
 ## Goal
@@ -14,7 +14,7 @@ frame as text.
 ## Context
 
 - Crates: `crates/tui` (renders to a buffer, serialises it) + `crates/control`
-  (carries the `Render` response, M4-D #88). Builds on M4-F (#90) routing.
+  (carries the `Render` response, M4-D #89). Builds on M4-F (#91) routing.
 - `ratatui` already renders into a `Buffer` (the `tests/headless.rs` harness uses
   `TestBackend`, whose `buffer()` exposes the cell grid). Reuse that to render the
   current app frame off-screen and serialise it.
@@ -60,4 +60,4 @@ frame as text.
 - [ ] `cargo fmt --all --check` clean
 - [ ] `cargo clippy --workspace --all-targets` clean (warnings = errors)
 - [ ] `cargo test --workspace` green
-- [ ] PR against `main` from `claude/m4-state-render-snapshot`, `Closes #91`
+- [ ] PR against `main` from `claude/m4-state-render-snapshot`, `Closes #92`

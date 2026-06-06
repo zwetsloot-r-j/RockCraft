@@ -1,6 +1,6 @@
 # M4-E — control: localhost WebSocket server loop
 
-> Milestone: M4 — Agent Interface · Issue: #89 · Suggested tier: opus
+> Milestone: M4 — Agent Interface · Issue: #90 · Suggested tier: opus
 > Branch: `claude/m4-control-server`
 
 ## Goal
@@ -13,7 +13,7 @@ TUI app (one shared source of truth, no RT-thread blocking) is M4-F.
 
 ## Context
 
-- Crate: `crates/control`. Builds on the protocol + `handle` from M4-D (#88).
+- Crate: `crates/control`. Builds on the protocol + `handle` from M4-D (#89).
 - **New deps (this spec authorises them):** `tokio` (rt-multi-thread, macros,
   sync, net), `tokio-tungstenite`, `futures-util`. Add to
   `[workspace.dependencies]` and the crate. These are the project's first async
@@ -70,4 +70,4 @@ impl ControlServer {
 - [ ] `cargo fmt --all --check` clean
 - [ ] `cargo clippy --workspace --all-targets` clean (warnings = errors)
 - [ ] `cargo test --workspace` green
-- [ ] PR against `main` from `claude/m4-control-server`, `Closes #89`
+- [ ] PR against `main` from `claude/m4-control-server`, `Closes #90`

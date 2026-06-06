@@ -1,6 +1,6 @@
 # M4-B — core: pure `Composer` model (apply Actions)
 
-> Milestone: M4 — Agent Interface · Issue: #86 · Suggested tier: opus
+> Milestone: M4 — Agent Interface · Issue: #87 · Suggested tier: opus
 > Branch: `claude/m4-composer-core`
 
 ## Goal
@@ -13,7 +13,7 @@ one editor. `Composer::apply(Action)` mutates the timeline and returns the
 ## Context
 
 - Crate: `crates/core`, new module `composer.rs`. Builds on `Action`/`Effect`
-  from M4-A (#85), and on existing `History` (#61), `Timeline` (#49),
+  from M4-A (#86), and on existing `History` (#61), `Timeline` (#49),
   `Grid`, `Key::diatonic_chord`, `MidiNote`, `Velocity`.
 - **This is a port, not a redesign.** The exact behaviour to reproduce lives in
   `crates/tui/src/edit.rs` (`EditScreen`): cursor/grab/chord/selection/clipboard/
@@ -121,4 +121,4 @@ with `Action`s, asserting identical outcomes. At minimum:
 - [ ] `cargo fmt --all --check` clean
 - [ ] `cargo clippy --workspace --all-targets` clean (warnings = errors)
 - [ ] `cargo test --workspace` green
-- [ ] PR against `main` from `claude/m4-composer-core`, `Closes #86`
+- [ ] PR against `main` from `claude/m4-composer-core`, `Closes #87`
