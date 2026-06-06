@@ -40,6 +40,13 @@ Invariants:
 - The merge gate is `.github/workflows/ci.yml`: `cargo fmt --all --check`,
   `cargo clippy --workspace --all-targets` (warnings are errors), and
   `cargo test --workspace`. Run all three locally before opening a PR.
+- **System deps (one-time):** the `audio`/`tui` crates link ALSA via `alsa-sys`
+  (rodio/midir). Without the dev headers, `cargo build`/`test` aborts in
+  `alsa-sys`'s build script with `pkg-config exited with status code 1 … Package
+  alsa was not found` — this is a missing system library, not a code bug. Fix it
+  once with `./scripts/setup-dev.sh` (or `sudo apt-get install -y libasound2-dev
+  pkg-config`); CI runs the same step. Pure `core` work needs none of this —
+  scope to `cargo test -p rockcraft-core`.
 - One crate per task where possible — the workspace makes crates independent so
   parallel agents don't collide.
 - Branch naming: humans `feat/*` etc.; Claude agents `claude/*`; Vibe agents
