@@ -12,6 +12,7 @@
 pub mod action;
 pub mod buffer;
 pub mod chord;
+pub mod composer;
 pub mod events;
 pub mod grid;
 pub mod history;
@@ -24,6 +25,7 @@ pub mod wait;
 pub use action::{action_from_name, action_names, Action, ActionError, Effect};
 pub use buffer::EventBuffer;
 pub use chord::{ChordKind, Key, Scale};
+pub use composer::{Composer, ComposerSnapshot, Cursor, InputMode, NoteView, SelectionView};
 pub use events::{MidiNote, NoteEvent, NoteEventKind, Velocity};
 pub use grid::{Grid, Subdivision, TimeSig};
 pub use history::History;
