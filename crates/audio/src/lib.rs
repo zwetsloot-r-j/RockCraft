@@ -5,7 +5,8 @@
 //! hear what you play. The synth machinery lives in [`synth`].
 //!
 //! [`play_file`] plays a decoded audio file (wav/mp3/ogg/flac) on a separate
-//! output stream, returning a [`BackingHandle`] to stop it.
+//! output stream, returning a [`BackingHandle`] to stop it; [`play_file_at`]
+//! starts it seeked to a position, for syncing a backing track to the highway.
 
 pub mod synth;
 
@@ -138,6 +139,20 @@ impl BackingHandle {
 /// Returns immediately; playback runs on the rodio audio thread. Supports
 /// wav, mp3, ogg, and flac via rodio/symphonia.
 pub fn play_file(path: &std::path::Path) -> Result<BackingHandle, AudioError> {
+    play_file_at(path, std::time::Duration::ZERO)
+}
+
+/// Like [`play_file`], but seek to `start` before playback begins.
+///
+/// Used to sync a backing track to the falling-note highway: the caller decides
+/// the file position with `rockcraft_core::backing_position_us`. Seeking is
+/// best-effort — if the decoder can't seek (some formats), playback falls back
+/// to the start rather than failing, which is inaudible for the sub-frame
+/// offsets this is normally called with.
+pub fn play_file_at(
+    path: &std::path::Path,
+    start: std::time::Duration,
+) -> Result<BackingHandle, AudioError> {
     let (stream, stream_handle) =
         OutputStream::try_default().map_err(|e| AudioError::Device(e.to_string()))?;
     let sink = rodio::Sink::try_new(&stream_handle).map_err(|e| AudioError::Play(e.to_string()))?;
@@ -145,6 +160,10 @@ pub fn play_file(path: &std::path::Path) -> Result<BackingHandle, AudioError> {
     let source = rodio::Decoder::new(std::io::BufReader::new(file))
         .map_err(|e| AudioError::Decode(e.to_string()))?;
     sink.append(source);
+    if !start.is_zero() {
+        // Best-effort: ignore decoders that don't support seeking.
+        let _ = sink.try_seek(start);
+    }
     Ok(BackingHandle {
         _stream: stream,
         sink,

@@ -116,18 +116,9 @@ impl Shell {
                 self.screen = Screen::Record(RecordScreen::with_backing(self.backing_path.clone()));
             }
             Some(1) => match latest_recording() {
-                Some(path) => match std::fs::read(&path) {
-                    Ok(bytes) => {
-                        let title = path
-                            .file_name()
-                            .map(|s| s.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| "song".into());
-                        match PlayScreen::from_smf_bytes(title, &bytes, self.synth.clone()) {
-                            Ok(p) => self.screen = Screen::Play(p),
-                            Err(e) => self.status = format!("load failed: {e}"),
-                        }
-                    }
-                    Err(e) => self.status = format!("read failed: {e}"),
+                Some(path) => match load_play_screen(&path, self.synth.clone()) {
+                    Ok(p) => self.screen = Screen::Play(p),
+                    Err(e) => self.status = e,
                 },
                 None => self.status = "no recordings yet — record one first".into(),
             },
@@ -324,9 +315,12 @@ pub fn run_loop<B: ratatui::backend::Backend>(
             }
         }
 
-        // Tick song-synth triggers (clock-driven, not frame-rate-driven).
+        // Tick song-synth triggers and the backing track (clock-driven, not
+        // frame-rate-driven); the backing arms itself once the clock reaches the
+        // lead-in's end so it lines up with the notes hitting the keyboard line.
         if let Screen::Play(play) = &mut shell.screen {
             play.tick_song_synth();
+            play.tick_backing();
         }
 
         // Tick editor transport audition (clock-driven).
@@ -415,29 +409,71 @@ fn load_meta_grid_key(bundle_dir: &std::path::Path) -> (Grid, Key) {
     )
 }
 
-/// Find `song.mid` inside the most recent `take-*/` bundle under `recordings/`.
+/// Find the MIDI of the most recent recording under `recordings/`.
 fn latest_recording() -> Option<std::path::PathBuf> {
     latest_recording_from(std::path::Path::new("recordings"))
 }
 
-/// Find `song.mid` inside the most recent `take-*/` bundle under `base`.
-/// Extracted so tests can point at a temp directory.
+/// Find the MIDI of the most recent recording under `base`, preferring
+/// `take-*/` bundle directories (returning their `song.mid`) but also finding
+/// legacy loose `take-*.mid` files. Newest wins by take name (the unix-stamp in
+/// `take-<stamp>`). Extracted so tests can point at a temp directory.
 pub(crate) fn latest_recording_from(base: &std::path::Path) -> Option<std::path::PathBuf> {
-    let mut bundles: Vec<_> = std::fs::read_dir(base)
+    // (take name, midi path) — the name keys the "newest" sort; bundles and
+    // loose files share the `take-<stamp>` naming so they order together.
+    let mut candidates: Vec<(String, std::path::PathBuf)> = std::fs::read_dir(base)
         .ok()?
         .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            p.is_dir()
-                && p.file_name()
-                    .map(|n| n.to_string_lossy().starts_with("take-"))
-                    .unwrap_or(false)
+        .filter_map(|e| {
+            let path = e.path();
+            let name = path.file_name()?.to_string_lossy().into_owned();
+            if !name.starts_with("take-") {
+                return None;
+            }
+            if path.is_dir() {
+                // Bundle: the MIDI lives inside as song.mid.
+                let midi = path.join("song.mid");
+                midi.exists().then_some((name, midi))
+            } else if path.extension().map(|x| x == "mid").unwrap_or(false) {
+                // Legacy loose take-*.mid; key on the stem so it sorts with bundles.
+                let stem = path.file_stem()?.to_string_lossy().into_owned();
+                Some((stem, path))
+            } else {
+                None
+            }
         })
         .collect();
-    bundles.sort();
-    let latest = bundles.pop()?;
-    let midi = latest.join("song.mid");
-    midi.exists().then_some(midi)
+    candidates.sort_by(|a, b| a.0.cmp(&b.0));
+    candidates.pop().map(|(_, midi)| midi)
+}
+
+/// Build a [`PlayScreen`] for the MIDI at `midi_path`, attaching the bundle's
+/// backing track when its sibling `meta.json` declares one. Loose `.mid` files
+/// (no sibling manifest) load MIDI-only, exactly as before.
+fn load_play_screen(
+    midi_path: &std::path::Path,
+    synth: Option<SynthHandle>,
+) -> Result<PlayScreen, String> {
+    let bytes = std::fs::read(midi_path).map_err(|e| format!("read failed: {e}"))?;
+    let title = midi_path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "song".into());
+    let mut play = PlayScreen::from_smf_bytes(title, &bytes, synth)
+        .map_err(|e| format!("load failed: {e}"))?;
+
+    // A bundle keeps its manifest next to song.mid; resolve the backing track
+    // (if any) relative to that directory so the bundle stays movable.
+    if let Some(dir) = midi_path.parent() {
+        if let Ok(json) = std::fs::read_to_string(dir.join("meta.json")) {
+            if let Ok(meta) = RecordingMeta::from_json(&json) {
+                if let Some(backing) = meta.backing {
+                    play = play.with_backing(dir.join(&backing.file), backing.audio_start_us);
+                }
+            }
+        }
+    }
+    Ok(play)
 }
 
 #[cfg(test)]

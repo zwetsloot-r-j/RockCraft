@@ -3,7 +3,8 @@
 //! the player's live keys over it (play-along; scoring is a later task).
 
 use std::collections::HashSet;
-use std::time::Instant;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use ratatui::{
     layout::{Constraint, Layout, Rect},
@@ -12,8 +13,8 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
-use rockcraft_audio::SynthHandle;
-use rockcraft_core::{MidiNote, NoteEvent, Velocity};
+use rockcraft_audio::{play_file_at, BackingHandle, SynthHandle};
+use rockcraft_core::{backing_position_us, MidiNote, NoteEvent, Velocity};
 use rockcraft_midi::smf_bytes_to_events;
 
 use crate::highway::{build_spans, project, song_duration_us, NoteSpan};
@@ -32,6 +33,13 @@ const PRE_ROLL_US: u64 = 1_500_000;
 /// Velocity used when the hear-the-song feature synthesizes recorded notes.
 const HEAR_VELOCITY: u8 = 80;
 
+/// A backing audio track attached to a bundle, plus the file position that
+/// lines up with recording time 0 (`audio_start_us`, from Task C).
+struct Backing {
+    path: PathBuf,
+    audio_start_us: u64,
+}
+
 pub struct PlayScreen {
     spans: Vec<NoteSpan>,
     duration_us: u64,
@@ -40,6 +48,15 @@ pub struct PlayScreen {
     title: String,
     finished_pause_us: u64,
     synth: Option<SynthHandle>,
+    /// Whole-song forward shift applied to the spans; the clock value at which
+    /// the first note's lead-in ends and the backing track should begin.
+    /// Equals `song_shift_us(first_note_us, PRE_ROLL_US, LEAD_US)`.
+    shift_us: u64,
+    /// Backing track to sync, if the loaded bundle has one.
+    backing: Option<Backing>,
+    /// Live playback handle once the backing track has started; `None` until the
+    /// clock reaches `shift_us` (and again after `restart` re-arms it).
+    backing_handle: Option<BackingHandle>,
     /// Whether the "hear the song" feature is active.
     hear_song: bool,
     /// Span indices for which we have already sent note_on to the song synth.
@@ -83,13 +100,28 @@ impl PlayScreen {
             title,
             finished_pause_us: LEAD_US,
             synth,
+            shift_us: offset,
+            backing: None,
+            backing_handle: None,
             hear_song: false,
             song_on_fired: HashSet::new(),
             song_off_fired: HashSet::new(),
         })
     }
 
-    /// Restart playback from the top; resets synth state.
+    /// Attach a backing audio track from the loaded bundle. `audio_start_us` is
+    /// the position in the file that lines up with recording time 0 (Task C).
+    /// Playback is armed lazily: it begins when the clock reaches `shift_us`.
+    pub fn with_backing(mut self, path: PathBuf, audio_start_us: u64) -> Self {
+        self.backing = Some(Backing {
+            path,
+            audio_start_us,
+        });
+        self
+    }
+
+    /// Restart playback from the top; resets synth state and re-arms the backing
+    /// track so it re-syncs from `shift_us` again.
     pub fn restart(&mut self) {
         self.started = Instant::now();
         self.song_on_fired.clear();
@@ -97,6 +129,45 @@ impl PlayScreen {
         if let Some(s) = &self.synth {
             s.all_off();
         }
+        if let Some(h) = self.backing_handle.take() {
+            h.stop();
+        }
+    }
+
+    /// The file position the backing track should be at for clock `now_us`, or
+    /// `None` if it should not be playing yet (clock still in the lead-in) or
+    /// there is no backing track. Shares core's `backing_position_us` formula so
+    /// the audio and the highway never drift apart.
+    fn backing_target_us(&self, now_us: u64) -> Option<u64> {
+        let b = self.backing.as_ref()?;
+        backing_position_us(now_us, self.shift_us, b.audio_start_us)
+    }
+
+    /// Start the backing track once the clock first reaches `shift_us`, seeking
+    /// the file to the matching position. Call once per event-loop iteration
+    /// (clock-driven, like [`Self::tick_song_synth`]). A no-op when there is no
+    /// backing track or it is already playing. Never blocks the audio thread.
+    pub fn tick_backing(&mut self) {
+        if self.backing_handle.is_some() {
+            return;
+        }
+        let Some(pos_us) = self.backing_target_us(self.now_us()) else {
+            return;
+        };
+        let Some(b) = &self.backing else {
+            return;
+        };
+        match play_file_at(&b.path, Duration::from_micros(pos_us)) {
+            Ok(h) => self.backing_handle = Some(h),
+            // On a persistent failure (missing/undecodable file), drop the track
+            // rather than retry every frame; the song still plays silently.
+            Err(_) => self.backing = None,
+        }
+    }
+
+    /// Whether the backing track is currently audible (for the status line).
+    fn backing_playing(&self) -> bool {
+        self.backing_handle.is_some()
     }
 
     /// Forward a live `NoteEvent` to both the held-key tracker and the synth.
@@ -150,10 +221,14 @@ impl PlayScreen {
         }
     }
 
-    /// Silence all notes — call when leaving the screen.
+    /// Silence all notes and stop the backing track — call when leaving the
+    /// screen. (The handle also stops when the `PlayScreen` is dropped.)
     pub fn leave(&self) {
         if let Some(s) = &self.synth {
             s.all_off();
+        }
+        if let Some(h) = &self.backing_handle {
+            h.stop();
         }
     }
 
@@ -227,16 +302,24 @@ impl PlayScreen {
         } else {
             Color::DarkGray
         };
-        let line = Line::from(vec![
+        let mut spans = vec![
             Span::styled(" PLAY ", Style::default().fg(Color::Black).bg(TARGET_COLOR)),
             Span::raw(format!("  {:.1}s / {:.1}s  ", secs, total)),
             Span::raw("[r] restart  [Tab] menu  "),
             Span::styled("[m] music  ", Style::default().fg(music_color)),
+        ];
+        if self.backing_playing() {
+            spans.push(Span::styled(
+                "♪ backing  ",
+                Style::default().fg(Color::Green),
+            ));
+        }
+        spans.extend([
             Span::styled("● target ", Style::default().fg(TARGET_COLOR)),
             Span::styled("● you ", Style::default().fg(HELD_COLOR)),
             Span::styled("● match", Style::default().fg(MATCH_COLOR)),
         ]);
-        f.render_widget(Paragraph::new(line), area);
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
     fn draw_highway(&self, f: &mut Frame, area: Rect, scale: Scale, x0: u16, now: u64) {
@@ -386,6 +469,56 @@ mod tests {
         // Both have started; neither has ended yet.
         assert_eq!(on, vec![0, 1]);
         assert!(off.is_empty());
+    }
+
+    // ── backing-track sync decision (shares core's backing_position_us) ───────
+
+    use rockcraft_midi::events_to_smf_bytes;
+
+    /// A one-note song whose single note is at t=0, so the whole-song shift is
+    /// `PRE_ROLL_US + LEAD_US` (no first-note compensation).
+    fn one_note_screen() -> PlayScreen {
+        let events = vec![
+            NoteEvent::on(MidiNote::new(60).unwrap(), Velocity::new(80).unwrap(), 0),
+            NoteEvent::off(MidiNote::new(60).unwrap(), 500_000),
+        ];
+        let bytes = events_to_smf_bytes(&events);
+        PlayScreen::from_smf_bytes("test".into(), &bytes, None).unwrap()
+    }
+
+    #[test]
+    fn no_backing_track_never_targets() {
+        let play = one_note_screen();
+        assert_eq!(play.backing_target_us(0), None);
+        assert_eq!(play.backing_target_us(10_000_000), None);
+    }
+
+    #[test]
+    fn backing_silent_during_lead_in() {
+        let play = one_note_screen().with_backing(PathBuf::from("backing.mp3"), 0);
+        let shift = PRE_ROLL_US + LEAD_US;
+        // Before the lead-in ends: no audio yet.
+        assert_eq!(play.backing_target_us(0), None);
+        assert_eq!(play.backing_target_us(shift - 1), None);
+    }
+
+    #[test]
+    fn backing_starts_at_shift_and_tracks_clock() {
+        let play = one_note_screen().with_backing(PathBuf::from("backing.mp3"), 0);
+        let shift = PRE_ROLL_US + LEAD_US;
+        // At the shift point the file plays from its start.
+        assert_eq!(play.backing_target_us(shift), Some(0));
+        // One second later, one second into the file.
+        assert_eq!(play.backing_target_us(shift + 1_000_000), Some(1_000_000));
+    }
+
+    #[test]
+    fn backing_respects_audio_start_offset() {
+        let play = one_note_screen().with_backing(PathBuf::from("backing.mp3"), 250_000);
+        let shift = PRE_ROLL_US + LEAD_US;
+        // A trimmed lead-in: at the shift point the file is already 250ms in.
+        assert_eq!(play.backing_target_us(shift), Some(250_000));
+        assert_eq!(play.backing_target_us(shift + 1_000_000), Some(1_250_000));
     }
 
     #[test]
