@@ -10,6 +10,8 @@ repository.workspace = true
 rockcraft-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
+
+[dev-dependencies]

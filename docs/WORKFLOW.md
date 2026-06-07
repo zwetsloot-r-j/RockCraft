@@ -54,3 +54,6 @@ work"). To make a queue safe, ensure queue issues are well-specced and not
 Anything verifiable by `cargo test` without hardware: `core`, file parsing,
 scoring (against committed `fixtures/midi/`), refactors. Anything `loc:local`
 stays with a human at the piano. See `CLAUDE.md` for architecture invariants.
+
+For agent-driven editing via the WebSocket control interface, see
+[`AGENT-CONTROL.md`](AGENT-CONTROL.md).
