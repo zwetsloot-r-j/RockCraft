@@ -12,3 +12,6 @@ pub mod keyboard;
 pub mod play;
 pub mod record;
 pub mod render;
+
+#[cfg(feature = "screenshot")]
+pub mod screenshot;
