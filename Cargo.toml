@@ -5,6 +5,7 @@ members = [
     "crates/midi",
     "crates/audio",
     "crates/tui",
+    "crates/control",
 ]
 
 # Shared metadata + dependency versions for every crate in the workspace.
@@ -21,6 +22,7 @@ repository = "https://github.com/zwetsloot-r-j/RockCraft"
 rockcraft-core = { path = "crates/core" }
 rockcraft-midi = { path = "crates/midi" }
 rockcraft-audio = { path = "crates/audio" }
+rockcraft-control = { path = "crates/control" }
 
 # Serialization (core uses these for RecordingMeta / meta.json; no hardware dep)
 serde = { version = "1", features = ["derive"] }
