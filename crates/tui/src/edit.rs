@@ -315,6 +315,35 @@ impl EditScreen {
         }
     }
 
+    /// Mutable access to the underlying [`Composer`] — the control seam.
+    ///
+    /// The shell hands this to [`rockcraft_control::handle`] so remote
+    /// `run_action`s mutate the very same composer the keyboard edits. Effects
+    /// from a remote edit are auditioned via [`EditScreen::apply_remote`], not
+    /// here, so callers reaching for the composer directly stay rendering-only.
+    pub fn composer_mut(&mut self) -> &mut Composer {
+        &mut self.composer
+    }
+
+    /// Apply one remote control [`Request`] against the owned composer, audition
+    /// any effects through the synth (so remote edits sound like key edits), and
+    /// re-sync the mirrored grid. Returns the protocol [`Response`] for the
+    /// caller to send back over the request's oneshot.
+    ///
+    /// This is the remote analogue of [`EditScreen::dispatch`]: same composer,
+    /// same effect interpreter, same grid re-sync — only the trigger differs.
+    ///
+    /// [`Request`]: rockcraft_control::Request
+    /// [`Response`]: rockcraft_control::Response
+    pub fn apply_remote(&mut self, req: rockcraft_control::Request) -> rockcraft_control::Response {
+        let response = rockcraft_control::handle(&mut self.composer, req);
+        if let rockcraft_control::Response::Ok { effects, .. } = &response {
+            self.run_effects(effects);
+        }
+        self.grid = self.composer.grid();
+        response
+    }
+
     /// Consume a played MIDI event from the input source (piano / mock keyboard).
     /// Routing is the composer's: ignored in direct-edit, placed in step/live
     /// record. Any effects (none today) are interpreted for the synth.

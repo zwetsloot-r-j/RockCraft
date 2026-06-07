@@ -26,6 +26,20 @@ pub enum Request {
     },
 }
 
+impl Request {
+    /// The correlation id the client attached to this request, if any. Used to
+    /// echo the id back on responses synthesised outside [`handle`] (e.g. a
+    /// channel-closed error from the socket task).
+    pub fn id(&self) -> Option<u64> {
+        match self {
+            Request::RunAction { id, .. }
+            | Request::Query { id, .. }
+            | Request::Subscribe { id, .. }
+            | Request::Unsubscribe { id, .. } => *id,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {

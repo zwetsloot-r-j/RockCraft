@@ -19,10 +19,18 @@ path = "src/lib.rs"
 rockcraft-core.workspace = true
 rockcraft-midi.workspace = true
 rockcraft-audio.workspace = true
+rockcraft-control.workspace = true
 ratatui = "0.29"
 crossterm = "0.28"
+# Channel types for the control seam plus a runtime to host the server thread.
+# The render/MIDI loop stays sync — it only ever `try_recv`s the channel; the
+# tokio runtime is confined to a dedicated server thread spawned in `main`.
+tokio = { workspace = true }
 
 [dev-dependencies]
 rockcraft-core.workspace = true
 rockcraft-midi.workspace = true
+rockcraft-control.workspace = true
 crossterm = "0.28"
+tokio = { workspace = true }
+serde_json = { workspace = true }

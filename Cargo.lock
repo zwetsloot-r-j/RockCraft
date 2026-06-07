@@ -1181,8 +1181,11 @@ dependencies = [
  "crossterm",
  "ratatui",
  "rockcraft-audio",
+ "rockcraft-control",
  "rockcraft-core",
  "rockcraft-midi",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
