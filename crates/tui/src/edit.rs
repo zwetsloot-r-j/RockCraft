@@ -2,15 +2,32 @@
 //!
 //! Renders a [`Timeline`] on the existing note-highway projection with a movable
 //! `(pitch, step)` cursor navigated vim-style across all 88 keys. Supports full
-//! note editing: add, delete, resize, move (grab), and velocity adjust.
+//! note editing: add, delete, resize, move (grab), velocity, chords, selection,
+//! transport, loop, metronome and live/step recording.
 //!
-//! All mutations go through [`Timeline`] ops so a future undo layer (#61) can
-//! wrap them without changing this module.
+//! ## A thin frontend over [`Composer`]
 //!
-//! Nothing here touches a device or the disk, so the whole screen is
-//! headless-testable via the existing `TestBackend` harness.
+//! As of M4-C this screen is a **view + I/O shell** around the pure
+//! [`rockcraft_core::Composer`]. All editing, transport, loop, metronome,
+//! count-in and recording *logic* lives in `core`; the screen only owns what is
+//! genuinely a frontend concern:
+//!
+//! - a [`key_to_action`] / [`chord_key_to_action`] keymap (`KeyCode → Action`),
+//! - an [`EditScreen::run_effects`] interpreter ([`Effect`] → synth),
+//! - view-only state (the help overlay),
+//! - file save (`save` / `save_bundle`) and rendering.
+//!
+//! **The keymap functions are the rebinding seam.** Re-mapping a key is a table
+//! edit here, not a logic change — a full user-facing rebind UI is out of scope.
+//!
+//! `on_key` resolves a `KeyCode` to an optional [`Action`], hands it to
+//! [`Composer::apply`], and feeds the returned effects through `run_effects`.
+//! The run loop advances the pure playhead via [`Composer::advance`] and routes
+//! its effects the same way; played MIDI goes through [`Composer::ingest`].
+//!
+//! Nothing here touches a device or the disk on the hot path, so the whole
+//! screen stays headless-testable via the existing `TestBackend` harness.
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -24,13 +41,13 @@ use ratatui::{
 };
 use rockcraft_audio::SynthHandle;
 use rockcraft_core::{
-    ChordKind, Grid, History, Key, MidiNote, Note, NoteEvent, NoteEventKind, NoteId, RecordingMeta,
-    Scale as MusicScale, Subdivision, Timeline, Velocity,
+    Action, Composer, Cursor, Effect, Grid, InputMode, Key, MidiNote, Note, NoteEvent, NoteId,
+    RecordingMeta, Scale as MusicScale, Subdivision, Timeline, Velocity,
 };
 use rockcraft_midi::events_to_smf_bytes;
 
 use crate::highway::{build_spans, project, NoteSpan};
-use crate::keyboard::{black_key_col, is_black_key, white_index, Scale, HIGHEST_MIDI, LOWEST_MIDI};
+use crate::keyboard::{black_key_col, is_black_key, white_index, Scale, LOWEST_MIDI};
 use crate::render::draw_keyboard;
 
 /// Base directory for saved bundles.
@@ -45,22 +62,20 @@ const CURSOR_ANCHOR_NUM: u64 = 1;
 const CURSOR_ANCHOR_DEN: u64 = 4;
 
 /// One semitone above A0 × octave for the default cursor: middle C (MIDI 60).
+/// Mirrors `Composer`'s default; retained here as the oracle the unit tests
+/// assert against.
+#[allow(dead_code)]
 const DEFAULT_CURSOR_PITCH: u8 = 60;
 
-/// Default velocity for newly added notes.
+/// Default velocity for auditioned chord notes (single-note auditions carry the
+/// velocity in their [`Effect`]).
 const DEFAULT_NOTE_VEL: u8 = 80;
-
-/// Maximum entries in the undo stack. Oldest checkpoints are dropped when
-/// this limit is exceeded.
-const HISTORY_CAPACITY: usize = 100;
 
 /// Velocity step for `+`/`-` adjustments.
 const VEL_STEP: u8 = 8;
 
 /// Cursor highlight (status badge, cursor key, cursor cell).
 const CURSOR_COLOR: Color = Color::Magenta;
-/// Grab-mode badge colour.
-const GRAB_COLOR: Color = Color::Yellow;
 /// Chord-mode badge colour.
 const CHORD_COLOR: Color = Color::Cyan;
 /// Record-armed badge colour (step / live record).
@@ -71,144 +86,116 @@ const NOTE_COLOR: Color = Color::Indexed(33);
 const GRID_COLOR: Color = Color::DarkGray;
 /// Transport playhead line colour.
 const PLAYHEAD_COLOR: Color = Color::Green;
-/// MIDI note value used for metronome clicks (E5 — a bright piano tone).
-const CLICK_MIDI_VALUE: u8 = 76;
-/// Duration of each metronome click note in µs (50 ms).
-const CLICK_DUR_US: u64 = 50_000;
-/// Velocity for beat-1 accent clicks.
-const CLICK_VEL_ACCENT: u8 = 110;
-/// Velocity for off-beat clicks.
-const CLICK_VEL_NORMAL: u8 = 80;
 /// Selected-note highlight on the highway.
 const SELECT_COLOR: Color = Color::LightGreen;
 
-/// A `(pitch, step)` editing cursor.
+/// Map a `KeyCode` to the composer [`Action`] it triggers in normal (non-chord)
+/// mode, or `None` when the key is unbound.
 ///
-/// `pitch` is a MIDI note constrained to the 88-key range `21..=108`; `step` is
-/// a grid-step index along the time axis (its microsecond position is
-/// `grid.us_of_step(step)`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Cursor {
-    pub pitch: u8,
-    pub step: u64,
+/// This table is the **rebinding seam**: changing a binding is an edit here, not
+/// a change to any editing logic (which lives in [`Composer`]). Keys that are
+/// mode-sensitive at the *logic* level (e.g. `Space`/`hjkl` behaving differently
+/// while grabbing) still map to a single `Action`; the composer interprets them
+/// per its current state. Chord-mode keys route through [`chord_key_to_action`].
+fn key_to_action(code: KeyCode) -> Option<Action> {
+    Some(match code {
+        // ── navigation ──────────────────────────────────────────────────
+        KeyCode::Char('h') | KeyCode::Left => Action::CursorLeft,
+        KeyCode::Char('l') | KeyCode::Right => Action::CursorRight,
+        KeyCode::Char('j') | KeyCode::Down => Action::CursorDown,
+        KeyCode::Char('k') | KeyCode::Up => Action::CursorUp,
+        KeyCode::Char('H') => Action::CursorBarLeft,
+        KeyCode::Char('L') => Action::CursorBarRight,
+        KeyCode::Char('J') => Action::CursorOctaveDown,
+        KeyCode::Char('K') => Action::CursorOctaveUp,
+        KeyCode::Char('0') => Action::CursorToStart,
+        KeyCode::Char('$') => Action::CursorToEnd,
+        KeyCode::Char('>') => Action::SubdivisionFiner,
+        KeyCode::Char('<') => Action::SubdivisionCoarser,
+
+        // ── edit ────────────────────────────────────────────────────────
+        KeyCode::Char('a') | KeyCode::Char('i') => Action::AddNote,
+        KeyCode::Char('x') | KeyCode::Char('d') => Action::DeleteNote,
+        KeyCode::Char(']') => Action::ResizeNote { delta_steps: 1 },
+        KeyCode::Char('[') => Action::ResizeNote { delta_steps: -1 },
+        KeyCode::Char('+') | KeyCode::Char('=') => Action::AdjustVelocity {
+            delta: VEL_STEP as i16,
+        },
+        KeyCode::Char('-') => Action::AdjustVelocity {
+            delta: -(VEL_STEP as i16),
+        },
+        KeyCode::Char('m') => Action::ToggleGrab,
+        KeyCode::Char('c') => Action::EnterChordMode,
+
+        // ── input mode ──────────────────────────────────────────────────
+        KeyCode::Char('R') => Action::ToggleRecordArm,
+        KeyCode::Char('t') => Action::ToggleRecordFlavour,
+
+        // ── transport ───────────────────────────────────────────────────
+        KeyCode::Char(' ') => Action::TogglePlayCursor,
+        KeyCode::Char('P') => Action::PlayFromStart,
+
+        // ── loop / metronome / count-in ─────────────────────────────────
+        KeyCode::Char('o') => Action::ToggleLoop,
+        KeyCode::Char('M') => Action::ToggleMetronome,
+        KeyCode::Char('C') => Action::StartCountInRecord,
+
+        // ── selection / clipboard ───────────────────────────────────────
+        KeyCode::Char('v') => Action::StartSelection,
+        KeyCode::Char('y') => Action::YankSelection,
+        KeyCode::Char('p') => Action::PasteClipboard,
+        KeyCode::Char('D') => Action::DeleteSelection,
+        KeyCode::Esc => Action::ClearSelection,
+
+        // ── history ─────────────────────────────────────────────────────
+        KeyCode::Char('u') => Action::Undo,
+        KeyCode::Char('U') => Action::Redo,
+
+        _ => return None,
+    })
 }
 
-/// How notes get into the editor.
-///
-/// - `DirectEdit`: cursor + keys place notes (`a`/`c`/…); played MIDI is ignored.
-/// - `StepRecord`: each played note-on lands at the cursor (with the *played*
-///   pitch) and the cursor steps forward one grid step — no transport needed.
-/// - `LiveRecord`: played on/off events are written into the timeline at the
-///   current playhead µs (snapped to grid), pairing on→off into a `Note`. Needs
-///   the transport (#59) to advance the playhead; tests drive `set_playhead_us`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InputMode {
-    DirectEdit,
-    StepRecord,
-    LiveRecord,
+/// Map a `KeyCode` to the chord-selector [`Action`] it triggers while the
+/// selector is open, or `None` when unbound. The other half of the rebinding
+/// seam (see [`key_to_action`]).
+fn chord_key_to_action(code: KeyCode) -> Option<Action> {
+    Some(match code {
+        KeyCode::Char(c @ '1'..='7') => Action::SetChordDegree {
+            degree: c as u8 - b'0',
+        },
+        KeyCode::Char(']') => Action::CycleChordDegree { delta: 1 },
+        KeyCode::Char('[') => Action::CycleChordDegree { delta: -1 },
+        KeyCode::Char('s') => Action::ToggleChordKind,
+        KeyCode::Enter => Action::CommitChord,
+        KeyCode::Esc => Action::CancelChord,
+        _ => return None,
+    })
 }
 
-/// Transport state: stopped or playing from a song position.
-enum Transport {
-    Stopped,
-    Playing {
-        /// Song µs where playback began.
-        song_start_us: u64,
-        /// Wall-clock reference; reset by `advance()` to absorb injected time.
-        wall_ref: Instant,
-        /// Accumulated microseconds injected via `advance()` (for headless tests).
-        extra_us: u64,
-    },
-}
-
-/// Live state of the key-aware chord selector (`c`).
-///
-/// While active, the screen keeps a *preview* chord inserted in the timeline so
-/// it renders as a ghost and auditions through the synth. Cycling the degree or
-/// quality replaces that preview in place (it never piles up). `Enter` commits
-/// the preview (it becomes permanent); `Esc` removes it.
-struct ChordMode {
-    /// Scale degree `1..=7` of the chord under construction.
-    degree: u8,
-    /// Triad (3 notes) or Seventh (4 notes).
-    kind: ChordKind,
-    /// Ids of the notes currently previewing this chord in the timeline.
-    preview_ids: Vec<NoteId>,
-    /// The pitches of the current preview (ascending), exposed for tests.
-    pitches: Vec<MidiNote>,
-}
-
-/// The composer edit screen: a timeline rendered on the highway with a navigable
-/// cursor.  Supports vim-style navigation (#52) and note-mutation ops (#53).
+/// The composer edit screen: a [`Composer`] rendered on the highway, plus the
+/// frontend-only state needed to interpret its effects and draw it.
 pub struct EditScreen {
-    history: History,
+    /// The pure editor. Owns the timeline, cursor, grab, chord, selection,
+    /// clipboard, input mode, transport, loop, metronome and count-in state.
+    composer: Composer,
+    /// The grid, mirrored from the composer for rendering and for `save`. Kept
+    /// in sync after every dispatch (it only changes via subdivision actions).
     grid: Grid,
-    cursor: Cursor,
-    /// The note currently held in grab mode; `None` when not grabbing.
-    grabbed: Option<NoteId>,
-    /// Optional synth for auditioning notes on add / move.
+    /// The piece's key, used by `save`'s metadata. Also pushed into the composer
+    /// so it voices diatonic chords from the same key.
+    key: Key,
+    /// Optional synth for auditioning notes; `None` makes `run_effects` a no-op.
     synth: Option<SynthHandle>,
-    /// The pitch currently sounding from an audition; stopped before the next one.
+    /// The single pitch currently sounding from an edit audition (stopped before
+    /// the next one). Frontend bookkeeping for the stop-previous discipline.
     auditioning: Option<MidiNote>,
     /// Pitches currently sounding from a chord audition; stopped before the next.
     auditioning_chord: Vec<MidiNote>,
-    /// The piece's key, used to voice diatonic chords. Default C major (later
-    /// persisted by #56 and made editable by a follow-up).
-    key: Key,
-    /// Live chord-selector state; `None` when not in chord mode.
-    chord: Option<ChordMode>,
-    /// Pitches of the most recently committed chord, exposed for tests.
-    last_committed: Vec<MidiNote>,
-    /// How played MIDI is consumed: direct-edit (ignore) vs step/live record.
-    input_mode: InputMode,
-    /// Playhead position for `LiveRecord`. A seam the transport drives;
-    /// tests advance it via `set_playhead_us`.
-    live_playhead_us: u64,
-    /// Note-ons awaiting their off during `LiveRecord`: `(pitch, snapped start µs,
-    /// velocity)`. Closed and inserted as a `Note` when the matching off arrives.
-    live_pending: Vec<(MidiNote, u64, Velocity)>,
-    /// Transport state: stopped or playing.
-    transport: Transport,
-    /// Spans cached from the timeline at the moment playback was started.
-    audition_spans: Vec<NoteSpan>,
-    /// Span indices for which note_on has been sent during this playback.
-    audition_on_fired: HashSet<usize>,
-    /// Span indices for which note_off has been sent during this playback.
-    audition_off_fired: HashSet<usize>,
-
-    // ── loop region ──────────────────────────────────────────────────────
-    /// Whether the playhead should loop between `loop_start_us`/`loop_end_us`.
-    loop_enabled: bool,
-    /// Loop region start (inclusive) in song µs.
-    loop_start_us: u64,
-    /// Loop region end (exclusive) in song µs. Must be > `loop_start_us`.
-    loop_end_us: u64,
-
-    // ── metronome ────────────────────────────────────────────────────────
-    /// Whether the metronome click is armed during playback.
-    metronome_enabled: bool,
-    /// Beat index (`playhead_us / quarter_us`) of the last fired click.
-    last_click_beat: Option<u64>,
-    /// Playhead µs at which to fire the pending click note_off, if any.
-    click_pending_off: Option<u64>,
-    /// Click triggers fired since playback started — test seam.
-    click_count: usize,
-
-    // ── count-in ─────────────────────────────────────────────────────────
-    /// True during the pre-recording count-in phase; MIDI input is ignored.
-    counting_in: bool,
-    /// Playhead µs at which the count-in phase ends and recording begins.
-    count_in_end_us: u64,
-    /// Number of bars to count in before live recording (default 1).
-    count_in_bars: u32,
-
-    // ── help / selection / clipboard ─────────────────────────────────────
-    /// Whether the help overlay is currently visible.
+    /// Wall-clock reference for converting frame time into a `dt_us` for
+    /// [`Composer::advance`]. The clock the pure composer deliberately lacks.
+    last_tick: Option<Instant>,
+    /// Whether the help overlay is currently visible (view-only state).
     show_help: bool,
-    /// Where `v` was pressed to start a visual selection. `None` = no selection.
-    selection_anchor: Option<Cursor>,
-    /// In-editor clipboard: notes normalised to the selection's top-left (0, 0).
-    clipboard: Vec<Note>,
 }
 
 impl EditScreen {
@@ -225,49 +212,28 @@ impl EditScreen {
     }
 
     fn from_parts(timeline: Timeline, grid: Grid, synth: Option<SynthHandle>) -> Self {
+        let key = Key {
+            root_pc: 0,
+            scale: MusicScale::Major,
+        };
+        let mut composer = Composer::from_timeline(timeline, grid);
+        composer.set_key(key);
         Self {
-            history: History::new(timeline, HISTORY_CAPACITY),
+            composer,
             grid,
-            cursor: Cursor {
-                pitch: DEFAULT_CURSOR_PITCH,
-                step: 0,
-            },
-            grabbed: None,
+            key,
             synth,
             auditioning: None,
             auditioning_chord: Vec::new(),
-            key: Key {
-                root_pc: 0,
-                scale: MusicScale::Major,
-            },
-            chord: None,
-            last_committed: Vec::new(),
-            input_mode: InputMode::DirectEdit,
-            live_playhead_us: 0,
-            live_pending: Vec::new(),
-            transport: Transport::Stopped,
-            audition_spans: Vec::new(),
-            audition_on_fired: HashSet::new(),
-            audition_off_fired: HashSet::new(),
-            loop_enabled: false,
-            loop_start_us: 0,
-            loop_end_us: 0,
-            metronome_enabled: false,
-            last_click_beat: None,
-            click_pending_off: None,
-            click_count: 0,
-            counting_in: false,
-            count_in_end_us: 0,
-            count_in_bars: 1,
+            last_tick: None,
             show_help: false,
-            selection_anchor: None,
-            clipboard: Vec::new(),
         }
     }
 
     /// Set the key used to voice diatonic chords. (No UI yet — #56 persists it.)
     pub fn set_key(&mut self, key: Key) {
         self.key = key;
+        self.composer.set_key(key);
     }
 
     /// Attach a synth handle so edits are auditioned. Called by the shell after
@@ -276,21 +242,13 @@ impl EditScreen {
         self.synth = Some(synth);
     }
 
-    /// Stop any in-progress audition. Call this before navigating away from the
-    /// screen so held notes don't linger. An uncommitted chord preview is
-    /// cancelled (its notes removed) so leaving never strands a ghost chord.
+    /// Stop any in-progress audition and editor state and return to a clean rest.
+    /// An uncommitted chord preview is cancelled (its notes removed) so leaving
+    /// never strands a ghost chord. Call before navigating away from the screen.
     pub fn leave(&mut self) {
-        self.cancel_chord();
-        self.selection_anchor = None;
-        self.transport = Transport::Stopped;
-        self.counting_in = false;
-        let prev = self.auditioning.take();
-        if let Some(synth) = &self.synth {
-            if let Some(p) = prev {
-                synth.note_off(p);
-            }
-            synth.all_off();
-        }
+        let effects = self.composer.leave();
+        self.run_effects(&effects);
+        self.last_tick = None;
     }
 
     /// Save the timeline as a `take-<stamp>` bundle under `recordings/`.
@@ -308,7 +266,7 @@ impl EditScreen {
             .unwrap_or(0);
         let bundle_dir = base.join(format!("take-{stamp}"));
         std::fs::create_dir_all(&bundle_dir)?;
-        let bytes = events_to_smf_bytes(&self.history.current().to_events());
+        let bytes = events_to_smf_bytes(&self.timeline().to_events());
         std::fs::write(bundle_dir.join("song.mid"), bytes)?;
         let meta = RecordingMeta {
             midi_file: "song.mid".into(),
@@ -321,253 +279,18 @@ impl EditScreen {
         Ok(bundle_dir)
     }
 
-    // ── read-only accessors ───────────────────────────────────────────────
-
-    /// The current cursor position (for tests and status rendering).
-    pub fn cursor(&self) -> Cursor {
-        self.cursor
-    }
-
-    /// The current subdivision (for tests and status display).
-    pub fn current_subdivision(&self) -> Subdivision {
-        self.grid.subdivision
-    }
-
-    /// Total number of notes in the timeline.
-    pub fn note_count(&self) -> usize {
-        self.history.current().len()
-    }
-
-    /// The id of the note whose span `[start, start+dur)` covers the cursor's
-    /// current `(pitch, step)`, if any.
-    pub fn note_under_cursor(&self) -> Option<NoteId> {
-        self.history
-            .current()
-            .find_at(self.cursor.pitch, self.cursor_us())
-    }
-
-    /// Look up note data by id (convenience for tests and status display).
-    pub fn get_note(&self, id: NoteId) -> Option<Note> {
-        self.history.current().get(id).copied()
-    }
-
-    /// Ids of notes whose start falls inside the current visual selection rectangle.
-    /// Empty when there is no active selection.
-    pub fn selection_ids(&self) -> Vec<NoteId> {
-        let Some((pitch_lo, pitch_hi, us_lo, us_hi)) = self.selection_bounds() else {
-            return Vec::new();
-        };
-        self.history
-            .current()
-            .notes_in_region(pitch_lo, pitch_hi, us_lo, us_hi)
-    }
-
-    /// Number of notes currently held in the clipboard.
-    pub fn clipboard_len(&self) -> usize {
-        self.clipboard.len()
-    }
-
-    /// Whether the chord selector is currently active.
-    pub fn in_chord_mode(&self) -> bool {
-        self.chord.is_some()
-    }
-
-    /// Whether the help overlay is currently visible.
-    pub fn help_visible(&self) -> bool {
-        self.show_help
-    }
-
-    /// Whether a visual selection is in progress (`v` was pressed and `Esc`
-    /// hasn't been received yet).
-    pub fn in_visual_mode(&self) -> bool {
-        self.selection_anchor.is_some()
-    }
-
-    /// The current input mode (direct-edit vs step / live record).
-    pub fn input_mode(&self) -> InputMode {
-        self.input_mode
-    }
-
-    /// Set the `LiveRecord` playhead position. This is the seam the transport
-    /// drives; tests advance it manually to place recorded notes.
-    pub fn set_playhead_us(&mut self, us: u64) {
-        self.live_playhead_us = us;
-    }
-
-    /// Whether the transport is currently playing.
-    pub fn is_playing(&self) -> bool {
-        matches!(self.transport, Transport::Playing { .. })
-    }
-
-    /// Current playhead position in song microseconds.
-    /// Returns `cursor_us` when stopped.
-    pub fn playhead_us(&self) -> u64 {
-        match &self.transport {
-            Transport::Stopped => self.cursor_us(),
-            Transport::Playing {
-                song_start_us,
-                wall_ref,
-                extra_us,
-            } => song_start_us + wall_ref.elapsed().as_micros() as u64 + extra_us,
-        }
-    }
-
-    /// Advance the playhead by `dt_us` microseconds (for headless tests).
-    /// No-op when stopped.
-    pub fn advance(&mut self, dt_us: u64) {
-        if let Transport::Playing {
-            wall_ref, extra_us, ..
-        } = &mut self.transport
-        {
-            *extra_us += wall_ref.elapsed().as_micros() as u64 + dt_us;
-            *wall_ref = Instant::now();
-        }
-    }
-
-    // ── loop / metronome / count-in accessors ────────────────────────────
-
-    /// Whether loop mode is currently active.
-    pub fn is_looping(&self) -> bool {
-        self.loop_enabled
-    }
-
-    /// The current loop region as `(start_us, end_us)`.
-    pub fn loop_bounds(&self) -> (u64, u64) {
-        (self.loop_start_us, self.loop_end_us)
-    }
-
-    /// Explicitly set the loop region (does not toggle looping on/off).
-    pub fn set_loop_bounds(&mut self, start_us: u64, end_us: u64) {
-        self.loop_start_us = start_us;
-        self.loop_end_us = end_us;
-    }
-
-    /// Toggle loop on/off. Turning on auto-sets bounds to the bar under the
-    /// cursor when no valid bounds have been set yet.
-    pub fn toggle_loop(&mut self) {
-        if self.loop_enabled {
-            self.loop_enabled = false;
-        } else {
-            if self.loop_end_us <= self.loop_start_us {
-                let (start, end) = self.current_bar_bounds();
-                self.loop_start_us = start;
-                self.loop_end_us = end;
-            }
-            self.loop_enabled = true;
-        }
-    }
-
-    /// Whether the metronome click is armed.
-    pub fn is_metronome_on(&self) -> bool {
-        self.metronome_enabled
-    }
-
-    /// Toggle the metronome click on/off.
-    pub fn toggle_metronome(&mut self) {
-        self.metronome_enabled = !self.metronome_enabled;
-    }
-
-    /// Number of metronome clicks fired since playback last started.
-    /// Reset to 0 each time `start_play` is called. Test seam.
-    pub fn metronome_click_count(&self) -> usize {
-        self.click_count
-    }
-
-    /// Whether a count-in phase is currently in progress.
-    pub fn is_counting_in(&self) -> bool {
-        self.counting_in
-    }
-
-    /// Start a count-in then begin live recording. Arms `LiveRecord`, plays
-    /// `count_in_bars` bars of metronome clicks with no note recording, then
-    /// recording begins automatically. Playback starts from the cursor position.
-    pub fn start_count_in_record(&mut self) {
-        let from = self.cursor_us();
-        let count_in_dur = self.grid.bar_us() * self.count_in_bars as u64;
-        let count_in_end = from + count_in_dur;
-        self.input_mode = InputMode::LiveRecord;
-        self.start_play(from); // resets counting_in → false; order matters
-        self.counting_in = true;
-        self.count_in_end_us = count_in_end;
-    }
-
-    /// Fire synth note_on / note_off for any spans whose boundaries the
-    /// playhead has crossed since the last call. Call once per event-loop
-    /// iteration from the shell's run loop, like `tick_song_synth`.
-    pub fn tick_audition(&mut self) {
-        if !self.is_playing() {
-            return;
-        }
-        let now = self.playhead_us();
-
-        // Loop wrap: when the playhead crosses loop_end, restart from loop_start.
-        if self.loop_enabled && self.loop_end_us > self.loop_start_us && now >= self.loop_end_us {
-            self.start_play(self.loop_start_us);
-            return; // next tick fires notes from the new position
-        }
-
-        // Count-in expiry: switch from silent pre-roll to recording.
-        if self.counting_in && now >= self.count_in_end_us {
-            self.counting_in = false;
-        }
-
-        // Metronome / count-in clicks.
-        if self.metronome_enabled || self.counting_in {
-            self.tick_metronome_click(now);
-        }
-
-        let (need_on, need_off) = audition_pending_triggers(
-            &self.audition_spans,
-            now,
-            &self.audition_on_fired,
-            &self.audition_off_fired,
-        );
-        let velocity = Velocity::new(DEFAULT_NOTE_VEL).expect("80 is always valid");
-        for i in need_on {
-            if let Some(note) = MidiNote::new(self.audition_spans[i].note) {
-                if let Some(s) = &self.synth {
-                    s.note_on(note, velocity);
-                }
-            }
-            self.audition_on_fired.insert(i);
-        }
-        for i in need_off {
-            if let Some(note) = MidiNote::new(self.audition_spans[i].note) {
-                if let Some(s) = &self.synth {
-                    s.note_off(note);
-                }
-            }
-            self.audition_off_fired.insert(i);
-        }
-    }
-
-    /// The pitches of the chord currently being previewed, or `None` when not in
-    /// chord mode.
-    pub fn previewed_chord(&self) -> Option<Vec<MidiNote>> {
-        self.chord.as_ref().map(|c| c.pitches.clone())
-    }
-
-    /// The pitches of the most recently committed chord (empty before the first
-    /// commit).
-    pub fn last_committed_pitches(&self) -> &[MidiNote] {
-        &self.last_committed
-    }
-
     // ── key routing ───────────────────────────────────────────────────────
 
-    /// Route a key press through the full keymap. Tab/Esc are handled by the
+    /// Route a key press through the keymap. Tab/Esc-to-leave are handled by the
     /// shell, not here.
     ///
-    /// Mode-key precedence (mirrors the routing comment in `app.rs`): chord mode
-    /// takes the whole keymap when active; otherwise *all* navigation and edit
-    /// keys are handled here in **every** input mode (direct-edit / step / live),
-    /// so navigation never changes with the mode. Played MIDI note events arrive
-    /// separately through [`EditScreen::ingest`] and only place notes in a record
-    /// mode. `R` arms/disarms record (direct-edit ↔ step-record); while armed `t`
-    /// flips step ↔ live.
+    /// `?` toggles the help overlay locally; Esc closes it when shown. Otherwise
+    /// the key is resolved to an [`Action`] (chord-selector keymap while the
+    /// selector is open, the normal keymap otherwise) and dispatched to the
+    /// [`Composer`]; the returned effects drive the synth via `run_effects`.
     pub fn on_key(&mut self, code: KeyCode) {
-        // Help overlay: `?` toggles visibility; Esc closes it.
-        // This takes precedence over all other modes so help is always accessible.
+        // Help overlay: `?` toggles visibility; Esc closes it. Takes precedence
+        // over every other mode so help is always reachable.
         match code {
             KeyCode::Char('?') => {
                 self.show_help = !self.show_help;
@@ -580,812 +303,280 @@ impl EditScreen {
             _ => {}
         }
 
-        // In chord mode the keymap is taken over by the selector (digits pick a
+        // While the chord selector is open it owns the keymap (digits pick a
         // degree, `[`/`]` cycle it, `s` toggles quality, Enter/Esc commit/cancel).
-        if self.chord.is_some() {
-            self.on_chord_key(code);
-            return;
-        }
-        match code {
-            // ── navigation ──────────────────────────────────────────────
-            // Step left / right (clamp left at 0; right is unbounded).
-            // In grab mode, h/l move the grabbed note's start instead of just
-            // the cursor; the cursor tracks along with the note.
-            KeyCode::Char('h') | KeyCode::Left => {
-                if let Some(id) = self.grabbed {
-                    self.history.checkpoint();
-                    let new_step = self.cursor.step.saturating_sub(1);
-                    self.history
-                        .current_mut()
-                        .set_start(id, self.grid.us_of_step(new_step));
-                    self.cursor.step = new_step;
-                    self.audition_note(id);
-                } else {
-                    self.cursor.step = self.cursor.step.saturating_sub(1);
-                }
-            }
-            KeyCode::Char('l') | KeyCode::Right => {
-                if let Some(id) = self.grabbed {
-                    self.history.checkpoint();
-                    let new_step = self.cursor.step + 1;
-                    self.history
-                        .current_mut()
-                        .set_start(id, self.grid.us_of_step(new_step));
-                    self.cursor.step = new_step;
-                    self.audition_note(id);
-                } else {
-                    self.cursor.step += 1;
-                }
-            }
-            // Semitone down / up (clamp to the 88-key range).
-            // In grab mode, j/k transpose the grabbed note; cursor tracks.
-            KeyCode::Char('j') | KeyCode::Down => {
-                if let Some(id) = self.grabbed {
-                    self.history.checkpoint();
-                    if self.history.current_mut().transpose(id, -1) {
-                        self.cursor.pitch = self.cursor.pitch.saturating_sub(1).max(LOWEST_MIDI);
-                    }
-                    self.audition_note(id);
-                } else {
-                    self.cursor.pitch = self.cursor.pitch.saturating_sub(1).max(LOWEST_MIDI);
-                }
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                if let Some(id) = self.grabbed {
-                    self.history.checkpoint();
-                    if self.history.current_mut().transpose(id, 1) {
-                        self.cursor.pitch = (self.cursor.pitch + 1).min(HIGHEST_MIDI);
-                    }
-                    self.audition_note(id);
-                } else {
-                    self.cursor.pitch = (self.cursor.pitch + 1).min(HIGHEST_MIDI);
-                }
-            }
-            // One bar left / right (navigation only; no grab movement).
-            KeyCode::Char('H') => {
-                self.cursor.step = self.cursor.step.saturating_sub(self.steps_per_bar());
-            }
-            KeyCode::Char('L') => {
-                self.cursor.step += self.steps_per_bar();
-            }
-            // One octave down / up (navigation only; no grab movement).
-            KeyCode::Char('J') => {
-                self.cursor.pitch = self.cursor.pitch.saturating_sub(12).max(LOWEST_MIDI);
-            }
-            KeyCode::Char('K') => {
-                self.cursor.pitch = (self.cursor.pitch + 12).min(HIGHEST_MIDI);
-            }
-            // Song start / last note end.
-            KeyCode::Char('0') => {
-                self.cursor.step = 0;
-            }
-            KeyCode::Char('$') => {
-                self.cursor.step = self.last_step();
-            }
-            // Snap resolution: finer / coarser subdivision.
-            KeyCode::Char('>') => {
-                self.change_subdivision_finer();
-            }
-            KeyCode::Char('<') => {
-                self.change_subdivision_coarser();
-            }
-
-            // ── edit operations ──────────────────────────────────────────
-            // Add a note at cursor (pitch=cursor, start=cursor_us, dur=1 step,
-            // vel=80). If the cell is already occupied the existing note is
-            // removed first — replace / re-trigger semantics.
-            KeyCode::Char('a') | KeyCode::Char('i') => {
-                self.add_note();
-            }
-            // Delete the note under the cursor; no-op on an empty cell.
-            KeyCode::Char('x') | KeyCode::Char('d') => {
-                self.delete_note();
-            }
-            // Lengthen / shorten the note under the cursor by one grid step.
-            // Shorten clamps at a minimum of one step.
-            KeyCode::Char(']') => {
-                self.resize_note(1);
-            }
-            KeyCode::Char('[') => {
-                self.resize_note(-1);
-            }
-            // Velocity +8 / −8, clamped to 1..=127.
-            KeyCode::Char('+') | KeyCode::Char('=') => {
-                self.adjust_velocity(VEL_STEP as i16);
-            }
-            KeyCode::Char('-') => {
-                self.adjust_velocity(-(VEL_STEP as i16));
-            }
-            // Toggle grab mode: h/j/k/l move the grabbed note; `m` again drops.
-            KeyCode::Char('m') => {
-                self.toggle_grab();
-            }
-            // Enter the key-aware chord selector at the cursor.
-            KeyCode::Char('c') => {
-                self.enter_chord_mode();
-            }
-
-            // ── input mode ───────────────────────────────────────────────
-            // Arm / disarm record (direct-edit ↔ step-record).
-            KeyCode::Char('R') => {
-                self.toggle_record_arm();
-            }
-            // While armed, flip step ↔ live; a no-op in direct-edit.
-            KeyCode::Char('t') => {
-                self.toggle_record_flavour();
-            }
-
-            // Transport: Space toggles play-from-cursor / stop (not in grab mode).
-            KeyCode::Char(' ') => {
-                if self.grabbed.is_none() {
-                    self.toggle_play_cursor();
-                }
-            }
-            // Transport: `P` plays the whole song from position 0.
-            KeyCode::Char('P') => {
-                self.start_play(0);
-            }
-
-            // Loop: `o` toggles the loop region on/off.
-            KeyCode::Char('o') => {
-                self.toggle_loop();
-            }
-            // Metronome: `M` toggles the click on/off.
-            KeyCode::Char('M') => {
-                self.toggle_metronome();
-            }
-            // Count-in live record: `C` arms live record and counts in N bars
-            // of metronome before recording starts.
-            KeyCode::Char('C') => {
-                self.start_count_in_record();
-            }
-
-            // ── region select (vim visual-mode style) ────────────────────
-            // `v` starts (or resets) the selection anchor at the cursor.
-            KeyCode::Char('v') => {
-                self.selection_anchor = Some(self.cursor);
-            }
-            // `y` yanks the selection into the clipboard (normalised to top-left).
-            KeyCode::Char('y') => {
-                self.yank_selection();
-            }
-            // `p` pastes the clipboard at the cursor; no-op when clipboard is empty.
-            KeyCode::Char('p') => {
-                self.paste_clipboard();
-            }
-            // `D` deletes all notes in the selection.
-            KeyCode::Char('D') => {
-                self.delete_selection();
-            }
-            // `Esc` clears the selection (visual mode off).
-            KeyCode::Esc => {
-                self.selection_anchor = None;
-            }
-
-            // Undo / redo. `u` = undo; `U` = redo.
-            // `R` is reserved for record-arm (#57), so redo uses `U` (shift-u).
-            KeyCode::Char('u') => {
-                self.stop_play();
-                if self.history.undo() {
-                    self.grabbed = None;
-                    self.live_pending.clear();
-                    self.selection_anchor = None;
-                }
-            }
-            KeyCode::Char('U') => {
-                self.stop_play();
-                if self.history.redo() {
-                    self.grabbed = None;
-                    self.live_pending.clear();
-                    self.selection_anchor = None;
-                }
-            }
-
-            _ => {}
-        }
-    }
-
-    // ── input mode ──────────────────────────────────────────────────────────
-
-    /// Toggle the record arm: direct-edit ↔ step-record. Disarming from either
-    /// record flavour returns to direct-edit.
-    fn toggle_record_arm(&mut self) {
-        self.input_mode = match self.input_mode {
-            InputMode::DirectEdit => InputMode::StepRecord,
-            InputMode::StepRecord | InputMode::LiveRecord => InputMode::DirectEdit,
+        let action = if self.composer.in_chord_mode() {
+            chord_key_to_action(code)
+        } else {
+            key_to_action(code)
         };
-    }
-
-    /// Flip the record flavour step ↔ live. A no-op while disarmed (direct-edit).
-    fn toggle_record_flavour(&mut self) {
-        self.input_mode = match self.input_mode {
-            InputMode::StepRecord => InputMode::LiveRecord,
-            InputMode::LiveRecord => InputMode::StepRecord,
-            InputMode::DirectEdit => InputMode::DirectEdit,
-        };
+        if let Some(action) = action {
+            self.dispatch(action);
+        }
     }
 
     /// Consume a played MIDI event from the input source (piano / mock keyboard).
-    /// Behaviour depends on the input mode:
-    /// - `DirectEdit`: ignored (the editor is cursor-driven).
-    /// - `StepRecord`: a note-on inserts a one-step note at the cursor step using
-    ///   the *played* pitch, then advances the cursor one step. Note-offs are
-    ///   ignored — v1 fixes every step-recorded note to a single grid step.
-    /// - `LiveRecord`: on/off events are written at the snapped playhead, pairing
-    ///   on→off into a `Note` (like `Timeline::from_events`).
+    /// Routing is the composer's: ignored in direct-edit, placed in step/live
+    /// record. Any effects (none today) are interpreted for the synth.
     pub fn ingest(&mut self, ev: NoteEvent) {
-        match self.input_mode {
-            InputMode::DirectEdit => {}
-            InputMode::StepRecord => self.ingest_step(ev),
-            InputMode::LiveRecord => self.ingest_live(ev),
-        }
+        let effects = self.composer.ingest(ev);
+        self.run_effects(&effects);
     }
 
-    /// Step-record a single event: only note-ons place a note (fixed one-step
-    /// duration), replacing any note already in the cursor cell, then step on.
-    fn ingest_step(&mut self, ev: NoteEvent) {
-        let NoteEventKind::On { velocity } = ev.kind else {
+    /// Apply one [`Action`] to the composer and interpret its effects, then
+    /// re-sync the mirrored grid (a subdivision change is the only thing that
+    /// moves it). The single funnel every key / shim flows through.
+    fn dispatch(&mut self, action: Action) {
+        let effects = self.composer.apply(action).unwrap_or_default();
+        self.run_effects(&effects);
+        self.grid = self.composer.grid();
+    }
+
+    // ── effect interpreter ──────────────────────────────────────────────────
+
+    /// Interpret composer [`Effect`]s against the synth, owning the
+    /// "currently sounding" bookkeeping `core` deliberately doesn't.
+    ///
+    /// - [`Effect::AuditionNote`] with velocity 0 is a note-off (the convention
+    ///   the composer uses for playback span ends and metronome click releases).
+    /// - A single-note edit audition (velocity > 0 while stopped) stops the
+    ///   previous audition first, matching the old stop-previous-then-play feel.
+    /// - During playback note-ons stay polyphonic (multiple notes can sound).
+    /// - [`Effect::AuditionChord`] replaces any prior audition with the chord.
+    /// - [`Effect::AllOff`] silences everything and clears the bookkeeping.
+    ///
+    /// A no-op when no synth is attached (the headless test default).
+    fn run_effects(&mut self, effects: &[Effect]) {
+        let Some(synth) = self.synth.clone() else {
             return;
         };
-        if velocity.is_note_off() {
-            return; // running-status note-off
-        }
-        self.history.checkpoint();
-        // Replace semantics, matching `add_note`: a played pitch already in this
-        // cell is overwritten rather than stacked.
-        let existing = self
-            .history
-            .current()
-            .find_at(ev.note.value(), self.cursor_us());
-        if let Some(id) = existing {
-            self.history.current_mut().remove(id);
-            if self.grabbed == Some(id) {
-                self.grabbed = None;
-            }
-        }
-        let start_us = self.cursor_us();
-        let dur_us = self.grid.step_us();
-        self.history.current_mut().insert(Note {
-            pitch: ev.note,
-            start_us,
-            dur_us,
-            velocity,
-        });
-        self.cursor.step += 1;
-    }
-
-    /// Live-record a single event at the snapped playhead. A note-on opens a
-    /// pending span; the matching note-off closes it into a `Note` (minimum one
-    /// grid step so a zero-length tap is still audible/visible).
-    /// Events during the count-in phase are silently discarded.
-    fn ingest_live(&mut self, ev: NoteEvent) {
-        if self.counting_in {
-            return;
-        }
-        let at = self.grid.snap(self.live_playhead_us);
-        match ev.kind {
-            NoteEventKind::On { velocity } if !velocity.is_note_off() => {
-                self.live_pending.push((ev.note, at, velocity));
-            }
-            // Note-off (or a zero-velocity note-on): close the matching pending on.
-            _ => {
-                if let Some(pos) = self.live_pending.iter().position(|(p, _, _)| *p == ev.note) {
-                    let (pitch, start, velocity) = self.live_pending.remove(pos);
-                    let end = at.max(start + self.grid.step_us());
-                    self.history.checkpoint();
-                    self.history.current_mut().insert(Note {
-                        pitch,
-                        start_us: start,
-                        dur_us: end - start,
-                        velocity,
-                    });
+        let playing = self.composer.is_playing();
+        for effect in effects {
+            match effect {
+                Effect::AuditionNote { pitch, velocity } => {
+                    let Some(note) = MidiNote::new(*pitch) else {
+                        continue;
+                    };
+                    if *velocity == 0 {
+                        // An explicit note-off (playback span end / click off).
+                        synth.note_off(note);
+                        if self.auditioning == Some(note) {
+                            self.auditioning = None;
+                        }
+                        self.auditioning_chord.retain(|p| *p != note);
+                    } else if playing {
+                        // Polyphonic playback / metronome note-on.
+                        if let Some(vel) = Velocity::new(*velocity) {
+                            synth.note_on(note, vel);
+                        }
+                    } else {
+                        // A single edit audition: stop the previous, then play.
+                        self.stop_audition(&synth);
+                        if let Some(vel) = Velocity::new(*velocity) {
+                            synth.note_on(note, vel);
+                            self.auditioning = Some(note);
+                        }
+                    }
+                }
+                Effect::AuditionChord { pitches } => {
+                    self.stop_audition(&synth);
+                    let vel = Velocity::new(DEFAULT_NOTE_VEL).expect("80 is always valid");
+                    let mut sounding = Vec::with_capacity(pitches.len());
+                    for &pitch in pitches {
+                        if let Some(note) = MidiNote::new(pitch) {
+                            synth.note_on(note, vel);
+                            sounding.push(note);
+                        }
+                    }
+                    self.auditioning_chord = sounding;
+                }
+                Effect::AllOff => {
+                    synth.all_off();
+                    self.auditioning = None;
+                    self.auditioning_chord.clear();
                 }
             }
         }
     }
 
-    /// Route a key while the chord selector is active.
-    fn on_chord_key(&mut self, code: KeyCode) {
-        match code {
-            // Choose a scale degree directly and place its diatonic chord.
-            KeyCode::Char(c @ '1'..='7') => self.set_chord_degree(c as u8 - b'0'),
-            // Cycle the degree up / down through the 7 fitting chords.
-            KeyCode::Char(']') => self.cycle_chord_degree(1),
-            KeyCode::Char('[') => self.cycle_chord_degree(-1),
-            // Toggle Triad ↔ Seventh for the placed chord.
-            KeyCode::Char('s') => self.toggle_chord_kind(),
-            // Commit the preview / cancel and remove it.
-            KeyCode::Enter => self.commit_chord(),
-            KeyCode::Esc => self.cancel_chord(),
-            _ => {}
+    /// Silence the current edit / chord audition (the stop half of
+    /// stop-previous-then-play).
+    fn stop_audition(&mut self, synth: &SynthHandle) {
+        if let Some(prev) = self.auditioning.take() {
+            synth.note_off(prev);
+        }
+        for prev in std::mem::take(&mut self.auditioning_chord) {
+            synth.note_off(prev);
         }
     }
 
-    // ── edit helpers ──────────────────────────────────────────────────────
+    // ── transport tick ──────────────────────────────────────────────────────
 
-    /// Add a note at the cursor. If the cell is occupied the existing note is
-    /// removed first (replace semantics: the new note wins, velocity resets to
-    /// the default 80, duration resets to one step).
-    fn add_note(&mut self) {
-        self.history.checkpoint();
-        if let Some(id) = self.note_under_cursor() {
-            self.history.current_mut().remove(id);
-            if self.grabbed == Some(id) {
-                self.grabbed = None;
-            }
-        }
-        let pitch = MidiNote::new(self.cursor.pitch).expect("cursor pitch is always valid");
-        let velocity = Velocity::new(DEFAULT_NOTE_VEL).expect("80 is always valid");
-        let note = Note {
-            pitch,
-            start_us: self.cursor_us(),
-            dur_us: self.grid.step_us(),
-            velocity,
-        };
-        self.history.current_mut().insert(note);
-        self.audition(pitch, velocity);
+    /// Advance the pure playhead by `dt_us` and interpret the audition effects
+    /// it produces. Returns those effects so headless tests can assert on what
+    /// sounded. A no-op (empty) when the transport is stopped.
+    pub fn advance(&mut self, dt_us: u64) -> Vec<Effect> {
+        let effects = self.composer.advance(dt_us);
+        self.run_effects(&effects);
+        effects
     }
 
-    /// Delete the note under the cursor. No-op if the cell is empty.
-    fn delete_note(&mut self) {
-        let Some(id) = self.note_under_cursor() else {
-            return;
-        };
-        self.history.checkpoint();
-        self.history.current_mut().remove(id);
-        if self.grabbed == Some(id) {
-            self.grabbed = None;
-        }
-    }
-
-    /// Resize the note under the cursor by `delta_steps` grid steps. Positive
-    /// lengthens; negative shortens, clamped at one step minimum.
-    fn resize_note(&mut self, delta_steps: i64) {
-        let Some(id) = self.note_under_cursor() else {
-            return;
-        };
-        let Some(note) = self.history.current().get(id).copied() else {
-            return;
-        };
-        self.history.checkpoint();
-        let step = self.grid.step_us();
-        let new_dur = if delta_steps >= 0 {
-            note.dur_us.saturating_add(step * delta_steps as u64)
-        } else {
-            note.dur_us
-                .saturating_sub(step * (-delta_steps) as u64)
-                .max(step)
-        };
-        self.history.current_mut().resize(id, new_dur);
-    }
-
-    /// Adjust velocity on the note under the cursor by `delta`, clamped to
-    /// `1..=127`. Because `Timeline` has no `set_velocity`, the note is
-    /// removed and re-inserted; if it was grabbed the grab follows the new id.
-    fn adjust_velocity(&mut self, delta: i16) {
-        let Some(id) = self.note_under_cursor() else {
-            return;
-        };
-        let Some(note) = self.history.current().get(id).copied() else {
-            return;
-        };
-        self.history.checkpoint();
-        let new_vel = (note.velocity.value() as i16 + delta).clamp(1, 127) as u8;
-        let new_note = Note {
-            velocity: Velocity::new(new_vel).expect("clamped to 1..=127"),
-            ..note
-        };
-        self.history.current_mut().remove(id);
-        let new_id = self.history.current_mut().insert(new_note);
-        if self.grabbed == Some(id) {
-            self.grabbed = Some(new_id);
-        }
-    }
-
-    /// Toggle grab mode. While grabbing, h/j/k/l move the held note instead
-    /// of navigating the cursor (the cursor tracks the note). A second `m`
-    /// drops the grab. `m` on an empty cell is a no-op.
-    fn toggle_grab(&mut self) {
-        if self.grabbed.is_some() {
-            self.grabbed = None;
-        } else {
-            let id = self.note_under_cursor();
-            if let Some(id) = id {
-                self.grabbed = Some(id);
-                self.audition_note(id);
-            }
-        }
-    }
-
-    // ── chord selector ─────────────────────────────────────────────────────
-
-    /// Enter chord mode and immediately preview the tonic (degree 1) triad
-    /// voiced from the cursor. A no-op if already in chord mode.
-    fn enter_chord_mode(&mut self) {
-        if self.chord.is_some() {
-            return;
-        }
-        // Checkpoint the clean state before any preview notes are inserted so
-        // that commit leaves the undo history with one step, and cancel can
-        // rollback to here without affecting the redo stack.
-        self.history.checkpoint();
-        self.chord = Some(ChordMode {
-            degree: 1,
-            kind: ChordKind::Triad,
-            preview_ids: Vec::new(),
-            pitches: Vec::new(),
-        });
-        self.refresh_preview();
-    }
-
-    /// Set the chord degree directly (1..=7) and re-preview.
-    fn set_chord_degree(&mut self, degree: u8) {
-        if let Some(chord) = self.chord.as_mut() {
-            chord.degree = degree;
-        }
-        self.refresh_preview();
-    }
-
-    /// Cycle the degree by `delta`, wrapping within `1..=7`, and re-preview.
-    fn cycle_chord_degree(&mut self, delta: i8) {
-        if let Some(chord) = self.chord.as_mut() {
-            let zero_based = (chord.degree as i8 - 1 + delta).rem_euclid(7);
-            chord.degree = zero_based as u8 + 1;
-        }
-        self.refresh_preview();
-    }
-
-    /// Toggle the chord quality (Triad ↔ Seventh) and re-preview.
-    fn toggle_chord_kind(&mut self) {
-        if let Some(chord) = self.chord.as_mut() {
-            chord.kind = match chord.kind {
-                ChordKind::Triad => ChordKind::Seventh,
-                ChordKind::Seventh => ChordKind::Triad,
-            };
-        }
-        self.refresh_preview();
-    }
-
-    /// Replace the preview with the chord for the current degree/quality, voiced
-    /// from the cursor pitch as the root octave. Removes the previous preview
-    /// notes first so cycling never accumulates, then auditions the new chord.
-    fn refresh_preview(&mut self) {
-        let Some(chord) = self.chord.as_ref() else {
-            return;
-        };
-        let degree = chord.degree;
-        let kind = chord.kind;
-        let old_ids = chord.preview_ids.clone();
-
-        for id in old_ids {
-            self.history.current_mut().remove(id);
-        }
-
-        let root = MidiNote::new(self.cursor.pitch).expect("cursor pitch is always valid");
-        let pitches = self.key.diatonic_chord(degree, kind, root);
-        let start = self.cursor_us();
-        let dur = self.grid.step_us();
-        let velocity = Velocity::new(DEFAULT_NOTE_VEL).expect("80 is always valid");
-
-        let ids: Vec<NoteId> = pitches
-            .iter()
-            .map(|&pitch| {
-                self.history.current_mut().insert(Note {
-                    pitch,
-                    start_us: start,
-                    dur_us: dur,
-                    velocity,
-                })
-            })
-            .collect();
-
-        self.audition_chord(&pitches);
-
-        if let Some(chord) = self.chord.as_mut() {
-            chord.preview_ids = ids;
-            chord.pitches = pitches;
-        }
-    }
-
-    /// Commit the previewed chord: its notes stay in the timeline permanently
-    /// and chord mode ends. A no-op if not in chord mode.
-    fn commit_chord(&mut self) {
-        if let Some(chord) = self.chord.take() {
-            self.last_committed = chord.pitches;
-        }
-        self.stop_chord_audition();
-    }
-
-    /// Cancel the previewed chord: all preview mutations are discarded by
-    /// rolling back to the checkpoint saved at `enter_chord_mode`. Chord mode
-    /// ends. A no-op if not in chord mode.
-    fn cancel_chord(&mut self) {
-        if self.chord.take().is_some() {
-            self.history.rollback();
-        }
-        self.stop_chord_audition();
-    }
-
-    // ── audition ─────────────────────────────────────────────────────────
-
-    /// Audition the note identified by `id`: stops the previous audition first,
-    /// then plays a note-on. No-op when no synth is attached.
-    fn audition_note(&mut self, id: NoteId) {
-        let Some(note) = self.history.current().get(id).copied() else {
-            return;
-        };
-        self.audition(note.pitch, note.velocity);
-    }
-
-    /// Stop any previous audition and start a new one.
-    fn audition(&mut self, pitch: MidiNote, velocity: Velocity) {
-        let prev = self.auditioning.take();
-        // Clone the handle so there are no outstanding borrows while we
-        // mutate `auditioning`.
-        let Some(synth) = self.synth.clone() else {
-            return;
-        };
-        if let Some(p) = prev {
-            synth.note_off(p);
-        }
-        synth.note_on(pitch, velocity);
-        self.auditioning = Some(pitch);
-    }
-
-    /// Audition a whole chord: stop any prior single-note and chord auditions,
-    /// then sound every pitch. No-op when no synth is attached.
-    fn audition_chord(&mut self, pitches: &[MidiNote]) {
-        let prev_single = self.auditioning.take();
-        let prev_chord = std::mem::take(&mut self.auditioning_chord);
-        let Some(synth) = self.synth.clone() else {
-            return;
-        };
-        if let Some(p) = prev_single {
-            synth.note_off(p);
-        }
-        for p in prev_chord {
-            synth.note_off(p);
-        }
-        let velocity = Velocity::new(DEFAULT_NOTE_VEL).expect("80 is always valid");
-        for &p in pitches {
-            synth.note_on(p, velocity);
-        }
-        self.auditioning_chord = pitches.to_vec();
-    }
-
-    /// Silence a chord audition (on commit / cancel / leave).
-    fn stop_chord_audition(&mut self) {
-        let prev = std::mem::take(&mut self.auditioning_chord);
-        if let Some(synth) = self.synth.clone() {
-            for p in prev {
-                synth.note_off(p);
-            }
-        }
-    }
-
-    // ── navigation helpers ────────────────────────────────────────────────
-
-    /// Steps per bar = `bar_us / step_us` (at least 1).
-    fn steps_per_bar(&self) -> u64 {
-        (self.grid.bar_us() / self.grid.step_us()).max(1)
-    }
-
-    /// Grid step of the last note's end (0 for an empty timeline) — the `$` jump.
-    fn last_step(&self) -> u64 {
-        let end_us = self
-            .history
-            .current()
-            .notes()
-            .map(|(_, n)| n.start_us + n.dur_us)
-            .max()
+    /// Advance the transport by the real wall-clock time elapsed since the last
+    /// tick and fire the resulting auditions. Called once per run-loop iteration;
+    /// this is the frontend clock the pure [`Composer`] omits. A no-op while the
+    /// transport is stopped (the elapsed time is simply discarded).
+    pub fn tick_audition(&mut self) {
+        let now = Instant::now();
+        let dt = self
+            .last_tick
+            .map(|prev| now.duration_since(prev).as_micros() as u64)
             .unwrap_or(0);
-        self.grid.step_index(end_us)
+        self.last_tick = Some(now);
+        self.advance(dt);
     }
 
-    /// Change to a finer subdivision, re-snapping the cursor to the new grid.
-    fn change_subdivision_finer(&mut self) {
-        let cursor_us = self.cursor_us(); // Calculate using current grid
-        self.grid.subdivision = self.grid.subdivision.finer();
-        self.resnap_cursor_from_us(cursor_us);
+    /// Set the `LiveRecord` playhead position. The seam the transport drives;
+    /// tests advance it manually to place recorded notes.
+    pub fn set_playhead_us(&mut self, us: u64) {
+        self.composer.set_playhead_us(us);
     }
 
-    /// Change to a coarser subdivision, re-snapping the cursor to the new grid.
-    fn change_subdivision_coarser(&mut self) {
-        let cursor_us = self.cursor_us(); // Calculate using current grid
-        self.grid.subdivision = self.grid.subdivision.coarser();
-        self.resnap_cursor_from_us(cursor_us);
+    // ── read-only accessors (thin shims over `Composer`) ─────────────────────
+
+    /// The current (live-editing) timeline.
+    pub fn timeline(&self) -> &Timeline {
+        self.composer.timeline()
     }
 
-    /// Re-snap the cursor to the nearest grid line of the current subdivision
-    /// given a microsecond position from the previous grid.
-    fn resnap_cursor_from_us(&mut self, cursor_us: u64) {
-        let snapped_us = self.grid.snap(cursor_us);
-        self.cursor.step = self.grid.step_index(snapped_us);
+    /// The current cursor position (for tests and status rendering).
+    pub fn cursor(&self) -> Cursor {
+        self.composer.cursor()
     }
 
-    // ── region-select helpers ─────────────────────────────────────────────
-
-    /// Bounding rectangle of the active visual selection, or `None` when no
-    /// selection is active. Returns `(pitch_lo, pitch_hi, us_lo, us_hi)`.
-    fn selection_bounds(&self) -> Option<(u8, u8, u64, u64)> {
-        let anchor = self.selection_anchor?;
-        let pitch_lo = anchor.pitch.min(self.cursor.pitch);
-        let pitch_hi = anchor.pitch.max(self.cursor.pitch);
-        let step_lo = anchor.step.min(self.cursor.step);
-        let step_hi = anchor.step.max(self.cursor.step);
-        let us_lo = self.grid.us_of_step(step_lo);
-        // Include the whole last step so a single-step selection is non-empty.
-        let us_hi = self.grid.us_of_step(step_hi) + self.grid.step_us();
-        Some((pitch_lo, pitch_hi, us_lo, us_hi))
+    /// The current subdivision (for tests and status display).
+    pub fn current_subdivision(&self) -> Subdivision {
+        self.composer.current_subdivision()
     }
 
-    /// Copy the selected notes into the clipboard, normalised to the
-    /// selection's top-left `(pitch_lo, us_lo)`. Clears the selection on
-    /// success; no-op when the selection is empty or inactive.
-    fn yank_selection(&mut self) {
-        let Some((pitch_lo, _, us_lo, _)) = self.selection_bounds() else {
-            return;
-        };
-        let ids = self.selection_ids();
-        if ids.is_empty() {
-            return;
-        }
-        let notes: Vec<Note> = ids
-            .iter()
-            .filter_map(|&id| self.history.current().get(id).copied())
-            .collect();
-        self.clipboard = notes
-            .into_iter()
-            .map(|n| Note {
-                pitch: MidiNote::new(n.pitch.value().saturating_sub(pitch_lo))
-                    .expect("relative pitch always 0..=127"),
-                start_us: n.start_us.saturating_sub(us_lo),
-                ..n
-            })
-            .collect();
-        self.selection_anchor = None;
+    /// Total number of notes in the timeline.
+    pub fn note_count(&self) -> usize {
+        self.composer.note_count()
     }
 
-    /// Paste the clipboard at the cursor: each note is shifted so the
-    /// clipboard's top-left lands at `(cursor.pitch, cursor_us)`. No-op when
-    /// the clipboard is empty.
-    fn paste_clipboard(&mut self) {
-        if self.clipboard.is_empty() {
-            return;
-        }
-        self.history.checkpoint();
-        let d_pitch = self.cursor.pitch as i8;
-        let d_us = self.cursor_us();
-        let clipboard = self.clipboard.clone();
-        self.history
-            .current_mut()
-            .insert_shifted(&clipboard, d_pitch, d_us);
+    /// The id of the note whose span covers the cursor's `(pitch, step)`, if any.
+    pub fn note_under_cursor(&self) -> Option<NoteId> {
+        self.composer.note_under_cursor()
     }
 
-    /// Delete all notes in the current selection. Clears the selection.
-    /// No-op when the selection is inactive or contains no notes.
-    fn delete_selection(&mut self) {
-        let ids = self.selection_ids();
-        if ids.is_empty() {
-            self.selection_anchor = None;
-            return;
-        }
-        self.history.checkpoint();
-        for id in ids {
-            self.history.current_mut().remove(id);
-            if self.grabbed == Some(id) {
-                self.grabbed = None;
-            }
-        }
-        self.selection_anchor = None;
+    /// Look up note data by id (convenience for tests and status display).
+    pub fn get_note(&self, id: NoteId) -> Option<Note> {
+        self.composer.get_note(id)
     }
 
-    // ── transport helpers ─────────────────────────────────────────────────
-
-    /// Toggle play-from-cursor / stop.
-    fn toggle_play_cursor(&mut self) {
-        if self.is_playing() {
-            self.stop_play();
-        } else {
-            let from = self.cursor_us();
-            self.start_play(from);
-        }
+    /// Ids of notes whose start falls inside the current visual selection.
+    pub fn selection_ids(&self) -> Vec<NoteId> {
+        self.composer.selection_ids()
     }
 
-    /// Begin playback from `from_us` in song time, caching spans and
-    /// pre-marking notes that already ended before the start position.
-    /// Resets click tracking and cancels any active count-in.
-    fn start_play(&mut self, from_us: u64) {
-        if let Some(synth) = &self.synth {
-            synth.all_off();
-        }
-        self.auditioning = None;
-        self.audition_spans = build_spans(&self.history.current().to_events());
-        self.audition_on_fired.clear();
-        self.audition_off_fired.clear();
-        // Skip spans that ended before the start position.
-        for (i, span) in self.audition_spans.iter().enumerate() {
-            if span.end_us <= from_us {
-                self.audition_on_fired.insert(i);
-                self.audition_off_fired.insert(i);
-            }
-        }
-        // Reset metronome / count-in state.
-        self.last_click_beat = None;
-        self.click_pending_off = None;
-        self.click_count = 0;
-        self.counting_in = false;
-        self.transport = Transport::Playing {
-            song_start_us: from_us,
-            wall_ref: Instant::now(),
-            extra_us: 0,
-        };
+    /// Number of notes currently held in the clipboard.
+    pub fn clipboard_len(&self) -> usize {
+        self.composer.clipboard_len()
     }
 
-    /// Stop playback and silence all notes. Cancels any active count-in.
-    fn stop_play(&mut self) {
-        self.transport = Transport::Stopped;
-        self.counting_in = false;
-        if let Some(synth) = &self.synth {
-            synth.all_off();
-        }
+    /// Whether the chord selector is currently active.
+    pub fn in_chord_mode(&self) -> bool {
+        self.composer.in_chord_mode()
     }
 
-    // ── metronome helper ──────────────────────────────────────────────────
+    /// Whether the help overlay is currently visible.
+    pub fn help_visible(&self) -> bool {
+        self.show_help
+    }
 
-    /// Fire a metronome click when the beat index advances. Called from
-    /// `tick_audition` whenever the metronome or count-in is active.
-    fn tick_metronome_click(&mut self, now: u64) {
-        let beat_us = self.grid.quarter_us();
-        let current_beat = now / beat_us;
+    /// Whether a visual selection is in progress.
+    pub fn in_visual_mode(&self) -> bool {
+        self.composer.in_visual_mode()
+    }
 
-        // Release pending click note_off if its time has come.
-        if let Some(off_at) = self.click_pending_off {
-            if now >= off_at {
-                if let Some(s) = &self.synth {
-                    if let Some(note) = MidiNote::new(CLICK_MIDI_VALUE) {
-                        s.note_off(note);
-                    }
-                }
-                self.click_pending_off = None;
-            }
-        }
+    /// The current input mode (direct-edit vs step / live record).
+    pub fn input_mode(&self) -> InputMode {
+        self.composer.input_mode()
+    }
 
-        // Fire note_on when a new beat starts.
-        if self.last_click_beat != Some(current_beat) {
-            let beats_per_bar = self.grid.time_sig.beats_per_bar as u64;
-            let is_accent = current_beat.is_multiple_of(beats_per_bar);
-            let vel_value = if is_accent {
-                CLICK_VEL_ACCENT
-            } else {
-                CLICK_VEL_NORMAL
-            };
-            if let Some(s) = &self.synth {
-                if let Some(note) = MidiNote::new(CLICK_MIDI_VALUE) {
-                    if let Some(vel) = Velocity::new(vel_value) {
-                        s.note_on(note, vel);
-                    }
-                }
-            }
-            self.click_pending_off = Some(now + CLICK_DUR_US);
-            self.last_click_beat = Some(current_beat);
-            self.click_count += 1;
-        }
+    /// Whether the transport is currently playing.
+    pub fn is_playing(&self) -> bool {
+        self.composer.is_playing()
+    }
+
+    /// Current playhead position in song microseconds (cursor position when
+    /// stopped).
+    pub fn playhead_us(&self) -> u64 {
+        self.composer.playhead_us()
+    }
+
+    /// The pitches of the chord currently being previewed, or `None`.
+    pub fn previewed_chord(&self) -> Option<Vec<MidiNote>> {
+        self.composer.previewed_chord()
+    }
+
+    /// The pitches of the most recently committed chord (empty before the first).
+    pub fn last_committed_pitches(&self) -> &[MidiNote] {
+        self.composer.last_committed_pitches()
+    }
+
+    // ── loop / metronome / count-in shims ────────────────────────────────────
+
+    /// Whether loop mode is currently active.
+    pub fn is_looping(&self) -> bool {
+        self.composer.is_looping()
+    }
+
+    /// The current loop region as `(start_us, end_us)`.
+    pub fn loop_bounds(&self) -> (u64, u64) {
+        self.composer.loop_bounds()
+    }
+
+    /// Explicitly set the loop region (does not toggle looping on/off).
+    pub fn set_loop_bounds(&mut self, start_us: u64, end_us: u64) {
+        self.dispatch(Action::SetLoopBounds { start_us, end_us });
+    }
+
+    /// Toggle loop on/off. Turning on auto-sets bounds to the bar under the
+    /// cursor when no valid bounds have been set yet.
+    pub fn toggle_loop(&mut self) {
+        self.dispatch(Action::ToggleLoop);
+    }
+
+    /// Whether the metronome click is armed.
+    pub fn is_metronome_on(&self) -> bool {
+        self.composer.is_metronome_on()
+    }
+
+    /// Toggle the metronome click on/off.
+    pub fn toggle_metronome(&mut self) {
+        self.dispatch(Action::ToggleMetronome);
+    }
+
+    /// Number of metronome clicks fired since playback last started.
+    pub fn metronome_click_count(&self) -> usize {
+        self.composer.metronome_click_count()
+    }
+
+    /// Whether a count-in phase is currently in progress.
+    pub fn is_counting_in(&self) -> bool {
+        self.composer.is_counting_in()
+    }
+
+    /// Arm live record and count in N bars of clicks before recording begins.
+    pub fn start_count_in_record(&mut self) {
+        self.dispatch(Action::StartCountInRecord);
     }
 
     // ── time-axis viewport ────────────────────────────────────────────────
 
-    /// Bar bounds (start_us, end_us) for the bar containing the cursor.
-    fn current_bar_bounds(&self) -> (u64, u64) {
-        let bar_us = self.grid.bar_us();
-        let cursor_us = self.cursor_us();
-        let bar_start = cursor_us / bar_us * bar_us;
-        (bar_start, bar_start + bar_us)
-    }
-
     /// Microsecond position of the cursor on the time axis.
     fn cursor_us(&self) -> u64 {
-        self.grid.us_of_step(self.cursor.step)
+        self.grid.us_of_step(self.composer.cursor().step)
     }
 
     /// How far into the future the top of the highway represents.
@@ -1426,7 +617,7 @@ impl EditScreen {
             .title(" keyboard (88) ");
         let kb_inner = kb_block.inner(chunks[2]);
         f.render_widget(kb_block, chunks[2]);
-        let cursor_pitch = self.cursor.pitch;
+        let cursor_pitch = self.composer.cursor().pitch;
         let layout = draw_keyboard(f, kb_inner, &|note| {
             (note == cursor_pitch).then_some(CURSOR_COLOR)
         });
@@ -1445,24 +636,25 @@ impl EditScreen {
     }
 
     fn draw_status(&self, f: &mut Frame, area: Rect) {
+        let cursor = self.composer.cursor();
         let (bar, beat) = self.grid.bar_beat_of(self.cursor_us());
-        let pitch_name = MidiNote::new(self.cursor.pitch)
+        let pitch_name = MidiNote::new(cursor.pitch)
             .map(|n| n.name())
             .unwrap_or_default();
 
-        // In chord mode the badge and hint switch to the selector controls.
-        if let Some(chord) = &self.chord {
-            let quality = match chord.kind {
-                ChordKind::Triad => "triad",
-                ChordKind::Seventh => "7th",
-            };
+        // In chord mode the badge and hint switch to the selector controls. The
+        // preview pitches come straight from the composer (it owns degree/kind).
+        if self.composer.in_chord_mode() {
+            let names: Vec<String> = self
+                .composer
+                .previewed_chord()
+                .unwrap_or_default()
+                .iter()
+                .map(|p| p.name())
+                .collect();
             let line = Line::from(vec![
                 Span::styled(" CHORD ", Style::default().fg(Color::Black).bg(CHORD_COLOR)),
-                Span::raw(format!("  degree {} ({quality})  ", chord.degree)),
-                Span::styled(
-                    format!("♪ {pitch_name}  "),
-                    Style::default().fg(CHORD_COLOR),
-                ),
+                Span::raw(format!("  {}  ", names.join(" "))),
                 Span::styled(
                     "[1-7] degree  [ [ / ] ] cycle  [s] 7th  [Enter] commit  [Esc] cancel",
                     Style::default().fg(Color::DarkGray),
@@ -1472,16 +664,14 @@ impl EditScreen {
             return;
         }
 
-        // Badge priority: grab > visual selection > input mode.
-        let (badge_text, badge_style) = if self.grabbed.is_some() {
-            (" GRAB ", Style::default().fg(Color::Black).bg(GRAB_COLOR))
-        } else if self.selection_anchor.is_some() {
+        // Badge priority: visual selection > input mode.
+        let (badge_text, badge_style) = if self.composer.in_visual_mode() {
             (
                 " VISUAL ",
                 Style::default().fg(Color::Black).bg(SELECT_COLOR),
             )
         } else {
-            match self.input_mode {
+            match self.composer.input_mode() {
                 InputMode::DirectEdit => {
                     (" EDIT ", Style::default().fg(Color::Black).bg(CURSOR_COLOR))
                 }
@@ -1496,17 +686,17 @@ impl EditScreen {
             }
         };
 
-        let loop_span = if self.loop_enabled {
+        let loop_span = if self.composer.is_looping() {
             Span::styled(" LOOP ", Style::default().fg(Color::Black).bg(Color::Green))
         } else {
             Span::raw("")
         };
-        let metro_span = if self.metronome_enabled {
+        let metro_span = if self.composer.is_metronome_on() {
             Span::styled(" METRO ", Style::default().fg(Color::Black).bg(Color::Cyan))
         } else {
             Span::raw("")
         };
-        let count_in_span = if self.counting_in {
+        let count_in_span = if self.composer.is_counting_in() {
             Span::styled(
                 " COUNT-IN ",
                 Style::default().fg(Color::Black).bg(REC_COLOR),
@@ -1541,6 +731,7 @@ impl EditScreen {
         let w = scale.white_width();
         let now = self.view_now_us();
         let lead = self.lead_us();
+        let cursor = self.composer.cursor();
 
         // Column for a note's left edge on the highway, matching keyboard layout.
         let note_col = |note: u8| -> Option<u16> {
@@ -1558,10 +749,14 @@ impl EditScreen {
         self.draw_playhead(f, area, now, lead);
 
         // Pre-compute selection bounds so we can highlight selected notes.
-        let sel = self.selection_bounds();
+        let sel = self
+            .composer
+            .snapshot()
+            .selection
+            .map(|s| (s.pitch_lo, s.pitch_hi, s.us_lo, s.us_hi));
 
         // Timeline notes.
-        for span in build_spans(&self.history.current().to_events()) {
+        for span in build_spans(&self.timeline().to_events()) {
             let Some(rs) = project(&span, now, lead, area.height) else {
                 continue;
             };
@@ -1597,18 +792,14 @@ impl EditScreen {
         }
 
         // The cursor cell, on top of everything.
-        if let Some(col) = note_col(self.cursor.pitch) {
+        if let Some(col) = note_col(cursor.pitch) {
             let cur = NoteSpan {
-                note: self.cursor.pitch,
+                note: cursor.pitch,
                 start_us: self.cursor_us(),
                 end_us: self.cursor_us() + 1,
             };
             if let Some(rs) = project(&cur, now, lead, area.height) {
-                let cell_w = if is_black_key(self.cursor.pitch) {
-                    1
-                } else {
-                    w
-                };
+                let cell_w = if is_black_key(cursor.pitch) { 1 } else { w };
                 let y = area.y + rs.bottom_row;
                 let rect = Rect::new(col, y, cell_w, 1);
                 f.render_widget(
@@ -1782,31 +973,56 @@ impl Default for EditScreen {
     }
 }
 
-/// Returns `(need_on, need_off)`: span indices whose note_on / note_off should
-/// fire at `now_us` but haven't yet. Mirrors the same helper in `play.rs`.
-fn audition_pending_triggers(
-    spans: &[NoteSpan],
-    now_us: u64,
-    on_fired: &HashSet<usize>,
-    off_fired: &HashSet<usize>,
-) -> (Vec<usize>, Vec<usize>) {
-    let mut need_on = Vec::new();
-    let mut need_off = Vec::new();
-    for (i, span) in spans.iter().enumerate() {
-        if now_us >= span.start_us && !on_fired.contains(&i) {
-            need_on.push(i);
-        }
-        if now_us >= span.end_us && !off_fired.contains(&i) {
-            need_off.push(i);
-        }
-    }
-    (need_on, need_off)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keyboard::HIGHEST_MIDI;
     use ratatui::{backend::TestBackend, Terminal};
+
+    /// Count `AuditionNote` effects that turn a note on (velocity > 0).
+    fn count_note_ons(effects: &[Effect]) -> usize {
+        effects
+            .iter()
+            .filter(|e| matches!(e, Effect::AuditionNote { velocity, .. } if *velocity > 0))
+            .count()
+    }
+
+    /// Count `AuditionNote` effects that turn a note off (velocity 0 — the MIDI
+    /// note-off convention the composer emits for playback span ends).
+    fn count_note_offs(effects: &[Effect]) -> usize {
+        effects
+            .iter()
+            .filter(|e| matches!(e, Effect::AuditionNote { velocity, .. } if *velocity == 0))
+            .count()
+    }
+
+    /// The keymap seam in action: a representative key (`a`) resolves through
+    /// `key_to_action` to `Action::AddNote`, the `Composer` applies it and emits
+    /// an `Effect::AuditionNote`, and the screen consumes that effect (no synth
+    /// attached → a silent no-op) while the note lands.
+    #[test]
+    fn key_a_maps_to_add_note_and_audits() {
+        // Rebinding seam: `a` is bound to `AddNote`.
+        assert_eq!(key_to_action(KeyCode::Char('a')), Some(Action::AddNote));
+
+        // The composer gives that action meaning, auditioning the new note.
+        let mut composer = Composer::new();
+        let effects = composer.apply(Action::AddNote).expect("add_note applies");
+        assert!(
+            matches!(effects.as_slice(), [Effect::AuditionNote { .. }]),
+            "AddNote auditions the new note"
+        );
+
+        // End to end through the screen with no synth: the effect is consumed
+        // without panicking and the note is placed via the composer.
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('a'));
+        assert_eq!(
+            e.note_count(),
+            1,
+            "key `a` placed a note through the composer"
+        );
+    }
 
     fn note(pitch: u8, start_us: u64, dur_us: u64) -> Note {
         Note {
@@ -2285,8 +1501,7 @@ mod tests {
         let step = e.grid.step_us();
         for &p in &[60u8, 64, 67] {
             let id = e
-                .history
-                .current()
+                .timeline()
                 .find_at(p, e.cursor_us())
                 .expect("preview note present");
             let n = e.get_note(id).unwrap();
@@ -2516,8 +1731,7 @@ mod tests {
         let step = e.grid.step_us();
         for (i, &p) in [60u8, 62, 64].iter().enumerate() {
             let id = e
-                .history
-                .current()
+                .timeline()
                 .find_at(p, e.grid.us_of_step(i as u64))
                 .expect("note at consecutive step");
             let n = e.get_note(id).unwrap();
@@ -2587,8 +1801,7 @@ mod tests {
 
         assert_eq!(e.note_count(), 1);
         let id = e
-            .history
-            .current()
+            .timeline()
             .find_at(60, 0)
             .expect("note recorded at playhead");
         let n = e.get_note(id).unwrap();
@@ -2614,11 +1827,7 @@ mod tests {
         e.ingest(NoteEvent::off(pitch, 0));
 
         assert_eq!(e.note_count(), 1);
-        let id = e
-            .history
-            .current()
-            .find_at(67, step)
-            .expect("snapped to the step");
+        let id = e.timeline().find_at(67, step).expect("snapped to the step");
         let n = e.get_note(id).unwrap();
         assert_eq!(n.start_us, step, "start snapped to grid");
         assert_eq!(n.dur_us, step, "zero-length tap floored to one step");
@@ -2700,31 +1909,21 @@ mod tests {
         e.on_key(KeyCode::Char('P'));
         assert!(e.is_playing());
 
-        // Before start_us: no on-fired.
-        assert_eq!(e.audition_on_fired.len(), 0);
-
-        // Advance to just before the note.
-        e.advance(499_000);
-        e.tick_audition();
+        // Advance to just before the note: no note-on effect yet.
+        let fx = e.advance(499_000);
         assert_eq!(
-            e.audition_on_fired.len(),
+            count_note_ons(&fx),
             0,
             "note_on should not fire before start_us"
         );
 
-        // Advance past start_us.
-        e.advance(2_000);
-        e.tick_audition();
-        assert_eq!(
-            e.audition_on_fired.len(),
-            1,
-            "note_on should fire exactly once"
-        );
+        // Advance past start_us: the note-on fires exactly once.
+        let fx = e.advance(2_000);
+        assert_eq!(count_note_ons(&fx), 1, "note_on should fire exactly once");
 
-        // Advance again — still only fired once.
-        e.advance(10_000);
-        e.tick_audition();
-        assert_eq!(e.audition_on_fired.len(), 1, "note_on fires only once");
+        // Advance again — no further note-on.
+        let fx = e.advance(10_000);
+        assert_eq!(count_note_ons(&fx), 0, "note_on fires only once");
     }
 
     #[test]
@@ -2735,20 +1934,14 @@ mod tests {
 
         e.on_key(KeyCode::Char('P'));
 
-        // Advance past start (0); note_on fires.
-        e.advance(1_000);
-        e.tick_audition();
-        assert_eq!(e.audition_on_fired.len(), 1);
-        assert_eq!(e.audition_off_fired.len(), 0);
+        // Advance past start (0): note_on fires, no note_off yet.
+        let fx = e.advance(1_000);
+        assert_eq!(count_note_ons(&fx), 1);
+        assert_eq!(count_note_offs(&fx), 0);
 
-        // Advance past end (200_000); note_off fires.
-        e.advance(200_000);
-        e.tick_audition();
-        assert_eq!(
-            e.audition_off_fired.len(),
-            1,
-            "note_off should fire after dur_us"
-        );
+        // Advance past end (200_000): note_off fires.
+        let fx = e.advance(200_000);
+        assert_eq!(count_note_offs(&fx), 1, "note_off should fire after dur_us");
     }
 
     #[test]
@@ -2787,10 +1980,12 @@ mod tests {
         }
         e.on_key(KeyCode::Char(' ')); // play from cursor_us > 100_000
 
-        // Span at index 0 should be pre-marked as fired since end_us <= from_us.
-        assert!(
-            e.audition_on_fired.contains(&0),
-            "note ending before play start should be pre-skipped"
+        // The note ended before the play start, so advancing never sounds it.
+        let fx = e.advance(1_000_000);
+        assert_eq!(
+            count_note_ons(&fx),
+            0,
+            "a note ending before play start is pre-skipped"
         );
     }
 
@@ -3147,7 +2342,8 @@ mod tests {
         // Move cursor to a position that's valid in multiple subdivisions
         // At 120 BPM: Quarter=500000, Eighth=250000, Sixteenth=125000
         // Position at 250000 µs (2 steps in Sixteenth, 1 step in Eighth)
-        e.cursor.step = 2; // 2 * 125000 = 250000 µs
+        e.on_key(KeyCode::Char('l'));
+        e.on_key(KeyCode::Char('l')); // 2 * 125000 = 250000 µs
 
         // Change to Eighth (250000 µs = 1 step in Eighth)
         e.on_key(KeyCode::Char('<'));
