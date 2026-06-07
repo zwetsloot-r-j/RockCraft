@@ -25,3 +25,7 @@ target
 
 # Windows-side build output (native midir/TUI work; WSL uses /target)
 /target-win/
+
+# Output of `cargo run --example screenshot --features screenshot` (M4-H)
+/screenshot.png
+/render.txt
