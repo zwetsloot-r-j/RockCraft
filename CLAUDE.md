@@ -110,3 +110,6 @@ Step 0 complete: workspace scaffold, CI gate, this guide. Builds offline (no
 third-party deps yet). Next: **M0 "Echo"** — `midir` reads the piano, a
 `ratatui` view lists note events, and the session records to a `.mid`
 (re-playable via `midly`). Third-party deps are added then, not before.
+
+The WebSocket control interface for agent-driven editing is documented in
+[`docs/AGENT-CONTROL.md`](docs/AGENT-CONTROL.md).
