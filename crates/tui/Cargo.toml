@@ -15,6 +15,11 @@ path = "src/main.rs"
 name = "rockcraft_tui"
 path = "src/lib.rs"
 
+[features]
+# Optional visual-verification tier (M4-H).  Heavy image/font deps stay behind
+# this flag so the default `cargo build`/`cargo test` remain unaffected.
+screenshot = ["dep:image"]
+
 [dependencies]
 rockcraft-core.workspace = true
 rockcraft-midi.workspace = true
@@ -26,6 +31,8 @@ crossterm = "0.28"
 # The render/MIDI loop stays sync — it only ever `try_recv`s the channel; the
 # tokio runtime is confined to a dedicated server thread spawned in `main`.
 tokio = { workspace = true }
+# Optional screenshot deps (M4-H) — never pulled into the default build.
+image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
 
 [dev-dependencies]
 rockcraft-core.workspace = true
@@ -34,3 +41,7 @@ rockcraft-control.workspace = true
 crossterm = "0.28"
 tokio = { workspace = true }
 serde_json = { workspace = true }
+
+[[example]]
+name = "screenshot"
+required-features = ["screenshot"]
