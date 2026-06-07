@@ -1007,6 +1007,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rockcraft-control"
+version = "0.1.0"
+dependencies = [
+ "rockcraft-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rockcraft-core"
 version = "0.1.0"
 dependencies = [
