@@ -798,9 +798,10 @@ mod tests {
 
     // ── render_to_string (M4-G) ──────────────────────────────────────────────
 
-    /// `render_to_string` produces exactly `height` rows, each no wider than
-    /// `width`. Placing a note changes the dump, and the same state always
-    /// produces the same string (determinism).
+    /// `render_to_string` produces exactly `height` rows and is deterministic:
+    /// the same state always yields the same string. Moving the cursor (which
+    /// shifts the `█` marker to a different piano-key column) must change the
+    /// dump, proving that state changes propagate to the render.
     #[test]
     fn render_to_string_dimensions_and_determinism() {
         let w = 80u16;
@@ -811,25 +812,36 @@ mod tests {
         let (tx, rx) = mpsc::channel::<RemoteCommand>(16);
         shell.set_command_receiver(rx);
 
-        let before = shell.render_to_string(w, h);
-        let lines_before: Vec<&str> = before.split('\n').collect();
+        // Initial render: must have exactly h rows.
+        let initial = shell.render_to_string(w, h);
         assert_eq!(
-            lines_before.len(),
+            initial.split('\n').count(),
             h as usize,
             "must produce exactly h lines"
         );
 
-        // Add a note via the channel and re-render.
-        let (cmd, _) = remote(r#"{"type":"run_action","action":"add_note"}"#);
+        // Same state → identical string (determinism).
+        let initial2 = shell.render_to_string(w, h);
+        assert_eq!(initial, initial2, "render_to_string must be deterministic");
+
+        // Move cursor up one semitone: the cursor block shifts to a different
+        // piano-key column, so the render must change.
+        let (cmd, _) = remote(r#"{"type":"run_action","action":"cursor_up"}"#);
         tx.try_send(cmd).unwrap();
         shell.drain_remote_commands();
 
-        let after = shell.render_to_string(w, h);
-        assert_ne!(before, after, "adding a note must change the render dump");
+        let after_move = shell.render_to_string(w, h);
+        assert_ne!(
+            initial, after_move,
+            "cursor move must change the render dump"
+        );
 
-        // Same state → same string.
-        let after2 = shell.render_to_string(w, h);
-        assert_eq!(after, after2, "render_to_string must be deterministic");
+        // Still deterministic after the state change.
+        let after_move2 = shell.render_to_string(w, h);
+        assert_eq!(
+            after_move, after_move2,
+            "render_to_string must be deterministic after state change"
+        );
     }
 
     /// `render_to_string` returns non-empty text that includes at least one
