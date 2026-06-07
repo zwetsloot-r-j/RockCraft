@@ -15,7 +15,7 @@ use ratatui::{
     Frame, Terminal,
 };
 use rockcraft_audio::SynthHandle;
-use rockcraft_control::{RemoteCommand, Request, Response};
+use rockcraft_control::{QueryKind, RemoteCommand, Request, Response};
 use rockcraft_core::{Grid, Key, RecordingMeta, Scale, Timeline};
 use rockcraft_midi::{smf_bytes_to_events, NoteSource};
 use tokio::sync::mpsc;
@@ -65,6 +65,10 @@ pub struct Shell {
     /// when no `--control` server was started (the default). The render/MIDI
     /// loop never awaits this — it only polls it.
     commands: Option<mpsc::Receiver<RemoteCommand>>,
+    /// Last known terminal dimensions, updated each frame in the run loop.
+    /// Used by `render_to_string` when no explicit size is given. Falls back to
+    /// 80×24 in headless / test contexts where the run loop never fires.
+    terminal_size: (u16, u16),
 }
 
 impl Shell {
@@ -84,6 +88,7 @@ impl Shell {
             should_quit: false,
             backing_path,
             commands: None,
+            terminal_size: (80, 24),
         }
     }
 
@@ -98,6 +103,31 @@ impl Shell {
     /// Render the current state into a frame. Useful for headless tests.
     pub fn render(&self, f: &mut ratatui::Frame) {
         draw(f, self);
+    }
+
+    /// Render the app's current view into an off-screen `TestBackend` of the
+    /// given size and flatten the buffer to text: one line per row, trailing
+    /// blanks trimmed, rows joined by `\n`.
+    pub fn render_to_string(&self, width: u16, height: u16) -> String {
+        use ratatui::backend::TestBackend;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("TestBackend init");
+        terminal
+            .draw(|f| draw(f, self))
+            .expect("render_to_string draw");
+        let buf = terminal.backend().buffer();
+        let content = buf.content();
+        let w = width as usize;
+        (0..height as usize)
+            .map(|row| {
+                let row_str: String = content[row * w..(row + 1) * w]
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect();
+                row_str.trim_end().to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn menu_move(&mut self, delta: isize) {
@@ -277,10 +307,23 @@ impl Shell {
 
     /// Apply one remote [`Request`] against the composer the app owns.
     ///
-    /// The composer lives inside the edit screen (post M4-C), so requests are
-    /// served only while editing; outside it, the request is rejected with an
-    /// error that echoes the request id rather than mutating anything.
+    /// `Query::Render` is intercepted here and rendered from the full shell
+    /// (not just the composer) using the last known terminal size. All other
+    /// requests are forwarded to the active screen; outside the editor they are
+    /// rejected with an error echoing the request id.
     fn handle_remote(&mut self, req: Request) -> Response {
+        // Render queries need the shell, not just the composer.
+        if let Request::Query {
+            id,
+            what: QueryKind::Render,
+        } = &req
+        {
+            let (w, h) = self.terminal_size;
+            return Response::Render {
+                id: *id,
+                text: self.render_to_string(w, h),
+            };
+        }
         match &mut self.screen {
             Screen::Edit(edit) => edit.apply_remote(req),
             _ => Response::Err {
@@ -398,7 +441,8 @@ pub fn run_loop<B: ratatui::backend::Backend>(
             }
         }
 
-        terminal.draw(|f| draw(f, shell))?;
+        let completed = terminal.draw(|f| draw(f, shell))?;
+        shell.terminal_size = (completed.area.width, completed.area.height);
 
         if let Some(code) = keys.poll_key(Duration::from_millis(16))? {
             shell.on_key(code);
@@ -750,5 +794,110 @@ mod tests {
 
         assert_eq!(loaded_grid, grid, "grid must round-trip through meta.json");
         assert_eq!(loaded_key, key, "key must round-trip through meta.json");
+    }
+
+    // ── render_to_string (M4-G) ──────────────────────────────────────────────
+
+    /// `render_to_string` produces exactly `height` rows and is deterministic:
+    /// the same state always yields the same string. Moving the cursor (which
+    /// shifts the `█` marker to a different piano-key column) must change the
+    /// dump, proving that state changes propagate to the render.
+    #[test]
+    fn render_to_string_dimensions_and_determinism() {
+        let w = 80u16;
+        let h = 24u16;
+
+        let mut shell = make_shell();
+        shell.activate_edit();
+        let (tx, rx) = mpsc::channel::<RemoteCommand>(16);
+        shell.set_command_receiver(rx);
+
+        // Initial render: must have exactly h rows.
+        let initial = shell.render_to_string(w, h);
+        assert_eq!(
+            initial.split('\n').count(),
+            h as usize,
+            "must produce exactly h lines"
+        );
+
+        // Same state → identical string (determinism).
+        let initial2 = shell.render_to_string(w, h);
+        assert_eq!(initial, initial2, "render_to_string must be deterministic");
+
+        // Move cursor up one semitone: the cursor block shifts to a different
+        // piano-key column, so the render must change.
+        let (cmd, _) = remote(r#"{"type":"run_action","action":"cursor_up"}"#);
+        tx.try_send(cmd).unwrap();
+        shell.drain_remote_commands();
+
+        let after_move = shell.render_to_string(w, h);
+        assert_ne!(
+            initial, after_move,
+            "cursor move must change the render dump"
+        );
+
+        // Still deterministic after the state change.
+        let after_move2 = shell.render_to_string(w, h);
+        assert_eq!(
+            after_move, after_move2,
+            "render_to_string must be deterministic after state change"
+        );
+    }
+
+    /// `render_to_string` returns non-empty text that includes at least one
+    /// non-space character (the keyboard row / border), even from the menu.
+    #[test]
+    fn render_to_string_non_empty_from_menu() {
+        let shell = make_shell(); // stays on menu
+        let text = shell.render_to_string(80, 24);
+        assert!(
+            text.chars().any(|c| !c.is_whitespace()),
+            "render dump must contain at least one non-space character"
+        );
+    }
+
+    /// Through the channel harness: `query state` reflects added notes and
+    /// `query render` returns non-empty text with the right number of rows.
+    #[test]
+    fn remote_query_state_and_render() {
+        let mut shell = make_shell();
+        shell.activate_edit();
+        let (tx, rx) = mpsc::channel::<RemoteCommand>(16);
+        shell.set_command_receiver(rx);
+
+        // Add two notes via remote commands.
+        let (c1, _) = remote(r#"{"type":"run_action","action":"add_note"}"#);
+        let (c2, _) = remote(r#"{"type":"run_action","action":"cursor_right"}"#);
+        let (c3, _) = remote(r#"{"type":"run_action","action":"add_note"}"#);
+        tx.try_send(c1).unwrap();
+        tx.try_send(c2).unwrap();
+        tx.try_send(c3).unwrap();
+        shell.drain_remote_commands();
+
+        // query state — snapshot must list the two notes.
+        let (cmd, mut reply_rx) = remote(r#"{"type":"query","what":"State"}"#);
+        tx.try_send(cmd).expect("queue state query");
+        shell.drain_remote_commands();
+        let resp = reply_rx.try_recv().expect("state reply");
+        assert_eq!(snapshot_note_count(&resp), 2, "state query sees both notes");
+
+        // query render — text must be non-empty and have exactly h rows.
+        // Shell defaults to 80×24 before any run-loop frame fires.
+        let h = 24u16;
+        let (cmd, mut reply_rx) = remote(r#"{"type":"query","what":"Render"}"#);
+        tx.try_send(cmd).expect("queue render query");
+        shell.drain_remote_commands();
+        match reply_rx.try_recv().expect("render reply") {
+            Response::Render { text, .. } => {
+                assert!(!text.is_empty(), "render query must return non-empty text");
+                let lines: Vec<&str> = text.split('\n').collect();
+                assert_eq!(
+                    lines.len(),
+                    h as usize,
+                    "render text must have exactly h={h} rows"
+                );
+            }
+            other => panic!("expected Render response, got {other:?}"),
+        }
     }
 }
