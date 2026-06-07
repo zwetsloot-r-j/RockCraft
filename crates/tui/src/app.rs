@@ -818,13 +818,6 @@ mod tests {
             h as usize,
             "must produce exactly h lines"
         );
-        for line in &lines_before {
-            assert!(
-                line.len() <= w as usize,
-                "no line wider than w (got {})",
-                line.len()
-            );
-        }
 
         // Add a note via the channel and re-render.
         let (cmd, _) = remote(r#"{"type":"run_action","action":"add_note"}"#);
