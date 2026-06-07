@@ -15,8 +15,10 @@ use ratatui::{
     Frame, Terminal,
 };
 use rockcraft_audio::SynthHandle;
+use rockcraft_control::{RemoteCommand, Request, Response};
 use rockcraft_core::{Grid, Key, RecordingMeta, Scale, Timeline};
 use rockcraft_midi::{smf_bytes_to_events, NoteSource};
+use tokio::sync::mpsc;
 
 use crate::backing::{BackingPicker, PickerOutcome};
 use crate::edit::EditScreen;
@@ -58,6 +60,11 @@ pub struct Shell {
     should_quit: bool,
     /// Optional backing track path forwarded to each new `RecordScreen`.
     backing_path: Option<PathBuf>,
+    /// Inbound remote commands from the control server, if one is running.
+    /// Drained once per run-loop iteration with non-blocking `try_recv`; `None`
+    /// when no `--control` server was started (the default). The render/MIDI
+    /// loop never awaits this — it only polls it.
+    commands: Option<mpsc::Receiver<RemoteCommand>>,
 }
 
 impl Shell {
@@ -76,7 +83,16 @@ impl Shell {
             status: String::new(),
             should_quit: false,
             backing_path,
+            commands: None,
         }
+    }
+
+    /// Attach the receiving half of the control-server command channel. Called
+    /// by [`run`] when `--control` is enabled; the run loop then drains it each
+    /// iteration. Kept off the `new` signature so existing callers/tests are
+    /// unaffected.
+    pub fn set_command_receiver(&mut self, rx: mpsc::Receiver<RemoteCommand>) {
+        self.commands = Some(rx);
     }
 
     /// Render the current state into a frame. Useful for headless tests.
@@ -237,6 +253,43 @@ impl Shell {
         }
     }
 
+    /// Drain every queued remote command and apply it, in receive order.
+    ///
+    /// Non-blocking: `try_recv` until the channel is empty, so the render/MIDI
+    /// loop never stalls on the socket. Commands are collected first (to release
+    /// the borrow on `self.commands`) then applied in order, each replying over
+    /// its own oneshot with the post-edit snapshot. A no-op when no control
+    /// server is attached.
+    pub(crate) fn drain_remote_commands(&mut self) {
+        let mut pending = Vec::new();
+        if let Some(rx) = self.commands.as_mut() {
+            // `try_recv` returns Empty (stop) or Disconnected (also stop).
+            while let Ok(cmd) = rx.try_recv() {
+                pending.push(cmd);
+            }
+        }
+        for cmd in pending {
+            let response = self.handle_remote(cmd.req);
+            // The client may have gone away; a failed reply is not fatal.
+            let _ = cmd.reply.send(response);
+        }
+    }
+
+    /// Apply one remote [`Request`] against the composer the app owns.
+    ///
+    /// The composer lives inside the edit screen (post M4-C), so requests are
+    /// served only while editing; outside it, the request is rejected with an
+    /// error that echoes the request id rather than mutating anything.
+    fn handle_remote(&mut self, req: Request) -> Response {
+        match &mut self.screen {
+            Screen::Edit(edit) => edit.apply_remote(req),
+            _ => Response::Err {
+                id: req.id(),
+                error: "unavailable: open the editor to accept control commands".into(),
+            },
+        }
+    }
+
     /// Name of the currently active screen — for assertions in tests.
     pub fn screen_name(&self) -> &'static str {
         match &self.screen {
@@ -261,17 +314,22 @@ impl Shell {
 /// Run the app shell until the user quits.
 ///
 /// If `start_edit` is true the shell boots directly into the composer (the
-/// `--edit` flag in `main.rs`), bypassing the menu.
+/// `--edit` flag in `main.rs`), bypassing the menu. When `commands` is `Some`,
+/// the loop also drains remote control commands from the control server.
 pub fn run(
     input: Box<dyn NoteSource>,
     synth: Option<SynthHandle>,
     backing_path: Option<PathBuf>,
     start_edit: bool,
+    commands: Option<mpsc::Receiver<RemoteCommand>>,
 ) -> io::Result<()> {
     let mut terminal = ratatui::init();
     let mut shell = Shell::new(input, synth, backing_path);
     if start_edit {
         shell.activate_edit();
+    }
+    if let Some(rx) = commands {
+        shell.set_command_receiver(rx);
     }
     let mut keys = CrosstermKeys;
     let res = run_loop(&mut terminal, &mut shell, &mut keys);
@@ -287,6 +345,10 @@ pub fn run_loop<B: ratatui::backend::Backend>(
     keys: &mut dyn KeySource,
 ) -> io::Result<()> {
     loop {
+        // Apply any remote control commands first, so a remote edit and a
+        // keypress in the same frame both land before this iteration's redraw.
+        shell.drain_remote_commands();
+
         // Drain MIDI and route to the active screen. Clone the synth handle out
         // first so we don't hold a borrow of `shell` across the screen match.
         let synth = shell.synth.clone();
@@ -481,6 +543,7 @@ mod tests {
     use super::*;
     use rockcraft_core::{Grid, Key, MidiNote, Note, Scale, Timeline, Velocity};
     use rockcraft_midi::ScriptedSource;
+    use tokio::sync::oneshot;
 
     fn make_note(pitch: u8, start: u64, dur: u64) -> Note {
         Note {
@@ -547,6 +610,108 @@ mod tests {
             expected_count,
             "editor is pre-populated with the saved notes"
         );
+    }
+
+    // ── control-server wiring (M4-F) ─────────────────────────────────────
+
+    /// Build a `RemoteCommand` from a wire-format JSON request, returning it
+    /// alongside the oneshot receiver that will carry its response.
+    fn remote(json: &str) -> (RemoteCommand, oneshot::Receiver<Response>) {
+        let req: Request = serde_json::from_str(json).expect("valid request json");
+        let (reply, reply_rx) = oneshot::channel();
+        (RemoteCommand { req, reply }, reply_rx)
+    }
+
+    /// Note count carried by an `Ok` response's snapshot.
+    fn snapshot_note_count(resp: &Response) -> usize {
+        match resp {
+            Response::Ok {
+                state: Some(snap), ..
+            } => snap.notes.len(),
+            other => panic!("expected Ok with state, got {other:?}"),
+        }
+    }
+
+    /// A remote `add_note` and a scripted keypress edit converge on the same
+    /// `Composer`: the note count reflects both, and a follow-up `query state`
+    /// returns the merged snapshot.
+    #[test]
+    fn remote_and_keypress_converge_on_one_composer() {
+        let mut shell = make_shell();
+        shell.activate_edit();
+        let (tx, rx) = mpsc::channel::<RemoteCommand>(16);
+        shell.set_command_receiver(rx);
+
+        // Remote add at the default cursor (middle C, step 0).
+        let (cmd, mut reply_rx) = remote(r#"{"type":"run_action","action":"add_note"}"#);
+        tx.try_send(cmd).expect("queue remote add");
+        shell.drain_remote_commands();
+        let resp = reply_rx.try_recv().expect("remote reply");
+        assert_eq!(snapshot_note_count(&resp), 1, "remote add lands");
+        assert_eq!(shell.edit_note_count(), Some(1));
+
+        // Keyboard add at a fresh cell (move right, then add).
+        shell.on_key(KeyCode::Char('l'));
+        shell.on_key(KeyCode::Char('a'));
+        assert_eq!(shell.edit_note_count(), Some(2), "keypress add lands too");
+
+        // A remote state query sees the merged result of both surfaces.
+        let (cmd, mut reply_rx) = remote(r#"{"type":"query","what":"State"}"#);
+        tx.try_send(cmd).expect("queue query");
+        shell.drain_remote_commands();
+        let resp = reply_rx.try_recv().expect("query reply");
+        assert_eq!(
+            snapshot_note_count(&resp),
+            2,
+            "query reflects remote + keypress edits"
+        );
+    }
+
+    /// Commands queued before a single drain apply in receive order, and each
+    /// oneshot reply carries that command's own post-edit snapshot.
+    #[test]
+    fn interleaved_commands_apply_in_receive_order() {
+        let mut shell = make_shell();
+        shell.activate_edit();
+        let (tx, rx) = mpsc::channel::<RemoteCommand>(16);
+        shell.set_command_receiver(rx);
+
+        // add_note (→1), cursor_right (still 1), add_note (→2): one drain.
+        let (c1, mut r1) = remote(r#"{"type":"run_action","action":"add_note"}"#);
+        let (c2, mut r2) = remote(r#"{"type":"run_action","action":"cursor_right"}"#);
+        let (c3, mut r3) = remote(r#"{"type":"run_action","action":"add_note"}"#);
+        tx.try_send(c1).unwrap();
+        tx.try_send(c2).unwrap();
+        tx.try_send(c3).unwrap();
+
+        shell.drain_remote_commands();
+
+        // Replies carry each step's post-edit snapshot, proving in-order apply.
+        assert_eq!(snapshot_note_count(&r1.try_recv().unwrap()), 1);
+        assert_eq!(snapshot_note_count(&r2.try_recv().unwrap()), 1);
+        assert_eq!(snapshot_note_count(&r3.try_recv().unwrap()), 2);
+        assert_eq!(shell.edit_note_count(), Some(2));
+    }
+
+    /// A remote command received while not in the editor is rejected (not
+    /// applied) and the error echoes the request id.
+    #[test]
+    fn remote_command_outside_editor_is_rejected() {
+        let mut shell = make_shell(); // stays on the menu
+        let (tx, rx) = mpsc::channel::<RemoteCommand>(4);
+        shell.set_command_receiver(rx);
+
+        let (cmd, mut reply_rx) = remote(r#"{"type":"run_action","id":9,"action":"add_note"}"#);
+        tx.try_send(cmd).expect("queue remote add");
+        shell.drain_remote_commands();
+
+        match reply_rx.try_recv().expect("reply") {
+            Response::Err { id, error } => {
+                assert_eq!(id, Some(9), "error echoes the request id");
+                assert!(error.starts_with("unavailable:"), "got {error}");
+            }
+            other => panic!("expected Err, got {other:?}"),
+        }
     }
 
     /// Saving a composition with a custom grid and key, then loading it via
