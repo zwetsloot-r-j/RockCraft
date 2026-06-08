@@ -30,5 +30,14 @@ target
 /screenshot.png
 /render.txt
 
-# M6 video-import output — extracted charts are never committed (M6-B)
-/import-out/
+# Imported content — the TOOL is shared, the songs are NOT. Never commit these.
+/import-out/           # extracted .mid chart bundles (M6-A output root)
+/import-cache/         # downloaded / fetched source media
+/scripts/local/        # private, machine-local fetch wrapper (yt-dlp etc.)
+*.mp4
+*.mkv
+*.webm
+*.mov
+*.m4a
+# audio: *.mp3 *.wav *.ogg *.flac are kept out of glob to allow curated fixtures/;
+# the CI guard enforces the boundary — only fixtures/ may contain tracked audio/.mid
