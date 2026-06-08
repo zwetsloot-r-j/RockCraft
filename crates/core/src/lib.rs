@@ -22,7 +22,9 @@ pub mod stats;
 pub mod timeline;
 pub mod wait;
 
-pub use action::{action_from_name, action_names, Action, ActionError, Effect};
+pub use action::{
+    action_from_name, action_help, action_names, Action, ActionError, ActionInfo, Effect, ParamInfo,
+};
 pub use buffer::EventBuffer;
 pub use chord::{ChordKind, Key, Scale};
 pub use composer::{Composer, ComposerSnapshot, Cursor, InputMode, NoteView, SelectionView};

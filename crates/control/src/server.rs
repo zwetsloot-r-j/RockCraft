@@ -25,7 +25,7 @@ use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
 use rockcraft_core::Composer;
 
-use crate::protocol::{handle, Request, Response};
+use crate::protocol::{handle, hello, Request, Response};
 
 /// A localhost-only WebSocket control server over the M4-D protocol.
 ///
@@ -110,6 +110,11 @@ async fn handle_connection(
 ) -> Result<(), WsError> {
     let ws = tokio_tungstenite::accept_async(stream).await?;
     let (mut write, mut read) = ws.split();
+
+    // Greet the client before it sends anything: the banner advertises the
+    // protocol verbs and that `query help` enumerates every action.
+    let banner = serde_json::to_string(&hello()).expect("hello banner serialises");
+    write.send(Message::Text(banner)).await?;
 
     while let Some(msg) = read.next().await {
         match msg? {

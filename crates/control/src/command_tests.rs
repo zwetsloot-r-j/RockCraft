@@ -65,7 +65,14 @@ mod tests {
             .expect("send");
         loop {
             match ws.next().await.expect("a reply").expect("no ws error") {
-                Message::Text(t) => return serde_json::from_str(&t).expect("reply is json"),
+                Message::Text(t) => {
+                    let v: Value = serde_json::from_str(&t).expect("reply is json");
+                    // Skip unsolicited server frames (connect banner, async events).
+                    if v["type"] == "hello" || v["type"] == "event" {
+                        continue;
+                    }
+                    return v;
+                }
                 _ => continue,
             }
         }

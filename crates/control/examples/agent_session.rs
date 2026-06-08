@@ -54,11 +54,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let req_str = req.to_string();
         write.send(Message::Text(req_str)).await?;
 
-        // Read response - wait for next text message
+        // Read response - wait for next text message, skipping unsolicited
+        // server frames (the connect banner and any async events).
         while let Some(msg) = read.next().await {
             match msg? {
                 Message::Text(text) => {
-                    return Ok(serde_json::from_str(&text)?);
+                    let value: serde_json::Value = serde_json::from_str(&text)?;
+                    if value["type"] == "hello" || value["type"] == "event" {
+                        continue;
+                    }
+                    return Ok(value);
                 }
                 Message::Ping(_) => continue,
                 Message::Close(_) => return Err("connection closed".into()),
