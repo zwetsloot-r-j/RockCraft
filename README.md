@@ -25,7 +25,7 @@ in `.github/workflows/ci.yml` — run them before opening a PR.
 ```sh
 cargo run -p rockcraft-tui                     # connect to piano (port "casio")
 cargo run -p rockcraft-tui -- <port-substr>    # match a different MIDI port name
-cargo run -p rockcraft-tui -- --mock           # no piano: play with the QWERTY keys
+cargo run -p rockcraft-tui -- --mock           # no piano: play with the number row (1-0)
 cargo run -p rockcraft-tui -- <port> <backing.wav>  # play a backing track while recording
 ```
 
@@ -39,8 +39,9 @@ device is available it runs silently.
 | Screen | Keys |
 | --- | --- |
 | Menu | `↑`/`k` `↓`/`j` move · `Enter` select · `q`/`Esc` quit |
-| Record | type/play notes · `s` save take · `Tab`/`Esc` back to menu |
+| Record | play notes (mock: number row `1`-`0` = C-major) · `s` save take · `Tab`/`Esc` back to menu |
 | Play | `r` restart · `m` toggle hear song · `Tab`/`Esc` back to menu |
+| Edit | letters/symbols = editor commands · `R` arm record, then number row `1`-`0` plays notes · `?` help |
 
 Menu items: **Record**, **Play last recording**, **Quit**. Recordings are saved
 as `recordings/take-*/song.mid`; "Play last recording" loads the most recent.

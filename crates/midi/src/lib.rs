@@ -17,5 +17,5 @@ pub mod source;
 
 pub use file::{events_to_smf_bytes, smf_bytes_to_events, MidiFileError};
 pub use live::{parse_note_message, LiveInput, LiveInputError};
-pub use mock::{MockKeyboard, ScriptedSource};
+pub use mock::{key_map, MockKeyboard, ScriptedSource};
 pub use source::NoteSource;

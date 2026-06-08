@@ -54,10 +54,12 @@ impl MockKeyboard {
 }
 ```
 
-- Keyboard→note map: tracker/FL-style over ~two octaves starting at C4 (note 60).
-  White keys `a s d f g h j k l ;` → C D E F G A B C D E; black keys
-  `w e t y u o p` → the sharps in between. Spell the exact map in code with a
-  comment; pin it in tests.
+- Keyboard→note map: the **number row** `1 2 3 4 5 6 7 8 9 0` → a C-major
+  (white-key) scale C D E F G A B C D E from C4 (note 60). Spell the exact map in
+  code with a comment; pin it in tests. (Updated by #124: the original home-row
+  `a s d f …` map collided with the editor's letter command keys; the digit row
+  is disjoint from those commands. Shift is avoided — crossterm delivers `Shift+1`
+  as `!` — so the plain digit row is the distinguishable choice.)
 - Terminals don't reliably deliver key **release**, so each `press` enqueues a
   note-on at `now_us` and a note-off at `now_us + SUSTAIN_MS*1000`
   (`SUSTAIN_MS` ≈ 120). `events()` returns only events whose timestamp has
@@ -88,7 +90,7 @@ frame, not by calling screen methods directly.
 
 In `crates/midi` (headless, no hardware):
 
-- `press('a')` returns `Some(C4=60)`; an unmapped key returns `None`.
+- `press('1')` returns `Some(C4=60)`; an unmapped key (e.g. a letter) returns `None`.
 - After a `press`, `events()` eventually yields a note-on then a note-off for
   the same pitch (drive/inspect via the clock or a small seam); the off
   timestamp is `SUSTAIN_MS` after the on.

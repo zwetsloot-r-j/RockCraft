@@ -20,38 +20,47 @@ const SUSTAIN_MS: u64 = 120;
 /// Velocity stamped on mock note-ons (a firm-but-not-max strike).
 const MOCK_VELOCITY: u8 = 80;
 
-/// Keyboard → MIDI note map, tracker/FL-style over ~two octaves from C4 (60).
-///
-/// Home row is the white keys; the QWERTY row sits the black keys in the gaps:
+/// Keyboard → MIDI note map: the **number row** plays a C-major (white-key)
+/// scale spanning just over an octave, from middle C (60):
 ///
 /// ```text
-///   w   e       t   y   u       o   p
-/// a   s   d   f   g   h   j   k   l   ;
-/// C   D   E   F   G   A   B   C   D   E      (octave 4 → 5)
+///   1   2   3   4   5   6   7   8   9   0
+///   C4  D4  E4  F4  G4  A4  B4  C5  D5  E5
+///   60  62  64  65  67  69  71  72  74  76
 /// ```
+///
+/// **Why the number row, and not the home row?** In the composer the letter
+/// keys are *editor commands* (`a` adds a note, `d` deletes, `s` saves, `hjkl`
+/// navigate…), so a letter-based note map collides with editing — the confusion
+/// reported in #124. Digits are unbound in the editor's normal mode, so notes on
+/// the number row stay clear of the command keys. Shift is deliberately avoided:
+/// crossterm delivers `Shift+1` as `'!'`, not `'1'`, so a shifted scheme would be
+/// indistinguishable from the symbols; the plain digit row sidesteps that.
+///
+/// White keys only — this is a no-piano development aid, not a substitute for the
+/// real keyboard; play a piano for accidentals and full range.
 ///
 /// Keys not in this table are unmapped (`press` returns `None`). Pinned in tests.
 const KEY_MAP: &[(char, u8)] = &[
-    // White keys: C4 D4 E4 F4 G4 A4 B4 C5 D5 E5.
-    ('a', 60),
-    ('s', 62),
-    ('d', 64),
-    ('f', 65),
-    ('g', 67),
-    ('h', 69),
-    ('j', 71),
-    ('k', 72),
-    ('l', 74),
-    (';', 76),
-    // Black keys: C#4 D#4 F#4 G#4 A#4 C#5 D#5.
-    ('w', 61),
-    ('e', 63),
-    ('t', 66),
-    ('y', 68),
-    ('u', 70),
-    ('o', 73),
-    ('p', 75),
+    ('1', 60), // C4
+    ('2', 62), // D4
+    ('3', 64), // E4
+    ('4', 65), // F4
+    ('5', 67), // G4
+    ('6', 69), // A4
+    ('7', 71), // B4
+    ('8', 72), // C5
+    ('9', 74), // D5
+    ('0', 76), // E5
 ];
+
+/// The mock keyboard's key → MIDI-note table (the number-row C-major scale).
+///
+/// Exposed so a frontend can render an accurate, drift-proof legend from the
+/// single source of truth instead of duplicating the mapping in view code.
+pub fn key_map() -> &'static [(char, u8)] {
+    KEY_MAP
+}
 
 /// Look up the MIDI note a key maps to, if any.
 fn key_to_note(key: char) -> Option<MidiNote> {
@@ -208,22 +217,25 @@ mod tests {
     // -- MockKeyboard tests ---------------------------------------------------
 
     #[test]
-    fn press_a_is_middle_c() {
+    fn press_1_is_middle_c() {
         let mut kb = MockKeyboard::new();
-        assert_eq!(kb.press('a').map(|n| n.value()), Some(60));
+        assert_eq!(kb.press('1').map(|n| n.value()), Some(60));
     }
 
     #[test]
     fn unmapped_key_returns_none() {
         let mut kb = MockKeyboard::new();
+        // Letters are editor commands, not notes — they must stay unmapped so
+        // note-entry and command-entry don't collide (#124).
         assert_eq!(kb.press('z'), None);
-        assert_eq!(kb.press('1'), None);
+        assert_eq!(kb.press('a'), None);
+        assert_eq!(kb.press('s'), None);
     }
 
     #[test]
     fn press_enqueues_on_then_off_sustain_apart() {
         let mut kb = MockKeyboard::new();
-        kb.press_at('a', 1_000);
+        kb.press_at('1', 1_000);
 
         // Nothing is due before the on-stamp.
         assert!(kb.drain_until(999).is_empty());
@@ -248,24 +260,18 @@ mod tests {
     #[test]
     fn keymap_is_pinned() {
         let mut kb = MockKeyboard::new();
+        // The number row, left to right, is the C-major scale from middle C.
         let expected: &[(char, u8)] = &[
-            ('a', 60),
-            ('w', 61),
-            ('s', 62),
-            ('e', 63),
-            ('d', 64),
-            ('f', 65),
-            ('t', 66),
-            ('g', 67),
-            ('y', 68),
-            ('h', 69),
-            ('u', 70),
-            ('j', 71),
-            ('k', 72),
-            ('o', 73),
-            ('l', 74),
-            ('p', 75),
-            (';', 76),
+            ('1', 60), // C4
+            ('2', 62), // D4
+            ('3', 64), // E4
+            ('4', 65), // F4
+            ('5', 67), // G4
+            ('6', 69), // A4
+            ('7', 71), // B4
+            ('8', 72), // C5
+            ('9', 74), // D5
+            ('0', 76), // E5
         ];
         for (key, note) in expected {
             assert_eq!(
@@ -277,11 +283,34 @@ mod tests {
     }
 
     #[test]
+    fn key_map_getter_matches_press() {
+        // The exported table is the same source of truth `press` consults, so a
+        // legend built from it can never drift from the actual behaviour.
+        let mut kb = MockKeyboard::new();
+        for (key, note) in key_map() {
+            assert_eq!(kb.press(*key).map(|n| n.value()), Some(*note));
+        }
+    }
+
+    #[test]
+    fn key_map_is_a_white_key_c_major_scale() {
+        // Every mapped pitch is a white key (no accidentals): pitch-class is one
+        // of C D E F G A B.
+        const WHITE_PCS: [u8; 7] = [0, 2, 4, 5, 7, 9, 11];
+        for (_, note) in key_map() {
+            assert!(
+                WHITE_PCS.contains(&(note % 12)),
+                "note {note} is not a white key"
+            );
+        }
+    }
+
+    #[test]
     fn events_drain_in_timestamp_order() {
         let mut kb = MockKeyboard::new();
         // Two presses; the second's on lands before the first's off.
-        kb.press_at('a', 0);
-        kb.press_at('s', 10_000);
+        kb.press_at('1', 0);
+        kb.press_at('2', 10_000);
 
         let all = kb.drain_until(1_000_000);
         let stamps: Vec<u64> = all.iter().map(|e| e.timestamp_us).collect();
