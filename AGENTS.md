@@ -5,6 +5,13 @@
   same commit.
 -->
 
+<!--
+  CANONICAL AGENT INSTRUCTIONS.
+  Keep CLAUDE.md and AGENTS.md byte-for-byte identical — Claude reads CLAUDE.md,
+  Mistral Vibe reads AGENTS.md. If you edit one, mirror it to the other in the
+  same commit.
+-->
+
 # RockCraft — agent guide
 
 RockCraft helps people learn songs on a USB-MIDI digital piano: a scrolling
@@ -40,6 +47,13 @@ Invariants:
 - The merge gate is `.github/workflows/ci.yml`: `cargo fmt --all --check`,
   `cargo clippy --workspace --all-targets` (warnings are errors), and
   `cargo test --workspace`. Run all three locally before opening a PR.
+- **System deps (one-time):** the `audio`/`tui` crates link ALSA via `alsa-sys`
+  (rodio/midir). Without the dev headers, `cargo build`/`test` aborts in
+  `alsa-sys`'s build script with `pkg-config exited with status code 1 … Package
+  alsa was not found` — this is a missing system library, not a code bug. Fix it
+  once with `./scripts/setup-dev.sh` (or `sudo apt-get install -y libasound2-dev
+  pkg-config`); CI runs the same step. Pure `core` work needs none of this —
+  scope to `cargo test -p rockcraft-core`.
 - One crate per task where possible — the workspace makes crates independent so
   parallel agents don't collide.
 - Branch naming: humans `feat/*` etc.; Claude agents `claude/*`; Vibe agents
@@ -103,3 +117,24 @@ Step 0 complete: workspace scaffold, CI gate, this guide. Builds offline (no
 third-party deps yet). Next: **M0 "Echo"** — `midir` reads the piano, a
 `ratatui` view lists note events, and the session records to a `.mid`
 (re-playable via `midly`). Third-party deps are added then, not before.
+
+## Driving a running instance (agent control)
+
+A running RockCraft exposes a **localhost WebSocket control interface** so an
+agent can edit the composer programmatically — the same `core::Action`s the
+keyboard triggers. To drive it:
+
+1. **Start it.** `cargo run --bin rockcraft-tui -- --control`. The bound address
+   is printed to **stderr** (`Control server listening on ws://127.0.0.1:<PORT>`).
+   For a known, stable address, pin it — this also enables the server, so
+   `--control` is then optional: `ROCKCRAFT_CONTROL_ADDR=127.0.0.1:9001`.
+2. **Connect** a WebSocket client to `ws://127.0.0.1:<PORT>`. The server greets
+   you with an unsolicited `hello` banner naming the request verbs and the query
+   kinds.
+3. **Discover, then act.** Send `{"type":"query","what":"Help"}` first — it
+   returns every action with its parameter schema and a description (the live,
+   drift-proof catalog). Then `run_action` and read back the `state` snapshot.
+
+Full protocol reference: [`docs/AGENT-CONTROL.md`](docs/AGENT-CONTROL.md). A
+guided session exercising every action, with the equivalent TUI keystroke per
+beat, is in [`docs/DEMO-SCENARIO.md`](docs/DEMO-SCENARIO.md).

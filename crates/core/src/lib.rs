@@ -16,21 +16,25 @@ pub mod composer;
 pub mod events;
 pub mod grid;
 pub mod history;
+pub mod play_clock;
 pub mod scoring;
 pub mod song;
 pub mod stats;
 pub mod timeline;
 pub mod wait;
 
-pub use action::{action_from_name, action_names, Action, ActionError, Effect};
+pub use action::{
+    action_from_name, action_help, action_names, Action, ActionError, ActionInfo, Effect, ParamInfo,
+};
 pub use buffer::EventBuffer;
 pub use chord::{ChordKind, Key, Scale};
 pub use composer::{Composer, ComposerSnapshot, Cursor, InputMode, NoteView, SelectionView};
 pub use events::{MidiNote, NoteEvent, NoteEventKind, Velocity};
 pub use grid::{Grid, Subdivision, TimeSig};
 pub use history::History;
+pub use play_clock::PlayClock;
 pub use scoring::{score, ExpectedNote, NoteJudgment, ScoreConfig, ScoreReport, Timing};
 pub use song::{backing_position_us, song_shift_us, BackingTrack, MetaError, RecordingMeta};
 pub use stats::Summary;
 pub use timeline::{Note, NoteId, Timeline};
-pub use wait::{Step, WaitTracker};
+pub use wait::{GateState, Step, WaitGate, WaitTracker};

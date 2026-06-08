@@ -1,5 +1,6 @@
 use rockcraft_core::{
-    action_from_name, action_names, ActionError, Composer, ComposerSnapshot, Effect,
+    action_from_name, action_help, action_names, ActionError, ActionInfo, Composer,
+    ComposerSnapshot, Effect,
 };
 use serde::{Deserialize, Serialize};
 
@@ -58,9 +59,22 @@ pub enum Response {
         id: Option<u64>,
         actions: Vec<&'static str>,
     },
+    Help {
+        id: Option<u64>,
+        actions: Vec<ActionInfo>,
+    },
     Render {
         id: Option<u64>,
         text: String,
+    },
+    /// Unsolicited banner sent once, right after the WebSocket handshake, before
+    /// the client sends anything. It names the protocol verbs and points at
+    /// `query help`, so even an agent that never read the docs can bootstrap.
+    Hello {
+        protocol: &'static str,
+        requests: Vec<&'static str>,
+        queries: Vec<&'static str>,
+        hint: &'static str,
     },
     Event {
         topic: Topic,
@@ -68,10 +82,25 @@ pub enum Response {
     },
 }
 
+/// The connection banner (a [`Response::Hello`]) every server sends on connect.
+///
+/// Kept in one place so both [`crate::server::ControlServer`] and
+/// [`crate::command::CommandServer`] greet clients identically.
+pub fn hello() -> Response {
+    Response::Hello {
+        protocol: "rockcraft-control/1",
+        requests: vec!["run_action", "query", "subscribe", "unsubscribe"],
+        // Mirrors the `QueryKind` variants (PascalCase on the wire).
+        queries: vec!["State", "Actions", "Help", "Render"],
+        hint: r#"send {"type":"query","what":"Help"} for the full action catalog"#,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum QueryKind {
     State,
     Actions,
+    Help,
     Render,
 }
 
@@ -128,6 +157,13 @@ pub fn handle(c: &mut Composer, req: Request) -> Response {
         } => Response::Actions {
             id,
             actions: action_names().to_vec(),
+        },
+        Request::Query {
+            id,
+            what: QueryKind::Help,
+        } => Response::Help {
+            id,
+            actions: action_help().to_vec(),
         },
         Request::Query {
             id,
