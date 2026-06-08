@@ -9,9 +9,12 @@ Public surface:
 * :data:`EXTRACTOR_VERSION` — stamped into ``SourceMeta``.
 * :mod:`schema` — dataclasses mirroring the Rust ``rockcraft-import`` schema.
 * :func:`pipeline.extract_chart` — frames + fps -> ``ExtractedChart``.
+* :func:`audio.fuse_chart` — optional M6-F pass: enrich a chart with velocity +
+  tighter timing from clean-piano audio (no-ops on a full mix).
 * :mod:`synth` — synthetic clip generator used by the tests (never a real video).
 """
 
+from .audio import TranscribedNote, assess_suitability, fuse, fuse_chart, transcribe
 from .schema import EXTRACTOR_VERSION, ExtractedChart, ExtractedNote, Hand, SourceMeta
 
 __all__ = [
@@ -20,4 +23,9 @@ __all__ = [
     "ExtractedNote",
     "Hand",
     "SourceMeta",
+    "TranscribedNote",
+    "assess_suitability",
+    "fuse",
+    "fuse_chart",
+    "transcribe",
 ]

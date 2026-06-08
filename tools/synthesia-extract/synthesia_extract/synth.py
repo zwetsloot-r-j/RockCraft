@@ -23,6 +23,8 @@ from typing import Optional
 
 import numpy as np
 
+from .audio import REFERENCE_PEAK_AMPLITUDE
+
 # White-key semitone offsets within an octave (C=0 .. B=11).
 _WHITE_SEMITONES = [0, 2, 4, 5, 7, 9, 11]
 # For a white key, is there a black key immediately to its right (within octave)?
@@ -39,12 +41,18 @@ RIGHT_COLOR = (60, 200, 60)  # green-ish
 
 @dataclass(frozen=True)
 class SynthNote:
-    """A ground-truth note for synthesis and comparison."""
+    """A ground-truth note for synthesis and comparison.
+
+    ``velocity`` is the ground-truth MIDI velocity (1..127) used only by the
+    audio renderer (:func:`render_audio`) and the M6-F fusion tests; the visual
+    renderer ignores it (the falling roll carries no dynamics).
+    """
 
     pitch: int
     start_us: int
     dur_us: int
     hand: str  # "Left" / "Right" / "Unknown"
+    velocity: int = 64
 
 
 @dataclass
@@ -189,23 +197,111 @@ def render_frames(notes: list[SynthNote], cfg: SynthConfig) -> tuple[list[np.nda
     return frames, kb
 
 
+# --------------------------------------------------------------------------- #
+# Synthetic audio (M6-F): a clean tone-per-note render, and a full-mix decoy.
+# --------------------------------------------------------------------------- #
+# A modest sample rate keeps the FFTs in the tests fast while leaving plenty of
+# frequency resolution for the piano range (lowest fixture pitch ~130 Hz).
+DEFAULT_SAMPLE_RATE = 16_000
+
+
+def pitch_to_freq(pitch: int) -> float:
+    """MIDI note number -> fundamental frequency in Hz (A4 = 440, MIDI 69)."""
+    return 440.0 * 2.0 ** ((pitch - 69) / 12.0)
+
+
+def _note_envelope(n_samples: int, sample_rate: int) -> np.ndarray:
+    """A simple percussive envelope: fast attack, gentle decay, short release.
+
+    The envelope peaks at ~1.0 just after the (very short) attack, so the
+    rendered note's peak amplitude equals its velocity gain — which is exactly
+    what :func:`synthesia_extract.audio.transcribe` reads back as velocity.
+    """
+    env = np.ones(n_samples, dtype=np.float64)
+    attack = min(n_samples, max(1, int(0.003 * sample_rate)))  # ~3 ms
+    release = min(n_samples, max(1, int(0.02 * sample_rate)))  # ~20 ms
+    env[:attack] = np.linspace(0.0, 1.0, attack)
+    env *= np.linspace(1.0, 0.75, n_samples)  # gentle body decay
+    env[n_samples - release :] *= np.linspace(1.0, 0.0, release)
+    return env
+
+
+def render_audio(
+    notes: list[SynthNote],
+    *,
+    sample_rate: int = DEFAULT_SAMPLE_RATE,
+    total_s: Optional[float] = None,
+    harmonics: tuple[float, ...] = (1.0,),
+) -> np.ndarray:
+    """Render ``notes`` to a clean mono float32 track aligned to the video clock.
+
+    Each note is a tone at its pitch's fundamental (plus optional ``harmonics``),
+    started at ``start_us`` and shaped by :func:`_note_envelope`.  The peak
+    amplitude of a note equals ``velocity / 127`` (for the default single-harmonic
+    tone), which is the velocity contract the transcriber inverts.  Overlapping
+    notes simply sum — different pitches occupy different frequency bins, so the
+    per-pitch transcriber separates them without interference.
+    """
+    last_end_us = max((n.start_us + n.dur_us for n in notes), default=0)
+    if total_s is None:
+        total_s = last_end_us / 1e6 + 0.1
+    n_total = max(1, int(round(total_s * sample_rate)))
+    out = np.zeros(n_total, dtype=np.float64)
+
+    for note in notes:
+        n0 = int(round(note.start_us / 1e6 * sample_rate))
+        dur_n = max(1, int(round(note.dur_us / 1e6 * sample_rate)))
+        if n0 >= n_total:
+            continue
+        dur_n = min(dur_n, n_total - n0)
+        t = np.arange(dur_n) / sample_rate
+        f0 = pitch_to_freq(note.pitch)
+        sig = np.zeros(dur_n, dtype=np.float64)
+        for h_idx, h_amp in enumerate(harmonics, start=1):
+            sig += h_amp * np.sin(2.0 * np.pi * f0 * h_idx * t)
+        gain = float(np.clip(note.velocity / 127.0, 0.0, 1.0)) * REFERENCE_PEAK_AMPLITUDE
+        out[n0 : n0 + dur_n] += gain * _note_envelope(dur_n, sample_rate) * sig
+
+    return out.astype(np.float32)
+
+
+def render_full_mix_audio(
+    notes: list[SynthNote],
+    *,
+    sample_rate: int = DEFAULT_SAMPLE_RATE,
+    total_s: Optional[float] = None,
+    noise_level: float = 0.35,
+    seed: int = 0,
+) -> np.ndarray:
+    """A *decoy*: the piano tones drowned in broadband noise (a stand-in for a
+    full band mix with drums/vocals).  Its flat, broadband spectrum is what the
+    suitability check rejects so fusion safely no-ops on real-song audio."""
+    base = render_audio(
+        notes, sample_rate=sample_rate, total_s=total_s, harmonics=(1.0, 0.4, 0.2)
+    )
+    rng = np.random.default_rng(seed)
+    noise = rng.standard_normal(base.shape[0]).astype(np.float32) * float(noise_level)
+    return (base + noise).astype(np.float32)
+
+
 def c_major_demo(cfg: Optional[SynthConfig] = None) -> tuple[list[SynthNote], SynthConfig]:
     """A small two-hand fixture: right-hand C-major scale + a left-hand line and
     a closing chord. Returns the ground-truth notes and the config used."""
     cfg = cfg or SynthConfig()
     notes: list[SynthNote] = []
-    # Right hand: C4..C5 scale, one note every 400ms, 300ms long.
+    # Right hand: C4..C5 scale, one note every 400ms, 300ms long, with a gentle
+    # crescendo so the audio pass has distinct velocities to recover.
     scale = [60, 62, 64, 65, 67, 69, 71, 72]
     step = 400_000
     dur = 300_000
     for i, p in enumerate(scale):
-        notes.append(SynthNote(p, i * step, dur, "Right"))
-    # Left hand: sustained lower notes under the scale.
-    notes.append(SynthNote(48, 0, 700_000, "Left"))  # C3
-    notes.append(SynthNote(55, 800_000, 700_000, "Left"))  # G3
-    notes.append(SynthNote(48, 1_600_000, 700_000, "Left"))  # C3
-    # Closing chord (right hand): C-E-G together.
+        notes.append(SynthNote(p, i * step, dur, "Right", velocity=55 + i * 6))
+    # Left hand: sustained lower notes under the scale, played mezzo-forte.
+    notes.append(SynthNote(48, 0, 700_000, "Left", velocity=80))  # C3
+    notes.append(SynthNote(55, 800_000, 700_000, "Left", velocity=72))  # G3
+    notes.append(SynthNote(48, 1_600_000, 700_000, "Left", velocity=84))  # C3
+    # Closing chord (right hand): C-E-G together, fortissimo.
     chord_start = len(scale) * step
     for p in (60, 64, 67):
-        notes.append(SynthNote(p, chord_start, 500_000, "Right"))
+        notes.append(SynthNote(p, chord_start, 500_000, "Right", velocity=112))
     return notes, cfg

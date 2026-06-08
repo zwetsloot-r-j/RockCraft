@@ -58,12 +58,19 @@ class ExtractedNote:
 
 @dataclass
 class SourceMeta:
-    """Provenance/diagnostics. Mirrors ``rockcraft_import::schema::SourceMeta``."""
+    """Provenance/diagnostics. Mirrors ``rockcraft_import::schema::SourceMeta``.
+
+    ``audio_fusion`` is a sidecar-only diagnostic recording what the M6-F audio
+    pass did (``"applied: ..."`` / ``"skipped: ..."``). The Rust deserializer
+    does not ``deny_unknown_fields``, so it ignores this field — it exists for
+    logs and the M6-E review step, not for the Rust contract.
+    """
 
     extractor_version: str = EXTRACTOR_VERSION
     title: Optional[str] = None
     fps: Optional[float] = None
     scroll_px_per_s: Optional[float] = None
+    audio_fusion: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {"extractor_version": self.extractor_version}
@@ -73,6 +80,8 @@ class SourceMeta:
             out["fps"] = float(self.fps)
         if self.scroll_px_per_s is not None:
             out["scroll_px_per_s"] = float(self.scroll_px_per_s)
+        if self.audio_fusion is not None:
+            out["audio_fusion"] = str(self.audio_fusion)
         return out
 
 
