@@ -25,7 +25,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
-use crate::protocol::{Request, Response};
+use crate::protocol::{hello, Request, Response};
 
 /// A control request handed from the socket task to the application loop, paired
 /// with a one-shot channel for the application to return its [`Response`].
@@ -116,6 +116,11 @@ async fn handle_connection(
 ) -> Result<(), WsError> {
     let ws = tokio_tungstenite::accept_async(stream).await?;
     let (mut write, mut read) = ws.split();
+
+    // Greet the client before it sends anything: the banner advertises the
+    // protocol verbs and that `query help` enumerates every action.
+    let banner = serde_json::to_string(&hello()).expect("hello banner serialises");
+    write.send(Message::Text(banner)).await?;
 
     while let Some(msg) = read.next().await {
         match msg? {

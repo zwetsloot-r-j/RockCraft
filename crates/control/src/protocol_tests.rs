@@ -156,6 +156,52 @@ mod tests {
         }
     }
 
+    #[test]
+    fn query_help_returns_described_catalog() {
+        let mut c = new_composer();
+        let req = Request::Query {
+            id: Some(9),
+            what: QueryKind::Help,
+        };
+        match handle(&mut c, req) {
+            Response::Help { id, actions } => {
+                assert_eq!(id, Some(9));
+                // Same coverage as the name list, but now with params + prose.
+                assert_eq!(actions.len(), action_names().len());
+                let names: Vec<&str> = actions.iter().map(|a| a.name).collect();
+                assert_eq!(names, action_names());
+                // A parametrised action carries its param schema.
+                let set_cursor = actions
+                    .iter()
+                    .find(|a| a.name == "set_cursor")
+                    .expect("set_cursor described");
+                let param_names: Vec<&str> = set_cursor.params.iter().map(|p| p.name).collect();
+                assert_eq!(param_names, vec!["pitch", "step"]);
+            }
+            other => panic!("expected Help, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hello_banner_advertises_help_query() {
+        use crate::protocol::hello;
+        match hello() {
+            Response::Hello {
+                protocol,
+                requests,
+                queries,
+                hint,
+            } => {
+                assert_eq!(protocol, "rockcraft-control/1");
+                assert!(requests.contains(&"run_action"));
+                assert!(requests.contains(&"query"));
+                assert!(queries.contains(&"Help"));
+                assert!(hint.contains("Help"), "hint points at the help query");
+            }
+            other => panic!("expected Hello, got {other:?}"),
+        }
+    }
+
     // --- handle: Query::State ---
 
     #[test]

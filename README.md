@@ -63,6 +63,25 @@ with the `ROCKCRAFT_SF2` environment variable:
 ROCKCRAFT_SF2=/path/to/piano.sf2 cargo run -p rockcraft-tui
 ```
 
+## Agent control interface (drive it programmatically)
+
+A running RockCraft can expose a **localhost-only WebSocket** so an AI agent (or
+a script) can edit the composer using the same actions the keyboard triggers.
+
+```sh
+cargo run -p rockcraft-tui -- --control          # bound addr printed to stderr:
+                                                 #   Control server listening on ws://127.0.0.1:<PORT>
+ROCKCRAFT_CONTROL_ADDR=127.0.0.1:9001 cargo run -p rockcraft-tui   # pin a stable address (also enables it)
+```
+
+Connect to `ws://127.0.0.1:<PORT>`. The server sends a `hello` banner on
+connect; send `{"type":"query","what":"Help"}` to list every action with its
+parameters, then `run_action` and read back the state snapshot.
+
+- Protocol reference: [`docs/AGENT-CONTROL.md`](docs/AGENT-CONTROL.md)
+- Guided demo (every action, with the equivalent TUI key): [`docs/DEMO-SCENARIO.md`](docs/DEMO-SCENARIO.md)
+- Minimal client: [`crates/control/examples/agent_session.rs`](crates/control/examples/agent_session.rs)
+
 ## Notes
 
 - Anything needing the physical piano (live MIDI capture, latency, audio out) is

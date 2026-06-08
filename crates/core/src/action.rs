@@ -289,6 +289,99 @@ pub fn action_names() -> &'static [&'static str] {
     ]
 }
 
+/// One parameter of an [`Action`], for `query help` discovery.
+///
+/// `ty` is the Rust scalar name (`"u8"`, `"u64"`, `"i64"`, …) so a client knows
+/// what JSON value to send. Kept `&'static` — the catalog is fully const.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ParamInfo {
+    pub name: &'static str,
+    pub ty: &'static str,
+}
+
+/// Self-describing metadata for one [`Action`]: its wire name, the parameters it
+/// accepts, and a one-line human description.
+///
+/// This is the machine-readable counterpart to [`action_names`]: where the
+/// latter lists only names, [`action_help`] adds params and prose so an agent
+/// can discover the *whole* call shape live, with no hand-maintained doc table
+/// to drift. A test enforces that [`action_help`] covers exactly the same set of
+/// names as [`action_names`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ActionInfo {
+    pub name: &'static str,
+    pub params: &'static [ParamInfo],
+    pub description: &'static str,
+}
+
+/// Structured, self-describing catalog of every action — the source for
+/// `query help`. Mirrors [`action_names`] one-to-one (a test enforces parity)
+/// and adds parameters + a one-line description per action.
+pub fn action_help() -> &'static [ActionInfo] {
+    ACTION_HELP
+}
+
+const fn p(name: &'static str, ty: &'static str) -> ParamInfo {
+    ParamInfo { name, ty }
+}
+
+/// The const catalog backing [`action_help`]. A `static` so all the nested
+/// `&[ParamInfo]` slices promote to `'static` rather than being temporaries.
+static ACTION_HELP: &[ActionInfo] = {
+    &[
+        // ── navigation ──────────────────────────────────────────────────
+        ActionInfo { name: "cursor_left", params: &[], description: "Move the cursor one grid step left." },
+        ActionInfo { name: "cursor_right", params: &[], description: "Move the cursor one grid step right." },
+        ActionInfo { name: "cursor_up", params: &[], description: "Move the cursor up one semitone (or transpose the grabbed note)." },
+        ActionInfo { name: "cursor_down", params: &[], description: "Move the cursor down one semitone (or transpose the grabbed note)." },
+        ActionInfo { name: "cursor_bar_left", params: &[], description: "Move the cursor one bar left." },
+        ActionInfo { name: "cursor_bar_right", params: &[], description: "Move the cursor one bar right." },
+        ActionInfo { name: "cursor_octave_down", params: &[], description: "Move the cursor down one octave." },
+        ActionInfo { name: "cursor_octave_up", params: &[], description: "Move the cursor up one octave." },
+        ActionInfo { name: "cursor_to_start", params: &[], description: "Jump the cursor to the start of the timeline." },
+        ActionInfo { name: "cursor_to_end", params: &[], description: "Jump the cursor to the end of the timeline." },
+        ActionInfo { name: "set_cursor", params: &[p("pitch", "u8"), p("step", "u64")], description: "Absolute jump to a (pitch, step) cell — AI-friendly addressing." },
+        ActionInfo { name: "subdivision_finer", params: &[], description: "Halve the grid step for finer placement." },
+        ActionInfo { name: "subdivision_coarser", params: &[], description: "Double the grid step for coarser placement." },
+        // ── edit ────────────────────────────────────────────────────────
+        ActionInfo { name: "add_note", params: &[], description: "Add a note at the cursor (duration 1 step, velocity 80); replaces any note already in that cell." },
+        ActionInfo { name: "delete_note", params: &[], description: "Delete the note under the cursor." },
+        ActionInfo { name: "resize_note", params: &[p("delta_steps", "i64")], description: "Lengthen (positive) or shorten (negative) the note under the cursor by delta_steps grid steps." },
+        ActionInfo { name: "adjust_velocity", params: &[p("delta", "i16")], description: "Adjust the velocity of the note under the cursor by delta (clamped 1..=127)." },
+        ActionInfo { name: "toggle_grab", params: &[], description: "Grab/drop the note under the cursor so cursor moves drag it." },
+        // ── chord selector ──────────────────────────────────────────────
+        ActionInfo { name: "enter_chord_mode", params: &[], description: "Open the chord selector at the cursor and start previewing a chord." },
+        ActionInfo { name: "commit_chord", params: &[], description: "Write the previewed chord into the timeline and close the selector." },
+        ActionInfo { name: "cancel_chord", params: &[], description: "Close the chord selector without writing anything." },
+        ActionInfo { name: "toggle_chord_kind", params: &[], description: "Toggle the chord quality (e.g. triad ↔ seventh)." },
+        ActionInfo { name: "set_chord_degree", params: &[p("degree", "u8")], description: "Set the chord scale degree (1..=7)." },
+        ActionInfo { name: "cycle_chord_degree", params: &[p("delta", "i8")], description: "Cycle the chord scale degree by delta." },
+        // ── input mode ──────────────────────────────────────────────────
+        ActionInfo { name: "toggle_record_arm", params: &[], description: "Arm/disarm recording from live MIDI input." },
+        ActionInfo { name: "toggle_record_flavour", params: &[], description: "Flip the record flavour between step and live (no-op while disarmed)." },
+        // ── transport ───────────────────────────────────────────────────
+        ActionInfo { name: "toggle_play_cursor", params: &[], description: "Toggle playback starting at the cursor position." },
+        ActionInfo { name: "play_from_start", params: &[], description: "Play from the start of the timeline." },
+        ActionInfo { name: "stop", params: &[], description: "Stop playback." },
+        ActionInfo { name: "play", params: &[p("from_us", "u64")], description: "Start playback from from_us microseconds." },
+        ActionInfo { name: "set_playhead", params: &[p("us", "u64")], description: "Move the playhead to us microseconds." },
+        // ── loop / metronome / count-in ─────────────────────────────────
+        ActionInfo { name: "toggle_loop", params: &[], description: "Toggle looped playback over the loop region." },
+        ActionInfo { name: "toggle_metronome", params: &[], description: "Toggle the metronome click." },
+        ActionInfo { name: "start_count_in_record", params: &[], description: "Begin a metronome count-in, then start recording." },
+        ActionInfo { name: "set_loop_bounds", params: &[p("start_us", "u64"), p("end_us", "u64")], description: "Set the loop region to [start_us, end_us) microseconds." },
+        // ── selection / clipboard ───────────────────────────────────────
+        ActionInfo { name: "start_selection", params: &[], description: "Begin a selection rectangle anchored at the cursor." },
+        ActionInfo { name: "clear_selection", params: &[], description: "Clear the active selection." },
+        ActionInfo { name: "yank_selection", params: &[], description: "Copy the selected notes to the clipboard." },
+        ActionInfo { name: "paste_clipboard", params: &[], description: "Paste the clipboard at the cursor." },
+        ActionInfo { name: "delete_selection", params: &[], description: "Delete the notes inside the selection." },
+        // ── history ─────────────────────────────────────────────────────
+        ActionInfo { name: "undo", params: &[], description: "Undo the last edit." },
+        ActionInfo { name: "redo", params: &[], description: "Redo the last undone edit." },
+    ]
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,6 +475,47 @@ mod tests {
             from_variants, from_catalog,
             "action_names() must list exactly the Action variants"
         );
+    }
+
+    #[test]
+    fn action_help_matches_action_names_exactly() {
+        use std::collections::BTreeSet;
+        let from_help: BTreeSet<&str> = action_help().iter().map(|a| a.name).collect();
+        let from_names: BTreeSet<&str> = action_names().iter().copied().collect();
+        assert_eq!(
+            from_help, from_names,
+            "action_help() must describe exactly the names in action_names()"
+        );
+        // Same length too — guards against a duplicate masking a missing entry.
+        assert_eq!(action_help().len(), action_names().len());
+    }
+
+    #[test]
+    fn action_help_every_param_set_dispatches() {
+        // Each described action, called with a minimal valid value per param,
+        // must build via action_from_name — proving the documented param names
+        // and the deserialiser agree.
+        for info in action_help() {
+            let mut params = serde_json::Map::new();
+            for p in info.params {
+                // A small in-range value works for every scalar type we use.
+                params.insert(p.name.to_string(), json!(1));
+            }
+            action_from_name(info.name, &serde_json::Value::Object(params)).unwrap_or_else(|e| {
+                panic!("{} should dispatch from its help params: {e}", info.name)
+            });
+        }
+    }
+
+    #[test]
+    fn action_help_descriptions_are_non_empty() {
+        for info in action_help() {
+            assert!(
+                !info.description.is_empty(),
+                "{} has an empty description",
+                info.name
+            );
+        }
     }
 
     #[test]
