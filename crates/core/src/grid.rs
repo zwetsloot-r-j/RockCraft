@@ -102,10 +102,23 @@ impl Grid {
 
     pub fn bar_beat_of(&self, us: u64) -> (u64, u64) {
         let bar_us = self.bar_us();
-        let beat_us = self.quarter_us() * 4 / self.time_sig.beat_unit as u64;
+        let beat_us = self.beat_us();
         let bar = us / bar_us;
         let beat = (us % bar_us) / beat_us;
         (bar, beat)
+    }
+
+    /// Duration of one beat (the time-signature beat unit) in µs.
+    pub fn beat_us(&self) -> u64 {
+        self.quarter_us() * 4 / self.time_sig.beat_unit as u64
+    }
+
+    /// Step index within the current beat at position `us` (0-indexed).
+    /// Returns 0 when the subdivision is coarser than or equal to one beat.
+    pub fn step_in_beat(&self, us: u64) -> u64 {
+        let beat = self.beat_us().max(1);
+        let in_beat = us % beat;
+        in_beat / self.step_us().max(1)
     }
 }
 
