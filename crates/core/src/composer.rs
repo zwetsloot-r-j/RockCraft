@@ -263,6 +263,14 @@ impl Composer {
                 self.cursor.step = 0;
                 Vec::new()
             }
+            Action::CursorToPitchMin => {
+                self.cursor.pitch = LOWEST_MIDI;
+                Vec::new()
+            }
+            Action::CursorToPitchMax => {
+                self.cursor.pitch = HIGHEST_MIDI;
+                Vec::new()
+            }
             Action::CursorToEnd => {
                 self.cursor.step = self.last_step();
                 Vec::new()
