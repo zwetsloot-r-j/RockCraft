@@ -976,6 +976,36 @@ mod tests {
         );
     }
 
+    /// Pressing `+`/`-` on a note must produce a visible change in the rendered
+    /// output: the status bar's velocity indicator updates on every adjustment.
+    #[test]
+    fn velocity_change_visible_in_render() {
+        let mut shell = make_shell();
+        shell.activate_edit();
+        let (tx, rx) = mpsc::channel::<RemoteCommand>(16);
+        shell.set_command_receiver(rx);
+
+        let (c1, _) = remote(r#"{"type":"run_action","action":"add_note"}"#);
+        tx.try_send(c1).unwrap();
+        shell.drain_remote_commands();
+        let before = shell.render_to_string(80, 24);
+
+        let (c2, _) =
+            remote(r#"{"type":"run_action","action":"adjust_velocity","params":{"delta":8}}"#);
+        tx.try_send(c2).unwrap();
+        shell.drain_remote_commands();
+        let after = shell.render_to_string(80, 24);
+
+        assert_ne!(
+            before, after,
+            "+/- must change the rendered velocity indicator"
+        );
+        assert!(
+            after.contains("vel "),
+            "status bar must show 'vel N' after adjustment"
+        );
+    }
+
     /// Through the channel harness: `query state` reflects added notes and
     /// `query render` returns non-empty text with the right number of rows.
     #[test]
