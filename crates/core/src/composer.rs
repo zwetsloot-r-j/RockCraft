@@ -263,6 +263,14 @@ impl Composer {
                 self.cursor.step = 0;
                 Vec::new()
             }
+            Action::CursorToPitchMin => {
+                self.cursor.pitch = LOWEST_MIDI;
+                Vec::new()
+            }
+            Action::CursorToPitchMax => {
+                self.cursor.pitch = HIGHEST_MIDI;
+                Vec::new()
+            }
             Action::CursorToEnd => {
                 self.cursor.step = self.last_step();
                 Vec::new()
@@ -752,16 +760,20 @@ impl Composer {
         )
     }
 
-    /// Enter chord mode and preview the tonic triad voiced from the cursor. A
-    /// no-op if already in chord mode. Checkpoints first so a commit lands as
-    /// one undo step and a cancel can `rollback` cleanly.
+    /// Enter chord mode, rooting the initial preview chord at the cursor pitch.
+    /// If the cursor pitch class is a diatonic degree in the current key that
+    /// degree is used; otherwise falls back to degree 1. A no-op if already in
+    /// chord mode. Checkpoints first so a commit lands as one undo step and a
+    /// cancel can `rollback` cleanly.
     fn enter_chord_mode(&mut self) -> Vec<Effect> {
         if self.chord.is_some() {
             return Vec::new();
         }
         self.history.checkpoint();
+        let cursor_pc = self.cursor.pitch % 12;
+        let degree = self.key.degree_for_pc(cursor_pc).unwrap_or(1);
         self.chord = Some(ChordMode {
-            degree: 1,
+            degree,
             kind: ChordKind::Triad,
             preview_ids: Vec::new(),
             pitches: Vec::new(),
@@ -1677,6 +1689,49 @@ mod tests {
                 pitches: vec![60, 64, 67]
             }]
         );
+    }
+
+    #[test]
+    fn enter_chord_roots_at_cursor_pitch() {
+        // Cursor on A4 (MIDI 69) in C major → degree 6 (A minor triad A-C-E).
+        let mut c = Composer::new();
+        apply(&mut c, Action::SetCursor { pitch: 69, step: 0 });
+        apply(&mut c, Action::EnterChordMode);
+        assert!(c.in_chord_mode());
+        assert_eq!(
+            pitch_values(&c.previewed_chord().unwrap()),
+            vec![69, 72, 76],
+            "A minor triad (A4-C5-E5) rooted at cursor A4"
+        );
+    }
+
+    #[test]
+    fn re_entering_chord_mode_after_cursor_move_changes_root() {
+        // Enter on C4, cancel, move to E4, re-enter → E chord (degree 3).
+        let mut c = Composer::new();
+        apply(&mut c, Action::EnterChordMode);
+        apply(&mut c, Action::CancelChord);
+        apply(&mut c, Action::SetCursor { pitch: 64, step: 0 });
+        apply(&mut c, Action::EnterChordMode);
+        // E is degree 3 in C major → E-G-B voiced from E4 (64-67-71)
+        assert_eq!(
+            pitch_values(&c.previewed_chord().unwrap()),
+            vec![64, 67, 71],
+            "E minor triad (E4-G4-B4) rooted at cursor E4"
+        );
+    }
+
+    #[test]
+    fn enter_chord_non_scale_pitch_falls_back_to_degree_1() {
+        // C# (MIDI 61) is not in C major → falls back to degree 1 (C major triad).
+        let mut c = Composer::new();
+        apply(&mut c, Action::SetCursor { pitch: 61, step: 0 });
+        apply(&mut c, Action::EnterChordMode);
+        // Degree 1 voiced from C# upward: finds C above C# = C5 (72), E5, G5
+        assert!(c.in_chord_mode());
+        let preview = c.previewed_chord().unwrap();
+        // Root pitch class of the first note should be 0 (C) since degree 1 = C
+        assert_eq!(preview[0].value() % 12, 0, "falls back to degree 1 (C)");
     }
 
     #[test]

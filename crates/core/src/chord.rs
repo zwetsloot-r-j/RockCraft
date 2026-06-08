@@ -74,6 +74,12 @@ impl Key {
         notes
     }
 
+    /// Scale degree (1..=7) whose pitch-class matches `pc`, or `None` if `pc`
+    /// is not in this key.
+    pub fn degree_for_pc(self, pc: u8) -> Option<u8> {
+        (1u8..=7).find(|&d| self.degree_pc(d) == pc)
+    }
+
     /// If `root`'s pitch-class is a scale degree, the diatonic chord built on it;
     /// else None. (Used to recognise a chord under the cursor.)
     pub fn chord_for_root(self, root: MidiNote, kind: ChordKind) -> Option<Vec<MidiNote>> {
@@ -167,6 +173,28 @@ mod tests {
     fn degree_pc_wraps() {
         // degree 8 ≡ degree 1
         assert_eq!(c_major().degree_pc(8), c_major().degree_pc(1));
+    }
+
+    #[test]
+    fn degree_for_pc_finds_scale_degrees() {
+        let key = c_major();
+        assert_eq!(key.degree_for_pc(0), Some(1)); // C
+        assert_eq!(key.degree_for_pc(2), Some(2)); // D
+        assert_eq!(key.degree_for_pc(4), Some(3)); // E
+        assert_eq!(key.degree_for_pc(5), Some(4)); // F
+        assert_eq!(key.degree_for_pc(7), Some(5)); // G
+        assert_eq!(key.degree_for_pc(9), Some(6)); // A
+        assert_eq!(key.degree_for_pc(11), Some(7)); // B
+    }
+
+    #[test]
+    fn degree_for_pc_returns_none_for_chromatic_pitches() {
+        let key = c_major();
+        assert_eq!(key.degree_for_pc(1), None); // C#
+        assert_eq!(key.degree_for_pc(3), None); // D#
+        assert_eq!(key.degree_for_pc(6), None); // F#
+        assert_eq!(key.degree_for_pc(8), None); // G#
+        assert_eq!(key.degree_for_pc(10), None); // A#
     }
 
     #[test]
