@@ -22,7 +22,7 @@ use rockcraft_midi::{smf_bytes_to_events, NoteSource};
 use tokio::sync::mpsc;
 
 use crate::backing::{BackingPicker, PickerOutcome};
-use crate::edit::EditScreen;
+use crate::edit::{EditScreen, PromptOutcome};
 use crate::import_screen::{
     ImportOutcome, ImportingScreen, UrlInput, UrlInputOutcome, VideoPicker, VideoPickerOutcome,
 };
@@ -286,6 +286,7 @@ impl Shell {
                 }
                 KeyCode::Char('r') => play.restart(),
                 KeyCode::Char('m') => play.toggle_hear_song(),
+                KeyCode::Char('w') => play.toggle_wait_mode(),
                 KeyCode::Char(c) => {
                     self.input.forward_key(c);
                 }
@@ -303,21 +304,64 @@ impl Shell {
             // "cursor to lowest pitch" command. `forward_key` returns `false` for
             // unmapped keys (and on a real piano), so those fall through to the
             // editor keymap unchanged.
-            Screen::Edit(edit) => match code {
-                KeyCode::Esc if edit.in_chord_mode() => edit.on_key(KeyCode::Esc),
-                // Clear visual selection on Esc without leaving the editor.
-                KeyCode::Esc if edit.in_visual_mode() => edit.on_key(KeyCode::Esc),
-                KeyCode::Tab | KeyCode::Esc => {
-                    edit.leave();
-                    self.screen = Screen::Menu;
+            //
+            // When the editor is dirty and Tab/Esc is pressed, an exit-prompt
+            // overlay is shown first ("Save / Discard / Cancel").
+            Screen::Edit(edit) => {
+                if edit.is_prompting_exit() {
+                    // Route all keys to the prompt while it's visible.
+                    match edit.on_prompt_key(code) {
+                        PromptOutcome::SaveAndLeave => match edit.save() {
+                            Ok(p) => {
+                                self.status = format!("saved {}", p.display());
+                                edit.leave();
+                                self.screen = Screen::Menu;
+                            }
+                            Err(e) => {
+                                // Save failed: report it and dismiss the prompt so the
+                                // user can fix things before trying again.
+                                self.status = format!("save failed: {e}");
+                                edit.dismiss_exit_prompt();
+                            }
+                        },
+                        PromptOutcome::Leave => {
+                            edit.leave();
+                            self.screen = Screen::Menu;
+                        }
+                        PromptOutcome::Stay => {
+                            edit.dismiss_exit_prompt();
+                        }
+                    }
+                } else {
+                    match code {
+                        KeyCode::Esc if edit.in_chord_mode() => edit.on_key(KeyCode::Esc),
+                        // Clear visual selection on Esc without leaving the editor.
+                        KeyCode::Esc if edit.in_visual_mode() => edit.on_key(KeyCode::Esc),
+                        // Dirty editor: show the Save/Discard/Cancel prompt.
+                        KeyCode::Tab | KeyCode::Esc if edit.is_dirty() => {
+                            edit.start_exit_prompt();
+                        }
+                        KeyCode::Tab | KeyCode::Esc => {
+                            edit.leave();
+                            self.screen = Screen::Menu;
+                        }
+                        KeyCode::Char('s') => match edit.save() {
+                            Ok(p) => {
+                                let name = p
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_default();
+                                edit.set_save_flash(format!("Saved {name} ✓"));
+                                edit.mark_clean();
+                                self.status = format!("saved {}", p.display());
+                            }
+                            Err(e) => self.status = format!("save failed: {e}"),
+                        },
+                        KeyCode::Char(c) if edit.is_recording() && self.input.forward_key(c) => {}
+                        other => edit.on_key(other),
+                    }
                 }
-                KeyCode::Char('s') => match edit.save() {
-                    Ok(p) => self.status = format!("saved {}", p.display()),
-                    Err(e) => self.status = format!("save failed: {e}"),
-                },
-                KeyCode::Char(c) if edit.is_recording() && self.input.forward_key(c) => {}
-                other => edit.on_key(other),
-            },
+            }
             Screen::BackingPicker(picker) => {
                 let outcome = picker.on_key(code).clone();
                 match outcome {
@@ -516,6 +560,9 @@ pub fn run_loop<B: ratatui::backend::Backend>(
         // frame-rate-driven); the backing arms itself once the clock reaches the
         // lead-in's end so it lines up with the notes hitting the keyboard line.
         if let Screen::Play(play) = &mut shell.screen {
+            // Advance the pausable clock first (wait-mode may freeze it), then
+            // fire synth/backing for the resulting clock position.
+            play.tick();
             play.tick_song_synth();
             play.tick_backing();
         }
@@ -1265,6 +1312,120 @@ mod tests {
         assert!(
             shell.status.contains("cancel"),
             "status must mention cancellation"
+        );
+    }
+
+    // ── issue #127: save UX — feedback + dirty-exit prompt ──────────────────
+
+    /// After pressing `s` in the editor the render shows the save confirmation
+    /// and the dirty flag is cleared.
+    #[test]
+    fn save_key_shows_flash_and_clears_dirty() {
+        let mut shell = make_shell();
+        shell.activate_edit();
+        shell.on_key(KeyCode::Char('a')); // add note → dirty
+
+        if let Screen::Edit(edit) = &shell.screen {
+            assert!(
+                edit.is_dirty(),
+                "editor should be dirty after adding a note"
+            );
+        }
+
+        // Press `s` — this will write to the filesystem under recordings/.
+        shell.on_key(KeyCode::Char('s'));
+
+        let render = shell.render_to_string(80, 24);
+        assert!(
+            render.contains("Saved") && render.contains("✓"),
+            "render must show save confirmation after `s`, got:\n{render}"
+        );
+
+        if let Screen::Edit(edit) = &shell.screen {
+            assert!(!edit.is_dirty(), "dirty flag must be cleared after save");
+        }
+    }
+
+    /// Pressing Esc on a clean (un-edited) editor exits immediately to the menu.
+    #[test]
+    fn clean_editor_esc_exits_immediately() {
+        let mut shell = make_shell();
+        shell.activate_edit();
+        // No edits — editor is clean.
+        shell.on_key(KeyCode::Esc);
+        assert_eq!(shell.screen_name(), "menu", "clean editor exits on Esc");
+    }
+
+    /// Pressing Esc on a dirty editor shows the exit prompt (stays in editor).
+    #[test]
+    fn dirty_editor_esc_shows_exit_prompt() {
+        let mut shell = make_shell();
+        shell.activate_edit();
+        shell.on_key(KeyCode::Char('a')); // dirty
+        shell.on_key(KeyCode::Esc);
+        assert_eq!(
+            shell.screen_name(),
+            "edit",
+            "dirty editor must not leave on Esc"
+        );
+        let render = shell.render_to_string(80, 24);
+        assert!(
+            render.contains("Save") || render.contains("Discard"),
+            "render must show exit prompt, got:\n{render}"
+        );
+    }
+
+    /// Pressing Tab on a dirty editor also shows the exit prompt.
+    #[test]
+    fn dirty_editor_tab_shows_exit_prompt() {
+        let mut shell = make_shell();
+        shell.activate_edit();
+        shell.on_key(KeyCode::Char('a'));
+        shell.on_key(KeyCode::Tab);
+        assert_eq!(shell.screen_name(), "edit");
+        if let Screen::Edit(edit) = &shell.screen {
+            assert!(edit.is_prompting_exit());
+        }
+    }
+
+    /// On the exit prompt, `d` discards changes and leaves to the menu.
+    #[test]
+    fn exit_prompt_discard_leaves_to_menu() {
+        let mut shell = make_shell();
+        shell.activate_edit();
+        shell.on_key(KeyCode::Char('a'));
+        shell.on_key(KeyCode::Esc); // show prompt
+        shell.on_key(KeyCode::Char('d')); // discard
+        assert_eq!(shell.screen_name(), "menu");
+    }
+
+    /// On the exit prompt, any other key (treated as Cancel) dismisses the
+    /// prompt and stays in the editor.
+    #[test]
+    fn exit_prompt_cancel_stays_in_editor() {
+        let mut shell = make_shell();
+        shell.activate_edit();
+        shell.on_key(KeyCode::Char('a'));
+        shell.on_key(KeyCode::Esc); // show prompt
+        shell.on_key(KeyCode::Esc); // cancel (Esc on prompt → Stay)
+        assert_eq!(shell.screen_name(), "edit");
+        if let Screen::Edit(edit) = &shell.screen {
+            assert!(!edit.is_prompting_exit(), "prompt must be dismissed");
+        }
+    }
+
+    /// On the exit prompt, `s` saves and then leaves to the menu.
+    #[test]
+    fn exit_prompt_save_persists_and_leaves() {
+        let mut shell = make_shell();
+        shell.activate_edit();
+        shell.on_key(KeyCode::Char('a'));
+        shell.on_key(KeyCode::Esc); // show prompt
+        shell.on_key(KeyCode::Char('s')); // save via prompt
+        assert_eq!(
+            shell.screen_name(),
+            "menu",
+            "save via prompt must leave to menu"
         );
     }
 
