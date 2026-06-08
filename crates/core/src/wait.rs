@@ -85,6 +85,209 @@ impl WaitTracker {
     }
 }
 
+/// Whether a gated [`PlayClock`](crate::play_clock::PlayClock) should keep
+/// advancing or freeze on the current step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateState {
+    /// The clock may advance.
+    Running,
+    /// The clock must freeze: an armed wait-step is due and unsatisfied.
+    Frozen,
+}
+
+/// Couples a [`WaitTracker`] with the live held-note set to gate a
+/// [`PlayClock`](crate::play_clock::PlayClock). Pure: feed it held notes plus
+/// the clock position, read back whether playback should freeze on the current
+/// step. The gate freezes only once the clock has *reached* a step's `time_us`
+/// and that step is unsatisfied; while disarmed it never freezes (free
+/// play-through).
+#[derive(Debug, Clone)]
+pub struct WaitGate {
+    tracker: WaitTracker,
+    held: BTreeSet<u8>,
+    armed: bool,
+    /// The result of the most recent [`poll`](WaitGate::poll); backs
+    /// [`awaiting`](WaitGate::awaiting).
+    frozen: bool,
+}
+
+impl WaitGate {
+    /// Build a gate from expected (pitch, time) notes. Starts **disarmed**
+    /// (wait-mode off) with no notes held.
+    pub fn from_expected(notes: &[(MidiNote, u64)]) -> Self {
+        Self {
+            tracker: WaitTracker::from_expected(notes),
+            held: BTreeSet::new(),
+            armed: false,
+            frozen: false,
+        }
+    }
+
+    /// Turn wait-mode on (`armed = true`) or off.
+    pub fn set_armed(&mut self, armed: bool) {
+        self.armed = armed;
+        if !armed {
+            self.frozen = false;
+        }
+    }
+
+    /// Is wait-mode currently armed?
+    pub fn is_armed(&self) -> bool {
+        self.armed
+    }
+
+    /// Replace the live held-note set (call on every note-on/off).
+    pub fn set_held(&mut self, held: BTreeSet<u8>) {
+        self.held = held;
+    }
+
+    /// Advance the tracker past any now-satisfied steps, then report whether the
+    /// clock must freeze. Returns [`GateState::Frozen`] when armed AND the
+    /// current step's `time_us <= now_us` AND it is unsatisfied; otherwise
+    /// [`GateState::Running`]. Always `Running` while disarmed.
+    pub fn poll(&mut self, now_us: u64) -> GateState {
+        // Reuse the tracker's own advance-through-satisfied logic.
+        self.tracker.update(&self.held);
+
+        if !self.armed {
+            self.frozen = false;
+            return GateState::Running;
+        }
+
+        match self.tracker.current() {
+            Some(step) if step.time_us <= now_us && !self.tracker.is_satisfied(&self.held) => {
+                self.frozen = true;
+                GateState::Frozen
+            }
+            _ => {
+                self.frozen = false;
+                GateState::Running
+            }
+        }
+    }
+
+    /// Have all steps been satisfied? Delegates to the tracker.
+    pub fn is_complete(&self) -> bool {
+        self.tracker.is_complete()
+    }
+
+    /// The step currently being waited on, if the last [`poll`](WaitGate::poll)
+    /// froze the clock; otherwise `None`.
+    pub fn awaiting(&self) -> Option<&Step> {
+        if self.frozen {
+            self.tracker.current()
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+
+    fn n(v: u8) -> MidiNote {
+        MidiNote::new(v).unwrap()
+    }
+    fn held(notes: &[u8]) -> BTreeSet<u8> {
+        notes.iter().copied().collect()
+    }
+
+    #[test]
+    fn disarmed_is_always_running() {
+        let mut g = WaitGate::from_expected(&[(n(60), 0), (n(62), 1000)]);
+        assert!(!g.is_armed());
+        // No notes held, well past the first step's time — still Running.
+        assert_eq!(g.poll(5000), GateState::Running);
+        assert!(g.awaiting().is_none());
+        // Wrong notes held — still Running.
+        g.set_held(held(&[65]));
+        assert_eq!(g.poll(5000), GateState::Running);
+    }
+
+    #[test]
+    fn armed_runs_before_step_is_due() {
+        let mut g = WaitGate::from_expected(&[(n(60), 1000)]);
+        g.set_armed(true);
+        // now_us < step.time_us → not yet due → Running.
+        assert_eq!(g.poll(500), GateState::Running);
+        assert!(g.awaiting().is_none());
+    }
+
+    #[test]
+    fn armed_freezes_on_due_unsatisfied_step() {
+        let mut g = WaitGate::from_expected(&[(n(60), 1000)]);
+        g.set_armed(true);
+        assert_eq!(g.poll(1000), GateState::Frozen);
+        let step = g.awaiting().expect("frozen on the due step");
+        assert_eq!(step.notes, vec![60]);
+        assert_eq!(step.time_us, 1000);
+    }
+
+    #[test]
+    fn holding_required_note_unfreezes_and_advances() {
+        let mut g = WaitGate::from_expected(&[(n(60), 0), (n(62), 1000)]);
+        g.set_armed(true);
+        assert_eq!(g.poll(0), GateState::Frozen);
+        // Hold the required C; next poll advances past it and runs.
+        g.set_held(held(&[60]));
+        assert_eq!(g.poll(0), GateState::Running);
+        assert!(g.awaiting().is_none());
+        // The tracker advanced: the second step isn't due yet at now=0.
+        assert_eq!(g.poll(500), GateState::Running);
+        // It becomes due and unsatisfied at its time.
+        assert_eq!(g.poll(1000), GateState::Frozen);
+        assert_eq!(g.awaiting().unwrap().notes, vec![62]);
+    }
+
+    #[test]
+    fn chord_requires_all_notes() {
+        let mut g = WaitGate::from_expected(&[(n(60), 0), (n(64), 0), (n(67), 0)]);
+        g.set_armed(true);
+        g.set_held(held(&[60, 64])); // missing G
+        assert_eq!(g.poll(0), GateState::Frozen);
+        g.set_held(held(&[60, 64, 67])); // full chord
+        assert_eq!(g.poll(0), GateState::Running);
+        assert!(g.is_complete());
+    }
+
+    #[test]
+    fn multiple_satisfied_steps_skip_in_one_poll() {
+        let mut g = WaitGate::from_expected(&[(n(60), 0), (n(60), 100), (n(62), 200)]);
+        g.set_armed(true);
+        // Holding C satisfies both consecutive C-steps at once.
+        g.set_held(held(&[60]));
+        assert_eq!(g.poll(150), GateState::Running);
+        // Now waiting on the D step; due at 200.
+        assert_eq!(g.poll(200), GateState::Frozen);
+        assert_eq!(g.awaiting().unwrap().notes, vec![62]);
+    }
+
+    #[test]
+    fn complete_is_never_frozen() {
+        let mut g = WaitGate::from_expected(&[(n(60), 0)]);
+        g.set_armed(true);
+        g.set_held(held(&[60]));
+        assert_eq!(g.poll(0), GateState::Running);
+        assert!(g.is_complete());
+        // Past the end, even with nothing held, never freezes.
+        g.set_held(held(&[]));
+        assert_eq!(g.poll(10_000), GateState::Running);
+        assert!(g.awaiting().is_none());
+    }
+
+    #[test]
+    fn disarming_clears_frozen_state() {
+        let mut g = WaitGate::from_expected(&[(n(60), 0)]);
+        g.set_armed(true);
+        assert_eq!(g.poll(0), GateState::Frozen);
+        assert!(g.awaiting().is_some());
+        g.set_armed(false);
+        assert!(g.awaiting().is_none());
+        assert_eq!(g.poll(0), GateState::Running);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

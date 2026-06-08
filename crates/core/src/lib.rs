@@ -16,6 +16,7 @@ pub mod composer;
 pub mod events;
 pub mod grid;
 pub mod history;
+pub mod play_clock;
 pub mod scoring;
 pub mod song;
 pub mod stats;
@@ -31,8 +32,9 @@ pub use composer::{Composer, ComposerSnapshot, Cursor, InputMode, NoteView, Sele
 pub use events::{MidiNote, NoteEvent, NoteEventKind, Velocity};
 pub use grid::{Grid, Subdivision, TimeSig};
 pub use history::History;
+pub use play_clock::PlayClock;
 pub use scoring::{score, ExpectedNote, NoteJudgment, ScoreConfig, ScoreReport, Timing};
 pub use song::{backing_position_us, song_shift_us, BackingTrack, MetaError, RecordingMeta};
 pub use stats::Summary;
 pub use timeline::{Note, NoteId, Timeline};
-pub use wait::{Step, WaitTracker};
+pub use wait::{GateState, Step, WaitGate, WaitTracker};
