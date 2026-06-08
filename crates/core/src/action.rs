@@ -38,6 +38,10 @@ pub enum Action {
     CursorOctaveUp,
     CursorToStart,
     CursorToEnd,
+    /// Jump the cursor pitch to the lowest key (A0, MIDI 21).
+    CursorToPitchMin,
+    /// Jump the cursor pitch to the highest key (C8, MIDI 108).
+    CursorToPitchMax,
     /// Absolute jump to a `(pitch, step)` cell — AI-friendly addressing.
     SetCursor {
         pitch: u8,
@@ -129,6 +133,8 @@ impl Action {
             Action::CursorOctaveUp => "cursor_octave_up",
             Action::CursorToStart => "cursor_to_start",
             Action::CursorToEnd => "cursor_to_end",
+            Action::CursorToPitchMin => "cursor_to_pitch_min",
+            Action::CursorToPitchMax => "cursor_to_pitch_max",
             Action::SetCursor { .. } => "set_cursor",
             Action::SubdivisionFiner => "subdivision_finer",
             Action::SubdivisionCoarser => "subdivision_coarser",
@@ -262,6 +268,8 @@ pub fn action_names() -> &'static [&'static str] {
         "cursor_octave_up",
         "cursor_to_start",
         "cursor_to_end",
+        "cursor_to_pitch_min",
+        "cursor_to_pitch_max",
         "set_cursor",
         "subdivision_finer",
         "subdivision_coarser",
@@ -350,6 +358,8 @@ static ACTION_HELP: &[ActionInfo] = {
         ActionInfo { name: "cursor_octave_up", params: &[], description: "Move the cursor up one octave." },
         ActionInfo { name: "cursor_to_start", params: &[], description: "Jump the cursor to the start of the timeline." },
         ActionInfo { name: "cursor_to_end", params: &[], description: "Jump the cursor to the end of the timeline." },
+        ActionInfo { name: "cursor_to_pitch_min", params: &[], description: "Jump the cursor pitch to the lowest key (A0, MIDI 21)." },
+        ActionInfo { name: "cursor_to_pitch_max", params: &[], description: "Jump the cursor pitch to the highest key (C8, MIDI 108)." },
         ActionInfo { name: "set_cursor", params: &[p("pitch", "u8"), p("step", "u64")], description: "Absolute jump to a (pitch, step) cell — AI-friendly addressing." },
         ActionInfo { name: "subdivision_finer", params: &[], description: "Halve the grid step for finer placement." },
         ActionInfo { name: "subdivision_coarser", params: &[], description: "Double the grid step for coarser placement." },
@@ -416,6 +426,8 @@ mod tests {
             Action::CursorOctaveUp,
             Action::CursorToStart,
             Action::CursorToEnd,
+            Action::CursorToPitchMin,
+            Action::CursorToPitchMax,
             Action::SetCursor { pitch: 60, step: 4 },
             Action::SubdivisionFiner,
             Action::SubdivisionCoarser,

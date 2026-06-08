@@ -100,16 +100,22 @@ const SELECT_COLOR: Color = Color::LightGreen;
 fn key_to_action(code: KeyCode) -> Option<Action> {
     Some(match code {
         // ── navigation ──────────────────────────────────────────────────
-        KeyCode::Char('h') | KeyCode::Left => Action::CursorLeft,
-        KeyCode::Char('l') | KeyCode::Right => Action::CursorRight,
-        KeyCode::Char('j') | KeyCode::Down => Action::CursorDown,
-        KeyCode::Char('k') | KeyCode::Up => Action::CursorUp,
-        KeyCode::Char('H') => Action::CursorBarLeft,
-        KeyCode::Char('L') => Action::CursorBarRight,
-        KeyCode::Char('J') => Action::CursorOctaveDown,
-        KeyCode::Char('K') => Action::CursorOctaveUp,
-        KeyCode::Char('0') => Action::CursorToStart,
-        KeyCode::Char('$') => Action::CursorToEnd,
+        // Visual layout: horizontal = pitch (keyboard), vertical = time (falling notes).
+        // h/l navigate the pitch (horizontal) axis; j/k navigate the time (vertical) axis.
+        KeyCode::Char('h') | KeyCode::Left => Action::CursorDown, // pitch -1 (left on keyboard)
+        KeyCode::Char('l') | KeyCode::Right => Action::CursorUp,  // pitch +1 (right on keyboard)
+        KeyCode::Char('j') | KeyCode::Down => Action::CursorLeft, // step  -1 (earlier in timeline)
+        KeyCode::Char('k') | KeyCode::Up => Action::CursorRight,  // step  +1 (later  in timeline)
+        KeyCode::Char('H') => Action::CursorBarLeft,              // one bar earlier
+        KeyCode::Char('L') => Action::CursorBarRight,             // one bar later
+        KeyCode::Char('w') => Action::CursorOctaveUp,             // octave right (higher pitch)
+        KeyCode::Char('b') => Action::CursorOctaveDown,           // octave left  (lower  pitch)
+        KeyCode::Char('J') => Action::CursorOctaveDown,           // alias for b
+        KeyCode::Char('K') => Action::CursorOctaveUp,             // alias for w
+        KeyCode::Char('g') => Action::CursorToStart,              // timeline beginning
+        KeyCode::Char('G') => Action::CursorToEnd,                // timeline end (last note)
+        KeyCode::Char('0') => Action::CursorToPitchMin,           // leftmost key  (A0, MIDI 21)
+        KeyCode::Char('$') => Action::CursorToPitchMax,           // rightmost key (C8, MIDI 108)
         KeyCode::Char('>') => Action::SubdivisionFiner,
         KeyCode::Char('<') => Action::SubdivisionCoarser,
 
@@ -746,7 +752,7 @@ impl EditScreen {
                 Style::default().fg(CURSOR_COLOR),
             ),
             Span::styled(
-                "[a/x] add/del  []/[] size  [+/-] vel  [m] grab  [c] chord  [v] select  [y/p/D] yank/paste/del  [u/U] undo/redo  [R] rec  [t] step/live  [C] count-in  [o] loop  [M] metro  [hjkl] move  [HJKL] bar/oct  [0/$] ends  [s] save  [Tab] menu",
+                "[a/x] add/del  []/[] size  [+/-] vel  [m] grab  [c] chord  [v] select  [y/p/D] yank/paste/del  [u/U] undo/redo  [R] rec  [t] step/live  [C] count-in  [o] loop  [M] metro  [hjkl] pitch/time  [H/L] bar  [w/b] oct  [g/G] timeline ends  [0/$] pitch ends  [s] save  [Tab] menu",
                 Style::default().fg(Color::DarkGray),
             ),
         ]);
@@ -915,18 +921,27 @@ impl EditScreen {
         // Create the help content grouped by category
         let help_content = vec![
             Line::from(Span::styled(
-                " Navigation:",
+                " Navigation (h/l = pitch axis · j/k = time axis):",
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             )),
-            Line::from(Span::raw("  h/← : Left one step    l/→ : Right one step")),
             Line::from(Span::raw(
-                "  j/↓ : Down one semitone  k/↑ : Up one semitone",
+                "  h/← : Pitch -1 (left)   l/→ : Pitch +1 (right)",
             )),
-            Line::from(Span::raw("  H : Left one bar        L : Right one bar")),
-            Line::from(Span::raw("  J : Down one octave     K : Up one octave")),
-            Line::from(Span::raw("  0 : Song start          $ : Last note end")),
+            Line::from(Span::raw(
+                "  j/↓ : Step  -1 (earlier) k/↑ : Step  +1 (later)",
+            )),
+            Line::from(Span::raw("  H : One bar earlier     L : One bar later")),
+            Line::from(Span::raw(
+                "  w : Octave right (+12)  b : Octave left  (-12)",
+            )),
+            Line::from(Span::raw(
+                "  g : Timeline start      G : Timeline end (last note)",
+            )),
+            Line::from(Span::raw(
+                "  0 : Lowest pitch (A0)   $ : Highest pitch (C8)",
+            )),
             Line::from(Span::raw("")), // Empty line
             Line::from(Span::styled(
                 " Edit:",
@@ -1076,72 +1091,88 @@ mod tests {
         );
     }
 
-    #[test]
-    fn h_at_step_zero_stays_at_zero() {
-        let mut e = EditScreen::new();
-        e.on_key(KeyCode::Char('h'));
-        assert_eq!(e.cursor().step, 0);
-        e.on_key(KeyCode::Left);
-        assert_eq!(e.cursor().step, 0);
-    }
+    // h/l are now the pitch axis (horizontal); j/k are the time axis (vertical).
 
     #[test]
-    fn l_then_h_returns_to_start_step() {
+    fn h_and_l_move_pitch_by_one() {
         let mut e = EditScreen::new();
         e.on_key(KeyCode::Char('l'));
-        assert_eq!(e.cursor().step, 1);
+        assert_eq!(e.cursor().pitch, DEFAULT_CURSOR_PITCH + 1);
         e.on_key(KeyCode::Char('h'));
-        assert_eq!(e.cursor().step, 0);
+        assert_eq!(e.cursor().pitch, DEFAULT_CURSOR_PITCH);
         // Arrow aliases behave the same.
         e.on_key(KeyCode::Right);
-        e.on_key(KeyCode::Left);
-        assert_eq!(e.cursor().step, 0);
-    }
-
-    #[test]
-    fn k_and_j_move_pitch_by_one() {
-        let mut e = EditScreen::new();
-        e.on_key(KeyCode::Char('k'));
         assert_eq!(e.cursor().pitch, DEFAULT_CURSOR_PITCH + 1);
-        e.on_key(KeyCode::Char('j'));
+        e.on_key(KeyCode::Left);
         assert_eq!(e.cursor().pitch, DEFAULT_CURSOR_PITCH);
     }
 
     #[test]
-    fn k_clamps_at_top_108() {
+    fn h_clamps_at_pitch_min() {
         let mut e = EditScreen::new();
         for _ in 0..200 {
-            e.on_key(KeyCode::Char('k'));
-        }
-        assert_eq!(e.cursor().pitch, HIGHEST_MIDI);
-    }
-
-    #[test]
-    fn j_clamps_at_bottom_21() {
-        let mut e = EditScreen::new();
-        for _ in 0..200 {
-            e.on_key(KeyCode::Char('j'));
+            e.on_key(KeyCode::Char('h'));
         }
         assert_eq!(e.cursor().pitch, LOWEST_MIDI);
     }
 
     #[test]
+    fn l_clamps_at_pitch_max() {
+        let mut e = EditScreen::new();
+        for _ in 0..200 {
+            e.on_key(KeyCode::Char('l'));
+        }
+        assert_eq!(e.cursor().pitch, HIGHEST_MIDI);
+    }
+
+    #[test]
+    fn j_and_k_move_step_by_one() {
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('k'));
+        assert_eq!(e.cursor().step, 1);
+        e.on_key(KeyCode::Char('j'));
+        assert_eq!(e.cursor().step, 0);
+        // Arrow aliases.
+        e.on_key(KeyCode::Up);
+        assert_eq!(e.cursor().step, 1);
+        e.on_key(KeyCode::Down);
+        assert_eq!(e.cursor().step, 0);
+    }
+
+    #[test]
+    fn j_at_step_zero_stays_at_zero() {
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('j'));
+        assert_eq!(e.cursor().step, 0);
+        e.on_key(KeyCode::Down);
+        assert_eq!(e.cursor().step, 0);
+    }
+
+    #[test]
     fn octave_jumps_move_by_twelve_and_clamp() {
         let mut e = EditScreen::new();
-        e.on_key(KeyCode::Char('K'));
+        // w/b are the primary octave keys (right/left on the pitch axis).
+        e.on_key(KeyCode::Char('w'));
         assert_eq!(e.cursor().pitch, DEFAULT_CURSOR_PITCH + 12);
-        e.on_key(KeyCode::Char('J'));
+        e.on_key(KeyCode::Char('b'));
         assert_eq!(e.cursor().pitch, DEFAULT_CURSOR_PITCH);
 
         // Clamp at the top.
         for _ in 0..20 {
-            e.on_key(KeyCode::Char('K'));
+            e.on_key(KeyCode::Char('w'));
         }
         assert_eq!(e.cursor().pitch, HIGHEST_MIDI);
         // Clamp at the bottom.
         for _ in 0..20 {
-            e.on_key(KeyCode::Char('J'));
+            e.on_key(KeyCode::Char('b'));
         }
+        assert_eq!(e.cursor().pitch, LOWEST_MIDI);
+
+        // J/K are kept as aliases for b/w; verify from a known starting pitch.
+        // Cursor is at LOWEST_MIDI after the b clamp above; K moves up by 12.
+        e.on_key(KeyCode::Char('K'));
+        assert_eq!(e.cursor().pitch, LOWEST_MIDI + 12);
+        e.on_key(KeyCode::Char('J'));
         assert_eq!(e.cursor().pitch, LOWEST_MIDI);
     }
 
@@ -1164,25 +1195,35 @@ mod tests {
     }
 
     #[test]
-    fn zero_and_dollar_jump_to_song_start_and_last_note_end() {
+    fn g_and_shift_g_jump_to_timeline_start_and_end() {
         let mut tl = Timeline::new();
         // Last note ends at 3_000_000 us → step index at 1/16 (125_000 us) = 24.
         tl.insert(note(60, 0, 1_000_000));
         tl.insert(note(64, 2_000_000, 1_000_000));
         let mut e = EditScreen::from_timeline(tl, Grid::default_120());
 
-        e.on_key(KeyCode::Char('$'));
-        assert_eq!(e.cursor().step, 24);
-        e.on_key(KeyCode::Char('0'));
-        assert_eq!(e.cursor().step, 0);
+        e.on_key(KeyCode::Char('G'));
+        assert_eq!(e.cursor().step, 24, "G jumps to last note end");
+        e.on_key(KeyCode::Char('g'));
+        assert_eq!(e.cursor().step, 0, "g jumps to timeline start");
     }
 
     #[test]
-    fn dollar_on_empty_timeline_is_step_zero() {
+    fn shift_g_on_empty_timeline_is_step_zero() {
         let mut e = EditScreen::new();
-        e.on_key(KeyCode::Char('l')); // move off zero first
+        e.on_key(KeyCode::Char('k')); // move off step zero first
+        e.on_key(KeyCode::Char('G'));
+        assert_eq!(e.cursor().step, 0, "G on empty timeline stays at step 0");
+    }
+
+    #[test]
+    fn zero_and_dollar_jump_to_pitch_extremes() {
+        let mut e = EditScreen::new();
+        // Default cursor is middle C (MIDI 60); step stays unchanged.
+        e.on_key(KeyCode::Char('0'));
+        assert_eq!(e.cursor().pitch, LOWEST_MIDI, "0 jumps to A0 (MIDI 21)");
         e.on_key(KeyCode::Char('$'));
-        assert_eq!(e.cursor().step, 0);
+        assert_eq!(e.cursor().pitch, HIGHEST_MIDI, "$ jumps to C8 (MIDI 108)");
     }
 
     #[test]
@@ -1391,15 +1432,16 @@ mod tests {
 
     // ── grab-mode tests ───────────────────────────────────────────────────
 
-    /// `m` + `l` moves the note's start forward by one step and the cursor tracks.
+    /// `m` + `k` moves the note's start later by one step and the cursor tracks.
+    /// (`k` is the time-forward key after the axis fix.)
     #[test]
-    fn grab_l_moves_note_start_and_cursor_tracks() {
+    fn grab_k_moves_note_start_and_cursor_tracks() {
         let mut e = EditScreen::new();
         e.on_key(KeyCode::Char('a')); // add note at step 0
 
         e.on_key(KeyCode::Char('m')); // grab it
 
-        e.on_key(KeyCode::Char('l')); // move right → step 1
+        e.on_key(KeyCode::Char('k')); // move later → step 1
         assert_eq!(e.cursor().step, 1, "cursor follows note");
         let id = e.note_under_cursor().expect("note at new position");
         assert_eq!(
@@ -1409,16 +1451,17 @@ mod tests {
         );
     }
 
-    /// `m` + `k` transposes the note up and the cursor pitch tracks.
+    /// `m` + `l` transposes the note up (right on keyboard) and the cursor pitch tracks.
+    /// (`l` is the pitch-up key after the axis fix.)
     #[test]
-    fn grab_k_transposes_note_and_cursor_tracks() {
+    fn grab_l_transposes_note_and_cursor_tracks() {
         let mut e = EditScreen::new();
         e.on_key(KeyCode::Char('a')); // add note at pitch 60
 
         e.on_key(KeyCode::Char('m')); // grab
-        e.on_key(KeyCode::Char('k')); // transpose up
+        e.on_key(KeyCode::Char('l')); // pitch up (right on keyboard)
 
-        assert_eq!(e.cursor().pitch, DEFAULT_CURSOR_PITCH + 1, "cursor up");
+        assert_eq!(e.cursor().pitch, DEFAULT_CURSOR_PITCH + 1, "cursor right");
         let id = e.note_under_cursor().expect("note at new pitch");
         assert_eq!(
             e.get_note(id).unwrap().pitch.value(),
@@ -1436,8 +1479,8 @@ mod tests {
         e.on_key(KeyCode::Char('m')); // grab
         e.on_key(KeyCode::Char('m')); // drop
 
-        // `l` should now only move the cursor, not the note.
-        e.on_key(KeyCode::Char('l'));
+        // `k` should now only move the cursor (step +1), not drag the note.
+        e.on_key(KeyCode::Char('k'));
         assert_eq!(e.cursor().step, 1, "cursor moved");
         // The note is still at step 0 (cursor moved away from it).
         assert!(
@@ -1452,7 +1495,7 @@ mod tests {
         let mut e = EditScreen::new();
         e.on_key(KeyCode::Char('m')); // nothing to grab
                                       // Navigation is still cursor-only.
-        e.on_key(KeyCode::Char('l'));
+        e.on_key(KeyCode::Char('k')); // step +1
         assert_eq!(e.cursor().step, 1);
         assert_eq!(e.note_count(), 0);
     }
@@ -1732,13 +1775,14 @@ mod tests {
     }
 
     /// Navigation keys behave identically regardless of input mode.
+    /// After the axis fix: l = pitch +1 (right), k = step +1 (later).
     #[test]
     fn navigation_unaffected_by_mode() {
         let mut e = EditScreen::new();
         e.on_key(KeyCode::Char('R')); // step-record armed
         e.on_key(KeyCode::Char('t')); // live-record
-        e.on_key(KeyCode::Char('l'));
-        e.on_key(KeyCode::Char('k'));
+        e.on_key(KeyCode::Char('l')); // pitch +1
+        e.on_key(KeyCode::Char('k')); // step +1
         assert_eq!(e.cursor().step, 1);
         assert_eq!(e.cursor().pitch, DEFAULT_CURSOR_PITCH + 1);
     }
@@ -1867,9 +1911,9 @@ mod tests {
     #[test]
     fn space_starts_play_from_cursor_and_second_space_stops() {
         let mut e = EditScreen::new();
-        // Move cursor to step 4 → some non-zero µs.
+        // Move cursor to step 4 → some non-zero µs (k = step +1).
         for _ in 0..4 {
-            e.on_key(KeyCode::Char('l'));
+            e.on_key(KeyCode::Char('k'));
         }
         let cursor_us = e.cursor_us();
         assert!(!e.is_playing());
@@ -1887,8 +1931,9 @@ mod tests {
     #[test]
     fn shift_p_plays_whole_song_from_zero() {
         let mut e = EditScreen::new();
+        // k = step +1; move 8 steps forward so cursor_us > 0.
         for _ in 0..8 {
-            e.on_key(KeyCode::Char('l'));
+            e.on_key(KeyCode::Char('k'));
         }
         assert!(e.cursor_us() > 0);
 
@@ -1986,9 +2031,9 @@ mod tests {
     #[test]
     fn play_from_cursor_sets_playhead_to_cursor_us() {
         let mut e = EditScreen::new();
-        // Move cursor to step 16 (one bar at default grid).
+        // Move cursor to step 16 (one bar at default grid); k = step +1.
         for _ in 0..16 {
-            e.on_key(KeyCode::Char('l'));
+            e.on_key(KeyCode::Char('k'));
         }
         let cursor_before = e.cursor_us();
 
@@ -2003,9 +2048,9 @@ mod tests {
         tl.insert(note(60, 0, 100_000));
         let mut e = EditScreen::from_timeline(tl, Grid::default_120());
 
-        // Move cursor past the note and start playing.
+        // Move cursor past the note and start playing; k = step +1.
         for _ in 0..4 {
-            e.on_key(KeyCode::Char('l'));
+            e.on_key(KeyCode::Char('k'));
         }
         e.on_key(KeyCode::Char(' ')); // play from cursor_us > 100_000
 
@@ -2024,9 +2069,9 @@ mod tests {
     #[test]
     fn u_undoes_and_shift_u_redoes() {
         let mut e = EditScreen::new();
-        e.on_key(KeyCode::Char('a')); // add note → 1 note
-        e.on_key(KeyCode::Char('l')); // step right (no checkpoint)
-        e.on_key(KeyCode::Char('a')); // add second note → 2 notes
+        e.on_key(KeyCode::Char('a')); // add note at pitch 60 → 1 note
+        e.on_key(KeyCode::Char('l')); // pitch +1 (no checkpoint)
+        e.on_key(KeyCode::Char('a')); // add second note at pitch 61 → 2 notes
 
         assert_eq!(e.note_count(), 2);
 
@@ -2050,17 +2095,17 @@ mod tests {
     #[test]
     fn new_edit_after_undo_clears_redo_in_edit_screen() {
         let mut e = EditScreen::new();
-        e.on_key(KeyCode::Char('a')); // note at step 0
-        e.on_key(KeyCode::Char('l')); // cursor → step 1
-        e.on_key(KeyCode::Char('a')); // note at step 1
+        e.on_key(KeyCode::Char('a')); // note at pitch 60
+        e.on_key(KeyCode::Char('l')); // cursor → pitch 61 (pitch +1)
+        e.on_key(KeyCode::Char('a')); // note at pitch 61
         assert_eq!(e.note_count(), 2);
 
-        e.on_key(KeyCode::Char('u')); // undo second add; cursor still at step 1
+        e.on_key(KeyCode::Char('u')); // undo second add; cursor still at pitch 61
         assert_eq!(e.note_count(), 1);
 
         // A new edit clears redo: move back and delete the remaining note.
-        e.on_key(KeyCode::Char('h')); // cursor → step 0
-        e.on_key(KeyCode::Char('x')); // delete the note at step 0
+        e.on_key(KeyCode::Char('h')); // cursor → pitch 60 (pitch -1)
+        e.on_key(KeyCode::Char('x')); // delete the note at pitch 60
         assert_eq!(e.note_count(), 0);
         e.on_key(KeyCode::Char('U')); // redo is gone
         assert_eq!(e.note_count(), 0, "redo cleared by the delete");
@@ -2368,11 +2413,11 @@ mod tests {
     #[test]
     fn cursor_stays_on_grid_line_after_snap_change() {
         let mut e = EditScreen::new();
-        // Move cursor to a position that's valid in multiple subdivisions
-        // At 120 BPM: Quarter=500000, Eighth=250000, Sixteenth=125000
+        // Move cursor to a position that's valid in multiple subdivisions.
+        // k = step +1; at 120 BPM: Quarter=500000, Eighth=250000, Sixteenth=125000
         // Position at 250000 µs (2 steps in Sixteenth, 1 step in Eighth)
-        e.on_key(KeyCode::Char('l'));
-        e.on_key(KeyCode::Char('l')); // 2 * 125000 = 250000 µs
+        e.on_key(KeyCode::Char('k'));
+        e.on_key(KeyCode::Char('k')); // 2 * 125000 = 250000 µs
 
         // Change to Eighth (250000 µs = 1 step in Eighth)
         e.on_key(KeyCode::Char('<'));
@@ -2446,27 +2491,28 @@ mod tests {
     // ── region-select tests ───────────────────────────────────────────────
 
     /// `v` + move + `y` yanks the right count; clipboard is normalised.
+    /// After the axis fix: l/h = pitch ±1, k/j = step ±1.
     #[test]
     fn v_move_y_copies_right_count() {
         let mut e = EditScreen::new();
-        // Add two notes: one at cursor (step 0, pitch 60) and one two steps right.
+        // Add two notes: one at (pitch 60, step 0) and one at (pitch 62, step 1).
         e.on_key(KeyCode::Char('a')); // note at (60, step 0)
-        e.on_key(KeyCode::Char('l'));
-        e.on_key(KeyCode::Char('l'));
-        e.on_key(KeyCode::Char('k')); // pitch 61
-        e.on_key(KeyCode::Char('a')); // note at (61, step 2)
+        e.on_key(KeyCode::Char('l')); // pitch 61
+        e.on_key(KeyCode::Char('l')); // pitch 62
+        e.on_key(KeyCode::Char('k')); // step 1
+        e.on_key(KeyCode::Char('a')); // note at (62, step 1)
         assert_eq!(e.note_count(), 2);
 
-        // Return to step 0 pitch 60 and start selection.
-        e.on_key(KeyCode::Char('h'));
-        e.on_key(KeyCode::Char('h'));
-        e.on_key(KeyCode::Char('j')); // back to pitch 60
+        // Return to (pitch 60, step 0) and start selection.
+        e.on_key(KeyCode::Char('h')); // pitch 61
+        e.on_key(KeyCode::Char('h')); // pitch 60
+        e.on_key(KeyCode::Char('j')); // step 0
         e.on_key(KeyCode::Char('v')); // anchor at (60, step 0)
 
         // Extend selection to cover both notes.
-        e.on_key(KeyCode::Char('l'));
-        e.on_key(KeyCode::Char('l')); // cursor at step 2
-        e.on_key(KeyCode::Char('k')); // cursor at pitch 61
+        e.on_key(KeyCode::Char('l')); // pitch 61
+        e.on_key(KeyCode::Char('l')); // pitch 62
+        e.on_key(KeyCode::Char('k')); // step 1
 
         // Both notes should be in the selection.
         assert_eq!(e.selection_ids().len(), 2, "both notes in selection");
@@ -2491,10 +2537,10 @@ mod tests {
         e.on_key(KeyCode::Char('y'));
         assert_eq!(e.clipboard_len(), 1);
 
-        // Move cursor to a new position and paste.
-        e.on_key(KeyCode::Char('l'));
-        e.on_key(KeyCode::Char('l'));
-        e.on_key(KeyCode::Char('k')); // pitch 61, step 2
+        // Move cursor to a new position (pitch 62, step 1) and paste.
+        e.on_key(KeyCode::Char('l')); // pitch 61
+        e.on_key(KeyCode::Char('l')); // pitch 62
+        e.on_key(KeyCode::Char('k')); // step 1
         let count_before = e.note_count();
         e.on_key(KeyCode::Char('p'));
         assert_eq!(
@@ -2508,16 +2554,16 @@ mod tests {
     #[test]
     fn shift_d_removes_selection() {
         let mut e = EditScreen::new();
-        // Two notes side by side.
-        e.on_key(KeyCode::Char('a')); // step 0, pitch 60
-        e.on_key(KeyCode::Char('l'));
-        e.on_key(KeyCode::Char('a')); // step 1, pitch 60
+        // Two notes at different pitches, same step.
+        e.on_key(KeyCode::Char('a')); // (pitch 60, step 0)
+        e.on_key(KeyCode::Char('l')); // pitch 61
+        e.on_key(KeyCode::Char('a')); // (pitch 61, step 0)
         assert_eq!(e.note_count(), 2);
 
         // Select both.
-        e.on_key(KeyCode::Char('h')); // back to step 0
-        e.on_key(KeyCode::Char('v')); // anchor at step 0
-        e.on_key(KeyCode::Char('l')); // extend to step 1
+        e.on_key(KeyCode::Char('h')); // back to pitch 60
+        e.on_key(KeyCode::Char('v')); // anchor at (60, step 0)
+        e.on_key(KeyCode::Char('l')); // extend to pitch 61
         assert_eq!(e.selection_ids().len(), 2);
 
         // Delete.
