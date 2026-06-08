@@ -256,8 +256,9 @@ impl Shell {
             },
             // Note-key precedence inside a screen: navigation keys (Tab/Esc/
             // Enter/arrows) and the screen's own letter controls (`s` save here)
-            // are handled first; any *other* letter is forwarded to the source
-            // as a note key (a no-op on a real piano, a `press` on the mock).
+            // are handled first; any other key is forwarded to the source as a
+            // note key — the mock maps the number row 1-0 to a C-major scale and
+            // ignores the rest; a real piano ignores the keyboard entirely.
             Screen::Record(rec) => match code {
                 KeyCode::Tab | KeyCode::Esc => {
                     // Release anything still sounding before leaving the screen.
@@ -276,8 +277,8 @@ impl Shell {
                 }
                 _ => {}
             },
-            // Same precedence as Record: `r`/`m` are reserved controls, other
-            // letters become note presses on the mock.
+            // Same precedence as Record: `r`/`m` are reserved controls; the mock
+            // turns the number row into note presses (other keys are no-ops).
             Screen::Play(play) => match code {
                 KeyCode::Tab | KeyCode::Esc => {
                     play.leave();
@@ -294,6 +295,14 @@ impl Shell {
             // timeline bundle (matching Record's convention); every other key is
             // routed into the screen's own keymap. Exception: while the chord
             // selector is active, Esc cancels the chord instead of leaving.
+            //
+            // Note-entry vs command-entry (#124): the mock keyboard's note keys
+            // are the *number row* (a no-op on a real piano), while editor
+            // commands are letters/symbols — disjoint sets. We only forward a key
+            // as a note while record is armed, so an unarmed `0` stays the
+            // "cursor to lowest pitch" command. `forward_key` returns `false` for
+            // unmapped keys (and on a real piano), so those fall through to the
+            // editor keymap unchanged.
             Screen::Edit(edit) => match code {
                 KeyCode::Esc if edit.in_chord_mode() => edit.on_key(KeyCode::Esc),
                 // Clear visual selection on Esc without leaving the editor.
@@ -306,6 +315,7 @@ impl Shell {
                     Ok(p) => self.status = format!("saved {}", p.display()),
                     Err(e) => self.status = format!("save failed: {e}"),
                 },
+                KeyCode::Char(c) if edit.is_recording() && self.input.forward_key(c) => {}
                 other => edit.on_key(other),
             },
             Screen::BackingPicker(picker) => {
@@ -738,6 +748,67 @@ mod tests {
             Some(0),
             "new composition starts with an empty timeline"
         );
+    }
+
+    /// Drain whatever the input source has queued into the active edit screen,
+    /// mirroring the MIDI-routing the run loop does each frame.
+    fn drain_input_into_edit(shell: &mut Shell) {
+        let events = shell.input.events();
+        if let Screen::Edit(edit) = &mut shell.screen {
+            for ev in events {
+                edit.ingest(ev);
+            }
+        }
+    }
+
+    /// The #124 fix: in the editor the mock note keys (the number row) only play
+    /// notes while record is armed; unarmed, a digit stays an editor *command*
+    /// and is never forwarded as a note.
+    #[test]
+    fn editor_forwards_digit_notes_only_when_record_armed() {
+        use rockcraft_midi::MockKeyboard;
+
+        let mut shell = Shell::new(Box::new(MockKeyboard::new()), None, None);
+        shell.activate_edit();
+
+        // Unarmed: `0` runs as the "cursor to lowest pitch" command, not a note.
+        shell.on_key(KeyCode::Char('0'));
+        drain_input_into_edit(&mut shell);
+        assert_eq!(
+            shell.edit_note_count(),
+            Some(0),
+            "no note is placed by a digit while in direct-edit"
+        );
+        if let Screen::Edit(e) = &shell.screen {
+            assert_eq!(
+                e.cursor().pitch,
+                21,
+                "unarmed `0` still moves the cursor to the lowest pitch (A0)"
+            );
+        } else {
+            panic!("expected edit screen");
+        }
+
+        // Arm step-record, then play three digits: each forwards as a note.
+        shell.on_key(KeyCode::Char('R'));
+        shell.on_key(KeyCode::Char('1'));
+        shell.on_key(KeyCode::Char('2'));
+        shell.on_key(KeyCode::Char('3'));
+        drain_input_into_edit(&mut shell);
+        assert_eq!(
+            shell.edit_note_count(),
+            Some(3),
+            "armed, the number row plays notes into the recorder"
+        );
+
+        // Letter commands still work while armed (they aren't note keys), so the
+        // armed user keeps navigation/editing. `R` here disarms record.
+        shell.on_key(KeyCode::Char('R'));
+        if let Screen::Edit(e) = &shell.screen {
+            assert!(!e.is_recording(), "`R` toggled record off even while armed");
+        } else {
+            panic!("expected edit screen");
+        }
     }
 
     /// Seeding a bundle then loading it via "Edit last recording" enters the

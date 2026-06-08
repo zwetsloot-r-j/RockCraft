@@ -44,7 +44,7 @@ use rockcraft_core::{
     Action, Composer, Cursor, Effect, Grid, InputMode, Key, MidiNote, Note, NoteEvent, NoteId,
     RecordingMeta, Scale as MusicScale, Subdivision, Timeline, Velocity,
 };
-use rockcraft_midi::events_to_smf_bytes;
+use rockcraft_midi::{events_to_smf_bytes, key_map as mock_key_map};
 
 use crate::highway::{build_spans, project, NoteSpan};
 use crate::keyboard::{black_key_col, is_black_key, white_index, Scale, LOWEST_MIDI};
@@ -538,6 +538,13 @@ impl EditScreen {
         self.composer.input_mode()
     }
 
+    /// Whether step or live record is armed — i.e. played notes are being
+    /// captured. The shell consults this to decide whether the mock keyboard's
+    /// number-row note keys should play notes (armed) or stay editor commands.
+    pub fn is_recording(&self) -> bool {
+        self.composer.input_mode() != InputMode::DirectEdit
+    }
+
     /// Whether the transport is currently playing.
     pub fn is_playing(&self) -> bool {
         self.composer.is_playing()
@@ -741,6 +748,19 @@ impl EditScreen {
             Span::raw("")
         };
 
+        // While record is armed, surface the mock note keys so no-piano users
+        // discover that the number row plays notes (the rest of the hint lists
+        // the letter command keys). Hidden in direct-edit, where digits are
+        // editor commands rather than notes.
+        let note_keys_span = if matches!(
+            self.composer.input_mode(),
+            InputMode::StepRecord | InputMode::LiveRecord
+        ) {
+            Span::styled("  play 1-0 (C-major)  ", Style::default().fg(REC_COLOR))
+        } else {
+            Span::raw("")
+        };
+
         // Show a sub-beat step counter when the subdivision is finer than one
         // beat — at 1/16 snap this turns every cursor_right into a visible
         // change rather than waiting 4 presses for the beat digit to flip.
@@ -769,6 +789,7 @@ impl EditScreen {
             loop_span,
             metro_span,
             count_in_span,
+            note_keys_span,
             pos_span,
             Span::raw(format!("snap {}  ", self.grid.subdivision.label())),
             Span::styled(
@@ -943,6 +964,10 @@ impl EditScreen {
         // Draw the overlay background (clear the area first)
         f.render_widget(help_block.clone(), help_area);
 
+        // The mock-keyboard note keys, pulled straight from the source's table so
+        // this legend can never drift from what the keys actually do.
+        let mock_keys: String = mock_key_map().iter().map(|(k, _)| *k).collect();
+
         // Create the help content grouped by category
         let help_content = vec![
             Line::from(Span::styled(
@@ -1008,6 +1033,9 @@ impl EditScreen {
             Line::from(Span::raw(
                 "  R : Toggle record arm    t : Toggle step/live record",
             )),
+            Line::from(Span::raw(format!(
+                "  Play notes (no piano, while armed): {mock_keys} → C-major C4–E5"
+            ))),
             Line::from(Span::raw("")), // Empty line
             Line::from(Span::styled(
                 " Undo/Redo:",
@@ -1869,9 +1897,9 @@ mod tests {
         e.on_key(KeyCode::Char('R')); // arm step-record
 
         let mut kb = MockKeyboard::new();
-        kb.forward_key('a'); // C4 = 60
-        kb.forward_key('s'); // D4 = 62
-        kb.forward_key('d'); // E4 = 64
+        kb.forward_key('1'); // C4 = 60
+        kb.forward_key('2'); // D4 = 62
+        kb.forward_key('3'); // E4 = 64
         for ev in kb.events() {
             e.ingest(ev);
         }

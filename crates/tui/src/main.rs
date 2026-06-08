@@ -51,7 +51,9 @@ fn main() {
     // Source selection: explicit `--mock`, otherwise the live piano — and when
     // no port matches, fall back to the mock so the app always launches.
     let input: Box<dyn NoteSource> = if force_mock {
-        eprintln!("Using MockKeyboard (--mock): type the home/QWERTY rows to play notes.");
+        eprintln!(
+            "Using MockKeyboard (--mock): type the number row 1-0 to play notes (C-major scale)."
+        );
         Box::new(MockKeyboard::new())
     } else {
         match LiveInput::connect(&filter) {
