@@ -49,7 +49,14 @@ mod tests {
             .expect("send");
         loop {
             match ws.next().await.expect("a reply").expect("no ws error") {
-                Message::Text(t) => return serde_json::from_str(&t).expect("reply is json"),
+                Message::Text(t) => {
+                    let v: Value = serde_json::from_str(&t).expect("reply is json");
+                    // Skip unsolicited server frames (connect banner, async events).
+                    if v["type"] == "hello" || v["type"] == "event" {
+                        continue;
+                    }
+                    return v;
+                }
                 // Ignore any control frames the server might interleave.
                 _ => continue,
             }
@@ -64,6 +71,27 @@ mod tests {
             Ok(_) => panic!("non-loopback bind must be refused"),
             Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
         }
+    }
+
+    #[tokio::test]
+    async fn connect_receives_hello_banner_first() {
+        let (url, handle) = spawn_server().await;
+        let mut ws = connect(&url).await;
+
+        // The very first frame is the unsolicited banner, before any request.
+        let first = match ws.next().await.expect("a frame").expect("no ws error") {
+            Message::Text(t) => serde_json::from_str::<Value>(&t).expect("json"),
+            other => panic!("expected text banner, got {other:?}"),
+        };
+        assert_eq!(first["type"], "hello");
+        assert_eq!(first["protocol"], "rockcraft-control/1");
+        assert!(first["queries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|q| q == "Help"));
+
+        handle.abort();
     }
 
     #[tokio::test]

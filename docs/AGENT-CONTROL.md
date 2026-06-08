@@ -11,27 +11,51 @@ This document describes the WebSocket control interface that lets an AI agent (o
 The control server is **localhost-only** and **unauthenticated** by design. It binds to `127.0.0.1` and refuses any non-loopback address.
 
 ```bash
-# From the TUI (most common)
-RUST_LOG=info cargo run --bin rockcraft-tui -- --control
-
-# Or programmatically via the control crate
-# The bound port is printed to stdout, e.g.:
-# [INFO] Control server bound to 127.0.0.1:38473
+# From the TUI (most common). The bound address is printed to STDERR, e.g.:
+#   Control server listening on ws://127.0.0.1:38473
+cargo run --bin rockcraft-tui -- --control
 ```
 
-You can also set the port via environment variable:
+You can pin a fixed `host:port` with the `ROCKCRAFT_CONTROL_ADDR` environment
+variable. Setting it **also enables the server**, so `--control` becomes
+optional — this is the recommended path for a scripted agent that needs a
+known, stable address:
 
 ```bash
-CONTROL_PORT=9001 cargo run --bin rockcraft-tui -- --control
+ROCKCRAFT_CONTROL_ADDR=127.0.0.1:9001 cargo run --bin rockcraft-tui
 ```
 
-If no port is specified, the OS assigns one; the actual address is logged and can be queried via the server's `local_addr()` method.
+If the address ends in `:0` (the default is `127.0.0.1:0`), the OS assigns the
+port; read the actual address from the stderr line above, or from the server's
+`local_addr()` when embedding the `rockcraft-control` crate directly.
 
 ### Connecting a client
 
 The server speaks plain WebSocket (no TLS). Connect to `ws://127.0.0.1:<PORT>`.
 
 See [`crates/control/examples/agent_session.rs`](../../crates/control/examples/agent_session.rs) for a minimal working example.
+
+### The connection banner
+
+Immediately after the handshake — **before you send anything** — the server
+pushes one unsolicited `hello` frame. It exists so an agent that never read this
+doc can still bootstrap: it names the request verbs and query kinds and points
+at `query help`.
+
+```json
+{
+  "type": "hello",
+  "protocol": "rockcraft-control/1",
+  "requests": ["run_action", "query", "subscribe", "unsubscribe"],
+  "queries": ["State", "Actions", "Help", "Render"],
+  "hint": "send {\"type\":\"query\",\"what\":\"Help\"} for the full action catalog"
+}
+```
+
+Because the banner (and any `event` you subscribe to) arrive **unsolicited**, a
+correct client must not assume the next frame is the reply to its last request.
+Correlate replies by skipping frames whose `type` is `hello` or `event` (and/or
+matching the `id` you sent). The example client and the demo test both do this.
 
 ## Protocol
 
@@ -46,7 +70,7 @@ All requests are JSON objects with a `type` field (snake_case) that determines t
 | Type | Purpose | Example |
 |------|---------|---------|
 | `run_action` | Execute a composer action | [Below](#run_action) |
-| `query` | Query state, actions, or render | [Below](#query) |
+| `query` | Query state, actions, help, or render | [Below](#query) |
 | `subscribe` | Subscribe to events | [Below](#subscribe) |
 | `unsubscribe` | Unsubscribe from events | [Below](#unsubscribe) |
 
@@ -131,12 +155,53 @@ Queries the current state of the composer or enumerates available actions.
 }
 ```
 
+**Request (help):**
+```json
+{
+  "type": "query",
+  "id": 7,
+  "what": "Help"
+}
+```
+
+**Response:**
+```json
+{
+  "type": "help",
+  "id": 7,
+  "actions": [
+    {
+      "name": "set_cursor",
+      "params": [
+        { "name": "pitch", "type": "u8" },
+        { "name": "step", "type": "u64" }
+      ],
+      "description": "Absolute jump to a (pitch, step) cell — AI-friendly addressing."
+    },
+    {
+      "name": "add_note",
+      "params": [],
+      "description": "Add a note at the cursor (duration 1 step, velocity 80); replaces any note already in that cell."
+    }
+  ]
+}
+```
+
+`help` is the structured superset of `actions`: it lists **every** action with
+its parameter schema (`name` + Rust scalar `type`) and a one-line description,
+derived from `core::action_help()`. Query it once on connect to discover the
+full call shape of every action — no hand-maintained table to consult.
+
+> **Note on `what` casing:** `QueryKind` serialises with its Rust variant names,
+> so the values are `State`, `Actions`, `Help`, `Render` (PascalCase), not
+> snake_case.
+
 **Request (render):**
 ```json
 {
   "type": "query",
   "id": 4,
-  "what": "render"
+  "what": "Render"
 }
 ```
 
@@ -227,11 +292,19 @@ Server: render { text: "..." }
 
 ### Action vocabulary
 
-The complete list of callable actions is available via `query { what: "actions" }`. **Do not hand-maintain a separate list** — the response from this query is the live source of truth, and it is guaranteed to stay in sync with `core::action_names()`.
+Two queries describe the vocabulary live, so **nothing here needs hand-maintaining**:
 
-Each action maps to a variant in `rockcraft_core::Action`. See the [core action module](../../crates/core/src/action.rs) for the full enumeration and parameter shapes.
+- `query { what: "Actions" }` — just the names (`core::action_names()`).
+- `query { what: "Help" }` — names **plus** parameter schema and a one-line
+  description for each (`core::action_help()`). Prefer this when connecting cold:
+  it tells you exactly what params each action takes.
 
-Common actions for agent use:
+Both are guaranteed in sync with the `Action` enum by parity tests in
+`crates/core/src/action.rs`. Each action maps to a variant in
+`rockcraft_core::Action`; see that module for the canonical definitions.
+
+The small table below is an at-a-glance convenience only — `query help` is the
+authoritative, exhaustive source:
 
 | Action | Parameters | Description |
 |--------|------------|-------------|
@@ -301,6 +374,9 @@ All errors return a response of type `err` with an `error` string. Common errors
 
 ## See also
 
+- [Demo scenario](DEMO-SCENARIO.md) — a guided session exercising every action,
+  with the equivalent TUI keystroke per beat (agent ⇄ human parity) and an
+  executable integration test
 - [Development workflow](../WORKFLOW.md) — how work is tracked and delegated
 - [CLAUDE.md](../CLAUDE.md) — architecture invariants and agent guide
 - [`rockcraft-control` crate](../../crates/control/) — implementation of the server and protocol

@@ -111,5 +111,23 @@ third-party deps yet). Next: **M0 "Echo"** — `midir` reads the piano, a
 `ratatui` view lists note events, and the session records to a `.mid`
 (re-playable via `midly`). Third-party deps are added then, not before.
 
-The WebSocket control interface for agent-driven editing is documented in
-[`docs/AGENT-CONTROL.md`](docs/AGENT-CONTROL.md).
+## Driving a running instance (agent control)
+
+A running RockCraft exposes a **localhost WebSocket control interface** so an
+agent can edit the composer programmatically — the same `core::Action`s the
+keyboard triggers. To drive it:
+
+1. **Start it.** `cargo run --bin rockcraft-tui -- --control`. The bound address
+   is printed to **stderr** (`Control server listening on ws://127.0.0.1:<PORT>`).
+   For a known, stable address, pin it — this also enables the server, so
+   `--control` is then optional: `ROCKCRAFT_CONTROL_ADDR=127.0.0.1:9001`.
+2. **Connect** a WebSocket client to `ws://127.0.0.1:<PORT>`. The server greets
+   you with an unsolicited `hello` banner naming the request verbs and the query
+   kinds.
+3. **Discover, then act.** Send `{"type":"query","what":"Help"}` first — it
+   returns every action with its parameter schema and a description (the live,
+   drift-proof catalog). Then `run_action` and read back the `state` snapshot.
+
+Full protocol reference: [`docs/AGENT-CONTROL.md`](docs/AGENT-CONTROL.md). A
+guided session exercising every action, with the equivalent TUI keystroke per
+beat, is in [`docs/DEMO-SCENARIO.md`](docs/DEMO-SCENARIO.md).
