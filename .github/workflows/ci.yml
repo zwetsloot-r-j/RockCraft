@@ -23,6 +23,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check no media or unguarded charts in git
+        run: bash scripts/check-no-media.sh
+
       # midir's Linux backend links ALSA via alsa-sys; the headers aren't on
       # ubuntu-latest by default. (No-op on the Windows build path.)
       - name: Install ALSA dev headers (for midir)
