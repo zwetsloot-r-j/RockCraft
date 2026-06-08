@@ -985,9 +985,15 @@ impl EditScreen {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             )),
-            Line::from(Span::raw("  c : Enter chord mode     1-7 : Choose degree")),
-            Line::from(Span::raw("  [/] : Cycle degree       s : Toggle 7th/triad")),
-            Line::from(Span::raw("  Enter : Commit chord     Esc : Cancel chord")),
+            Line::from(Span::raw(
+                "  c : Chord rooted at cursor   1-7 : Choose degree",
+            )),
+            Line::from(Span::raw(
+                "  [/] : Cycle degree           s : Toggle 7th/triad",
+            )),
+            Line::from(Span::raw(
+                "  Enter : Commit chord         Esc : Cancel chord",
+            )),
             Line::from(Span::raw("")), // Empty line
             Line::from(Span::styled(
                 " Transport:",
@@ -1580,9 +1586,9 @@ mod tests {
         notes.iter().map(|n| n.value()).collect()
     }
 
-    /// `c` enters chord mode and previews the tonic triad voiced from the cursor
-    /// (middle C → {C,E,G}); degree `5` places {G,B,D}. All notes share the
-    /// cursor's start and a one-step duration.
+    /// `c` enters chord mode rooted at the cursor pitch (middle C → {C,E,G});
+    /// degree `5` places {G,B,D}. All notes share the cursor's start and a
+    /// one-step duration.
     #[test]
     fn degree_one_then_five_in_c_major() {
         let mut e = EditScreen::new();
@@ -1675,6 +1681,25 @@ mod tests {
         assert_eq!(
             pitch_values(&e.previewed_chord().unwrap()),
             vec![60, 64, 67]
+        );
+    }
+
+    /// `c` on pitch A4 opens chord mode rooted on A (degree 6 in C major).
+    #[test]
+    fn enter_chord_roots_at_cursor_pitch() {
+        let mut e = EditScreen::new(); // cursor at C4 (MIDI 60)
+        for _ in 0..9 {
+            // Move up 9 semitones to A4 (MIDI 69) using 'k'.
+            e.on_key(KeyCode::Char('k'));
+        }
+        assert_eq!(e.cursor().pitch, 69);
+        e.on_key(KeyCode::Char('c'));
+        assert!(e.in_chord_mode());
+        // A4-C5-E5 = A minor triad (degree 6 in C major)
+        assert_eq!(
+            pitch_values(&e.previewed_chord().expect("preview present")),
+            vec![69, 72, 76],
+            "chord rooted at A4"
         );
     }
 
