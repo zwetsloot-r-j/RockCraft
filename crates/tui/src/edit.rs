@@ -666,7 +666,8 @@ impl EditScreen {
 
     fn draw_status(&self, f: &mut Frame, area: Rect) {
         let cursor = self.composer.cursor();
-        let (bar, beat) = self.grid.bar_beat_of(self.cursor_us());
+        let cursor_us = self.cursor_us();
+        let (bar, beat) = self.grid.bar_beat_of(cursor_us);
         let pitch_name = MidiNote::new(cursor.pitch)
             .map(|n| n.name())
             .unwrap_or_default();
@@ -734,12 +735,24 @@ impl EditScreen {
             Span::raw("")
         };
 
+        // Show a sub-beat step counter when the subdivision is finer than one
+        // beat — at 1/16 snap this turns every cursor_right into a visible
+        // change rather than waiting 4 presses for the beat digit to flip.
+        let beat_us = self.grid.beat_us();
+        let steps_per_beat = beat_us / self.grid.step_us().max(1);
+        let pos_span = if steps_per_beat > 1 {
+            let sub = self.grid.step_in_beat(cursor_us) + 1; // 1-indexed
+            Span::raw(format!("  bar {}:{}.{}  ", bar + 1, beat + 1, sub))
+        } else {
+            Span::raw(format!("  bar {}:{}  ", bar + 1, beat + 1))
+        };
+
         let line = Line::from(vec![
             Span::styled(badge_text, badge_style),
             loop_span,
             metro_span,
             count_in_span,
-            Span::raw(format!("  bar {}:{}  ", bar + 1, beat + 1)),
+            pos_span,
             Span::raw(format!("snap {}  ", self.grid.subdivision.label())),
             Span::styled(
                 format!("♪ {pitch_name}  "),
@@ -2563,5 +2576,78 @@ mod tests {
 
         e.on_key(KeyCode::Char('D')); // no selection
         assert_eq!(e.note_count(), 1, "D without selection is a no-op");
+    }
+
+    // ── issue #121: 1/16 snap cursor movement ─────────────────────────────
+
+    /// At 1/16 snap (120 BPM 4/4), N `cursor_right` presses advance the cursor
+    /// by exactly N × 125 000 µs (one sixteenth note). The step index matches
+    /// exactly, confirming the state machine is correct regardless of render
+    /// resolution.
+    #[test]
+    fn cursor_right_at_sixteenth_snap_advances_by_step_us() {
+        let mut e = EditScreen::new();
+        assert_eq!(e.current_subdivision(), Subdivision::Sixteenth);
+        let step_us = e.grid.step_us();
+        assert_eq!(step_us, 125_000, "one 1/16 at 120 BPM = 125 000 µs");
+
+        for n in 1u64..=8 {
+            e.on_key(KeyCode::Char('l'));
+            assert_eq!(e.cursor().step, n, "step index after {n} right press(es)");
+            assert_eq!(
+                e.grid.us_of_step(e.cursor().step),
+                n * step_us,
+                "cursor_us = N × step_us after {n} press(es)"
+            );
+        }
+
+        // Stepping left shrinks by the same unit.
+        e.on_key(KeyCode::Char('h'));
+        assert_eq!(e.cursor().step, 7);
+        assert_eq!(e.grid.us_of_step(e.cursor().step), 7 * step_us);
+    }
+
+    /// After a single `cursor_right` at 1/16 snap the rendered output must
+    /// differ from the initial render: the sub-beat position indicator in the
+    /// status bar advances from `.1` to `.2`, making the step change visible.
+    #[test]
+    fn cursor_step_visible_in_render_at_sixteenth_snap() {
+        let mut e = EditScreen::new();
+        assert_eq!(e.current_subdivision(), Subdivision::Sixteenth);
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+
+        // Capture the initial render.
+        terminal
+            .draw(|f| e.draw(f, f.area()))
+            .expect("initial draw panicked");
+        let content_before: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        // One 1/16 step right.
+        e.on_key(KeyCode::Char('l'));
+
+        // Capture the post-move render.
+        terminal
+            .draw(|f| e.draw(f, f.area()))
+            .expect("post-move draw panicked");
+        let content_after: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        assert_ne!(
+            content_before, content_after,
+            "a single 1/16-step move must change the rendered output \
+             (sub-beat indicator advances from .1 to .2)"
+        );
     }
 }
