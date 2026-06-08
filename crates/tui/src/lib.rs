@@ -7,6 +7,7 @@ pub mod app;
 pub mod backing;
 pub mod edit;
 pub mod highway;
+pub mod import_screen;
 pub mod key_source;
 pub mod keyboard;
 pub mod play;
