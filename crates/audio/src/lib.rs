@@ -5,8 +5,9 @@
 //! hear what you play. The synth machinery lives in [`synth`].
 //!
 //! [`play_file`] plays a decoded audio file (wav/mp3/ogg/flac) on a separate
-//! output stream, returning a [`BackingHandle`] to stop it; [`play_file_at`]
-//! starts it seeked to a position, for syncing a backing track to the highway.
+//! output stream, returning a [`BackingHandle`] to stop, pause, resume, or seek
+//! it; [`play_file_at`] starts it seeked to a position, for syncing a backing
+//! track to the highway.
 
 pub mod synth;
 
@@ -119,8 +120,11 @@ fn sf2_path() -> PathBuf {
 
 /// A playing backing-track audio file.
 ///
-/// Drop (or call [`BackingHandle::stop`]) to stop playback; the device stream
-/// is released on drop.
+/// Beyond [`stop`](BackingHandle::stop), the track can be paused, resumed, and
+/// re-seeked in place without tearing down the stream — used to hold the music
+/// while waiting for the right notes and to scrub the track while editing.
+/// Drop (or call [`stop`](BackingHandle::stop)) to stop playback; the device
+/// stream is released on drop.
 pub struct BackingHandle {
     // Keeps the device stream alive for the duration of playback.
     _stream: OutputStream,
@@ -131,6 +135,45 @@ impl BackingHandle {
     /// Stop playback immediately (also happens on drop).
     pub fn stop(&self) {
         self.sink.stop();
+    }
+
+    /// Pause playback, silencing output without dropping the stream. Idempotent;
+    /// resume in place with [`resume`](BackingHandle::resume). Does not block —
+    /// it only flags the sink.
+    pub fn pause(&self) {
+        self.sink.pause();
+    }
+
+    /// Resume playback from where [`pause`](BackingHandle::pause) left off.
+    /// Idempotent; a no-op if not paused. Does not block.
+    pub fn resume(&self) {
+        self.sink.play();
+    }
+
+    /// Pause or resume in one call: `set_paused(true)` ==
+    /// [`pause`](BackingHandle::pause), `set_paused(false)` ==
+    /// [`resume`](BackingHandle::resume).
+    pub fn set_paused(&self, paused: bool) {
+        if paused {
+            self.pause();
+        } else {
+            self.resume();
+        }
+    }
+
+    /// Whether playback is currently paused.
+    pub fn is_paused(&self) -> bool {
+        self.sink.is_paused()
+    }
+
+    /// Jump to `pos` in the track, best-effort.
+    ///
+    /// Mirrors the seeking in [`play_file_at`]: if the decoder can't seek, the
+    /// request is ignored rather than erroring. The paused/playing state is
+    /// preserved across the seek. Does not block.
+    pub fn seek(&self, pos: std::time::Duration) {
+        // Best-effort: ignore decoders that don't support seeking.
+        let _ = self.sink.try_seek(pos);
     }
 }
 
