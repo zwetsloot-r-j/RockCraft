@@ -753,6 +753,17 @@ impl EditScreen {
             Span::raw(format!("  bar {}:{}  ", bar + 1, beat + 1))
         };
 
+        let vel_span = self
+            .note_under_cursor()
+            .and_then(|id| self.get_note(id))
+            .map(|n| {
+                Span::styled(
+                    format!("vel {}  ", n.velocity.value()),
+                    Style::default().fg(CURSOR_COLOR),
+                )
+            })
+            .unwrap_or_else(|| Span::raw(""));
+
         let line = Line::from(vec![
             Span::styled(badge_text, badge_style),
             loop_span,
@@ -764,6 +775,7 @@ impl EditScreen {
                 format!("♪ {pitch_name}  "),
                 Style::default().fg(CURSOR_COLOR),
             ),
+            vel_span,
             Span::styled(
                 "[a/x] add/del  []/[] size  [+/-] vel  [m] grab  [c] chord  [v] select  [y/p/D] yank/paste/del  [u/U] undo/redo  [R] rec  [t] step/live  [C] count-in  [o] loop  [M] metro  [hjkl] pitch/time  [H/L] bar  [w/b] oct  [g/G] timeline ends  [0/$] pitch ends  [s] save  [Tab] menu",
                 Style::default().fg(Color::DarkGray),
