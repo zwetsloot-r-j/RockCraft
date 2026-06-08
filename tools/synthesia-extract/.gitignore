@@ -17,3 +17,7 @@ debug-out/
 *.png
 *.jpg
 *.jpeg
+*.wav
+*.flac
+*.mp3
+*.ogg

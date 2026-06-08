@@ -12,8 +12,48 @@ deliberate.
 ## What it recovers (phase 1)
 
 For each note: **pitch + onset + duration + hand** (Left/Right/Unknown) plus a
-per-note **confidence**. Velocity is left `null` — it is filled later by M6-F
-audio-fusion.
+per-note **confidence**. Velocity is left `null` — it is filled by the optional
+M6-F audio-fusion pass (below).
+
+## Audio fusion (phase 2, M6-F) — optional
+
+The picture has no dynamics. When the video's audio is **clean piano** (a MIDI
+render or a solo-piano take), the optional `--audio-fusion` pass enriches the
+chart with what the picture can't give:
+
+* **velocity** — from each note's loudness, and
+* **sub-frame onset/offset** — audio is sample-precise where the visual roll is
+  quantised to the video frame grid.
+
+It is strictly additive: M6-C alone still produces a full chart, and on
+**full-band** audio (vocals/drums/broadband energy) the pass detects the
+unsuitable input and **no-ops**, leaving the visual notes authoritative rather
+than corrupting them.
+
+```bash
+# Visual + audio fusion (audio is a 16-bit PCM WAV alongside the video/frames):
+python extract.py --in frames_dir/ --fps 30 --audio clip.wav --audio-fusion --out chart.json
+```
+
+The diagnostic `source.audio_fusion` records what happened (`"applied: ..."` /
+`"skipped: ..."`). Fusion never overrides visual **pitch** or invents notes the
+picture didn't show: it only matches a transcribed event to an existing visual
+note (same pitch, onset within the visual's frame uncertainty), copies velocity,
+and nudges timing **within** that uncertainty. Unmatched visual notes keep their
+timing and take a default velocity.
+
+### Transcription dependency
+
+The bundled transcriber (`synthesia_extract.audio`) is **self-contained
+classical DSP** (per-pitch FFT band-pass → amplitude envelope → onsets +
+velocity), so it needs no ML weights and stays hermetic in CI. For real-world
+accuracy you can drop in a learned piano-transcription model — e.g.
+[`basic-pitch`](https://github.com/spotify/basic-pitch) or an
+Onsets-and-Frames implementation — behind the same `TranscribedNote` interface
+(`pitch`, `start_us`, `dur_us`, `velocity`); a learned model reports absolute
+MIDI velocity and would set `REFERENCE_PEAK_AMPLITUDE`/`_ENVELOPE_PEAK_CAL` to
+`1.0`. Such a model is an **optional** extra (heavy TF/Torch deps) and is *not*
+in `requirements.txt`; the fusion path works without it.
 
 ## Setup
 
