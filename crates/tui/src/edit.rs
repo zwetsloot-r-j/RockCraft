@@ -777,7 +777,7 @@ impl EditScreen {
             ),
             vel_span,
             Span::styled(
-                "[a/x] add/del  []/[] size  [+/-] vel  [m] grab  [c] chord  [v] select  [y/p/D] yank/paste/del  [u/U] undo/redo  [R] rec  [t] step/live  [C] count-in  [o] loop  [M] metro  [hjkl] pitch/time  [H/L] bar  [w/b] oct  [g/G] timeline ends  [0/$] pitch ends  [s] save  [Tab] menu",
+                "[a/x] add/del  []/[] size  [+/-] vel  [m] grab  [c] chord  [v] select  [y/p/D] yank/paste/del  [u/U] undo/redo  [R] rec  [t] step/live  [C] count-in  [o] loop  [M] metro  [P] play-start  [>/<] subdiv  [hjkl] pitch/time  [H/L] bar  [w/b] oct  [g/G] timeline ends  [0/$] pitch ends  [s] save  [Tab] menu",
                 Style::default().fg(Color::DarkGray),
             ),
         ]);
@@ -967,6 +967,9 @@ impl EditScreen {
             Line::from(Span::raw(
                 "  0 : Lowest pitch (A0)   $ : Highest pitch (C8)",
             )),
+            Line::from(Span::raw(
+                "  > : Finer subdivision    < : Coarser subdivision",
+            )),
             Line::from(Span::raw("")), // Empty line
             Line::from(Span::styled(
                 " Edit:",
@@ -978,6 +981,15 @@ impl EditScreen {
             Line::from(Span::raw("  ] : Lengthen note       [ : Shorten note")),
             Line::from(Span::raw("  +/= : Velocity +8       - : Velocity -8")),
             Line::from(Span::raw("  m : Grab mode (move note with h/j/k/l)")),
+            Line::from(Span::raw("")), // Empty line
+            Line::from(Span::styled(
+                " Selection/Clipboard:",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::raw("  v : Start selection     y : Yank selection")),
+            Line::from(Span::raw("  p : Paste              D : Delete selection")),
             Line::from(Span::raw("")), // Empty line
             Line::from(Span::styled(
                 " Chord:",
@@ -996,8 +1008,17 @@ impl EditScreen {
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::raw(
-                "  Space : Play/stop from cursor  p : Play from start",
+                "  Space : Play/stop from cursor  P : Play from start",
             )),
+            Line::from(Span::raw("")), // Empty line
+            Line::from(Span::styled(
+                " Loop/Metronome/Count-in:",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::raw("  o : Toggle loop         M : Toggle metronome")),
+            Line::from(Span::raw("  C : Count-in record")),
             Line::from(Span::raw("")), // Empty line
             Line::from(Span::styled(
                 " Input Mode:",
