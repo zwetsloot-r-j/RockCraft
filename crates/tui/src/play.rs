@@ -2,7 +2,7 @@
 //! scrolls its notes down to the keyboard line on a playback clock, and lights
 //! the player's live keys over it (play-along; scoring is a later task).
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -14,7 +14,9 @@ use ratatui::{
     Frame,
 };
 use rockcraft_audio::{play_file_at, BackingHandle, SynthHandle};
-use rockcraft_core::{backing_position_us, MidiNote, NoteEvent, Velocity};
+use rockcraft_core::{
+    backing_position_us, GateState, MidiNote, NoteEvent, PlayClock, Velocity, WaitGate,
+};
 use rockcraft_midi::smf_bytes_to_events;
 
 use crate::highway::{build_spans, project, song_duration_us, NoteSpan};
@@ -44,7 +46,17 @@ pub struct PlayScreen {
     spans: Vec<NoteSpan>,
     duration_us: u64,
     held: HeldNotes,
-    started: Instant,
+    /// Pausable song-time clock (M5-A). Replaces the old free-running `Instant`
+    /// so wait-mode can freeze the highway and the backing in lock-step. It only
+    /// accrues while running; `tick` advances it by the wall-clock frame delta.
+    clock: PlayClock,
+    /// Wall-clock anchor for the last `tick`; `None` until the first tick (and
+    /// after `restart`), so the first delta is zero. This is the only `Instant`
+    /// the screen keeps — purely to measure real elapsed time between frames.
+    last_tick: Option<Instant>,
+    /// Note-by-note wait gate (M5-A). Disarmed = free play-through (today's
+    /// behaviour); armed = freeze `clock` + backing on an unsatisfied due step.
+    wait: WaitGate,
     title: String,
     finished_pause_us: u64,
     synth: Option<SynthHandle>,
@@ -91,12 +103,15 @@ impl PlayScreen {
             })
             .collect();
         let duration_us = song_duration_us(&spans);
+        let wait = WaitGate::from_expected(&expected_steps(&spans));
 
         Ok(Self {
             spans,
             duration_us,
             held: HeldNotes::new(),
-            started: Instant::now(),
+            clock: PlayClock::new(),
+            last_tick: None,
+            wait,
             title,
             finished_pause_us: LEAD_US,
             synth,
@@ -123,7 +138,12 @@ impl PlayScreen {
     /// Restart playback from the top; resets synth state and re-arms the backing
     /// track so it re-syncs from `shift_us` again.
     pub fn restart(&mut self) {
-        self.started = Instant::now();
+        self.clock.reset();
+        self.last_tick = None;
+        // Rebuild the wait tracker from the top, keeping wait-mode armed or not.
+        let armed = self.wait.is_armed();
+        self.wait = WaitGate::from_expected(&expected_steps(&self.spans));
+        self.wait.set_armed(armed);
         self.song_on_fired.clear();
         self.song_off_fired.clear();
         if let Some(s) = &self.synth {
@@ -158,11 +178,84 @@ impl PlayScreen {
             return;
         };
         match play_file_at(&b.path, Duration::from_micros(pos_us)) {
-            Ok(h) => self.backing_handle = Some(h),
+            Ok(h) => {
+                // If the highway is frozen by wait-mode at the moment the
+                // backing arms, start it paused so it never gets ahead.
+                if !self.clock.is_running() {
+                    h.pause();
+                }
+                self.backing_handle = Some(h);
+            }
             // On a persistent failure (missing/undecodable file), drop the track
             // rather than retry every frame; the song still plays silently.
             Err(_) => self.backing = None,
         }
+    }
+
+    /// Advance the playback clock by the wall-clock time elapsed since the last
+    /// tick, gated by wait-mode. Called once per run-loop iteration; this is the
+    /// frontend clock the pure seams omit. Mirrors `EditScreen::tick_audition`.
+    pub fn tick(&mut self) {
+        let now = Instant::now();
+        let dt = self
+            .last_tick
+            .map(|prev| now.duration_since(prev).as_micros() as u64)
+            .unwrap_or(0);
+        self.last_tick = Some(now);
+        self.advance(dt);
+    }
+
+    /// Advance the gated clock by `dt_us`. The headless seam wait/clock tests
+    /// drive directly: it feeds the live held notes into the [`WaitGate`], polls
+    /// it at the current clock position, freezes (`clock` + backing paused) or
+    /// resumes on the transition, then advances the clock by `dt_us` — a no-op
+    /// while frozen. With wait-mode disarmed the gate is always `Running`, so
+    /// this is exactly the old free-running advance (no regression).
+    pub fn advance(&mut self, dt_us: u64) {
+        let held: BTreeSet<u8> = self.held.iter().collect();
+        self.wait.set_held(held);
+        let frozen = self.wait.poll(self.clock.now_us()) == GateState::Frozen;
+        // Only act on the running↔frozen transition so we don't spam the audio
+        // thread with pause/resume commands every frame.
+        if frozen && self.clock.is_running() {
+            self.clock.pause();
+            if let Some(h) = &self.backing_handle {
+                h.pause();
+            }
+        } else if !frozen && !self.clock.is_running() {
+            self.clock.resume();
+            if let Some(h) = &self.backing_handle {
+                h.resume();
+            }
+        }
+        self.clock.advance(dt_us);
+    }
+
+    /// Toggle note-by-note wait-mode (the `w` key / `Action::ToggleWaitMode`).
+    pub fn toggle_wait_mode(&mut self) {
+        self.set_wait_mode(!self.wait.is_armed());
+    }
+
+    /// Set wait-mode on/off (`Action::SetWaitMode`). Turning it off immediately
+    /// un-freezes the clock and backing so play resumes without waiting a frame.
+    pub fn set_wait_mode(&mut self, on: bool) {
+        self.wait.set_armed(on);
+        if !on && !self.clock.is_running() {
+            self.clock.resume();
+            if let Some(h) = &self.backing_handle {
+                h.resume();
+            }
+        }
+    }
+
+    /// Is wait-mode armed? (For the status line / control snapshot.)
+    pub fn is_wait_mode(&self) -> bool {
+        self.wait.is_armed()
+    }
+
+    /// The notes the player must hold to un-freeze, if currently waiting.
+    fn awaiting_notes(&self) -> Option<Vec<u8>> {
+        self.wait.awaiting().map(|step| step.notes.clone())
     }
 
     /// Whether the backing track is currently audible (for the status line).
@@ -232,9 +325,10 @@ impl PlayScreen {
         }
     }
 
-    /// Current playback time in microseconds since entering the screen.
+    /// Current playback time in microseconds since entering the screen. Reads
+    /// the pausable [`PlayClock`]; frozen wait-mode holds this value steady.
     fn now_us(&self) -> u64 {
-        self.started.elapsed().as_micros() as u64
+        self.clock.now_us()
     }
 
     /// Has the song (plus tail) finished?
@@ -302,16 +396,34 @@ impl PlayScreen {
         } else {
             Color::DarkGray
         };
+        let wait_color = if self.is_wait_mode() {
+            Color::Green
+        } else {
+            Color::DarkGray
+        };
         let mut spans = vec![
             Span::styled(" PLAY ", Style::default().fg(Color::Black).bg(TARGET_COLOR)),
             Span::raw(format!("  {:.1}s / {:.1}s  ", secs, total)),
             Span::raw("[r] restart  [Tab] menu  "),
             Span::styled("[m] music  ", Style::default().fg(music_color)),
+            Span::styled("[w] wait  ", Style::default().fg(wait_color)),
         ];
         if self.backing_playing() {
             spans.push(Span::styled(
                 "♪ backing  ",
                 Style::default().fg(Color::Green),
+            ));
+        }
+        // While frozen, tell the player exactly what to hold to continue.
+        if let Some(notes) = self.awaiting_notes() {
+            let names = notes
+                .iter()
+                .filter_map(|&p| MidiNote::new(p).map(|n| n.name()))
+                .collect::<Vec<_>>()
+                .join(" ");
+            spans.push(Span::styled(
+                format!("⏸ waiting — play {names}  "),
+                Style::default().fg(Color::Yellow),
             ));
         }
         spans.extend([
@@ -366,6 +478,16 @@ impl PlayScreen {
             }
         }
     }
+}
+
+/// Expected `(pitch, start_us)` pairs feeding the [`WaitGate`]: every span's
+/// note at its (already-shifted) start. Notes sharing a start collapse into one
+/// chord step inside the gate.
+fn expected_steps(spans: &[NoteSpan]) -> Vec<(MidiNote, u64)> {
+    spans
+        .iter()
+        .filter_map(|s| MidiNote::new(s.note).map(|n| (n, s.start_us)))
+        .collect()
 }
 
 /// Returns `(need_on, need_off)`: indices into `spans` where note_on / note_off
@@ -539,5 +661,175 @@ mod tests {
         let (on, off) = pending_triggers(&spans, 2000, &on_fired, &off_fired);
         assert_eq!(on, vec![0]);
         assert_eq!(off, vec![0]);
+    }
+
+    // ── wait-mode (freeze highway + backing until the right notes are held) ──
+
+    const SHIFT: u64 = PRE_ROLL_US + LEAD_US;
+
+    fn note_on(play: &mut PlayScreen, pitch: u8) {
+        play.ingest(NoteEvent::on(
+            MidiNote::new(pitch).unwrap(),
+            Velocity::new(80).unwrap(),
+            0,
+        ));
+    }
+
+    fn note_off(play: &mut PlayScreen, pitch: u8) {
+        play.ingest(NoteEvent::off(MidiNote::new(pitch).unwrap(), 0));
+    }
+
+    /// C at t=0 then D at t=1s. After the whole-song shift the steps fall at
+    /// `SHIFT` (C) and `SHIFT + 1_000_000` (D).
+    fn two_note_screen() -> PlayScreen {
+        let c = MidiNote::new(60).unwrap();
+        let d = MidiNote::new(62).unwrap();
+        let v = Velocity::new(80).unwrap();
+        let events = vec![
+            NoteEvent::on(c, v, 0),
+            NoteEvent::off(c, 500_000),
+            NoteEvent::on(d, v, 1_000_000),
+            NoteEvent::off(d, 1_500_000),
+        ];
+        let bytes = events_to_smf_bytes(&events);
+        PlayScreen::from_smf_bytes("test".into(), &bytes, None).unwrap()
+    }
+
+    #[test]
+    fn armed_clock_freezes_on_unsatisfied_step_and_resumes_when_held() {
+        let mut play = two_note_screen();
+        play.set_wait_mode(true);
+        // Run the lead-in up to the first step's time.
+        play.advance(SHIFT);
+        assert_eq!(play.now_us(), SHIFT);
+        // Nothing held: the step is due and unsatisfied, so the clock freezes —
+        // a big delta does NOT move the playhead past the step.
+        play.advance(5_000_000);
+        play.advance(5_000_000);
+        assert_eq!(
+            play.now_us(),
+            SHIFT,
+            "clock must freeze on the awaited step"
+        );
+        // Hold the required C: the gate advances and the clock resumes.
+        note_on(&mut play, 60);
+        play.advance(1_000_000);
+        assert_eq!(play.now_us(), SHIFT + 1_000_000, "clock advances once held");
+    }
+
+    #[test]
+    fn chord_step_requires_all_notes_extras_allowed() {
+        let c = MidiNote::new(60).unwrap();
+        let e = MidiNote::new(64).unwrap();
+        let g = MidiNote::new(67).unwrap();
+        let v = Velocity::new(80).unwrap();
+        let events = vec![
+            NoteEvent::on(c, v, 0),
+            NoteEvent::on(e, v, 0),
+            NoteEvent::on(g, v, 0),
+            NoteEvent::off(c, 500_000),
+            NoteEvent::off(e, 500_000),
+            NoteEvent::off(g, 500_000),
+        ];
+        let bytes = events_to_smf_bytes(&events);
+        let mut play = PlayScreen::from_smf_bytes("chord".into(), &bytes, None).unwrap();
+        play.set_wait_mode(true);
+        play.advance(SHIFT);
+        // Partial chord (missing G) keeps it frozen.
+        note_on(&mut play, 60);
+        note_on(&mut play, 64);
+        play.advance(2_000_000);
+        assert_eq!(
+            play.now_us(),
+            SHIFT,
+            "partial chord must not satisfy the step"
+        );
+        // Full chord plus an extra note (allowed) releases the freeze.
+        note_on(&mut play, 67);
+        note_on(&mut play, 72);
+        play.advance(1_000_000);
+        assert_eq!(play.now_us(), SHIFT + 1_000_000);
+    }
+
+    #[test]
+    fn disarmed_wait_mode_advances_freely() {
+        let mut play = two_note_screen();
+        // Wait-mode off (default): nothing held, yet the playhead runs straight
+        // through both steps — today's free play-through, no regression.
+        assert!(!play.is_wait_mode());
+        play.advance(SHIFT + 5_000_000);
+        assert_eq!(play.now_us(), SHIFT + 5_000_000);
+    }
+
+    #[test]
+    fn toggling_wait_off_resumes_a_frozen_clock() {
+        let mut play = two_note_screen();
+        play.toggle_wait_mode();
+        assert!(play.is_wait_mode());
+        play.advance(SHIFT);
+        play.advance(1_000_000); // freezes at SHIFT (nothing held)
+        assert_eq!(play.now_us(), SHIFT);
+        // Turning wait-mode off must unfreeze immediately.
+        play.toggle_wait_mode();
+        assert!(!play.is_wait_mode());
+        play.advance(1_000_000);
+        assert_eq!(play.now_us(), SHIFT + 1_000_000);
+    }
+
+    #[test]
+    fn releasing_a_held_note_re_freezes_on_the_next_step() {
+        let mut play = two_note_screen();
+        play.set_wait_mode(true);
+        play.advance(SHIFT);
+        // Satisfy the C step; clock advances toward the D step.
+        note_on(&mut play, 60);
+        play.advance(1_000_000);
+        assert_eq!(play.now_us(), SHIFT + 1_000_000);
+        // Release everything: the D step is now due and unsatisfied → frozen.
+        note_off(&mut play, 60);
+        play.advance(5_000_000);
+        assert_eq!(play.now_us(), SHIFT + 1_000_000, "re-freezes on the D step");
+        // Holding D resumes again.
+        note_on(&mut play, 62);
+        play.advance(500_000);
+        assert_eq!(play.now_us(), SHIFT + 1_500_000);
+    }
+
+    #[test]
+    fn frozen_backing_target_does_not_drift() {
+        let mut play = two_note_screen().with_backing(PathBuf::from("backing.mp3"), 0);
+        play.set_wait_mode(true);
+        play.advance(SHIFT);
+        // The backing position the highway expects at the freeze point.
+        let before = play.backing_target_us(play.now_us());
+        assert_eq!(before, Some(0));
+        // While frozen (nothing held) the clock — and thus the backing target —
+        // must not move, so audio and highway resume in sync.
+        play.advance(10_000_000);
+        assert_eq!(play.now_us(), SHIFT);
+        assert_eq!(play.backing_target_us(play.now_us()), before, "no drift");
+    }
+
+    #[test]
+    fn restart_rearms_wait_tracker_from_the_top() {
+        let mut play = two_note_screen();
+        play.set_wait_mode(true);
+        note_on(&mut play, 60);
+        play.advance(SHIFT);
+        play.advance(1_000_000); // past the C step
+        assert_eq!(play.now_us(), SHIFT + 1_000_000);
+        // Restart resets the clock and the tracker; wait-mode stays armed and the
+        // C step must be awaited again from t=0.
+        play.restart();
+        assert!(play.is_wait_mode());
+        assert_eq!(play.now_us(), 0);
+        note_off(&mut play, 60);
+        play.advance(SHIFT);
+        play.advance(1_000_000);
+        assert_eq!(
+            play.now_us(),
+            SHIFT,
+            "C step is awaited again after restart"
+        );
     }
 }

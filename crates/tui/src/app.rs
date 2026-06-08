@@ -285,6 +285,7 @@ impl Shell {
                 }
                 KeyCode::Char('r') => play.restart(),
                 KeyCode::Char('m') => play.toggle_hear_song(),
+                KeyCode::Char('w') => play.toggle_wait_mode(),
                 KeyCode::Char(c) => {
                     self.input.forward_key(c);
                 }
@@ -506,6 +507,9 @@ pub fn run_loop<B: ratatui::backend::Backend>(
         // frame-rate-driven); the backing arms itself once the clock reaches the
         // lead-in's end so it lines up with the notes hitting the keyboard line.
         if let Screen::Play(play) = &mut shell.screen {
+            // Advance the pausable clock first (wait-mode may freeze it), then
+            // fire synth/backing for the resulting clock position.
+            play.tick();
             play.tick_song_synth();
             play.tick_backing();
         }
