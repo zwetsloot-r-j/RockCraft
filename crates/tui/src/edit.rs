@@ -89,6 +89,17 @@ const PLAYHEAD_COLOR: Color = Color::Green;
 /// Selected-note highlight on the highway.
 const SELECT_COLOR: Color = Color::LightGreen;
 
+/// Outcome of a key press while the dirty-exit prompt is displayed.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PromptOutcome {
+    /// User chose "Save" — caller should save then navigate away.
+    SaveAndLeave,
+    /// User chose "Discard" — leave without saving.
+    Leave,
+    /// User chose "Cancel" — stay in the editor.
+    Stay,
+}
+
 /// Map a `KeyCode` to the composer [`Action`] it triggers in normal (non-chord)
 /// mode, or `None` when the key is unbound.
 ///
@@ -202,6 +213,15 @@ pub struct EditScreen {
     last_tick: Option<Instant>,
     /// Whether the help overlay is currently visible (view-only state).
     show_help: bool,
+    /// Whether the timeline has changed since the last save (or since opening
+    /// a fresh editor). Cleared by `mark_clean`; set by any mutating dispatch.
+    dirty: bool,
+    /// One-shot save confirmation shown after a successful save, cleared on the
+    /// next key press.
+    save_flash: Option<String>,
+    /// When `true` the "Save / Discard / Cancel" overlay is rendered and all
+    /// keys are routed to `on_prompt_key` instead of the normal keymap.
+    exit_prompt: bool,
 }
 
 impl EditScreen {
@@ -233,6 +253,9 @@ impl EditScreen {
             auditioning_chord: Vec::new(),
             last_tick: None,
             show_help: false,
+            dirty: false,
+            save_flash: None,
+            exit_prompt: false,
         }
     }
 
@@ -295,6 +318,9 @@ impl EditScreen {
     /// selector is open, the normal keymap otherwise) and dispatched to the
     /// [`Composer`]; the returned effects drive the synth via `run_effects`.
     pub fn on_key(&mut self, code: KeyCode) {
+        // Any key clears the save flash.
+        self.save_flash = None;
+
         // Help overlay: `?` toggles visibility; Esc closes it. Takes precedence
         // over every other mode so help is always reachable.
         match code {
@@ -354,17 +380,43 @@ impl EditScreen {
     /// Routing is the composer's: ignored in direct-edit, placed in step/live
     /// record. Any effects (none today) are interpreted for the synth.
     pub fn ingest(&mut self, ev: NoteEvent) {
+        let fp_before = self.timeline_fingerprint();
         let effects = self.composer.ingest(ev);
         self.run_effects(&effects);
+        if self.timeline_fingerprint() != fp_before {
+            self.dirty = true;
+            self.save_flash = None;
+        }
     }
 
     /// Apply one [`Action`] to the composer and interpret its effects, then
     /// re-sync the mirrored grid (a subdivision change is the only thing that
     /// moves it). The single funnel every key / shim flows through.
     fn dispatch(&mut self, action: Action) {
+        let fp_before = self.timeline_fingerprint();
         let effects = self.composer.apply(action).unwrap_or_default();
         self.run_effects(&effects);
         self.grid = self.composer.grid();
+        if self.timeline_fingerprint() != fp_before {
+            self.dirty = true;
+            self.save_flash = None;
+        }
+    }
+
+    /// A cheap content fingerprint of the timeline: changes whenever any note
+    /// is added, removed, moved, resized, or has its velocity adjusted.
+    fn timeline_fingerprint(&self) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        for (id, n) in self.composer.timeline().notes() {
+            id.hash(&mut h);
+            n.pitch.value().hash(&mut h);
+            n.start_us.hash(&mut h);
+            n.dur_us.hash(&mut h);
+            n.velocity.value().hash(&mut h);
+        }
+        h.finish()
     }
 
     // ── effect interpreter ──────────────────────────────────────────────────
@@ -538,6 +590,51 @@ impl EditScreen {
         self.composer.input_mode()
     }
 
+    // ── dirty / save-feedback / exit-prompt ──────────────────────────────────
+
+    /// Whether the timeline has unsaved changes.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Clear the dirty flag after a successful save.
+    pub fn mark_clean(&mut self) {
+        self.dirty = false;
+    }
+
+    /// Set the one-shot save-confirmation message shown after a successful save.
+    /// Cleared automatically when the user next presses any key.
+    pub fn set_save_flash(&mut self, msg: String) {
+        self.save_flash = Some(msg);
+    }
+
+    /// Whether the "Save / Discard / Cancel" exit-prompt overlay is showing.
+    pub fn is_prompting_exit(&self) -> bool {
+        self.exit_prompt
+    }
+
+    /// Show the exit-prompt overlay. Called by the shell when Tab/Esc is pressed
+    /// on a dirty editor.
+    pub fn start_exit_prompt(&mut self) {
+        self.exit_prompt = true;
+    }
+
+    /// Hide the exit-prompt overlay without navigating away (Cancel choice).
+    pub fn dismiss_exit_prompt(&mut self) {
+        self.exit_prompt = false;
+    }
+
+    /// Handle a key press while the exit-prompt overlay is active. Returns the
+    /// user's choice; the shell is responsible for acting on it.
+    pub fn on_prompt_key(&mut self, code: KeyCode) -> PromptOutcome {
+        match code {
+            KeyCode::Char('s') | KeyCode::Char('S') => PromptOutcome::SaveAndLeave,
+            KeyCode::Char('d') | KeyCode::Char('D') => PromptOutcome::Leave,
+            // Esc and 'c' both cancel (stay in editor).
+            _ => PromptOutcome::Stay,
+        }
+    }
+
     /// Whether the transport is currently playing.
     pub fn is_playing(&self) -> bool {
         self.composer.is_playing()
@@ -668,9 +765,30 @@ impl EditScreen {
         if self.show_help {
             self.draw_help_overlay(f, area);
         }
+
+        // Exit-prompt overlay sits on top of everything else.
+        if self.exit_prompt {
+            self.draw_exit_prompt(f, area);
+        }
     }
 
     fn draw_status(&self, f: &mut Frame, area: Rect) {
+        // Save-confirmation flash takes over the status line for one key cycle.
+        if let Some(flash) = &self.save_flash {
+            let line = Line::from(vec![
+                Span::styled(
+                    format!(" {flash} "),
+                    Style::default().fg(Color::Black).bg(Color::Green),
+                ),
+                Span::styled(
+                    "  [s] save  [Tab] menu",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]);
+            f.render_widget(Paragraph::new(line), area);
+            return;
+        }
+
         let cursor = self.composer.cursor();
         let cursor_us = self.cursor_us();
         let (bar, beat) = self.grid.bar_beat_of(cursor_us);
@@ -1039,6 +1157,28 @@ impl EditScreen {
         // Render the help content inside the block
         let inner_area = help_block.inner(help_area);
         f.render_widget(help_paragraph, inner_area);
+    }
+
+    /// Small centered overlay for the "Save / Discard / Cancel" exit prompt.
+    fn draw_exit_prompt(&self, f: &mut Frame, area: Rect) {
+        let label = " Unsaved changes — [s] Save  [d] Discard  [Esc/other] Cancel ";
+        let w = (label.len() as u16 + 4).min(area.width);
+        let h = 3u16;
+        let x = area.x + area.width.saturating_sub(w) / 2;
+        let y = area.y + area.height.saturating_sub(h) / 2;
+        let prompt_area = Rect::new(x, y, w, h.min(area.height));
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow));
+        let inner = block.inner(prompt_area);
+        f.render_widget(block, prompt_area);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                label,
+                Style::default().fg(Color::Yellow),
+            ))),
+            inner,
+        );
     }
 }
 
