@@ -1689,8 +1689,8 @@ mod tests {
     fn enter_chord_roots_at_cursor_pitch() {
         let mut e = EditScreen::new(); // cursor at C4 (MIDI 60)
         for _ in 0..9 {
-            // Move up 9 semitones to A4 (MIDI 69) using 'k'.
-            e.on_key(KeyCode::Char('k'));
+            // Move up 9 semitones to A4 (MIDI 69) using 'l' (pitch-right key).
+            e.on_key(KeyCode::Char('l'));
         }
         assert_eq!(e.cursor().pitch, 69);
         e.on_key(KeyCode::Char('c'));
