@@ -29,3 +29,6 @@ target
 # Output of `cargo run --example screenshot --features screenshot` (M4-H)
 /screenshot.png
 /render.txt
+
+# M6 video-import output — extracted charts are never committed (M6-B)
+/import-out/
