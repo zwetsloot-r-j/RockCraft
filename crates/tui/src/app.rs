@@ -17,11 +17,15 @@ use ratatui::{
 use rockcraft_audio::SynthHandle;
 use rockcraft_control::{QueryKind, RemoteCommand, Request, Response};
 use rockcraft_core::{Grid, Key, RecordingMeta, Scale, Timeline};
+use rockcraft_import::{fetch_command_configured, ImportInput};
 use rockcraft_midi::{smf_bytes_to_events, NoteSource};
 use tokio::sync::mpsc;
 
 use crate::backing::{BackingPicker, PickerOutcome};
 use crate::edit::EditScreen;
+use crate::import_screen::{
+    ImportOutcome, ImportingScreen, UrlInput, UrlInputOutcome, VideoPicker, VideoPickerOutcome,
+};
 use crate::key_source::{CrosstermKeys, KeySource};
 use crate::play::PlayScreen;
 use crate::record::RecordScreen;
@@ -37,17 +41,29 @@ pub(crate) enum Screen {
     Play(PlayScreen),
     Edit(Box<EditScreen>),
     BackingPicker(BackingPicker),
+    /// Browse for a local video file to import.
+    VideoPicker(VideoPicker),
+    /// Text input for a video URL to import.
+    UrlInput(UrlInput),
+    /// Running the import pipeline, showing progress.
+    Importing(ImportingScreen),
 }
 
-/// The menu entries, in order.
-const MENU_ITEMS: &[&str] = &[
+/// Fixed menu entries always shown.
+const MENU_ITEMS_BASE: &[&str] = &[
     "Record",
     "Play last recording",
     "Compose (new)",
     "Edit last recording",
     "Choose backing track",
-    "Quit",
+    "Import from video file…",
 ];
+
+/// Extra entry appended when a fetch command is configured (M6-D).
+const MENU_ITEM_URL: &str = "Import from URL…";
+
+/// Last entry always shown.
+const MENU_ITEM_QUIT: &str = "Quit";
 
 pub struct Shell {
     /// The swappable event source: real piano (`LiveInput`) or `MockKeyboard`.
@@ -69,6 +85,9 @@ pub struct Shell {
     /// Used by `render_to_string` when no explicit size is given. Falls back to
     /// 80×24 in headless / test contexts where the run loop never fires.
     terminal_size: (u16, u16),
+    /// `true` when a URL fetch command is configured (M6-D hook).
+    /// Determines whether the "Import from URL…" menu item is shown.
+    has_fetch_cmd: bool,
 }
 
 impl Shell {
@@ -89,7 +108,23 @@ impl Shell {
             backing_path,
             commands: None,
             terminal_size: (80, 24),
+            has_fetch_cmd: fetch_command_configured(),
         }
+    }
+
+    /// Override the fetch-command capability flag — used in tests.
+    pub fn set_has_fetch_cmd(&mut self, v: bool) {
+        self.has_fetch_cmd = v;
+    }
+
+    /// Build the current menu item list, injecting URL import when configured.
+    fn menu_items(&self) -> Vec<&str> {
+        let mut items: Vec<&str> = MENU_ITEMS_BASE.to_vec();
+        if self.has_fetch_cmd {
+            items.push(MENU_ITEM_URL);
+        }
+        items.push(MENU_ITEM_QUIT);
+        items
     }
 
     /// Attach the receiving half of the control-server command channel. Called
@@ -131,7 +166,7 @@ impl Shell {
     }
 
     fn menu_move(&mut self, delta: isize) {
-        let n = MENU_ITEMS.len() as isize;
+        let n = self.menu_items().len() as isize;
         let cur = self.menu_state.selected().unwrap_or(0) as isize;
         let next = (cur + delta).rem_euclid(n) as usize;
         self.menu_state.select(Some(next));
@@ -157,23 +192,24 @@ impl Shell {
 
     /// Act on the highlighted menu item.
     fn menu_activate(&mut self) {
-        match self.menu_state.selected() {
-            Some(0) => {
+        let items = self.menu_items();
+        let idx = self.menu_state.selected().unwrap_or(0);
+        let item = items.get(idx).copied().unwrap_or("");
+        match item {
+            "Record" => {
                 self.screen = Screen::Record(RecordScreen::with_backing(self.backing_path.clone()));
             }
-            Some(1) => match latest_recording() {
+            "Play last recording" => match latest_recording() {
                 Some(path) => match load_play_screen(&path, self.synth.clone()) {
                     Ok(p) => self.screen = Screen::Play(p),
                     Err(e) => self.status = e,
                 },
                 None => self.status = "no recordings yet — record one first".into(),
             },
-            Some(2) => {
-                // Compose (new): blank timeline.
+            "Compose (new)" => {
                 self.activate_edit();
             }
-            Some(3) => match latest_recording() {
-                // Edit last recording: load the latest take into the editor.
+            "Edit last recording" => match latest_recording() {
                 Some(path) => match std::fs::read(&path) {
                     Ok(bytes) => match smf_bytes_to_events(&bytes) {
                         Ok(events) => {
@@ -193,10 +229,16 @@ impl Shell {
                 },
                 None => self.status = "no recordings yet — record one first".into(),
             },
-            Some(4) => {
-                // Choose backing track: open the in-app file picker.
+            "Choose backing track" => {
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 self.screen = Screen::BackingPicker(BackingPicker::new(cwd));
+            }
+            "Import from video file…" => {
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                self.screen = Screen::VideoPicker(VideoPicker::new(cwd));
+            }
+            "Import from URL…" => {
+                self.screen = Screen::UrlInput(UrlInput::new());
             }
             _ => self.should_quit = true,
         }
@@ -280,6 +322,39 @@ impl Shell {
                     PickerOutcome::Pending => {}
                 }
             }
+            Screen::VideoPicker(picker) => {
+                let outcome = picker.on_key(code).clone();
+                match outcome {
+                    VideoPickerOutcome::Selected(path) => {
+                        self.screen =
+                            Screen::Importing(ImportingScreen::start(ImportInput::File(path)));
+                    }
+                    VideoPickerOutcome::Cancelled => {
+                        self.screen = Screen::Menu;
+                    }
+                    VideoPickerOutcome::Pending => {}
+                }
+            }
+            Screen::UrlInput(ui) => {
+                let outcome = ui.on_key(code).clone();
+                match outcome {
+                    UrlInputOutcome::Submitted(url) => {
+                        self.screen =
+                            Screen::Importing(ImportingScreen::start(ImportInput::Url(url)));
+                    }
+                    UrlInputOutcome::Cancelled => {
+                        self.screen = Screen::Menu;
+                    }
+                    UrlInputOutcome::Pending => {}
+                }
+            }
+            Screen::Importing(_) => {
+                // Esc cancels (the thread continues running but we abandon it).
+                if code == KeyCode::Esc {
+                    self.status = "import cancelled".into();
+                    self.screen = Screen::Menu;
+                }
+            }
         }
     }
 
@@ -341,6 +416,9 @@ impl Shell {
             Screen::Play(_) => "play",
             Screen::Edit(_) => "edit",
             Screen::BackingPicker(_) => "backing_picker",
+            Screen::VideoPicker(_) => "video_picker",
+            Screen::UrlInput(_) => "url_input",
+            Screen::Importing(_) => "importing",
         }
     }
 
@@ -416,7 +494,11 @@ pub fn run_loop<B: ratatui::backend::Backend>(
                     }
                 }
                 // These screens ignore live MIDI input.
-                Screen::Menu | Screen::BackingPicker(_) => {}
+                Screen::Menu
+                | Screen::BackingPicker(_)
+                | Screen::VideoPicker(_)
+                | Screen::UrlInput(_)
+                | Screen::Importing(_) => {}
             }
         }
 
@@ -441,6 +523,37 @@ pub fn run_loop<B: ratatui::backend::Backend>(
             }
         }
 
+        // Poll the import pipeline and handle completion.
+        let import_result = if let Screen::Importing(imp) = &mut shell.screen {
+            match imp.poll() {
+                Some(ImportOutcome::Done(path)) => Some(Ok(path.clone())),
+                Some(ImportOutcome::Failed(msg)) => Some(Err(msg.clone())),
+                None => None,
+            }
+        } else {
+            None
+        };
+        match import_result {
+            Some(Ok(bundle)) => {
+                let midi = bundle.join("song.mid");
+                match load_play_screen(&midi, shell.synth.clone()) {
+                    Ok(play) => {
+                        shell.status = format!("imported: {}", bundle.display());
+                        shell.screen = Screen::Play(play);
+                    }
+                    Err(e) => {
+                        shell.status = format!("import succeeded but load failed: {e}");
+                        shell.screen = Screen::Menu;
+                    }
+                }
+            }
+            Some(Err(msg)) => {
+                shell.status = format!("import failed: {msg}");
+                shell.screen = Screen::Menu;
+            }
+            None => {}
+        }
+
         let completed = terminal.draw(|f| draw(f, shell))?;
         shell.terminal_size = (completed.area.width, completed.area.height);
 
@@ -461,6 +574,9 @@ fn draw(f: &mut Frame, shell: &Shell) {
         Screen::Play(play) => play.draw(f, f.area()),
         Screen::Edit(edit) => edit.draw(f, f.area()),
         Screen::BackingPicker(picker) => picker.draw(f, f.area()),
+        Screen::VideoPicker(picker) => picker.draw(f, f.area()),
+        Screen::UrlInput(ui) => ui.draw(f, f.area()),
+        Screen::Importing(imp) => imp.draw(f, f.area()),
     }
 }
 
@@ -478,7 +594,11 @@ fn draw_menu(f: &mut Frame, area: Rect, shell: &Shell) {
     ));
     f.render_widget(Paragraph::new(title), chunks[0]);
 
-    let items: Vec<ListItem> = MENU_ITEMS.iter().map(|s| ListItem::new(*s)).collect();
+    let items: Vec<ListItem> = shell
+        .menu_items()
+        .iter()
+        .map(|s| ListItem::new(*s))
+        .collect();
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(" mode "))
         .highlight_style(
@@ -899,5 +1019,182 @@ mod tests {
             }
             other => panic!("expected Render response, got {other:?}"),
         }
+    }
+
+    // ── M6-E import menu integration ─────────────────────────────────────────
+
+    /// Without a fetch command, the "Import from URL…" item must be absent and
+    /// "Import from video file…" must be present.
+    #[test]
+    fn url_menu_item_absent_when_no_fetch_cmd() {
+        let mut shell = make_shell();
+        shell.set_has_fetch_cmd(false);
+
+        let items = shell.menu_items();
+        assert!(
+            items.contains(&"Import from video file…"),
+            "file import item must always be present"
+        );
+        assert!(
+            !items.contains(&"Import from URL…"),
+            "URL import item must be absent when no fetch command is configured"
+        );
+    }
+
+    /// With a fetch command configured, both import items are present.
+    #[test]
+    fn url_menu_item_present_when_fetch_cmd_configured() {
+        let mut shell = make_shell();
+        shell.set_has_fetch_cmd(true);
+
+        let items = shell.menu_items();
+        assert!(
+            items.contains(&"Import from video file…"),
+            "file import item must be present"
+        );
+        assert!(
+            items.contains(&"Import from URL…"),
+            "URL import item must be present when fetch command is configured"
+        );
+    }
+
+    /// Navigating to "Import from video file…" and pressing Enter opens the
+    /// video picker screen.
+    #[test]
+    fn import_from_file_menu_item_opens_video_picker() {
+        let mut shell = make_shell();
+        shell.set_has_fetch_cmd(false);
+
+        // Navigate to "Import from video file…" (index 5 in base items).
+        for _ in 0..5 {
+            shell.on_key(KeyCode::Down);
+        }
+        shell.on_key(KeyCode::Enter);
+
+        assert_eq!(shell.screen_name(), "video_picker");
+    }
+
+    /// Pressing Esc on the video picker returns to the menu.
+    #[test]
+    fn video_picker_esc_returns_to_menu() {
+        let mut shell = make_shell();
+        shell.set_has_fetch_cmd(false);
+
+        for _ in 0..5 {
+            shell.on_key(KeyCode::Down);
+        }
+        shell.on_key(KeyCode::Enter);
+        assert_eq!(shell.screen_name(), "video_picker");
+
+        shell.on_key(KeyCode::Esc);
+        assert_eq!(shell.screen_name(), "menu");
+    }
+
+    /// Navigating to "Import from URL…" and pressing Enter opens the URL input
+    /// screen (only when fetch command is configured).
+    #[test]
+    fn import_from_url_menu_item_opens_url_input() {
+        let mut shell = make_shell();
+        shell.set_has_fetch_cmd(true);
+
+        // Navigate to "Import from URL…" (index 6 when fetch cmd is present).
+        for _ in 0..6 {
+            shell.on_key(KeyCode::Down);
+        }
+        shell.on_key(KeyCode::Enter);
+
+        assert_eq!(shell.screen_name(), "url_input");
+    }
+
+    /// Pressing Esc on the URL input returns to the menu.
+    #[test]
+    fn url_input_esc_returns_to_menu() {
+        let mut shell = make_shell();
+        shell.set_has_fetch_cmd(true);
+
+        for _ in 0..6 {
+            shell.on_key(KeyCode::Down);
+        }
+        shell.on_key(KeyCode::Enter);
+        assert_eq!(shell.screen_name(), "url_input");
+
+        shell.on_key(KeyCode::Esc);
+        assert_eq!(shell.screen_name(), "menu");
+    }
+
+    /// Typing a URL and pressing Enter in the URL input transitions to the
+    /// importing screen and starts the pipeline.
+    #[test]
+    fn url_input_submit_starts_importing_screen() {
+        let mut shell = make_shell();
+        shell.set_has_fetch_cmd(true);
+
+        for _ in 0..6 {
+            shell.on_key(KeyCode::Down);
+        }
+        shell.on_key(KeyCode::Enter);
+        assert_eq!(shell.screen_name(), "url_input");
+
+        for c in "https://example.com/v.mp4".chars() {
+            shell.on_key(KeyCode::Char(c));
+        }
+        shell.on_key(KeyCode::Enter);
+
+        assert_eq!(shell.screen_name(), "importing");
+    }
+
+    /// Pressing Esc while importing cancels and returns to the menu.
+    #[test]
+    fn importing_esc_returns_to_menu() {
+        let mut shell = make_shell();
+        shell.set_has_fetch_cmd(true);
+
+        for _ in 0..6 {
+            shell.on_key(KeyCode::Down);
+        }
+        shell.on_key(KeyCode::Enter);
+        for c in "https://example.com/v.mp4".chars() {
+            shell.on_key(KeyCode::Char(c));
+        }
+        shell.on_key(KeyCode::Enter);
+        assert_eq!(shell.screen_name(), "importing");
+
+        shell.on_key(KeyCode::Esc);
+        assert_eq!(shell.screen_name(), "menu");
+        assert!(
+            shell.status.contains("cancel"),
+            "status must mention cancellation"
+        );
+    }
+
+    /// A failed import (missing file) eventually lands back on the menu with
+    /// an error status. Tested by polling the importing screen directly after
+    /// giving the worker thread time to fail.
+    #[test]
+    fn failed_import_returns_to_menu_with_status() {
+        use crate::import_screen::{ImportOutcome, ImportingScreen};
+        use rockcraft_import::ImportInput;
+
+        let mut screen = ImportingScreen::start(ImportInput::File(std::path::PathBuf::from(
+            "/nonexistent_rockcraft_test/video.mp4",
+        )));
+
+        // Give the worker thread up to 500 ms to complete.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let outcome = loop {
+            if let Some(o) = screen.poll() {
+                break Some(matches!(o, ImportOutcome::Failed(_)));
+            }
+            if std::time::Instant::now() > deadline {
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+
+        assert_eq!(
+            outcome,
+            Some(true),
+            "missing-file import must surface a Failed outcome"
+        );
     }
 }

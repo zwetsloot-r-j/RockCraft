@@ -24,6 +24,7 @@ rockcraft-core = { path = "crates/core" }
 rockcraft-midi = { path = "crates/midi" }
 rockcraft-audio = { path = "crates/audio" }
 rockcraft-control = { path = "crates/control" }
+rockcraft-import = { path = "crates/import" }
 
 # Serialization (core uses these for RecordingMeta / meta.json; no hardware dep)
 serde = { version = "1", features = ["derive"] }

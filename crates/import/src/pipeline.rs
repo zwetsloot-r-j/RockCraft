@@ -23,6 +23,15 @@ pub enum Progress {
     Done(PathBuf),
 }
 
+/// Returns `true` when a fetch command is configured for URL imports.
+///
+/// Checks `ROCKCRAFT_FETCH_CMD` env var first, then `scripts/local/fetch.sh`
+/// relative to the workspace root. Used by the TUI to decide whether to show
+/// the "Import from URL…" menu item.
+pub fn fetch_command_configured() -> bool {
+    env_fetch_cmd(&workspace_root()).is_some()
+}
+
 /// Resolve → extract → write. `on_progress` lets the TUI render status.
 ///
 /// Fetch hook: resolves `ROCKCRAFT_FETCH_CMD` first, then

@@ -1299,6 +1299,7 @@ dependencies = [
  "rockcraft-audio",
  "rockcraft-control",
  "rockcraft-core",
+ "rockcraft-import",
  "rockcraft-midi",
  "serde_json",
  "tokio",
