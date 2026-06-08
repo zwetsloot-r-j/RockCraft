@@ -1,0 +1,17 @@
+[package]
+name = "rockcraft-import"
+description = "Import pipeline data contract and chart bundle writer (M6 video import)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+rockcraft-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+midly = "0.5"
+
+[dev-dependencies]
+tempfile = "3"

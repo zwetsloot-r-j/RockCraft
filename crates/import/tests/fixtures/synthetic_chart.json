@@ -1,0 +1,16 @@
+{
+  "notes": [
+    {"pitch": 60, "start_us": 0,       "dur_us": 400000, "hand": "Right"},
+    {"pitch": 62, "start_us": 500000,  "dur_us": 400000, "hand": "Right"},
+    {"pitch": 64, "start_us": 1000000, "dur_us": 400000, "hand": "Right"},
+    {"pitch": 65, "start_us": 1500000, "dur_us": 400000, "hand": "Right"},
+    {"pitch": 67, "start_us": 2000000, "dur_us": 400000, "hand": "Right"},
+    {"pitch": 69, "start_us": 2500000, "dur_us": 400000, "hand": "Right"},
+    {"pitch": 71, "start_us": 3000000, "dur_us": 400000, "hand": "Right"},
+    {"pitch": 72, "start_us": 3500000, "dur_us": 400000, "hand": "Right"}
+  ],
+  "source": {
+    "title": "Synthetic C-major scale — fabricated test fixture, not a real song",
+    "extractor_version": "synthetic-test-0.1"
+  }
+}
