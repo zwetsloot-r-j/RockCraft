@@ -73,6 +73,12 @@ pub enum Action {
     ToggleRecordArm,
     ToggleRecordFlavour,
 
+    // ── wait mode (note-by-note play-along) ─────────────────────────────
+    ToggleWaitMode,
+    SetWaitMode {
+        on: bool,
+    },
+
     // ── transport (pure: time is injected, never wall-clock) ────────────
     TogglePlayCursor,
     PlayFromStart,
@@ -139,6 +145,8 @@ impl Action {
             Action::CycleChordDegree { .. } => "cycle_chord_degree",
             Action::ToggleRecordArm => "toggle_record_arm",
             Action::ToggleRecordFlavour => "toggle_record_flavour",
+            Action::ToggleWaitMode => "toggle_wait_mode",
+            Action::SetWaitMode { .. } => "set_wait_mode",
             Action::TogglePlayCursor => "toggle_play_cursor",
             Action::PlayFromStart => "play_from_start",
             Action::Stop => "stop",
@@ -270,6 +278,8 @@ pub fn action_names() -> &'static [&'static str] {
         "cycle_chord_degree",
         "toggle_record_arm",
         "toggle_record_flavour",
+        "toggle_wait_mode",
+        "set_wait_mode",
         "toggle_play_cursor",
         "play_from_start",
         "stop",
@@ -359,6 +369,9 @@ static ACTION_HELP: &[ActionInfo] = {
         // ── input mode ──────────────────────────────────────────────────
         ActionInfo { name: "toggle_record_arm", params: &[], description: "Arm/disarm recording from live MIDI input." },
         ActionInfo { name: "toggle_record_flavour", params: &[], description: "Flip the record flavour between step and live (no-op while disarmed)." },
+        // ── wait mode ─────────────────────────────────────────────────────
+        ActionInfo { name: "toggle_wait_mode", params: &[], description: "Toggle note-by-note wait mode: playback freezes until the required notes are held." },
+        ActionInfo { name: "set_wait_mode", params: &[p("on", "bool")], description: "Set note-by-note wait mode on (true) or off (false)." },
         // ── transport ───────────────────────────────────────────────────
         ActionInfo { name: "toggle_play_cursor", params: &[], description: "Toggle playback starting at the cursor position." },
         ActionInfo { name: "play_from_start", params: &[], description: "Play from the start of the timeline." },
@@ -419,6 +432,8 @@ mod tests {
             Action::CycleChordDegree { delta: -1 },
             Action::ToggleRecordArm,
             Action::ToggleRecordFlavour,
+            Action::ToggleWaitMode,
+            Action::SetWaitMode { on: true },
             Action::TogglePlayCursor,
             Action::PlayFromStart,
             Action::Stop,
@@ -498,8 +513,12 @@ mod tests {
         for info in action_help() {
             let mut params = serde_json::Map::new();
             for p in info.params {
-                // A small in-range value works for every scalar type we use.
-                params.insert(p.name.to_string(), json!(1));
+                // A type-appropriate sample value per documented scalar type.
+                let sample = match p.ty {
+                    "bool" => json!(true),
+                    _ => json!(1), // small in-range value for every numeric type
+                };
+                params.insert(p.name.to_string(), sample);
             }
             action_from_name(info.name, &serde_json::Value::Object(params)).unwrap_or_else(|e| {
                 panic!("{} should dispatch from its help params: {e}", info.name)
@@ -594,6 +613,38 @@ mod tests {
     fn missing_required_param_is_bad_params() {
         let err = action_from_name("set_cursor", &json!({ "pitch": 60 })).unwrap_err();
         assert!(matches!(err, ActionError::BadParams { .. }));
+    }
+
+    #[test]
+    fn wait_mode_actions_round_trip_via_name() {
+        // Nullary toggle dispatches from empty/null params.
+        assert_eq!(
+            action_from_name("toggle_wait_mode", &json!({})).unwrap(),
+            Action::ToggleWaitMode
+        );
+        // Parametrised set dispatches both polarities.
+        assert_eq!(
+            action_from_name("set_wait_mode", &json!({ "on": true })).unwrap(),
+            Action::SetWaitMode { on: true }
+        );
+        assert_eq!(
+            action_from_name("set_wait_mode", &json!({ "on": false })).unwrap(),
+            Action::SetWaitMode { on: false }
+        );
+    }
+
+    #[test]
+    fn set_wait_mode_rejects_missing_or_mistyped_on() {
+        // Missing `on`.
+        assert!(matches!(
+            action_from_name("set_wait_mode", &json!({})).unwrap_err(),
+            ActionError::BadParams { .. }
+        ));
+        // Mistyped `on` (number instead of bool).
+        match action_from_name("set_wait_mode", &json!({ "on": 1 })).unwrap_err() {
+            ActionError::BadParams { action, .. } => assert_eq!(action, "set_wait_mode"),
+            other => panic!("expected BadParams, got {other:?}"),
+        }
     }
 
     #[test]

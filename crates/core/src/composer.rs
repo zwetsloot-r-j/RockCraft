@@ -308,6 +308,11 @@ impl Composer {
                 Vec::new()
             }
 
+            // ── wait mode ───────────────────────────────────────────────
+            // Wait mode is owned by the Play transport (M5-C), not the
+            // composer; these are inert here.
+            Action::ToggleWaitMode | Action::SetWaitMode { .. } => Vec::new(),
+
             // ── transport ───────────────────────────────────────────────
             Action::TogglePlayCursor => {
                 // Space toggles play only when not grabbing, matching the TUI.
