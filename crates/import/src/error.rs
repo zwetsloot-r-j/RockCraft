@@ -10,6 +10,13 @@ pub enum ImportError {
     /// The target path is inside the workspace source tree.
     /// Write to `import-out/` instead (see `import_output_dir`).
     PathNotAllowed(String),
+    /// A URL was given but no fetch command is configured.
+    /// Set `ROCKCRAFT_FETCH_CMD` or add `scripts/local/fetch.sh`.
+    NoFetchCommand,
+    /// The Python sidecar script could not be found or its interpreter is missing.
+    SidecarMissing(String),
+    /// The sidecar ran but exited with a non-zero status.
+    SidecarFailed(String),
 }
 
 impl std::fmt::Display for ImportError {
@@ -19,6 +26,13 @@ impl std::fmt::Display for ImportError {
             ImportError::Json(msg) => write!(f, "JSON error: {msg}"),
             ImportError::Io(msg) => write!(f, "I/O error: {msg}"),
             ImportError::PathNotAllowed(msg) => write!(f, "path not allowed: {msg}"),
+            ImportError::NoFetchCommand => write!(
+                f,
+                "no fetch command configured: set ROCKCRAFT_FETCH_CMD or add \
+                 scripts/local/fetch.sh — see docs/IMPORT.md"
+            ),
+            ImportError::SidecarMissing(msg) => write!(f, "sidecar missing: {msg}"),
+            ImportError::SidecarFailed(msg) => write!(f, "sidecar failed: {msg}"),
         }
     }
 }
