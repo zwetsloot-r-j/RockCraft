@@ -2642,6 +2642,7 @@ mod tests {
     /// by exactly N × 125 000 µs (one sixteenth note). The step index matches
     /// exactly, confirming the state machine is correct regardless of render
     /// resolution.
+    /// After the axis fix: k/↑ is the time-forward key (step +1).
     #[test]
     fn cursor_right_at_sixteenth_snap_advances_by_step_us() {
         let mut e = EditScreen::new();
@@ -2650,7 +2651,7 @@ mod tests {
         assert_eq!(step_us, 125_000, "one 1/16 at 120 BPM = 125 000 µs");
 
         for n in 1u64..=8 {
-            e.on_key(KeyCode::Char('l'));
+            e.on_key(KeyCode::Char('k')); // k = step +1 (time forward)
             assert_eq!(e.cursor().step, n, "step index after {n} right press(es)");
             assert_eq!(
                 e.grid.us_of_step(e.cursor().step),
@@ -2659,8 +2660,8 @@ mod tests {
             );
         }
 
-        // Stepping left shrinks by the same unit.
-        e.on_key(KeyCode::Char('h'));
+        // Stepping back shrinks by the same unit.
+        e.on_key(KeyCode::Char('j')); // j = step -1 (time backward)
         assert_eq!(e.cursor().step, 7);
         assert_eq!(e.grid.us_of_step(e.cursor().step), 7 * step_us);
     }
