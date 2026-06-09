@@ -160,6 +160,13 @@ pub struct Composer {
     selection_anchor: Option<Cursor>,
     /// In-editor clipboard: notes normalised to the selection's top-left (0, 0).
     clipboard: Vec<Note>,
+
+    // ── backing alignment ───────────────────────────────────────────────────
+    /// File position (µs) in the attached backing track that lines up with song
+    /// time 0. Adjusted by [`Action::NudgeBackingOffset`] and consumed by the
+    /// frontend's [`crate::backing_position_us`] seek. Pure state: the composer
+    /// owns no audio, only the number frontends and `query state` read.
+    backing_offset_us: u64,
 }
 
 impl Composer {
@@ -206,6 +213,7 @@ impl Composer {
             count_in_bars: 1,
             selection_anchor: None,
             clipboard: Vec::new(),
+            backing_offset_us: 0,
         }
     }
 
@@ -219,6 +227,19 @@ impl Composer {
     /// [`Action::SetPlayhead`].
     pub fn set_playhead_us(&mut self, us: u64) {
         self.record_playhead_us = us;
+    }
+
+    /// The backing-track alignment offset (`audio_start_us`): the file position
+    /// lining up with song time 0. Frontends read this to seek the audio.
+    pub fn backing_offset_us(&self) -> u64 {
+        self.backing_offset_us
+    }
+
+    /// Set the backing-track alignment offset, e.g. when loading a bundle whose
+    /// `meta.json` declared one. Live editing goes through
+    /// [`Action::NudgeBackingOffset`] instead.
+    pub fn set_backing_offset_us(&mut self, us: u64) {
+        self.backing_offset_us = us;
     }
 
     // ── core API ──────────────────────────────────────────────────────────
@@ -335,6 +356,16 @@ impl Composer {
             Action::Play { from_us } => self.start_play(from_us),
             Action::SetPlayhead { us } => {
                 self.record_playhead_us = us;
+                Vec::new()
+            }
+
+            // ── backing alignment ───────────────────────────────────────
+            // Slide the backing offset, clamped at 0 (it can never be
+            // negative). Frontends re-seek the audio to the new mapping.
+            Action::NudgeBackingOffset { delta_us } => {
+                self.backing_offset_us = (self.backing_offset_us as i64)
+                    .saturating_add(delta_us)
+                    .max(0) as u64;
                 Vec::new()
             }
 
@@ -464,6 +495,7 @@ impl Composer {
             selection,
             chord_preview,
             clipboard_len: self.clipboard.len(),
+            backing_offset_us: self.backing_offset_us,
         }
     }
 
@@ -1323,6 +1355,9 @@ pub struct ComposerSnapshot {
     pub selection: Option<SelectionView>,
     pub chord_preview: Option<Vec<u8>>,
     pub clipboard_len: usize,
+    /// Backing-track alignment offset (`audio_start_us`): the file position that
+    /// lines up with song time 0. `0` when no backing or no nudge applied.
+    pub backing_offset_us: u64,
 }
 
 /// Build sustained spans from a time-ordered event stream by pairing each
@@ -2216,6 +2251,47 @@ mod tests {
         let mut c = Composer::new();
         apply(&mut c, Action::PasteClipboard);
         assert_eq!(c.note_count(), 0);
+    }
+
+    // ── backing alignment ──────────────────────────────────────────────────
+
+    #[test]
+    fn nudge_backing_offset_adjusts_clamps_and_shows_in_snapshot() {
+        let mut c = Composer::new();
+        assert_eq!(c.backing_offset_us(), 0);
+
+        // Forward nudges accumulate.
+        apply(&mut c, Action::NudgeBackingOffset { delta_us: 250_000 });
+        apply(&mut c, Action::NudgeBackingOffset { delta_us: 10_000 });
+        assert_eq!(c.backing_offset_us(), 260_000);
+        assert_eq!(c.snapshot().backing_offset_us, 260_000);
+
+        // Backward nudges subtract.
+        apply(&mut c, Action::NudgeBackingOffset { delta_us: -10_000 });
+        assert_eq!(c.backing_offset_us(), 250_000);
+
+        // It clamps at 0 — never negative.
+        apply(
+            &mut c,
+            Action::NudgeBackingOffset {
+                delta_us: -1_000_000,
+            },
+        );
+        assert_eq!(c.backing_offset_us(), 0);
+        assert_eq!(c.snapshot().backing_offset_us, 0);
+    }
+
+    #[test]
+    fn nudge_backing_offset_feeds_backing_position() {
+        // The seek target the frontend uses is backing_position_us with the
+        // nudged offset and the editor's zero shift.
+        let mut c = Composer::new();
+        apply(&mut c, Action::NudgeBackingOffset { delta_us: 250_000 });
+        let offset = c.backing_offset_us();
+        assert_eq!(
+            crate::backing_position_us(1_000_000, 0, offset),
+            Some(1_250_000)
+        );
     }
 
     // ── snapshot ──────────────────────────────────────────────────────────

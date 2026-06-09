@@ -76,6 +76,11 @@ const DEFAULT_NOTE_VEL: u8 = 80;
 /// Velocity step for `+`/`-` adjustments.
 const VEL_STEP: u8 = 8;
 
+/// Fine backing-alignment nudge step (10 ms), bound to `,` / `.`.
+const BACKING_NUDGE_FINE_US: i64 = 10_000;
+/// Coarse backing-alignment nudge step (250 ms), bound to `;` / `'`.
+const BACKING_NUDGE_COARSE_US: i64 = 250_000;
+
 /// Cursor highlight (status badge, cursor key, cursor cell).
 const CURSOR_COLOR: Color = Color::Magenta;
 /// Chord-mode badge colour.
@@ -154,6 +159,20 @@ fn key_to_action(code: KeyCode) -> Option<Action> {
         KeyCode::Char(' ') => Action::TogglePlayCursor,
         KeyCode::Char('P') => Action::PlayFromStart,
 
+        // ── backing alignment (slide audio under the highway) ─────────────
+        KeyCode::Char(',') => Action::NudgeBackingOffset {
+            delta_us: -BACKING_NUDGE_FINE_US,
+        },
+        KeyCode::Char('.') => Action::NudgeBackingOffset {
+            delta_us: BACKING_NUDGE_FINE_US,
+        },
+        KeyCode::Char(';') => Action::NudgeBackingOffset {
+            delta_us: -BACKING_NUDGE_COARSE_US,
+        },
+        KeyCode::Char('\'') => Action::NudgeBackingOffset {
+            delta_us: BACKING_NUDGE_COARSE_US,
+        },
+
         // ── loop / metronome / count-in ─────────────────────────────────
         KeyCode::Char('o') => Action::ToggleLoop,
         KeyCode::Char('M') => Action::ToggleMetronome,
@@ -191,13 +210,15 @@ fn chord_key_to_action(code: KeyCode) -> Option<Action> {
     })
 }
 
-/// A backing audio track attached to the editor, plus the file position that
-/// lines up with song time 0 (`audio_start_us`). The composer transport has no
-/// pre-roll, so the whole-song shift used by [`backing_position_us`] is always
-/// 0 here: the file position is simply `playhead_us + audio_start_us`.
+/// A backing audio track attached to the editor. The alignment offset
+/// (`audio_start_us` — the file position lining up with song time 0) lives on
+/// the [`Composer`] so it is editable via [`Action::NudgeBackingOffset`] and
+/// visible in `query state`; this struct only holds the file path. The composer
+/// transport has no pre-roll, so the whole-song shift used by
+/// [`backing_position_us`] is always 0 here: the file position is simply
+/// `playhead_us + audio_start_us`.
 struct Backing {
     path: PathBuf,
-    audio_start_us: u64,
 }
 
 /// What the backing track should do on a given tick, derived purely from the
@@ -261,6 +282,9 @@ pub struct EditScreen {
     /// Playhead position at the previous `poll_backing`; a backward jump while
     /// playing (loop wrap / rewind) triggers a re-seek.
     prev_playhead_us: u64,
+    /// Backing offset at the previous `poll_backing`; a change while playing
+    /// (an alignment nudge) triggers a re-seek so the shift is audible at once.
+    prev_offset_us: u64,
 }
 
 impl EditScreen {
@@ -299,6 +323,7 @@ impl EditScreen {
             backing_handle: None,
             prev_playing: false,
             prev_playhead_us: 0,
+            prev_offset_us: 0,
         }
     }
 
@@ -318,10 +343,10 @@ impl EditScreen {
     /// `audio_start_us` is the file position lining up with song time 0 (default
     /// 0; M5-E makes it adjustable). Builder form, mirroring `PlayScreen`.
     pub fn with_backing(mut self, path: PathBuf, audio_start_us: u64) -> Self {
-        self.backing = Some(Backing {
-            path,
-            audio_start_us,
-        });
+        self.backing = Some(Backing { path });
+        // The offset is composer state (editable + snapshot-visible); seed it
+        // from the loaded value so a reopened bundle restores its alignment.
+        self.composer.set_backing_offset_us(audio_start_us);
         self
     }
 
@@ -366,7 +391,7 @@ impl EditScreen {
             std::fs::copy(&b.path, bundle_dir.join(&filename))?;
             Some(BackingTrack {
                 file: filename,
-                audio_start_us: b.audio_start_us,
+                audio_start_us: self.composer.backing_offset_us(),
             })
         } else {
             None
@@ -610,8 +635,8 @@ impl EditScreen {
     /// editor transport has no pre-roll, so the whole-song shift is always 0 and
     /// the position is `playhead_us + audio_start_us`.
     fn backing_target_us(&self) -> Option<u64> {
-        let b = self.backing.as_ref()?;
-        backing_position_us(self.playhead_us(), 0, b.audio_start_us)
+        self.backing.as_ref()?;
+        backing_position_us(self.playhead_us(), 0, self.composer.backing_offset_us())
     }
 
     /// Decide what the backing should do this tick from the transport state, and
@@ -620,22 +645,27 @@ impl EditScreen {
     fn poll_backing(&mut self) -> BackingCmd {
         let playing = self.is_playing();
         let ph = self.playhead_us();
+        let offset = self.composer.backing_offset_us();
         let Some(target) = self.backing_target_us() else {
             // No backing: keep the snapshot coherent so a later attach behaves.
             self.prev_playing = playing;
             self.prev_playhead_us = ph;
+            self.prev_offset_us = offset;
             return BackingCmd::None;
         };
         let prev_playing = self.prev_playing;
         let prev_ph = self.prev_playhead_us;
+        let prev_offset = self.prev_offset_us;
         self.prev_playing = playing;
         self.prev_playhead_us = ph;
+        self.prev_offset_us = offset;
 
         if playing && !prev_playing {
             // Transport just started: (re)sync the backing to the playhead.
             BackingCmd::PlayAt(target)
-        } else if playing && ph < prev_ph {
-            // Playhead jumped backward (loop wrap / rewind): re-seek to match.
+        } else if playing && (ph < prev_ph || offset != prev_offset) {
+            // Playhead jumped backward (loop wrap / rewind) or the alignment
+            // offset was nudged: re-seek so the audio matches the new mapping.
             BackingCmd::Seek(target)
         } else if !playing && prev_playing {
             // Transport just stopped: pause in place.
@@ -1053,6 +1083,20 @@ impl EditScreen {
             })
             .unwrap_or_else(|| Span::raw(""));
 
+        // Surface the backing alignment offset (and its nudge keys) only when a
+        // track is attached, so MIDI-only editing keeps a clean status line.
+        let backing_span = if self.backing.is_some() {
+            Span::styled(
+                format!(
+                    "backing {:+}ms [,/.·;/']  ",
+                    self.composer.backing_offset_us() as i64 / 1000
+                ),
+                Style::default().fg(Color::Cyan),
+            )
+        } else {
+            Span::raw("")
+        };
+
         let line = Line::from(vec![
             Span::styled(badge_text, badge_style),
             loop_span,
@@ -1061,6 +1105,7 @@ impl EditScreen {
             note_keys_span,
             pos_span,
             Span::raw(format!("snap {}  ", self.grid.subdivision.label())),
+            backing_span,
             Span::styled(
                 format!("♪ {pitch_name}  "),
                 Style::default().fg(CURSOR_COLOR),
@@ -1309,6 +1354,16 @@ impl EditScreen {
             )),
             Line::from(Span::raw(
                 "  Space : Play/stop from cursor  P : Play from start",
+            )),
+            Line::from(Span::raw("")), // Empty line
+            Line::from(Span::styled(
+                " Backing alignment (slide audio under the highway):",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::raw(
+                "  , / . : Nudge -/+10ms      ; / ' : Nudge -/+250ms",
             )),
             Line::from(Span::raw("")), // Empty line
             Line::from(Span::styled(
@@ -3206,6 +3261,67 @@ mod tests {
         assert_eq!(backing.audio_start_us, 250_000);
         // The audio file was copied into the bundle under that name.
         assert!(bundle.join("backing.wav").exists());
+
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::remove_file(&src).ok();
+    }
+
+    #[test]
+    fn nudge_keys_adjust_offset_and_clamp() {
+        let mut e = EditScreen::new().with_backing(PathBuf::from("backing.wav"), 0);
+        // Coarse later (+250ms) then fine later (+10ms).
+        e.on_key(KeyCode::Char('\''));
+        e.on_key(KeyCode::Char('.'));
+        assert_eq!(e.composer.backing_offset_us(), 260_000);
+        // Fine earlier (-10ms).
+        e.on_key(KeyCode::Char(','));
+        assert_eq!(e.composer.backing_offset_us(), 250_000);
+        // Coarse earlier twice clamps at 0 (never negative).
+        e.on_key(KeyCode::Char(';'));
+        e.on_key(KeyCode::Char(';'));
+        assert_eq!(e.composer.backing_offset_us(), 0);
+    }
+
+    #[test]
+    fn nudge_while_playing_reseeks_backing_to_new_offset() {
+        let mut e = EditScreen::new().with_backing(PathBuf::from("backing.wav"), 0);
+        e.on_key(KeyCode::Char('P'));
+        assert_eq!(e.poll_backing(), BackingCmd::PlayAt(0));
+        e.advance(1_000_000);
+        assert_eq!(e.poll_backing(), BackingCmd::None);
+        // Nudge the alignment later by 250ms while playing: the next poll must
+        // re-seek the audio to playhead + new offset = 1_000_000 + 250_000.
+        e.on_key(KeyCode::Char('\''));
+        assert_eq!(e.composer.backing_offset_us(), 250_000);
+        assert_eq!(e.poll_backing(), BackingCmd::Seek(1_250_000));
+        // Having consumed the change, a steady poll free-runs again.
+        assert_eq!(e.poll_backing(), BackingCmd::None);
+    }
+
+    #[test]
+    fn nudged_offset_persists_through_save_and_reload() {
+        let src = temp_backing_file("nudge_persist", "wav");
+        let mut e = EditScreen::new().with_backing(src.clone(), 0);
+        // Nudge to a non-zero alignment, then save.
+        e.on_key(KeyCode::Char('\'')); // +250ms
+        e.on_key(KeyCode::Char('.')); // +10ms
+        assert_eq!(e.composer.backing_offset_us(), 260_000);
+
+        let base =
+            std::env::temp_dir().join(format!("rockcraft_edit_nudge_{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let bundle = e.save_bundle(&base).unwrap();
+
+        // meta.json carries the nudged offset.
+        let json = std::fs::read_to_string(bundle.join("meta.json")).unwrap();
+        let meta = RecordingMeta::from_json(&json).unwrap();
+        let backing = meta.backing.expect("backing persisted");
+        assert_eq!(backing.audio_start_us, 260_000);
+
+        // Reopening the bundle (the "Edit last recording" path) restores it.
+        let reopened =
+            EditScreen::new().with_backing(bundle.join(&backing.file), backing.audio_start_us);
+        assert_eq!(reopened.composer.backing_offset_us(), 260_000);
 
         std::fs::remove_dir_all(&base).ok();
         std::fs::remove_file(&src).ok();
