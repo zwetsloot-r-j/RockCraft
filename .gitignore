@@ -32,9 +32,15 @@ target
 /render.txt
 
 # Imported content — the TOOL is shared, the songs are NOT. Never commit these.
-/import-out/           # extracted .mid chart bundles (M6-A output root)
-/import-cache/         # downloaded / fetched source media
-/scripts/local/        # private, machine-local fetch wrapper (yt-dlp etc.)
+# NOTE: .gitignore has NO inline comments — a `#` only starts a comment at the
+# start of a line, so keep each pattern alone on its line (a pattern like
+# `/foo/   # bar` matches a path literally containing those chars, not foo/).
+/import-out/
+# extracted .mid chart bundles (M6-A output root)
+/import-cache/
+# downloaded / fetched source media
+/scripts/local/
+# private, machine-local fetch wrapper (yt-dlp etc.)
 *.mp4
 *.mkv
 *.webm
