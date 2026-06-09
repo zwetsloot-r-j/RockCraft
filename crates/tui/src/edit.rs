@@ -29,7 +29,7 @@
 //! screen stays headless-testable via the existing `TestBackend` harness.
 
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossterm::event::KeyCode;
 use ratatui::{
@@ -39,15 +39,17 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
-use rockcraft_audio::SynthHandle;
+use rockcraft_audio::{play_file_at, BackingHandle, SynthHandle};
 use rockcraft_core::{
-    Action, Composer, Cursor, Effect, Grid, InputMode, Key, MidiNote, Note, NoteEvent, NoteId,
-    RecordingMeta, Scale as MusicScale, Subdivision, Timeline, Velocity,
+    backing_position_us, Action, BackingTrack, Composer, Cursor, Effect, Grid, InputMode, Key,
+    MidiNote, Note, NoteEvent, NoteId, RecordingMeta, Scale as MusicScale, Subdivision, Timeline,
+    Velocity,
 };
 use rockcraft_midi::{events_to_smf_bytes, key_map as mock_key_map};
 
 use crate::highway::{build_spans, project, NoteSpan};
 use crate::keyboard::{black_key_col, is_black_key, white_index, Scale, LOWEST_MIDI};
+use crate::record::bundle_backing_filename;
 use crate::render::draw_keyboard;
 
 /// Base directory for saved bundles.
@@ -189,6 +191,31 @@ fn chord_key_to_action(code: KeyCode) -> Option<Action> {
     })
 }
 
+/// A backing audio track attached to the editor, plus the file position that
+/// lines up with song time 0 (`audio_start_us`). The composer transport has no
+/// pre-roll, so the whole-song shift used by [`backing_position_us`] is always
+/// 0 here: the file position is simply `playhead_us + audio_start_us`.
+struct Backing {
+    path: PathBuf,
+    audio_start_us: u64,
+}
+
+/// What the backing track should do on a given tick, derived purely from the
+/// transport state (no device touched). [`EditScreen::poll_backing`] computes
+/// it; [`EditScreen::tick_backing`] applies it to the live [`BackingHandle`].
+/// Splitting the decision from the effect keeps the sync logic headless-testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackingCmd {
+    /// Transport started: begin (or resume) playback seeked to this file position.
+    PlayAt(u64),
+    /// Re-seek to this file position while still playing (loop wrap / rewind).
+    Seek(u64),
+    /// Transport stopped: pause in place, keeping the stream open.
+    Pause,
+    /// Nothing to do — free-running, or no backing attached.
+    None,
+}
+
 /// The composer edit screen: a [`Composer`] rendered on the highway, plus the
 /// frontend-only state needed to interpret its effects and draw it.
 pub struct EditScreen {
@@ -222,6 +249,18 @@ pub struct EditScreen {
     /// When `true` the "Save / Discard / Cancel" overlay is rendered and all
     /// keys are routed to `on_prompt_key` instead of the normal keymap.
     exit_prompt: bool,
+    /// Backing audio track to play in lock-step with the transport, if attached
+    /// (via `with_backing`). `None` makes all backing wiring a no-op.
+    backing: Option<Backing>,
+    /// Live playback handle once the backing track has started; `None` until the
+    /// transport first plays. Paused (not torn down) when the transport stops.
+    backing_handle: Option<BackingHandle>,
+    /// Whether the transport was playing at the previous `poll_backing`, to
+    /// detect the stop↔play transitions that start/pause the backing.
+    prev_playing: bool,
+    /// Playhead position at the previous `poll_backing`; a backward jump while
+    /// playing (loop wrap / rewind) triggers a re-seek.
+    prev_playhead_us: u64,
 }
 
 impl EditScreen {
@@ -256,6 +295,10 @@ impl EditScreen {
             dirty: false,
             save_flash: None,
             exit_prompt: false,
+            backing: None,
+            backing_handle: None,
+            prev_playing: false,
+            prev_playhead_us: 0,
         }
     }
 
@@ -271,6 +314,17 @@ impl EditScreen {
         self.synth = Some(synth);
     }
 
+    /// Attach a backing audio track that plays in lock-step with the transport.
+    /// `audio_start_us` is the file position lining up with song time 0 (default
+    /// 0; M5-E makes it adjustable). Builder form, mirroring `PlayScreen`.
+    pub fn with_backing(mut self, path: PathBuf, audio_start_us: u64) -> Self {
+        self.backing = Some(Backing {
+            path,
+            audio_start_us,
+        });
+        self
+    }
+
     /// Stop any in-progress audition and editor state and return to a clean rest.
     /// An uncommitted chord preview is cancelled (its notes removed) so leaving
     /// never strands a ghost chord. Call before navigating away from the screen.
@@ -278,6 +332,13 @@ impl EditScreen {
         let effects = self.composer.leave();
         self.run_effects(&effects);
         self.last_tick = None;
+        // Stop and drop the backing stream (mirrors `RecordScreen`); the next
+        // entry re-arms it from the playhead.
+        if let Some(h) = self.backing_handle.take() {
+            h.stop();
+        }
+        self.prev_playing = false;
+        self.prev_playhead_us = self.playhead_us();
     }
 
     /// Save the timeline as a `take-<stamp>` bundle under `recordings/`.
@@ -297,9 +358,22 @@ impl EditScreen {
         std::fs::create_dir_all(&bundle_dir)?;
         let bytes = events_to_smf_bytes(&self.timeline().to_events());
         std::fs::write(bundle_dir.join("song.mid"), bytes)?;
+        // Carry an attached backing track into the bundle: copy the file in and
+        // record its bundle-relative name + start offset, mirroring Record.
+        // MIDI-only saves keep `backing: None`.
+        let backing = if let Some(b) = &self.backing {
+            let filename = bundle_backing_filename(&b.path);
+            std::fs::copy(&b.path, bundle_dir.join(&filename))?;
+            Some(BackingTrack {
+                file: filename,
+                audio_start_us: b.audio_start_us,
+            })
+        } else {
+            None
+        };
         let meta = RecordingMeta {
             midi_file: "song.mid".into(),
-            backing: None,
+            backing,
             grid: Some(self.grid),
             key: Some(self.key),
             version: 1,
@@ -526,6 +600,83 @@ impl EditScreen {
     /// tests advance it manually to place recorded notes.
     pub fn set_playhead_us(&mut self, us: u64) {
         self.composer.set_playhead_us(us);
+    }
+
+    // ── backing-track sync ───────────────────────────────────────────────────
+
+    /// The file position the backing track should be at for the current
+    /// playhead, or `None` when no track is attached. Shares core's
+    /// [`backing_position_us`] formula so audio and the highway never drift; the
+    /// editor transport has no pre-roll, so the whole-song shift is always 0 and
+    /// the position is `playhead_us + audio_start_us`.
+    fn backing_target_us(&self) -> Option<u64> {
+        let b = self.backing.as_ref()?;
+        backing_position_us(self.playhead_us(), 0, b.audio_start_us)
+    }
+
+    /// Decide what the backing should do this tick from the transport state, and
+    /// record the playing/playhead snapshot for the next call. Pure (touches no
+    /// device), so the sync decision is headless-testable.
+    fn poll_backing(&mut self) -> BackingCmd {
+        let playing = self.is_playing();
+        let ph = self.playhead_us();
+        let Some(target) = self.backing_target_us() else {
+            // No backing: keep the snapshot coherent so a later attach behaves.
+            self.prev_playing = playing;
+            self.prev_playhead_us = ph;
+            return BackingCmd::None;
+        };
+        let prev_playing = self.prev_playing;
+        let prev_ph = self.prev_playhead_us;
+        self.prev_playing = playing;
+        self.prev_playhead_us = ph;
+
+        if playing && !prev_playing {
+            // Transport just started: (re)sync the backing to the playhead.
+            BackingCmd::PlayAt(target)
+        } else if playing && ph < prev_ph {
+            // Playhead jumped backward (loop wrap / rewind): re-seek to match.
+            BackingCmd::Seek(target)
+        } else if !playing && prev_playing {
+            // Transport just stopped: pause in place.
+            BackingCmd::Pause
+        } else {
+            // Free-running with the sink, or idle while stopped.
+            BackingCmd::None
+        }
+    }
+
+    /// Sync the live backing handle to the transport. Call once per run-loop
+    /// iteration right after [`tick_audition`](Self::tick_audition). Never blocks
+    /// the audio thread; a persistent file failure drops the track so editing
+    /// continues silently.
+    pub fn tick_backing(&mut self) {
+        match self.poll_backing() {
+            BackingCmd::PlayAt(pos) => {
+                let Some(b) = &self.backing else { return };
+                if let Some(h) = &self.backing_handle {
+                    // Resume an existing (paused) stream from the new position.
+                    h.seek(Duration::from_micros(pos));
+                    h.resume();
+                } else {
+                    match play_file_at(&b.path, Duration::from_micros(pos)) {
+                        Ok(h) => self.backing_handle = Some(h),
+                        Err(_) => self.backing = None,
+                    }
+                }
+            }
+            BackingCmd::Seek(pos) => {
+                if let Some(h) = &self.backing_handle {
+                    h.seek(Duration::from_micros(pos));
+                }
+            }
+            BackingCmd::Pause => {
+                if let Some(h) = &self.backing_handle {
+                    h.pause();
+                }
+            }
+            BackingCmd::None => {}
+        }
     }
 
     // ── read-only accessors (thin shims over `Composer`) ─────────────────────
@@ -2922,5 +3073,154 @@ mod tests {
             "a single 1/16-step move must change the rendered output \
              (sub-beat indicator advances from .1 to .2)"
         );
+    }
+
+    // ── backing-track sync (M5-D) ────────────────────────────────────────────
+
+    /// A temp file standing in for a backing audio file; `save_bundle` copies it.
+    fn temp_backing_file(suffix: &str, ext: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("rockcraft_edit_backing_{suffix}.{ext}"));
+        std::fs::write(&path, b"not-real-audio").unwrap();
+        path
+    }
+
+    #[test]
+    fn backing_target_tracks_playhead_with_zero_shift() {
+        // Editor has no pre-roll, so the file position is playhead + audio_start.
+        let mut e = EditScreen::new().with_backing(PathBuf::from("backing.wav"), 0);
+        // Stopped at the song start: the target is 0.
+        assert_eq!(e.backing_target_us(), Some(0));
+        // Playing and advanced one second: the file is one second in.
+        e.on_key(KeyCode::Char('P'));
+        e.advance(1_000_000);
+        assert_eq!(e.backing_target_us(), Some(1_000_000));
+    }
+
+    #[test]
+    fn backing_target_respects_audio_start_offset() {
+        let e = EditScreen::new().with_backing(PathBuf::from("backing.wav"), 250_000);
+        // A trimmed lead-in: at playhead 0 the file is already 250ms in.
+        assert_eq!(e.backing_target_us(), Some(250_000));
+    }
+
+    #[test]
+    fn no_backing_never_targets_or_commands() {
+        let mut e = EditScreen::new();
+        assert_eq!(e.backing_target_us(), None);
+        e.on_key(KeyCode::Char('P'));
+        assert_eq!(e.poll_backing(), BackingCmd::None);
+        e.advance(1_000_000);
+        assert_eq!(e.poll_backing(), BackingCmd::None);
+    }
+
+    #[test]
+    fn transport_start_commands_play_at_playhead() {
+        let mut e = EditScreen::new().with_backing(PathBuf::from("backing.wav"), 0);
+        // Stopped: nothing to do.
+        assert_eq!(e.poll_backing(), BackingCmd::None);
+        // Pressing play seeks the backing to the playhead (0) and starts it.
+        e.on_key(KeyCode::Char('P'));
+        assert_eq!(e.poll_backing(), BackingCmd::PlayAt(0));
+    }
+
+    #[test]
+    fn playing_free_runs_without_recommanding() {
+        let mut e = EditScreen::new().with_backing(PathBuf::from("backing.wav"), 0);
+        e.on_key(KeyCode::Char('P'));
+        assert_eq!(e.poll_backing(), BackingCmd::PlayAt(0));
+        // While playing forward the sink free-runs: no further commands.
+        e.advance(500_000);
+        assert_eq!(e.poll_backing(), BackingCmd::None);
+        e.advance(500_000);
+        assert_eq!(e.poll_backing(), BackingCmd::None);
+    }
+
+    #[test]
+    fn stop_commands_pause() {
+        let mut e = EditScreen::new().with_backing(PathBuf::from("backing.wav"), 0);
+        e.on_key(KeyCode::Char('P'));
+        assert_eq!(e.poll_backing(), BackingCmd::PlayAt(0));
+        // Space stops the transport: the backing pauses in place.
+        e.on_key(KeyCode::Char(' '));
+        assert!(!e.is_playing());
+        assert_eq!(e.poll_backing(), BackingCmd::Pause);
+    }
+
+    #[test]
+    fn backward_jump_while_playing_reseeks() {
+        let mut e = EditScreen::new().with_backing(PathBuf::from("backing.wav"), 0);
+        e.on_key(KeyCode::Char('P'));
+        assert_eq!(e.poll_backing(), BackingCmd::PlayAt(0));
+        e.advance(2_000_000);
+        assert_eq!(e.poll_backing(), BackingCmd::None);
+        // Play-from-start while already playing rewinds the playhead to 0 — a
+        // backward jump (like a loop wrap) that must re-seek the backing.
+        e.on_key(KeyCode::Char('P'));
+        assert_eq!(e.playhead_us(), 0);
+        assert_eq!(e.poll_backing(), BackingCmd::Seek(0));
+    }
+
+    #[test]
+    fn replay_after_stop_reseeks_from_current_playhead() {
+        let mut e = EditScreen::new().with_backing(PathBuf::from("backing.wav"), 0);
+        // Play from the cursor (run loop polls every tick).
+        e.on_key(KeyCode::Char(' '));
+        assert!(e.is_playing());
+        assert_eq!(e.poll_backing(), BackingCmd::PlayAt(0));
+        e.advance(750_000);
+        assert_eq!(e.poll_backing(), BackingCmd::None);
+        // Stop, then replay: PlayAt re-syncs from wherever the playhead now sits.
+        e.on_key(KeyCode::Char(' '));
+        assert_eq!(e.poll_backing(), BackingCmd::Pause);
+        e.on_key(KeyCode::Char(' '));
+        assert!(e.is_playing());
+        let target = e.backing_target_us().unwrap();
+        assert_eq!(e.poll_backing(), BackingCmd::PlayAt(target));
+    }
+
+    #[test]
+    fn leave_resets_backing_sync_state() {
+        let mut e = EditScreen::new().with_backing(PathBuf::from("backing.wav"), 0);
+        e.on_key(KeyCode::Char('P'));
+        assert_eq!(e.poll_backing(), BackingCmd::PlayAt(0));
+        e.advance(1_000_000);
+        e.leave();
+        // After leaving, the prev-playing snapshot is cleared, so re-entering and
+        // playing again issues a fresh PlayAt rather than a stale free-run.
+        e.on_key(KeyCode::Char('P'));
+        assert!(matches!(e.poll_backing(), BackingCmd::PlayAt(_)));
+    }
+
+    #[test]
+    fn save_bundle_roundtrips_backing_into_meta() {
+        let src = temp_backing_file("save_rt", "wav");
+        let e = EditScreen::new().with_backing(src.clone(), 250_000);
+        let base = std::env::temp_dir().join(format!("rockcraft_edit_save_{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let bundle = e.save_bundle(&base).unwrap();
+
+        let json = std::fs::read_to_string(bundle.join("meta.json")).unwrap();
+        let meta = RecordingMeta::from_json(&json).unwrap();
+        let backing = meta.backing.expect("backing persisted");
+        assert_eq!(backing.file, "backing.wav");
+        assert_eq!(backing.audio_start_us, 250_000);
+        // The audio file was copied into the bundle under that name.
+        assert!(bundle.join("backing.wav").exists());
+
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::remove_file(&src).ok();
+    }
+
+    #[test]
+    fn save_bundle_midi_only_keeps_backing_none() {
+        let e = EditScreen::new();
+        let base =
+            std::env::temp_dir().join(format!("rockcraft_edit_save_none_{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let bundle = e.save_bundle(&base).unwrap();
+        let json = std::fs::read_to_string(bundle.join("meta.json")).unwrap();
+        let meta = RecordingMeta::from_json(&json).unwrap();
+        assert!(meta.backing.is_none());
+        std::fs::remove_dir_all(&base).ok();
     }
 }

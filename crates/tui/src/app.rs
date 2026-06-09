@@ -178,6 +178,11 @@ impl Shell {
         if let Some(s) = &self.synth {
             edit.attach_synth(s.clone());
         }
+        // A backing track chosen this session plays under the composer at offset
+        // 0 (M5-E adds an adjustable offset).
+        if let Some(path) = &self.backing_path {
+            edit = edit.with_backing(path.clone(), 0);
+        }
         self.screen = Screen::Edit(Box::new(edit));
     }
 
@@ -220,6 +225,14 @@ impl Shell {
                             edit.set_key(key);
                             if let Some(s) = &self.synth {
                                 edit.attach_synth(s.clone());
+                            }
+                            // Prefer a backing the bundle itself declares (path +
+                            // offset from meta); otherwise fall back to a track
+                            // chosen this session.
+                            if let Some((bpath, start)) = load_meta_backing(bundle_dir) {
+                                edit = edit.with_backing(bpath, start);
+                            } else if let Some(path) = &self.backing_path {
+                                edit = edit.with_backing(path.clone(), 0);
                             }
                             self.screen = Screen::Edit(Box::new(edit));
                         }
@@ -567,9 +580,11 @@ pub fn run_loop<B: ratatui::backend::Backend>(
             play.tick_backing();
         }
 
-        // Tick editor transport audition (clock-driven).
+        // Tick editor transport audition and the backing track (clock-driven);
+        // the backing arms on transport play and re-syncs on stop/seek/loop-wrap.
         if let Screen::Edit(edit) = &mut shell.screen {
             edit.tick_audition();
+            edit.tick_backing();
         }
 
         // A finished song returns to the menu on its own.
@@ -690,6 +705,16 @@ fn load_meta_grid_key(bundle_dir: &std::path::Path) -> (Grid, Key) {
         meta.grid.unwrap_or_else(Grid::default_120),
         meta.key.unwrap_or(default_key),
     )
+}
+
+/// Resolve a bundle's backing track from its `meta.json`, returning the
+/// absolute file path (relative to the bundle dir, so it stays movable) and the
+/// `audio_start_us` offset. `None` when there is no manifest or no backing.
+fn load_meta_backing(bundle_dir: &std::path::Path) -> Option<(PathBuf, u64)> {
+    let json = std::fs::read_to_string(bundle_dir.join("meta.json")).ok()?;
+    let meta = RecordingMeta::from_json(&json).ok()?;
+    let backing = meta.backing?;
+    Some((bundle_dir.join(&backing.file), backing.audio_start_us))
 }
 
 /// Find the MIDI of the most recent recording under `recordings/`.
