@@ -94,6 +94,14 @@ pub enum Action {
         us: u64,
     },
 
+    // ── backing alignment ───────────────────────────────────────────────
+    /// Slide the attached backing track's `audio_start_us` by `delta_us`
+    /// (clamped at 0): positive shifts the audio later in the file, negative
+    /// earlier. Editor-side state; a no-op for frontends with no backing.
+    NudgeBackingOffset {
+        delta_us: i64,
+    },
+
     // ── loop / metronome / count-in ─────────────────────────────────────
     ToggleLoop,
     ToggleMetronome,
@@ -158,6 +166,7 @@ impl Action {
             Action::Stop => "stop",
             Action::Play { .. } => "play",
             Action::SetPlayhead { .. } => "set_playhead",
+            Action::NudgeBackingOffset { .. } => "nudge_backing_offset",
             Action::ToggleLoop => "toggle_loop",
             Action::ToggleMetronome => "toggle_metronome",
             Action::StartCountInRecord => "start_count_in_record",
@@ -293,6 +302,7 @@ pub fn action_names() -> &'static [&'static str] {
         "stop",
         "play",
         "set_playhead",
+        "nudge_backing_offset",
         "toggle_loop",
         "toggle_metronome",
         "start_count_in_record",
@@ -388,6 +398,8 @@ static ACTION_HELP: &[ActionInfo] = {
         ActionInfo { name: "stop", params: &[], description: "Stop playback." },
         ActionInfo { name: "play", params: &[p("from_us", "u64")], description: "Start playback from from_us microseconds." },
         ActionInfo { name: "set_playhead", params: &[p("us", "u64")], description: "Move the playhead to us microseconds." },
+        // ── backing alignment ───────────────────────────────────────────
+        ActionInfo { name: "nudge_backing_offset", params: &[p("delta_us", "i64")], description: "Slide the backing track's audio_start_us by delta_us (clamped at 0) to align it under the highway." },
         // ── loop / metronome / count-in ─────────────────────────────────
         ActionInfo { name: "toggle_loop", params: &[], description: "Toggle looped playback over the loop region." },
         ActionInfo { name: "toggle_metronome", params: &[], description: "Toggle the metronome click." },
@@ -451,6 +463,7 @@ mod tests {
             Action::Stop,
             Action::Play { from_us: 1_000 },
             Action::SetPlayhead { us: 2_000 },
+            Action::NudgeBackingOffset { delta_us: 10_000 },
             Action::ToggleLoop,
             Action::ToggleMetronome,
             Action::StartCountInRecord,
@@ -657,6 +670,24 @@ mod tests {
             ActionError::BadParams { action, .. } => assert_eq!(action, "set_wait_mode"),
             other => panic!("expected BadParams, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn nudge_backing_offset_round_trips_via_name() {
+        // Both signs dispatch from their JSON params.
+        assert_eq!(
+            action_from_name("nudge_backing_offset", &json!({ "delta_us": 10_000 })).unwrap(),
+            Action::NudgeBackingOffset { delta_us: 10_000 }
+        );
+        assert_eq!(
+            action_from_name("nudge_backing_offset", &json!({ "delta_us": -250_000 })).unwrap(),
+            Action::NudgeBackingOffset { delta_us: -250_000 }
+        );
+        // Missing param is rejected.
+        assert!(matches!(
+            action_from_name("nudge_backing_offset", &json!({})).unwrap_err(),
+            ActionError::BadParams { .. }
+        ));
     }
 
     #[test]
