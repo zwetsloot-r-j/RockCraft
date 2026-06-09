@@ -64,6 +64,39 @@ with the `ROCKCRAFT_SF2` environment variable:
 ROCKCRAFT_SF2=/path/to/piano.sf2 cargo run -p rockcraft-tui
 ```
 
+## Importing from a video (Synthesia tutorials)
+
+Turn a Synthesia-style piano-tutorial video into a playable chart, from the
+menu (**Import from video file…**, or **Import from URL…**). The importer ships
+in-repo; the *downloader*, the videos, and the extracted charts do **not** —
+see the content policy in [`docs/IMPORT.md`](docs/IMPORT.md). Imported charts
+land in the gitignored `import-out/`.
+
+One-time setup:
+
+1. **Extractor sidecar — required for any import.** Install its Python deps and
+   `ffmpeg`:
+
+   ```sh
+   pip install -r tools/synthesia-extract/requirements.txt   # numpy, opencv-headless
+   ```
+
+   ⚠️ The pipeline runs the sidecar as **`python3 tools/synthesia-extract/extract.py`**
+   (bare `python3`). Install the deps into the `python3` on your `PATH`, **or**
+   activate a virtualenv before launching the app — a venv that isn't active
+   won't be seen. (Details: [`tools/synthesia-extract/README.md`](tools/synthesia-extract/README.md).)
+
+2. **URL downloads — optional, only for "Import from URL".** Downloading is not
+   committed; provide a private fetch hook and a downloader:
+
+   - Put an executable script at `scripts/local/fetch.sh` (gitignored, not
+     shipped — copy it between machines yourself), or point `ROCKCRAFT_FETCH_CMD`
+     at one. It is invoked as `fetch.sh <URL> <TARGET_PATH>` and must leave the
+     downloaded video at exactly `<TARGET_PATH>` (exit non-zero on failure).
+   - Install a downloader the hook calls — e.g. `pipx install yt-dlp` so it is on
+     your `PATH`. Without a configured hook, only **Import from video file…** is
+     offered.
+
 ## Agent control interface (drive it programmatically)
 
 A running RockCraft can expose a **localhost-only WebSocket** so an AI agent (or
