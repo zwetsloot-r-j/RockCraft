@@ -33,6 +33,7 @@ from synthesia_extract.synth import (  # noqa: E402
     SynthNote,
     c_major_demo,
     render_frames,
+    render_overlay_frames,
 )
 
 
@@ -153,6 +154,60 @@ def test_chords_recovered():
     frames, _ = render_frames(notes, cfg)
     chart = extract_chart(frames, cfg.fps)
     assert sorted(n.pitch for n in chart.notes) == [60, 64, 67]
+
+
+# --------------------------------------------------------------------------- #
+# Overlay style: translucent white bars over busy artwork, filmed-piano keys
+# --------------------------------------------------------------------------- #
+def test_overlay_full_clip_recovers_notes():
+    """The style that broke the saturation-based extractor (issue #148)."""
+    cfg = SynthConfig()
+    notes, _ = c_major_demo(cfg)
+    frames, _ = render_overlay_frames(notes, cfg)
+    chart = extract_chart(frames, cfg.fps, title="overlay-synthetic")
+
+    tol = _frame_tol_us(cfg, frames=2)
+    got_pitches = sorted(n.pitch for n in chart.notes)
+    want_pitches = sorted(n.pitch for n in notes)
+    assert got_pitches == want_pitches
+
+    for gt in notes:
+        m = _match(chart.notes, gt.pitch, gt.start_us)
+        assert m is not None, f"missing note pitch={gt.pitch}"
+        assert abs(m.start_us - gt.start_us) <= tol, f"onset off for {gt}"
+        assert abs(m.dur_us - gt.dur_us) <= tol, f"dur off for {gt}"
+    # All bars are the same white -> hands are unknowable from colour.
+    assert all(n.hand == schema.Hand.UNKNOWN for n in chart.notes)
+
+
+def test_overlay_scroll_unaffected_by_static_lyrics():
+    """Static text overlays must not drag the scroll estimate toward zero."""
+    cfg = SynthConfig()
+    notes, _ = c_major_demo(cfg)
+    frames, _ = render_overlay_frames(notes, cfg, lyrics=True)
+    chart = extract_chart(frames, cfg.fps)
+    assert chart.source.scroll_px_per_s is not None
+    assert abs(chart.source.scroll_px_per_s - cfg.scroll_px_per_s) / cfg.scroll_px_per_s < 0.1
+
+
+def test_overlay_black_pattern_calibration():
+    """Faint separators defeat white-run calibration; the black-key-pattern
+    fallback must still recover every key's lane."""
+    cfg = SynthConfig()
+    notes, _ = c_major_demo(cfg)
+    frames, kb_truth = render_overlay_frames(notes, cfg)
+    from synthesia_extract.pipeline import background_plate
+
+    plate = background_plate(frames)
+    assert plate is not None
+    hit = detect_hit_line(plate)
+    assert abs(hit - cfg.hit_line) <= 2
+    kb = calibrate_keyboard(plate, hit)
+    assert len(kb.white_centers) >= len(kb_truth.white_pitches) - 2
+    for n in notes:
+        span = kb_truth.pitch_x_range(n.pitch)
+        cx = (span[0] + span[1]) // 2
+        assert kb.x_to_pitch[cx] == n.pitch, f"lane miscalibrated for pitch {n.pitch}"
 
 
 # --------------------------------------------------------------------------- #

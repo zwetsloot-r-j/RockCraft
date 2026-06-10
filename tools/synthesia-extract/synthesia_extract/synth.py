@@ -197,6 +197,81 @@ def render_frames(notes: list[SynthNote], cfg: SynthConfig) -> tuple[list[np.nda
     return frames, kb
 
 
+def render_overlay_frames(
+    notes: list[SynthNote],
+    cfg: SynthConfig,
+    *,
+    alpha: float = 0.7,
+    seed: int = 7,
+    lyrics: bool = True,
+) -> tuple[list[np.ndarray], SynthKeyboard]:
+    """Render an *overlay-style* clip: translucent white bars over a busy,
+    colorful static background, above a filmed-piano-like keyboard.
+
+    Differences from :func:`render_frames` that the extractor must cope with:
+
+    * the falling region shows saturated artwork, not a dark background;
+    * bars are alpha-blended white (no hand colours, near-zero saturation);
+    * the keyboard has *faint* grey separators (a photo, not a rendering), so
+      white-run calibration fails and the black-key-pattern fallback must run;
+    * the bottom rows fade to dark like a filmed piano's front edge;
+    * optionally a static "lyrics" text overlay sits mid-highway and changes
+      halfway through (it must not drag the scroll estimate to zero).
+    """
+    import cv2
+
+    kb = SynthKeyboard(cfg)
+    width, height, hit = kb.width, cfg.height, cfg.hit_line
+    v = cfg.scroll_px_per_s
+
+    rng = np.random.default_rng(seed)
+    art = rng.integers(0, 256, size=(height // 8 + 1, width // 8 + 1, 3), dtype=np.uint8)
+    art = cv2.resize(art, (width, height), interpolation=cv2.INTER_CUBIC)
+    art = cv2.GaussianBlur(art, (0, 0), 5)
+
+    static = art.copy()
+    # Filmed-piano keyboard: off-white keys, faint separators, dark fade at the
+    # bottom edge.  (Faint = far above the rendered-path's <80 dark threshold.)
+    kb_x0 = kb.white_spans[0][0]
+    kb_x1 = kb.white_spans[-1][1]
+    static[hit:height, kb_x0:kb_x1] = (215, 215, 215)
+    for (x0, _x1) in kb.white_spans[1:]:
+        static[hit:height, x0 : x0 + 1] = (150, 150, 150)
+    for (bx0, bx1, _bp) in kb.black:
+        static[hit : hit + cfg.black_h, bx0:bx1] = (25, 25, 25)
+    static[height - 8 : height, :] = (10, 10, 10)
+
+    last_off = max((n.start_us + n.dur_us for n in notes), default=0) / 1e6
+    total_s = last_off + cfg.falling_h / v + 0.2
+    n_frames = max(1, int(round(total_s * cfg.fps)))
+
+    frames: list[np.ndarray] = []
+    for f in range(n_frames):
+        t = f / cfg.fps
+        frame = static.copy()
+        for note in notes:
+            span = kb.lane_x_range(note.pitch)
+            if span is None:
+                continue
+            x0, x1 = span
+            start = note.start_us / 1e6
+            dur = note.dur_us / 1e6
+            y0 = max(0, int(round(hit + (t - start - dur) * v)))
+            y1 = min(hit, int(round(hit + (t - start) * v)))
+            if y1 <= y0:
+                continue
+            region = frame[y0:y1, x0:x1].astype(np.float32)
+            frame[y0:y1, x0:x1] = (alpha * 255.0 + (1.0 - alpha) * region).astype(np.uint8)
+        if lyrics:
+            text = "LA LA LA" if t < total_s / 2 else "NA NA NA"
+            cv2.putText(
+                frame, text, (width // 4, hit // 2),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2,
+            )
+        frames.append(frame)
+    return frames, kb
+
+
 # --------------------------------------------------------------------------- #
 # Synthetic audio (M6-F): a clean tone-per-note render, and a full-mix decoy.
 # --------------------------------------------------------------------------- #
