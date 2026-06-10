@@ -49,15 +49,27 @@ def load_frames(path: str, fps_override: Optional[float] = None) -> tuple[list[n
     n_est = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
     w = cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0
     h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0
+
+    # ~360p is plenty for the extractor (falling bars just need to be legible);
+    # halving 720p/1080p sources quarters/divides-by-9 the memory per frame,
+    # which the budget below converts into far better *temporal* resolution.
+    shrink = max(1, int(round(w / 640))) if w > 720 else 1
+
     if n_est > 0 and w > 0 and h > 0:
         budget_bytes = _clip_budget_bytes()
-        total = n_est * w * h * 3
+        total = n_est * (w / shrink) * (h / shrink) * 3
         if total > budget_bytes:
             step = int(np.ceil(total / budget_bytes))
 
     frames: list[np.ndarray] = []
     for i, f in enumerate(_iter_capture(cap)):
         if i % step == 0:
+            if shrink > 1:
+                f = cv2.resize(
+                    f,
+                    (f.shape[1] // shrink, f.shape[0] // shrink),
+                    interpolation=cv2.INTER_AREA,
+                )
             frames.append(f)
     cap.release()
     return frames, float(fps) / step

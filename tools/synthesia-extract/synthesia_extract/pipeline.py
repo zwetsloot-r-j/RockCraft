@@ -254,12 +254,26 @@ def calibrate_keyboard(
     which are high-contrast in any keyboard image.
     """
     kb = _calibrate_white_runs(frame, hit_line, anchor_c4_x)
-    if len(kb.white_centers) >= 10:
+    if kb is not None and len(kb.white_centers) >= 10:
         return _clamp_to_midi(kb)
     fallback = _calibrate_black_pattern(frame, hit_line, anchor_c4_x)
-    if fallback is not None and len(fallback.white_centers) > len(kb.white_centers):
+    if fallback is not None and (
+        kb is None or len(fallback.white_centers) > len(kb.white_centers)
+    ):
         return _clamp_to_midi(fallback)
-    return _clamp_to_midi(kb)
+    if kb is not None:
+        return _clamp_to_midi(kb)
+    # No anchorable keyboard at all: an empty ruler (zero notes downstream)
+    # beats guessing an anchor and transposing the whole chart.
+    return Keyboard(
+        hit_line=hit_line,
+        x_to_pitch=np.full(frame.shape[1], -1, dtype=np.int32),
+        white_centers=[],
+        white_pitches=[],
+        centers=[],
+        strip_half=1,
+        anchor_c4_x=anchor_c4_x if anchor_c4_x is not None else 0,
+    )
 
 
 def _clamp_to_midi(kb: Keyboard) -> Keyboard:
@@ -285,8 +299,12 @@ def _clamp_to_midi(kb: Keyboard) -> Keyboard:
 
 def _calibrate_white_runs(
     frame: np.ndarray, hit_line: int, anchor_c4_x: Optional[int] = None
-) -> Keyboard:
+) -> Optional[Keyboard]:
     """Rendered-keyboard calibration: white-key runs split by dark separators.
+
+    Returns ``None`` when no C can be identified from the black-key pattern —
+    anchoring blindly (e.g. "leftmost white is C") transposes the whole chart,
+    which is far worse than letting the black-pattern fallback take over.
 
     Both reference rows are *searched* with adaptive thresholds rather than
     assumed: the keyboard may not reach the frame bottom (a filmed piano can
@@ -341,6 +359,8 @@ def _calibrate_white_runs(
     # Anchor letters: a run of exactly two consecutive has_black_right whites is
     # [C, D]; the first is C. (A run of three is [F, G, A].)
     c_indices = _c_white_indices(has_black_right)
+    if not c_indices:
+        return None
 
     # Choose the C nearest the anchor x (default: keyboard centre) as middle C.
     if anchor_c4_x is None and white_centers:
