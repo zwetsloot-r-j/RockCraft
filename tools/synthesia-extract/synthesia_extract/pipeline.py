@@ -172,12 +172,39 @@ def bar_mask(
 # 1. Hit-line
 # --------------------------------------------------------------------------- #
 def detect_hit_line(frame: np.ndarray) -> int:
-    """Row index of the keyboard's top edge (the hit-line).
+    """Row index of the playing keyboard's top edge (the hit-line).
 
-    The keyboard rows are mostly white (white keys dominate even across the
-    black-key band); the falling region above is dark.  The hit-line is the top
-    of the contiguous bottom block of high-white-fraction rows.
+    A keyboard band has a strong *periodic* horizontal structure (keys repeat
+    every 6–60 px); falling bars, artwork and text do not.  The hit-line is
+    the top of the **topmost** keyboard-like band in the lower half of the
+    frame — topmost, because tutorial videos often stack a filmed piano
+    *below* the rendered keyboard the bars actually land on.
     """
+    h, w = frame.shape[:2]
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float64)
+    y0 = int(h * 0.45)
+    k_lo = max(2, int(round(w / 60)))
+    k_hi = int(round(w / 6))
+    # Absolute amplitude of the strongest in-band spatial frequency: the
+    # black-key band swings dark/bright at full contrast (amplitude ~100+),
+    # while periodic scenery (fences, blurred art) and the thin white-key
+    # separators stay far below.
+    amp = np.zeros(h)
+    for y in range(y0, h):
+        p = gray[y] - gray[y].mean()
+        spec = np.abs(np.fft.rfft(p))
+        hi = min(len(spec) - 1, k_hi)
+        if hi <= k_lo:
+            break
+        amp[y] = 2.0 * float(spec[k_lo : hi + 1].max()) / w
+    bands = [r for r in _find_runs(amp > 50.0) if r[1] - r[0] >= 8]
+    if bands:
+        return bands[0][0]
+    return _hit_line_white_walk(frame)
+
+
+def _hit_line_white_walk(frame: np.ndarray) -> int:
+    """Legacy hit-line: top of the contiguous bottom block of mostly-white rows."""
     white = np.all(frame > 200, axis=2)  # HxW
     white_frac = white.mean(axis=1)  # per-row
     h = frame.shape[0]
@@ -238,22 +265,47 @@ def calibrate_keyboard(
 def _calibrate_white_runs(
     frame: np.ndarray, hit_line: int, anchor_c4_x: Optional[int] = None
 ) -> Keyboard:
-    """Rendered-keyboard calibration: white-key runs split by dark separators."""
+    """Rendered-keyboard calibration: white-key runs split by dark separators.
+
+    Both reference rows are *searched* with adaptive thresholds rather than
+    assumed: the keyboard may not reach the frame bottom (a filmed piano can
+    sit below the rendered one) and separators may not be absolute black.
+    The white row is scored by run count *and* width uniformity, so a row
+    inside the black-key band (whose gaps are non-uniform) never wins over
+    the whites-only band below it.
+    """
     h, w = frame.shape[:2]
-    dark = np.all(frame < 80, axis=2)  # HxW
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float64)
 
-    # White keys: a row near the very bottom is white-keys-only; dark runs are
-    # the 1px separators, white runs are the keys.
-    wk_row = min(h - 2, hit_line + (h - hit_line) - 2)
-    sep = dark[wk_row]  # True at separators / outside the keyboard
-    white_runs = [r for r in _find_runs(~sep) if (r[1] - r[0]) >= 4]
+    band_hi = min(h - 1, hit_line + max(4, (h - hit_line)))
+    best_white: Optional[tuple[float, list[tuple[int, int]]]] = None
+    best_black: Optional[tuple[int, list[tuple[int, int]]]] = None
+    for r in range(hit_line + 2, band_hi):
+        row = gray[r]
+        bright = float(np.percentile(row, 90))
+        if bright < 60:
+            continue
+        sep = row < 0.55 * bright
+        runs = [run for run in _find_runs(~sep) if 4 <= run[1] - run[0] <= w // 8]
+        if len(runs) >= 10:
+            widths = np.array([b - a for a, b in runs], dtype=np.float64)
+            cv = float(widths.std() / max(widths.mean(), 1e-6))
+            # Real white keys are uniform; gaps inside the black-key band and
+            # filmed-piano artefacts are not.  Reject non-uniform rows outright
+            # so the black-pattern fallback handles them instead.
+            if cv < 0.15:
+                score = len(runs) - 10.0 * cv
+                if best_white is None or score > best_white[0]:
+                    best_white = (score, runs)
+        dark_runs = [
+            run for run in _find_runs(row < 0.45 * bright) if 3 <= run[1] - run[0] <= w // 20
+        ]
+        if best_black is None or len(dark_runs) > best_black[0]:
+            best_black = (len(dark_runs), dark_runs)
+
+    white_runs = best_white[1] if best_white else []
     white_centers = [int((a + b) / 2) for (a, b) in white_runs]
-
-    # Black keys: a row just below the hit-line, inside the black-key band. Dark
-    # runs wider than a separator are black keys.
-    bk_row = min(h - 1, hit_line + max(2, (h - hit_line) // 8))
-    bk_dark = dark[bk_row]
-    black_runs = [r for r in _find_runs(bk_dark) if (r[1] - r[0]) >= 6]
+    black_runs = best_black[1] if best_black else []
     black_centers = [int((a + b) / 2) for (a, b) in black_runs]
 
     n_white = len(white_centers)
@@ -385,19 +437,24 @@ def _calibrate_black_pattern(
     deltas = unit_gaps
 
     # Anchor: C# starts a 2-group -> delta pattern (1, 2, 1, 1); F# starts a
-    # 3-group -> (1, 1, 2).
-    anchor_unit: Optional[int] = None
+    # 3-group -> (1, 1, 2).  A single occluded black key (key-press glow,
+    # lighting) can fake either pattern elsewhere, so every match votes for
+    # its implied "C# lattice phase" (anchor unit mod 7) and the majority
+    # wins instead of the first match.
+    phase_votes: dict[int, int] = {}
     for i in range(len(deltas) - 3):
         if deltas[i : i + 4] == [1, 2, 1, 1]:
-            anchor_unit = units[i]  # C#
-            break
-    if anchor_unit is None:
-        for i in range(len(deltas) - 2):
-            if deltas[i : i + 3] == [1, 1, 2]:
-                anchor_unit = units[i] - 3  # F# is 3 units after C#
-                break
-    if anchor_unit is None:
+            phase = units[i] % 7  # C# here
+            phase_votes[phase] = phase_votes.get(phase, 0) + 1
+    for i in range(len(deltas) - 2):
+        if deltas[i : i + 3] == [1, 1, 2]:
+            phase = (units[i] - 3) % 7  # F# is 3 units after C#
+            phase_votes[phase] = phase_votes.get(phase, 0) + 1
+    if not phase_votes:
         return None
+    best_phase = max(phase_votes, key=lambda k: phase_votes[k])
+    # Any concrete unit with the winning phase serves as the C# anchor.
+    anchor_unit = best_phase
 
     # Least-squares x(u) so mild perspective doesn't accumulate.
     u_arr = np.array(units, dtype=np.float64)
@@ -737,6 +794,35 @@ def extract_notes(
     return raws
 
 
+def suppress_black_phantoms(raws: list[_RawNote], tol_us: int = 60_000) -> list[_RawNote]:
+    """Drop black-key notes that are shadows of an adjacent white note.
+
+    Some renderers draw white-note bars across the *full* key width, which
+    covers the black-lane sampling strips sitting on the white-key boundaries:
+    every white note then spawns a phantom black note with the same interval.
+    A black note co-starting and co-ending (within ``tol_us``) with a white
+    semitone neighbour is such a shadow — genuine minor-second simultaneities
+    with matching onsets *and* offsets are practically nonexistent in piano
+    writing.
+    """
+    black = {1, 3, 6, 8, 10}
+    by_pitch: dict[int, list[_RawNote]] = {}
+    for r in raws:
+        by_pitch.setdefault(r.pitch, []).append(r)
+
+    def shadowed(r: _RawNote) -> bool:
+        for np_ in (r.pitch - 1, r.pitch + 1):
+            for w in by_pitch.get(np_, ()):
+                if (
+                    abs(w.start_us - r.start_us) <= tol_us
+                    and abs((w.start_us + w.dur_us) - (r.start_us + r.dur_us)) <= tol_us
+                ):
+                    return True
+        return False
+
+    return [r for r in raws if (r.pitch % 12) not in black or not shadowed(r)]
+
+
 def assign_hands(raws: list[_RawNote]) -> list[ExtractedNote]:
     """Cluster bar colours into up to two hands and map them to Left/Right.
 
@@ -880,6 +966,7 @@ def extract_chart(
         threshold=0.6,
         min_run_px=max(3, int(round(0.04 * scroll))),
     )
+    raws = suppress_black_phantoms(raws)
     notes = assign_hands(raws)
 
     if debug_dir:

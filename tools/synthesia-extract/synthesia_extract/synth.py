@@ -144,8 +144,18 @@ def _white_index(pitch: int) -> int:
     return _WHITE_SEMITONES.index(pitch % 12)
 
 
-def render_frames(notes: list[SynthNote], cfg: SynthConfig) -> tuple[list[np.ndarray], SynthKeyboard]:
-    """Render the full clip as a list of BGR frames plus the keyboard layout."""
+def render_frames(
+    notes: list[SynthNote],
+    cfg: SynthConfig,
+    *,
+    full_width_white_bars: bool = False,
+) -> tuple[list[np.ndarray], SynthKeyboard]:
+    """Render the full clip as a list of BGR frames plus the keyboard layout.
+
+    ``full_width_white_bars`` mimics renderers that draw white-note bars across
+    the entire key width (overlapping the black-key lanes), which produces
+    phantom black notes unless the extractor suppresses them.
+    """
     kb = SynthKeyboard(cfg)
     width = kb.width
     height = cfg.height
@@ -174,7 +184,10 @@ def render_frames(notes: list[SynthNote], cfg: SynthConfig) -> tuple[list[np.nda
         t = f / cfg.fps
         frame = keyboard.copy()
         for note in notes:
-            span = kb.lane_x_range(note.pitch)
+            if full_width_white_bars and (note.pitch % 12) not in (1, 3, 6, 8, 10):
+                span = kb.pitch_x_range(note.pitch)
+            else:
+                span = kb.lane_x_range(note.pitch)
             if span is None:
                 continue
             x0, x1 = span

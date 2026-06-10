@@ -144,6 +144,17 @@ def test_empty_clip_does_not_crash():
     assert chart.source.extractor_version == schema.EXTRACTOR_VERSION
 
 
+def test_full_width_white_bars_no_black_phantoms():
+    """Renderers that draw white bars across the whole key width must not
+    produce phantom black notes (the bar overlaps the black sampling lanes)."""
+    cfg = SynthConfig()
+    notes, _ = c_major_demo(cfg)  # all-white C-major material
+    frames, _ = render_frames(notes, cfg, full_width_white_bars=True)
+    chart = extract_chart(frames, cfg.fps)
+    got_pitches = sorted(n.pitch for n in chart.notes)
+    assert got_pitches == sorted(n.pitch for n in notes)
+
+
 def test_chords_recovered():
     cfg = SynthConfig()
     notes = [
