@@ -40,11 +40,46 @@ def load_frames(path: str, fps_override: Optional[float] = None) -> tuple[list[n
     if not cap.isOpened():
         raise FileNotFoundError(f"could not open video: {path}")
     fps = fps_override or cap.get(cv2.CAP_PROP_FPS) or 30.0
+
+    # Long videos do not fit in RAM decoded (a 7-minute 360p clip is ~8 GB).
+    # Keep every k-th frame so the in-memory clip stays under the budget; the
+    # effective fps is divided accordingly, which the extractor handles — its
+    # timing comes from scroll geometry, not from a fixed frame rate.
+    step = 1
+    n_est = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+    w = cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0
+    h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0
+    if n_est > 0 and w > 0 and h > 0:
+        budget_bytes = _clip_budget_bytes()
+        total = n_est * w * h * 3
+        if total > budget_bytes:
+            step = int(np.ceil(total / budget_bytes))
+
     frames: list[np.ndarray] = []
-    for f in _iter_capture(cap):
-        frames.append(f)
+    for i, f in enumerate(_iter_capture(cap)):
+        if i % step == 0:
+            frames.append(f)
     cap.release()
-    return frames, float(fps)
+    return frames, float(fps) / step
+
+
+# ~2 GB of decoded frames; beyond this the loader decimates (see load_frames).
+_MAX_CLIP_BYTES = 2 * 1024**3
+
+
+def _clip_budget_bytes() -> int:
+    """Frame-memory budget: a third of the process's address-space cap when one
+    is set (see ``extract._limit_memory``), else the fixed default.  Low-memory
+    machines thus decimate harder instead of failing."""
+    try:
+        import resource
+
+        soft, _hard = resource.getrlimit(resource.RLIMIT_AS)
+        if soft != resource.RLIM_INFINITY:
+            return min(_MAX_CLIP_BYTES, max(soft // 3, 256 * 2**20))
+    except (ImportError, OSError, ValueError):
+        pass
+    return _MAX_CLIP_BYTES
 
 
 def _iter_capture(cap: "cv2.VideoCapture") -> Iterator[np.ndarray]:

@@ -29,6 +29,33 @@ from synthesia_extract.pipeline import extract_chart
 DEBUG_DIR = "debug-out"  # gitignored; see .gitignore
 
 
+def _limit_memory() -> None:
+    """Cap this process's address space below what the system can spare.
+
+    A runaway allocation then raises ``MemoryError`` (a clean traceback and a
+    non-zero exit the import pipeline reports as ``SidecarFailed``) instead of
+    invoking the kernel OOM killer — which on WSL can take the whole VM down
+    with it.  Best-effort: silently does nothing where unsupported.
+    """
+    try:
+        import resource
+
+        available_kb = None
+        with open("/proc/meminfo", encoding="ascii") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    available_kb = int(line.split()[1])
+                    break
+        if available_kb is None:
+            return
+        # Leave headroom for the rest of the system; never go below 2 GiB
+        # (the loader's own decimation budget; see io.load_frames).
+        cap = max(2 * 1024**3, available_kb * 1024 - 1200 * 2**20)
+        resource.setrlimit(resource.RLIMIT_AS, (cap, cap))
+    except (ImportError, OSError, ValueError):
+        return
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--in", dest="inp", required=True, help="video file or frames directory")
@@ -54,20 +81,37 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    _limit_memory()
+
     try:
         frames, fps = load_frames(args.inp, fps_override=args.fps)
     except (FileNotFoundError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
+    except MemoryError:
+        print(
+            "error: out of memory while loading frames — close other "
+            "applications or lower the source resolution",
+            file=sys.stderr,
+        )
+        return 3
 
-    chart = extract_chart(
-        frames,
-        fps,
-        title=args.title,
-        anchor_c4_x=args.anchor_c4_x,
-        scroll_override=args.scroll,
-        debug_dir=DEBUG_DIR if args.debug else None,
-    )
+    try:
+        chart = extract_chart(
+            frames,
+            fps,
+            title=args.title,
+            anchor_c4_x=args.anchor_c4_x,
+            scroll_override=args.scroll,
+            debug_dir=DEBUG_DIR if args.debug else None,
+        )
+    except MemoryError:
+        print(
+            "error: out of memory during extraction — this is a bug guardrail, "
+            "not a crash; please report the video's resolution and length",
+            file=sys.stderr,
+        )
+        return 3
 
     if args.audio_fusion:
         if not args.audio:
