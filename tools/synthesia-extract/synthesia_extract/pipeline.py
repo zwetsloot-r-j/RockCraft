@@ -255,10 +255,31 @@ def calibrate_keyboard(
     """
     kb = _calibrate_white_runs(frame, hit_line, anchor_c4_x)
     if len(kb.white_centers) >= 10:
-        return kb
+        return _clamp_to_midi(kb)
     fallback = _calibrate_black_pattern(frame, hit_line, anchor_c4_x)
     if fallback is not None and len(fallback.white_centers) > len(kb.white_centers):
-        return fallback
+        return _clamp_to_midi(fallback)
+    return _clamp_to_midi(kb)
+
+
+def _clamp_to_midi(kb: Keyboard) -> Keyboard:
+    """Drop lanes outside MIDI 0..127.
+
+    Miscalibration (spurious runs at the keyboard edges) can otherwise mint
+    impossible pitches, which the chart contract rightly rejects wholesale.
+    """
+    keep = [(cx, p) for (cx, p) in kb.centers if 0 <= p <= 127]
+    if len(keep) == len(kb.centers):
+        return kb
+    kb.centers = keep
+    kept_white = [
+        (cx, p) for cx, p in zip(kb.white_centers, kb.white_pitches) if 0 <= p <= 127
+    ]
+    kb.white_centers = [cx for cx, _p in kept_white]
+    kb.white_pitches = [p for _cx, p in kept_white]
+    kb.x_to_pitch = np.where(
+        (kb.x_to_pitch >= 0) & (kb.x_to_pitch <= 127), kb.x_to_pitch, -1
+    )
     return kb
 
 
@@ -769,6 +790,8 @@ def extract_notes(
     """
     raws: list[_RawNote] = []
     for pi, pitch in enumerate(pitches):
+        if not 0 <= pitch <= 127:  # never emit impossible MIDI (chart contract)
+            continue
         tot = totals[pi] if totals.ndim == 2 else totals
         coverage = votes[pi] / np.maximum(tot, 1e-6)
         on = (coverage > threshold) & (tot > 0)

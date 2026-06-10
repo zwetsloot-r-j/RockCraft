@@ -144,6 +144,21 @@ def test_empty_clip_does_not_crash():
     assert chart.source.extractor_version == schema.EXTRACTOR_VERSION
 
 
+def test_out_of_range_pitch_never_emitted():
+    """Miscalibration can mint pitches beyond MIDI 0..127; the importer's chart
+    contract rejects such charts wholesale, so they must be dropped here."""
+    import numpy as np
+
+    from synthesia_extract.pipeline import extract_notes
+
+    pitches = [60, 132, -4]
+    votes = np.ones((3, 50), dtype=np.float32)
+    totals = np.ones(50, dtype=np.float32)
+    color_sum = np.ones((3, 50, 3), dtype=np.float64)
+    raws = extract_notes(votes, totals, color_sum, pitches, 1000.0)
+    assert [r.pitch for r in raws] == [60]
+
+
 def test_full_width_white_bars_no_black_phantoms():
     """Renderers that draw white bars across the whole key width must not
     produce phantom black notes (the bar overlaps the black sampling lanes)."""
