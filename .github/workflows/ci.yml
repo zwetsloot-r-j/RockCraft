@@ -28,8 +28,18 @@ jobs:
 
       # midir's Linux backend links ALSA via alsa-sys; the headers aren't on
       # ubuntu-latest by default. (No-op on the Windows build path.)
-      - name: Install ALSA dev headers (for midir)
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      # GTK/WebKit headers back Tauri's Linux webview (rockcraft-tauri); they
+      # are needed so `cargo test --workspace` can build the src-tauri crate.
+      - name: Install system dev headers (ALSA for midir, GTK/WebKit for Tauri)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            librsvg2-dev \
+            libayatana-appindicator3-dev \
+            libxdo-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -42,8 +52,25 @@ jobs:
       - name: Formatting
         run: cargo fmt --all --check
 
+      # rockcraft-tauri is excluded from clippy: Tauri's codegen can emit
+      # false-positive lints until commands are defined (see
+      # specs/M2-tauri-scaffold.md). The crate is still compiled with
+      # `-D warnings` by the test step below, so it isn't unchecked.
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features
+        run: cargo clippy --workspace --exclude rockcraft-tauri --all-targets --all-features
 
       - name: Tests
         run: cargo test --workspace --all-features
+
+      # Frontend gate: type-check the Tauri webview. A full GUI build is not run
+      # in CI — `tsc --noEmit` + the workspace `cargo` build are the gate.
+      - name: Set up Node (Tauri frontend)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: tauri-app ts check
+        working-directory: tauri-app
+        run: |
+          npm ci
+          npx tsc --noEmit

@@ -7,6 +7,7 @@ members = [
     "crates/tui",
     "crates/control",
     "crates/import",
+    "tauri-app/src-tauri",
 ]
 
 # Shared metadata + dependency versions for every crate in the workspace.
