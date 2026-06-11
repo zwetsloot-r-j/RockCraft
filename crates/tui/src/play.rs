@@ -124,6 +124,16 @@ impl PlayScreen {
         })
     }
 
+    /// Start with the "hear the song" audition on or off. Imported charts enable
+    /// this so loading a bundle immediately synthesizes its notes (issue #152);
+    /// play-along recordings leave it off so the song doesn't sound over the
+    /// player. The `m` key still toggles it at runtime either way. Scoring keys
+    /// off live MIDI timestamps regardless, never this audio.
+    pub fn with_hear_song(mut self, on: bool) -> Self {
+        self.hear_song = on;
+        self
+    }
+
     /// Attach a backing audio track from the loaded bundle. `audio_start_us` is
     /// the position in the file that lines up with recording time 0 (Task C).
     /// Playback is armed lazily: it begins when the clock reaches `shift_us`.
@@ -282,6 +292,12 @@ impl PlayScreen {
                 s.all_off();
             }
         }
+    }
+
+    /// Whether the "hear the song" audition is currently active (for the status
+    /// line / tests).
+    pub fn is_hear_song(&self) -> bool {
+        self.hear_song
     }
 
     /// Check the playback clock and fire synth note_on / note_off commands for
@@ -661,6 +677,32 @@ mod tests {
         let (on, off) = pending_triggers(&spans, 2000, &on_fired, &off_fired);
         assert_eq!(on, vec![0]);
         assert_eq!(off, vec![0]);
+    }
+
+    // ── chart audition default (issue #152) ─────────────────────────────────
+
+    #[test]
+    fn hear_song_defaults_off_but_builder_enables_it() {
+        // Play-along default: the song does not sound over the player.
+        let play = one_note_screen();
+        assert!(!play.is_hear_song());
+        // Imports opt in so the chart is audible on load.
+        let play = one_note_screen().with_hear_song(true);
+        assert!(play.is_hear_song());
+    }
+
+    #[test]
+    fn pending_triggers_drive_audition_for_imported_chart() {
+        // An auditioned chart fires note_on at the (shifted) note start. The one
+        // note is at t=0, so after the whole-song shift it starts at SHIFT.
+        let play = one_note_screen().with_hear_song(true);
+        let shift = PRE_ROLL_US + LEAD_US;
+        let (on, _off) = pending_triggers(&play.spans, shift, &HashSet::new(), &HashSet::new());
+        assert_eq!(
+            on,
+            vec![0],
+            "the chart note is due to sound at the shift point"
+        );
     }
 
     // ── wait-mode (freeze highway + backing until the right notes are held) ──

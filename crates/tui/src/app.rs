@@ -686,7 +686,9 @@ pub fn run_loop<B: ratatui::backend::Backend>(
                 match load_play_screen(&midi, shell.synth.clone()) {
                     Ok(play) => {
                         shell.status = format!("imported: {}", bundle.display());
-                        shell.screen = Screen::Play(play);
+                        // Audition the imported chart immediately: without a live
+                        // piano part, an import would otherwise be silent (#152).
+                        shell.screen = Screen::Play(play.with_hear_song(true));
                     }
                     Err(e) => {
                         shell.status = format!("import succeeded but load failed: {e}");

@@ -55,6 +55,25 @@ bash scripts/install-hooks.sh
 This installs `.git/hooks/pre-commit` that runs the same guard on every
 `git commit`.
 
+## Backing audio (the source video's sound)
+
+After the chart is extracted, the pipeline derives an audio track from the
+source video so an imported song plays with its real recording behind it by
+default. It shells out to **ffmpeg** (`ffmpeg -i <video> -vn backing.wav`),
+writing `backing.wav` next to `song.mid` inside the bundle dir under
+`import-out/` (gitignored, like the rest of the bundle), and records it in the
+bundle's `meta.json` as `"backing"`. Play and Edit then pick it up automatically.
+
+ffmpeg is an **optional** system dependency:
+
+- If ffmpeg is installed (on `PATH`, or pointed at by `ROCKCRAFT_FFMPEG`), the
+  import attaches the extracted audio as the backing track.
+- If ffmpeg is absent — or the source has no audio stream — the import still
+  succeeds; the bundle is simply MIDI-only (`"backing": null`).
+
+The extracted `backing.wav` lives only under `import-out/` and is never tracked
+(same boundary the CI guard enforces above).
+
 ## Where downloading lives
 
 The actual media download step is intentionally **not** part of this repo.
