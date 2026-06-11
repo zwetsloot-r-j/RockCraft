@@ -43,7 +43,7 @@ use rockcraft_audio::{play_file_at, BackingHandle, SynthHandle};
 use rockcraft_core::{
     backing_position_us, Action, BackingTrack, Composer, Cursor, Effect, Grid, InputMode, Key,
     MidiNote, Note, NoteEvent, NoteId, RecordingMeta, Scale as MusicScale, Subdivision, Timeline,
-    Velocity,
+    TrackOrigin, Velocity,
 };
 use rockcraft_midi::{events_to_smf_bytes, key_map as mock_key_map};
 
@@ -105,6 +105,17 @@ pub enum PromptOutcome {
     Leave,
     /// User chose "Cancel" — stay in the editor.
     Stay,
+}
+
+/// Outcome of a key press while the "save to library" name overlay is shown.
+#[derive(Debug, PartialEq, Eq)]
+pub enum NameOutcome {
+    /// Enter on a non-empty name — caller saves the bundle under this name.
+    Submitted(String),
+    /// Esc — the overlay was cancelled, nothing saved.
+    Cancelled,
+    /// Still editing (a character typed, backspace, or empty Enter).
+    Pending,
 }
 
 /// Map a `KeyCode` to the composer [`Action`] it triggers in normal (non-chord)
@@ -270,6 +281,13 @@ pub struct EditScreen {
     /// When `true` the "Save / Discard / Cancel" overlay is rendered and all
     /// keys are routed to `on_prompt_key` instead of the normal keymap.
     exit_prompt: bool,
+    /// Provenance recorded into the bundle's `meta.json` on save. A fresh editor
+    /// is `Composed`; loading a recording/import for edit sets it to `Edited`
+    /// (or preserves the loaded bundle's origin).
+    origin: TrackOrigin,
+    /// When `Some`, the "save to library" name overlay is active and holds the
+    /// name typed so far. Keys route to `on_name_key` instead of the keymap.
+    name_prompt: Option<String>,
     /// Backing audio track to play in lock-step with the transport, if attached
     /// (via `with_backing`). `None` makes all backing wiring a no-op.
     backing: Option<Backing>,
@@ -319,6 +337,8 @@ impl EditScreen {
             dirty: false,
             save_flash: None,
             exit_prompt: false,
+            origin: TrackOrigin::Composed,
+            name_prompt: None,
             backing: None,
             backing_handle: None,
             prev_playing: false,
@@ -380,7 +400,27 @@ impl EditScreen {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let bundle_dir = base.join(format!("take-{stamp}"));
-        std::fs::create_dir_all(&bundle_dir)?;
+        self.write_bundle(&bundle_dir)
+    }
+
+    /// Save into a named bundle directory under `root` (the track library).
+    /// The name is slugified into a directory name; an existing bundle of the
+    /// same name is overwritten in place. Returns the bundle directory.
+    pub fn save_to_library(&self, root: &std::path::Path, name: &str) -> std::io::Result<PathBuf> {
+        let slug = crate::library::slug(name);
+        if slug.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "empty name",
+            ));
+        }
+        self.write_bundle(&root.join(slug))
+    }
+
+    /// Write the `song.mid` + `meta.json` bundle into `bundle_dir` (created if
+    /// needed). Shared by the take-stamp save and the named library save.
+    fn write_bundle(&self, bundle_dir: &std::path::Path) -> std::io::Result<PathBuf> {
+        std::fs::create_dir_all(bundle_dir)?;
         let bytes = events_to_smf_bytes(&self.timeline().to_events());
         std::fs::write(bundle_dir.join("song.mid"), bytes)?;
         // Carry an attached backing track into the bundle: copy the file in and
@@ -401,10 +441,11 @@ impl EditScreen {
             backing,
             grid: Some(self.grid),
             key: Some(self.key),
+            origin: Some(self.origin),
             version: 1,
         };
         std::fs::write(bundle_dir.join("meta.json"), meta.to_json())?;
-        Ok(bundle_dir)
+        Ok(bundle_dir.to_path_buf())
     }
 
     // ── key routing ───────────────────────────────────────────────────────
@@ -823,6 +864,63 @@ impl EditScreen {
         }
     }
 
+    // ── save-to-library name prompt ──────────────────────────────────────────
+
+    /// Record where this bundle came from; written into `meta.json` on save.
+    /// The shell sets `Edited` (or the loaded origin) when opening a bundle for
+    /// editing so a re-save keeps faithful provenance.
+    pub fn set_origin(&mut self, origin: TrackOrigin) {
+        self.origin = origin;
+    }
+
+    /// Whether the "save to library" name overlay is active.
+    pub fn is_naming(&self) -> bool {
+        self.name_prompt.is_some()
+    }
+
+    /// Open the name overlay so the user can save the chart into the library.
+    pub fn start_save_prompt(&mut self) {
+        self.name_prompt = Some(String::new());
+    }
+
+    /// The name typed so far in the save overlay (empty until shown / typed).
+    pub fn name_prompt_text(&self) -> &str {
+        self.name_prompt.as_deref().unwrap_or("")
+    }
+
+    /// Handle a key while the name overlay is active. Returns the typed name on
+    /// Enter (the shell then saves it), `None` while still editing, and clears
+    /// the overlay on Esc.
+    pub fn on_name_key(&mut self, code: KeyCode) -> NameOutcome {
+        let Some(buf) = self.name_prompt.as_mut() else {
+            return NameOutcome::Pending;
+        };
+        match code {
+            KeyCode::Esc => {
+                self.name_prompt = None;
+                NameOutcome::Cancelled
+            }
+            KeyCode::Enter => {
+                let name = buf.trim().to_string();
+                if name.is_empty() {
+                    NameOutcome::Pending
+                } else {
+                    self.name_prompt = None;
+                    NameOutcome::Submitted(name)
+                }
+            }
+            KeyCode::Backspace => {
+                buf.pop();
+                NameOutcome::Pending
+            }
+            KeyCode::Char(c) => {
+                buf.push(c);
+                NameOutcome::Pending
+            }
+            _ => NameOutcome::Pending,
+        }
+    }
+
     /// Whether the transport is currently playing.
     pub fn is_playing(&self) -> bool {
         self.composer.is_playing()
@@ -958,6 +1056,11 @@ impl EditScreen {
         if self.exit_prompt {
             self.draw_exit_prompt(f, area);
         }
+
+        // The save-to-library name overlay, when active, sits on top too.
+        if self.name_prompt.is_some() {
+            self.draw_name_prompt(f, area);
+        }
     }
 
     fn draw_status(&self, f: &mut Frame, area: Rect) {
@@ -969,7 +1072,7 @@ impl EditScreen {
                     Style::default().fg(Color::Black).bg(Color::Green),
                 ),
                 Span::styled(
-                    "  [s] save  [Tab] menu",
+                    "  [s] save  [S] library  [Tab] menu",
                     Style::default().fg(Color::DarkGray),
                 ),
             ]);
@@ -1112,7 +1215,7 @@ impl EditScreen {
             ),
             vel_span,
             Span::styled(
-                "[a/x] add/del  []/[] size  [+/-] vel  [m] grab  [c] chord  [v] select  [y/p/D] yank/paste/del  [u/U] undo/redo  [R] rec  [t] step/live  [C] count-in  [o] loop  [M] metro  [P] play-start  [>/<] subdiv  [hjkl] pitch/time  [H/L] bar  [w/b] oct  [g/G] timeline ends  [0/$] pitch ends  [s] save  [Tab] menu",
+                "[a/x] add/del  []/[] size  [+/-] vel  [m] grab  [c] chord  [v] select  [y/p/D] yank/paste/del  [u/U] undo/redo  [R] rec  [t] step/live  [C] count-in  [o] loop  [M] metro  [P] play-start  [>/<] subdiv  [hjkl] pitch/time  [H/L] bar  [w/b] oct  [g/G] timeline ends  [0/$] pitch ends  [s] save  [S] save to library  [Tab] menu",
                 Style::default().fg(Color::DarkGray),
             ),
         ]);
@@ -1431,6 +1534,30 @@ impl EditScreen {
             Paragraph::new(Line::from(Span::styled(
                 label,
                 Style::default().fg(Color::Yellow),
+            ))),
+            inner,
+        );
+    }
+
+    /// The "save to library" name overlay: a single-line text field showing the
+    /// name typed so far with a block cursor, plus the key hints.
+    fn draw_name_prompt(&self, f: &mut Frame, area: Rect) {
+        let typed = self.name_prompt_text();
+        let label = format!(" Save to library — name: {typed}█  [Enter] save  [Esc] cancel ");
+        let w = (label.len() as u16 + 4).min(area.width).max(20);
+        let h = 3u16;
+        let x = area.x + area.width.saturating_sub(w) / 2;
+        let y = area.y + area.height.saturating_sub(h) / 2;
+        let prompt_area = Rect::new(x, y, w, h.min(area.height));
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan));
+        let inner = block.inner(prompt_area);
+        f.render_widget(block, prompt_area);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                label,
+                Style::default().fg(Color::Cyan),
             ))),
             inner,
         );
