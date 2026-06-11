@@ -61,6 +61,26 @@ SUITABILITY_FLATNESS_MAX = 0.10
 _ENVELOPE_PEAK_CAL = 1.03
 
 
+# Transcription works on fundamentals (piano tops out ~4.2 kHz), so anything
+# above this rate just inflates the per-pitch FFT cost ~linearly.
+_TRANSCRIBE_MAX_SAMPLE_RATE = 16_000
+
+
+def _decimate_for_transcription(
+    samples: np.ndarray, sample_rate: int
+) -> tuple[np.ndarray, int]:
+    """Integer-factor downsample to <= 16 kHz with a windowed-sinc low-pass."""
+    factor = int(np.ceil(sample_rate / _TRANSCRIBE_MAX_SAMPLE_RATE))
+    if factor <= 1:
+        return samples, sample_rate
+    t = np.arange(-15, 16, dtype=np.float64)
+    cutoff = 0.5 / factor  # new Nyquist, in cycles per (old) sample
+    taps = 2.0 * cutoff * np.sinc(2.0 * cutoff * t) * np.hamming(t.size)
+    taps /= taps.sum()
+    filtered = np.convolve(np.asarray(samples, dtype=np.float64), taps, mode="same")
+    return filtered[::factor], sample_rate // factor
+
+
 @dataclass
 class TranscribedNote:
     """One note recovered from audio: pitch, sample-precise timing, velocity."""
@@ -165,6 +185,59 @@ def _runs_above(env: np.ndarray, on: float, off: float) -> list[tuple[int, int]]
     return runs
 
 
+def _strike_onsets(
+    seg: np.ndarray,
+    sample_rate: int,
+    *,
+    min_gap_s: float = 0.08,
+    rise_ratio: float = 1.3,
+    min_rise: float = 0.02,
+) -> list[int]:
+    """Indices (into ``seg``) where a key strike begins inside one envelope run.
+
+    A struck piano note decays monotonically, so a significant *rise* off the
+    local decay floor mid-run — at least ``rise_ratio`` times the running
+    minimum, and ``min_rise`` in absolute terms — is a re-strike of the same
+    pitch, even when pedal sustain keeps the envelope from ever dipping below
+    the hysteresis floor between strikes (which would otherwise merge repeats
+    into one long run).  The run's own attack is always the first onset; the
+    relative threshold keeps string-beating wobble (a few percent) from
+    triggering.
+    """
+    min_gap = max(1, int(round(min_gap_s * sample_rate)))
+    onsets = [0]
+    last_onset = 0
+    # Two-state walk: ride each strike's attack up to its peak, then track the
+    # decay's running minimum; a qualifying rise off that minimum is the next
+    # strike. (Tracking minima from the run's start would anchor at the attack
+    # base and never see the inter-strike floor.)
+    in_attack = True
+    cur_peak = float(seg[0])
+    local_min = float("inf")
+    local_min_i = 0
+    for i in range(1, seg.size):
+        v = float(seg[i])
+        if in_attack:
+            cur_peak = max(cur_peak, v)
+            if v <= 0.85 * cur_peak:  # decay has begun
+                in_attack = False
+                local_min = v
+                local_min_i = i
+        elif v < local_min:
+            local_min = v
+            local_min_i = i
+        elif (
+            v >= rise_ratio * local_min
+            and v - local_min >= min_rise
+            and local_min_i >= last_onset + min_gap
+        ):
+            onsets.append(local_min_i)  # the strike begins where the rise does
+            last_onset = local_min_i
+            in_attack = True
+            cur_peak = v
+    return onsets
+
+
 def transcribe(
     samples: np.ndarray,
     sample_rate: int,
@@ -183,8 +256,9 @@ def transcribe(
     velocity inferred from the envelope peak.
 
     A note's coarse extent is the run where the envelope is above the hysteresis
-    band; its **onset/offset are then snapped to the sharp edges** where the
-    envelope crosses ``onset_fraction`` of the run's peak.  This rejects the
+    band, further segmented at mid-run re-strikes (:func:`_strike_onsets`); each
+    segment's **onset/offset are then snapped to the sharp edges** where the
+    envelope crosses ``onset_fraction`` of the segment's peak.  This rejects the
     zero-phase band-pass's low-amplitude pre-ringing, which would otherwise pull
     onsets tens of milliseconds early.
     """
@@ -201,30 +275,146 @@ def transcribe(
         env = _bandpass_envelope(spectrum, freqs, n, sample_rate, f0)
         for a, b in _runs_above(env, on_threshold, off_threshold):
             seg = env[a:b]
-            peak = float(seg.max())
-            above = np.nonzero(seg >= onset_fraction * peak)[0]
-            if above.size == 0:
-                continue
-            on_i = a + int(above[0])
-            off_i = a + int(above[-1]) + 1
-            start_us = int(round(on_i / sample_rate * 1e6))
-            dur_us = int(round((off_i - on_i) / sample_rate * 1e6))
-            if dur_us < min_dur_us:
-                continue
-            amplitude = peak / _ENVELOPE_PEAK_CAL / REFERENCE_PEAK_AMPLITUDE
-            velocity = int(
-                np.clip(round(amplitude * 127.0), _MIN_VELOCITY, _MAX_VELOCITY)
-            )
-            out.append(
-                TranscribedNote(
-                    pitch=pitch,
-                    start_us=start_us,
-                    dur_us=max(1, dur_us),
-                    velocity=velocity,
+            bounds = _strike_onsets(seg, sample_rate)
+            bounds.append(seg.size)
+            for s0, s1 in zip(bounds, bounds[1:]):
+                sub = seg[s0:s1]
+                if sub.size == 0:
+                    continue
+                peak = float(sub.max())
+                above = np.nonzero(sub >= onset_fraction * peak)[0]
+                if above.size == 0:
+                    continue
+                on_i = a + s0 + int(above[0])
+                off_i = a + s0 + int(above[-1]) + 1
+                start_us = int(round(on_i / sample_rate * 1e6))
+                dur_us = int(round((off_i - on_i) / sample_rate * 1e6))
+                if dur_us < min_dur_us:
+                    continue
+                amplitude = peak / _ENVELOPE_PEAK_CAL / REFERENCE_PEAK_AMPLITUDE
+                velocity = int(
+                    np.clip(round(amplitude * 127.0), _MIN_VELOCITY, _MAX_VELOCITY)
                 )
-            )
+                out.append(
+                    TranscribedNote(
+                        pitch=pitch,
+                        start_us=start_us,
+                        dur_us=max(1, dur_us),
+                        velocity=velocity,
+                    )
+                )
     out.sort(key=lambda t: (t.start_us, t.pitch))
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Clock alignment + merged-note splitting
+# --------------------------------------------------------------------------- #
+def estimate_global_offset(
+    notes: list[ExtractedNote],
+    transcribed: list[TranscribedNote],
+    *,
+    search_us: int = 250_000,
+    min_matches: int = 30,
+) -> int:
+    """Median audio-minus-visual onset offset over same-pitch nearest matches.
+
+    The visual clock systematically leads or lags the audio clock by a small,
+    per-video constant (hit-line placement vs. the actual key strike, encoder
+    delay).  The median over many matches is robust to the transcriber's
+    occasional false events; with too few matches we return 0 rather than
+    trust a noisy estimate.
+    """
+    by_pitch: dict[int, list[int]] = {}
+    for t in transcribed:
+        by_pitch.setdefault(t.pitch, []).append(t.start_us)
+    deltas: list[int] = []
+    for n in notes:
+        starts = by_pitch.get(n.pitch)
+        if not starts:
+            continue
+        d = min((s - n.start_us for s in starts), key=abs)
+        if abs(d) <= search_us:
+            deltas.append(d)
+    if len(deltas) < min_matches:
+        return 0
+    return int(np.median(deltas))
+
+
+# A lower note's harmonics land exactly in a higher pitch's band (2nd harmonic
+# = +12 semitones, 3rd = +19, 4th = +24), so an onset there may be bleed, not a
+# re-strike. Bleed is much weaker than a struck fundamental; the velocity ratio
+# separates the two.
+_HARMONIC_INTERVALS = (12, 19, 24)
+_HARMONIC_VETO_RATIO = 0.6
+_HARMONIC_VETO_WINDOW_US = 50_000
+
+
+def split_merged_notes(
+    notes: list[ExtractedNote],
+    transcribed: list[TranscribedNote],
+    *,
+    min_segment_us: int = 80_000,
+) -> tuple[list[ExtractedNote], int]:
+    """Split visual notes that hold through an audible re-strike of their pitch.
+
+    Back-to-back bars touch on screen (the gap between repeated notes blurs
+    away at decimated frame rates), so the roll reads them as one long note.
+    The audio still carries each strike: a transcribed onset of the *same
+    pitch* well inside a visual note's span marks where to cut.  Audio only
+    segments here — pitch and hand stay visual ground truth, and no notes are
+    invented where the picture shows nothing.
+
+    Onsets within ``min_segment_us`` of a segment boundary are ignored (they
+    are timing jitter, not a distinct note), as are onsets explainable as a
+    lower note's harmonic bleeding into this pitch's band.
+    """
+    by_pitch: dict[int, list[TranscribedNote]] = {}
+    for t in transcribed:
+        by_pitch.setdefault(t.pitch, []).append(t)
+
+    def is_harmonic_bleed(t: TranscribedNote) -> bool:
+        for interval in _HARMONIC_INTERVALS:
+            for lower in by_pitch.get(t.pitch - interval, ()):
+                if (
+                    abs(lower.start_us - t.start_us) <= _HARMONIC_VETO_WINDOW_US
+                    and t.velocity < _HARMONIC_VETO_RATIO * lower.velocity
+                ):
+                    return True
+        return False
+
+    out: list[ExtractedNote] = []
+    n_split = 0
+    for note in notes:
+        end_us = note.start_us + note.dur_us
+        cuts: list[int] = []
+        last_bound = note.start_us
+        for t in sorted(by_pitch.get(note.pitch, ()), key=lambda t: t.start_us):
+            if (
+                t.start_us >= last_bound + min_segment_us
+                and t.start_us <= end_us - min_segment_us
+                and not is_harmonic_bleed(t)
+            ):
+                cuts.append(t.start_us)
+                last_bound = t.start_us
+        if not cuts:
+            out.append(note)
+            continue
+        n_split += 1
+        bounds = [note.start_us, *cuts, end_us]
+        for a, b in zip(bounds, bounds[1:]):
+            out.append(
+                ExtractedNote(
+                    pitch=note.pitch,
+                    start_us=a,
+                    dur_us=b - a,
+                    hand=note.hand,
+                    velocity=note.velocity,
+                    confidence=note.confidence,
+                )
+            )
+    out.sort(key=lambda n: (n.start_us, n.pitch))
+    return out, n_split
 
 
 # --------------------------------------------------------------------------- #
@@ -339,6 +529,7 @@ def fuse_chart(
     timing windows derive from the chart's fps (one frame of uncertainty, a
     two-frame match window) so callers usually pass only the audio.
     """
+    samples, sample_rate = _decimate_for_transcription(samples, sample_rate)
     suitable, reason = assess_suitability(samples, sample_rate)
     if not suitable:
         chart.source.audio_fusion = f"skipped: {reason}"
@@ -351,15 +542,41 @@ def fuse_chart(
     if match_tol_us is None:
         match_tol_us = 2 * frame_us
 
-    pitches = [n.pitch for n in chart.notes]
-    transcribed = transcribe(samples, sample_rate, pitches)
+    # Transcribe the chart's pitches plus the lower pitches whose harmonics
+    # land in them — the split pass needs those to recognise harmonic bleed.
+    pitches = {n.pitch for n in chart.notes}
+    pitches |= {
+        p - i for p in pitches for i in _HARMONIC_INTERVALS if p - i >= 21
+    }
+    transcribed = transcribe(samples, sample_rate, sorted(pitches))
+
+    # Align the visual clock to the audio clock before any per-note matching:
+    # the constant lead/lag would otherwise eat into every match tolerance.
+    offset_us = estimate_global_offset(chart.notes, transcribed)
+    notes = chart.notes
+    if offset_us:
+        notes = [
+            ExtractedNote(
+                pitch=n.pitch,
+                start_us=max(0, n.start_us + offset_us),
+                dur_us=n.dur_us,
+                hand=n.hand,
+                velocity=n.velocity,
+                confidence=n.confidence,
+            )
+            for n in notes
+        ]
+
+    notes, n_split = split_merged_notes(notes, transcribed)
+
     fused_notes, matched = _fuse_with_stats(
-        chart.notes,
+        notes,
         transcribed,
         frame_uncertainty_us=frame_uncertainty_us,
         match_tol_us=match_tol_us,
     )
     chart.source.audio_fusion = (
-        f"applied: {reason}; {matched}/{len(fused_notes)} notes matched"
+        f"applied: {reason}; offset {offset_us / 1000:+.0f} ms; "
+        f"split {n_split} merged notes; {matched}/{len(fused_notes)} notes matched"
     )
     return ExtractedChart(notes=fused_notes, source=chart.source)

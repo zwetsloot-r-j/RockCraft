@@ -25,10 +25,23 @@ chart with what the picture can't give:
 * **sub-frame onset/offset** — audio is sample-precise where the visual roll is
   quantised to the video frame grid.
 
+Beyond velocity and onset refinement, the pass also:
+
+* **aligns the visual clock to the audio clock** — the hit-line placement and
+  encoder delay give the whole chart a small constant lead/lag; the median
+  onset offset over all same-pitch matches measures it, and every note is
+  shifted by it (so the chart lines up with the backing track), and
+* **splits merged repeated notes** — back-to-back bars touch on screen, so the
+  roll reads two strikes as one long note; an audible re-strike of the same
+  pitch inside a visual note's span marks where to cut. A lower note's
+  harmonic landing in the pitch's band is recognised (much weaker, synchronous
+  with the lower strike) and never causes a split.
+
 It is strictly additive: M6-C alone still produces a full chart, and on
 **full-band** audio (vocals/drums/broadband energy) the pass detects the
 unsuitable input and **no-ops**, leaving the visual notes authoritative rather
-than corrupting them.
+than corrupting them. The M6-D pipeline runs it automatically whenever the
+source video yields a backing track.
 
 ```bash
 # Visual + audio fusion (audio is a 16-bit PCM WAV alongside the video/frames):
@@ -41,6 +54,19 @@ picture didn't show: it only matches a transcribed event to an existing visual
 note (same pitch, onset within the visual's frame uncertainty), copies velocity,
 and nudges timing **within** that uncertainty. Unmatched visual notes keep their
 timing and take a default velocity.
+
+## Scoring accuracy (eval.py)
+
+`eval.py` compares a chart against any independent reference transcription of
+the same source (e.g. a learned audio transcriber's output, or a hand-checked
+note list) and prints a bucketized report: exact matches, octave/semitone
+disagreements, missing notes, onsets buried inside longer chart notes (merged
+repeats), and chart-only notes. Reference files of copyrighted media stay
+local, like every other derived artifact (see docs/IMPORT.md).
+
+```bash
+python eval.py --chart chart.json --ref reference.json --tol-ms 150
+```
 
 ### Transcription dependency
 
