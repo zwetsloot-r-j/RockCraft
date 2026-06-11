@@ -1,0 +1,25 @@
+:root {
+  /* Palette — the dark base the note-highway and record screens build on. */
+  --rc-bg: #0f1016;
+  --rc-fg: #e7e8ef;
+  --rc-accent: #6c7bff;
+
+  --rc-font-sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+
+  color-scheme: dark;
+  font-family: var(--rc-font-sans);
+  color: var(--rc-fg);
+  background-color: var(--rc-bg);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+}
