@@ -5,6 +5,7 @@
 //! 2. `UrlInput`       — type a URL.
 //! 3. `ImportingScreen`— shows pipeline progress; on completion yields a bundle path.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
@@ -249,6 +250,9 @@ impl UrlInput {
 
 // ── Importing progress screen ──────────────────────────────────────────────────
 
+/// Most log lines we retain in memory for the scrolling output pane.
+const MAX_LOG_LINES: usize = 500;
+
 enum RunningState {
     Starting,
     Fetching,
@@ -258,6 +262,7 @@ enum RunningState {
 
 enum WorkerEvent {
     Running(RunningState),
+    Log(String),
     Done(PathBuf),
     Failed(String),
 }
@@ -271,6 +276,7 @@ pub enum ImportOutcome {
 pub struct ImportingScreen {
     rx: mpsc::Receiver<WorkerEvent>,
     running: RunningState,
+    log: VecDeque<String>,
     outcome: Option<ImportOutcome>,
 }
 
@@ -282,6 +288,7 @@ impl ImportingScreen {
             let result = import_video(input, &mut |p| {
                 let event = match p {
                     Progress::Fetching => WorkerEvent::Running(RunningState::Fetching),
+                    Progress::Log(line) => WorkerEvent::Log(line),
                     Progress::Extracting(f) => WorkerEvent::Running(RunningState::Extracting(f)),
                     Progress::Writing => WorkerEvent::Running(RunningState::Writing),
                     Progress::Done(path) => WorkerEvent::Done(path),
@@ -295,6 +302,7 @@ impl ImportingScreen {
         Self {
             rx,
             running: RunningState::Starting,
+            log: VecDeque::new(),
             outcome: None,
         }
     }
@@ -304,6 +312,12 @@ impl ImportingScreen {
         while let Ok(event) = self.rx.try_recv() {
             match event {
                 WorkerEvent::Running(s) => self.running = s,
+                WorkerEvent::Log(line) => {
+                    if self.log.len() == MAX_LOG_LINES {
+                        self.log.pop_front();
+                    }
+                    self.log.push_back(line);
+                }
                 WorkerEvent::Done(path) => {
                     self.outcome = Some(ImportOutcome::Done(path));
                 }
@@ -315,6 +329,11 @@ impl ImportingScreen {
         self.outcome.as_ref()
     }
 
+    /// True once the import has failed (the screen lingers to show the tail).
+    pub fn has_failed(&self) -> bool {
+        matches!(self.outcome, Some(ImportOutcome::Failed(_)))
+    }
+
     pub fn draw(&self, f: &mut Frame, area: Rect) {
         let chunks = Layout::vertical([
             Constraint::Length(2),
@@ -324,12 +343,11 @@ impl ImportingScreen {
         ])
         .split(area);
 
-        f.render_widget(
-            Paragraph::new(Line::from(
-                "Importing video — please wait…  (Esc to cancel)",
-            )),
-            chunks[0],
-        );
+        let header = match &self.outcome {
+            Some(ImportOutcome::Failed(_)) => "Import failed.  (Esc to dismiss)",
+            _ => "Importing video — please wait…  (Esc to cancel)",
+        };
+        f.render_widget(Paragraph::new(Line::from(header)), chunks[0]);
 
         let (label, ratio): (&str, f64) = match &self.running {
             RunningState::Starting => ("Starting…", 0.0),
@@ -345,13 +363,51 @@ impl ImportingScreen {
             .label(label);
         f.render_widget(gauge, chunks[1]);
 
-        if let Some(ImportOutcome::Done(path)) = &self.outcome {
-            f.render_widget(
-                Paragraph::new(Line::from(format!("Done: {}", path.display())))
-                    .style(Style::default().fg(Color::Green)),
-                chunks[2],
-            );
+        // Status line: success path, or the failure message (first line).
+        match &self.outcome {
+            Some(ImportOutcome::Done(path)) => {
+                f.render_widget(
+                    Paragraph::new(Line::from(format!("Done: {}", path.display())))
+                        .style(Style::default().fg(Color::Green)),
+                    chunks[2],
+                );
+            }
+            Some(ImportOutcome::Failed(msg)) => {
+                let first = msg.lines().next().unwrap_or(msg);
+                f.render_widget(
+                    Paragraph::new(Line::from(format!("Error: {first}")))
+                        .style(Style::default().fg(Color::Red)),
+                    chunks[2],
+                );
+            }
+            None => {}
         }
+
+        self.draw_log_pane(f, chunks[3]);
+    }
+
+    /// Render the last N captured output lines (N = visible pane height) in a
+    /// bordered, scrolling pane. The pane is empty until the fetch hook emits
+    /// output and, on failure, keeps the tail visible alongside the status line.
+    fn draw_log_pane(&self, f: &mut Frame, area: Rect) {
+        if area.height < 3 || self.log.is_empty() {
+            return;
+        }
+        // Two rows are consumed by the top/bottom border.
+        let visible = area.height.saturating_sub(2) as usize;
+        let start = self.log.len().saturating_sub(visible);
+        let lines: Vec<Line> = self
+            .log
+            .iter()
+            .skip(start)
+            .map(|l| Line::from(l.as_str()))
+            .collect();
+        f.render_widget(
+            Paragraph::new(lines)
+                .block(Block::default().borders(Borders::ALL).title(" output "))
+                .style(Style::default().fg(Color::DarkGray)),
+            area,
+        );
     }
 }
 
@@ -536,6 +592,21 @@ mod tests {
         assert!(
             matches!(outcome, Some(ImportOutcome::Failed(_))),
             "expected Failed for missing file"
+        );
+    }
+
+    #[test]
+    fn importing_screen_lingers_on_failure() {
+        // A failed import must report `has_failed()` so the screen can linger
+        // and keep its output tail visible instead of bouncing to the menu.
+        let mut screen = ImportingScreen::start(ImportInput::File(PathBuf::from(
+            "/nonexistent/path/video.mp4",
+        )));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let _ = screen.poll();
+        assert!(
+            screen.has_failed(),
+            "failed import should report has_failed"
         );
     }
 

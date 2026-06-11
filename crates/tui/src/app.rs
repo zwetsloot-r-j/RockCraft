@@ -462,10 +462,14 @@ impl Shell {
                     UrlInputOutcome::Pending => {}
                 }
             }
-            Screen::Importing(_) => {
+            Screen::Importing(imp) => {
                 // Esc cancels (the thread continues running but we abandon it).
+                // After a failure the screen lingers to show the output tail;
+                // Esc there just dismisses, keeping the existing failure status.
                 if code == KeyCode::Esc {
-                    self.status = "import cancelled".into();
+                    if !imp.has_failed() {
+                        self.status = "import cancelled".into();
+                    }
                     self.screen = Screen::Menu;
                 }
             }
@@ -691,8 +695,11 @@ pub fn run_loop<B: ratatui::backend::Backend>(
                 }
             }
             Some(Err(msg)) => {
-                shell.status = format!("import failed: {msg}");
-                shell.screen = Screen::Menu;
+                // Keep the Importing screen up so its output tail stays visible
+                // next to the error; Esc dismisses it back to the menu. Status
+                // carries only the first line (the rest is shown in the pane).
+                let first = msg.lines().next().unwrap_or(&msg);
+                shell.status = format!("import failed: {first}");
             }
             None => {}
         }
