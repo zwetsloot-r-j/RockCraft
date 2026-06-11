@@ -48,7 +48,7 @@ export function HighwayScreen() {
   return (
     <div
       style={{
-        height: "100vh",
+        height: "100%",
         display: "flex",
         "flex-direction": "column",
         background: "#0f1016",
