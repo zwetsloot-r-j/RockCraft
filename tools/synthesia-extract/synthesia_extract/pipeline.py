@@ -705,26 +705,56 @@ def extract_notes(
     us_per_px: float,
     *,
     threshold: float = 0.5,
+    hysteresis_low: Optional[float] = None,
     min_run_px: int = 3,
 ) -> list[_RawNote]:
     """Threshold per-pitch coverage into note runs.
 
     ``totals`` may be global (1-D, one value per bin) or per-lane (2-D,
     ``[pitch_index, bin]``, from the dead-zone-aware roll).
+
+    ``hysteresis_low`` enables dual-threshold *gap bridging*: two solid seeds
+    above ``threshold`` (each >= ``min_run_px`` long) merge into one run when
+    the gap between them is short (<= ``2 * min_run_px``) and stays above the
+    low threshold throughout.  Brief mask dropouts — washed-out scenes,
+    dead-zone holes — dip a bar's coverage below the high threshold mid-note
+    and would otherwise split one bar into fragments; they rarely dip below
+    the low one, while true gaps between repeated notes carry no votes at
+    all.  Only interior gaps are bridged — runs never extend past their
+    outermost seed bins, so a note's onset/offset always rests on
+    high-coverage evidence.
     """
     raws: list[_RawNote] = []
     for pi, pitch in enumerate(pitches):
         tot = totals[pi] if totals.ndim == 2 else totals
         coverage = votes[pi] / np.maximum(tot, 1e-6)
         on = (coverage > threshold) & (tot > 0)
-        for a, b in _find_runs(on):
+        if hysteresis_low is not None:
+            low_on = (coverage > hysteresis_low) & (tot > 0)
+            max_gap = 2 * min_run_px
+            merged: list[tuple[int, int]] = []
+            for a, b in _find_runs(on):
+                if b - a < min_run_px:
+                    continue
+                if merged and a - merged[-1][1] <= max_gap and low_on[merged[-1][1] : a].all():
+                    merged[-1] = (merged[-1][0], b)
+                else:
+                    merged.append((a, b))
+            runs = merged
+        else:
+            runs = _find_runs(on)
+        for a, b in runs:
             if b - a < min_run_px:
                 continue
-            seg_votes = votes[pi, a:b]
-            total_votes = float(seg_votes.sum())
-            if total_votes <= 0:
+            # Colour comes from the high-coverage core bins only: extension
+            # bins are weakly attested (their pixels are part background) and
+            # would tint the note's colour away from its ink.
+            core = on[a:b] if hysteresis_low is not None else np.ones(b - a, dtype=bool)
+            core_votes = float(votes[pi, a:b][core].sum())
+            total_votes = float(votes[pi, a:b].sum())
+            if total_votes <= 0 or core_votes <= 0:
                 continue
-            color = color_sum[pi, a:b].sum(axis=0) / total_votes
+            color = color_sum[pi, a:b][core].sum(axis=0) / core_votes
             cov = float(np.clip(coverage[a:b].mean(), 0.0, 1.0))
             raws.append(
                 _RawNote(
@@ -791,21 +821,31 @@ def filter_color_modes(
     *,
     radius: float = 0.12,
     min_mode_frac: float = 0.10,
-    max_modes: int = 4,
+    satellite_frac: float = 0.02,
+    satellite_dist: float = 0.35,
+    max_modes: int = 8,
     min_notes: int = 24,
 ) -> tuple[list[_RawNote], str]:
     """Keep only notes whose colour belongs to a tight, coverage-strong mode;
     return ``(survivors, diagnostic)``.
 
-    Real falling bars are rendered in a handful of solid colours (per hand, or
-    one translucent colour tinted per scene), so their *full* colours —
-    brightness included, since a translucent bar over any backdrop stays bright
-    — pile into modes that are simultaneously *tight* (every note near one
-    colour) and *strong* (a large share of the total vote mass).  Bright
-    animated artwork — characters, sparkles, flashes — is colour-diverse: its
-    false notes scatter across colour space and never form such a mode.
-    Dropping the diffuse residue removes them while leaving any solid-colour
-    bar population (however styled) untouched.
+    Real falling bars are rendered in a handful of solid inks (per hand), so
+    their *full* colours — brightness included, since a translucent bar over
+    any backdrop stays bright — pile into modes that are simultaneously *tight*
+    (every note near one colour) and *strong* (a large share of the total vote
+    mass).  Bright animated artwork — characters, sparkles, flashes — is
+    colour-diverse: its false notes scatter across colour space and never form
+    such a mode.  Dropping the diffuse residue removes them while leaving any
+    solid-colour bar population (however styled) untouched.
+
+    A translucent ink additionally spawns *satellite* modes: the same ink over
+    each recurring scene backdrop picks up that scene's tint, so rarer scenes
+    contribute small-but-tight modes *near* the main one in colour space.
+    Those are real notes — a weight floor alone would throw away every note
+    played during a rare backdrop.  A small tight mode is therefore also kept
+    when it sits within ``satellite_dist`` of an already-accepted mode; noise
+    modes (dark shadow shapes, saturated artwork colours) lie far from any bar
+    ink and still die regardless of their tightness.
 
     Fail-safes: clips with too few notes to support the statistics pass through
     unfiltered, as does a population with no qualifying mode at all (we cannot
@@ -823,7 +863,8 @@ def filter_color_modes(
     remaining = np.ones(len(raws), dtype=bool)
     keep = np.zeros(len(raws), dtype=bool)
     rng = np.random.default_rng(0)
-    modes = 0
+    accepted_centers: list[np.ndarray] = []
+    primaries = satellites = 0
     for _ in range(max_modes):
         idx = np.where(remaining)[0]
         if idx.size == 0:
@@ -841,17 +882,32 @@ def filter_color_modes(
                 break
             center = np.average(colors[idx][member], axis=0, weights=weight[idx][member])
         member = np.linalg.norm(colors[idx] - center, axis=1) <= radius
-        if float(weight[idx][member].sum()) / total < min_mode_frac:
-            break  # strongest remaining mode is weak -> the rest is residue
+        frac = float(weight[idx][member].sum()) / total
+        if frac < satellite_frac:
+            break  # strongest remaining mode is a speck -> the rest is residue
+        if frac >= min_mode_frac:
+            primaries += 1
+        elif accepted_centers and min(
+            float(np.linalg.norm(center - c)) for c in accepted_centers
+        ) <= satellite_dist:
+            satellites += 1
+        else:
+            # Tight but weak and far from every bar ink: noise. Carve it out
+            # of `remaining` so the next-densest mode can surface.
+            remaining[idx[member]] = False
+            continue
+        accepted_centers.append(center)
         keep[idx[member]] = True
         remaining[idx[member]] = False
-        modes += 1
 
-    if modes == 0:
+    if primaries == 0:
         return raws, "skipped: no qualifying colour mode"
     survivors = [r for r, k in zip(raws, keep) if k]
     dropped = len(raws) - len(survivors)
-    return survivors, f"kept {modes} mode(s), dropped {dropped}/{len(raws)} notes"
+    return survivors, (
+        f"kept {primaries} mode(s) + {satellites} satellite(s), "
+        f"dropped {dropped}/{len(raws)} notes"
+    )
 
 
 def assign_hands(raws: list[_RawNote]) -> list[ExtractedNote]:
@@ -995,6 +1051,7 @@ def extract_chart(
         pitches,
         us_per_px,
         threshold=0.6,
+        hysteresis_low=0.42,
         min_run_px=max(3, int(round(0.04 * scroll))),
     )
     n_extracted = len(raws)

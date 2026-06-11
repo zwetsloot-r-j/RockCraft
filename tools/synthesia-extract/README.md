@@ -103,12 +103,15 @@ pipeline:
 4. **Roll stitching** — every colored pixel of every frame votes into a per-pitch
    song-time occupancy map; overlapping frames reinforce true bars, sub-frame
    interpolation beats the frame grid.
-5. **Notes + noise rejection** — threshold coverage into note runs, then drop
-   what isn't a bar: *ghost notes* (a bar's bloom bleeding into the adjacent
-   lane — overlapping a much brighter same-chroma neighbour 1–2 semitones
-   away) and *animated-artwork noise* (bright characters/sparkles behind the
-   roll — their colours are diverse, while real bars pile into a few tight,
-   coverage-strong colour modes; diffuse residue is discarded). The
+5. **Notes + noise rejection** — threshold coverage into note runs (with
+   dual-threshold gap bridging, so a brief mask dropout doesn't split one bar
+   into fragments), then drop what isn't a bar: *ghost notes* (a bar's bloom
+   bleeding into the adjacent lane — overlapping a much brighter same-chroma
+   neighbour 1–2 semitones away) and *animated-artwork noise* (bright
+   characters/sparkles behind the roll — their colours are diverse, while
+   real bars pile into a few tight, coverage-strong colour modes; small tight
+   modes *near* an accepted one are kept too — the same ink tinted by a rarer
+   scene backdrop — while diffuse or far-away residue is discarded). The
    `source.noise_filter` diagnostic records what each stage dropped.
 6. **Hands** — cluster the (typically two) dominant bar colors into Left/Right
    (lower average pitch → Left), else `Unknown`. Coverage and color-purity feed
