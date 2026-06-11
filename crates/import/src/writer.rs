@@ -43,7 +43,8 @@ pub fn write_chart_bundle(chart: &ExtractedChart, dir: &Path) -> Result<PathBuf,
     let midi_bytes = events_to_smf_bytes(&events);
     std::fs::write(dir.join("song.mid"), &midi_bytes)?;
 
-    let meta = RecordingMeta::new_midi_only("song.mid");
+    let mut meta = RecordingMeta::new_midi_only("song.mid");
+    meta.origin = Some(rockcraft_core::TrackOrigin::Imported);
     std::fs::write(dir.join("meta.json"), meta.to_json())?;
 
     Ok(dir.to_path_buf())
