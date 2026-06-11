@@ -60,6 +60,7 @@ pub fn write_chart_bundle_with_backing(
 
     let mut meta = RecordingMeta::new_midi_only("song.mid");
     meta.backing = backing;
+    meta.origin = Some(rockcraft_core::TrackOrigin::Imported);
     std::fs::write(dir.join("meta.json"), meta.to_json())?;
 
     Ok(dir.to_path_buf())

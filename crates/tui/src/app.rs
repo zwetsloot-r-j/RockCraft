@@ -16,17 +16,19 @@ use ratatui::{
 };
 use rockcraft_audio::SynthHandle;
 use rockcraft_control::{QueryKind, RemoteCommand, Request, Response};
-use rockcraft_core::{Grid, Key, RecordingMeta, Scale, Timeline};
+use rockcraft_core::{Grid, Key, RecordingMeta, Scale, Timeline, TrackOrigin};
 use rockcraft_import::{fetch_command_configured, ImportInput};
 use rockcraft_midi::{smf_bytes_to_events, NoteSource};
 use tokio::sync::mpsc;
 
 use crate::backing::{BackingPicker, PickerOutcome};
-use crate::edit::{EditScreen, PromptOutcome};
+use crate::edit::{EditScreen, NameOutcome, PromptOutcome};
 use crate::import_screen::{
     ImportOutcome, ImportingScreen, UrlInput, UrlInputOutcome, VideoPicker, VideoPickerOutcome,
 };
 use crate::key_source::{CrosstermKeys, KeySource};
+use crate::library::{default_scan_roots, library_root};
+use crate::library_screen::{LibraryOutcome, LibraryScreen};
 use crate::play::PlayScreen;
 use crate::record::RecordScreen;
 
@@ -47,6 +49,8 @@ pub(crate) enum Screen {
     UrlInput(UrlInput),
     /// Running the import pipeline, showing progress.
     Importing(ImportingScreen),
+    /// Browse the track library and open a bundle in Play or Edit.
+    Library(LibraryScreen),
 }
 
 /// Fixed menu entries always shown.
@@ -57,6 +61,7 @@ const MENU_ITEMS_BASE: &[&str] = &[
     "Edit last recording",
     "Choose backing track",
     "Import from video file…",
+    "Library…",
 ];
 
 /// Extra entry appended when a fetch command is configured (M6-D).
@@ -186,6 +191,48 @@ impl Shell {
         self.screen = Screen::Edit(Box::new(edit));
     }
 
+    /// Load the bundle whose MIDI is at `midi_path` into the composer for
+    /// editing. Reuses the bundle's `meta.json` for grid/key/backing/origin and
+    /// falls back to a session backing track when the bundle declares none. On a
+    /// read/parse failure the status line is set and the screen is unchanged.
+    ///
+    /// Shared by "Edit last recording" and the Library browser's "open in Edit".
+    fn open_edit_from_midi(&mut self, midi_path: &std::path::Path) {
+        let bytes = match std::fs::read(midi_path) {
+            Ok(b) => b,
+            Err(e) => {
+                self.status = format!("read failed: {e}");
+                return;
+            }
+        };
+        let events = match smf_bytes_to_events(&bytes) {
+            Ok(ev) => ev,
+            Err(e) => {
+                self.status = format!("parse failed: {e}");
+                return;
+            }
+        };
+        let timeline = Timeline::from_events(&events);
+        let bundle_dir = midi_path.parent().unwrap_or(midi_path);
+        let (grid, key) = load_meta_grid_key(bundle_dir);
+        let mut edit = EditScreen::from_timeline(timeline, grid);
+        edit.set_key(key);
+        // Preserve the bundle's own provenance; a bundle with no origin recorded
+        // becomes `Edited` once reopened in the composer.
+        edit.set_origin(load_meta_origin(bundle_dir).unwrap_or(TrackOrigin::Edited));
+        if let Some(s) = &self.synth {
+            edit.attach_synth(s.clone());
+        }
+        // Prefer a backing the bundle itself declares (path + offset from meta);
+        // otherwise fall back to a track chosen this session.
+        if let Some((bpath, start)) = load_meta_backing(bundle_dir) {
+            edit = edit.with_backing(bpath, start);
+        } else if let Some(path) = &self.backing_path {
+            edit = edit.with_backing(path.clone(), 0);
+        }
+        self.screen = Screen::Edit(Box::new(edit));
+    }
+
     /// Number of notes in the edit screen; `None` if not in edit mode.
     pub fn edit_note_count(&self) -> Option<usize> {
         if let Screen::Edit(e) = &self.screen {
@@ -215,33 +262,12 @@ impl Shell {
                 self.activate_edit();
             }
             "Edit last recording" => match latest_recording() {
-                Some(path) => match std::fs::read(&path) {
-                    Ok(bytes) => match smf_bytes_to_events(&bytes) {
-                        Ok(events) => {
-                            let timeline = Timeline::from_events(&events);
-                            let bundle_dir = path.parent().unwrap_or(&path);
-                            let (grid, key) = load_meta_grid_key(bundle_dir);
-                            let mut edit = EditScreen::from_timeline(timeline, grid);
-                            edit.set_key(key);
-                            if let Some(s) = &self.synth {
-                                edit.attach_synth(s.clone());
-                            }
-                            // Prefer a backing the bundle itself declares (path +
-                            // offset from meta); otherwise fall back to a track
-                            // chosen this session.
-                            if let Some((bpath, start)) = load_meta_backing(bundle_dir) {
-                                edit = edit.with_backing(bpath, start);
-                            } else if let Some(path) = &self.backing_path {
-                                edit = edit.with_backing(path.clone(), 0);
-                            }
-                            self.screen = Screen::Edit(Box::new(edit));
-                        }
-                        Err(e) => self.status = format!("parse failed: {e}"),
-                    },
-                    Err(e) => self.status = format!("read failed: {e}"),
-                },
+                Some(path) => self.open_edit_from_midi(&path),
                 None => self.status = "no recordings yet — record one first".into(),
             },
+            "Library…" => {
+                self.screen = Screen::Library(LibraryScreen::new(&default_scan_roots()));
+            }
             "Choose backing track" => {
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 self.screen = Screen::BackingPicker(BackingPicker::new(cwd));
@@ -321,7 +347,26 @@ impl Shell {
             // When the editor is dirty and Tab/Esc is pressed, an exit-prompt
             // overlay is shown first ("Save / Discard / Cancel").
             Screen::Edit(edit) => {
-                if edit.is_prompting_exit() {
+                if edit.is_naming() {
+                    // The "save to library" name overlay owns all keys while up.
+                    match edit.on_name_key(code) {
+                        NameOutcome::Submitted(name) => {
+                            match edit.save_to_library(&library_root(), &name) {
+                                Ok(p) => {
+                                    let n = p
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().into_owned())
+                                        .unwrap_or_default();
+                                    edit.set_save_flash(format!("Saved {n} ✓"));
+                                    edit.mark_clean();
+                                    self.status = format!("saved {}", p.display());
+                                }
+                                Err(e) => self.status = format!("save failed: {e}"),
+                            }
+                        }
+                        NameOutcome::Cancelled | NameOutcome::Pending => {}
+                    }
+                } else if edit.is_prompting_exit() {
                     // Route all keys to the prompt while it's visible.
                     match edit.on_prompt_key(code) {
                         PromptOutcome::SaveAndLeave => match edit.save() {
@@ -370,6 +415,8 @@ impl Shell {
                             }
                             Err(e) => self.status = format!("save failed: {e}"),
                         },
+                        // Shift-S opens the "save to library" name overlay.
+                        KeyCode::Char('S') => edit.start_save_prompt(),
                         KeyCode::Char(c) if edit.is_recording() && self.input.forward_key(c) => {}
                         other => edit.on_key(other),
                     }
@@ -415,11 +462,37 @@ impl Shell {
                     UrlInputOutcome::Pending => {}
                 }
             }
-            Screen::Importing(_) => {
+            Screen::Importing(imp) => {
                 // Esc cancels (the thread continues running but we abandon it).
+                // After a failure the screen lingers to show the output tail;
+                // Esc there just dismisses, keeping the existing failure status.
                 if code == KeyCode::Esc {
-                    self.status = "import cancelled".into();
+                    if !imp.has_failed() {
+                        self.status = "import cancelled".into();
+                    }
                     self.screen = Screen::Menu;
+                }
+            }
+            Screen::Library(lib) => {
+                let outcome = lib.on_key(code).clone();
+                match outcome {
+                    LibraryOutcome::OpenPlay(dir) => {
+                        let midi = dir.join("song.mid");
+                        match load_play_screen(&midi, self.synth.clone()) {
+                            Ok(p) => self.screen = Screen::Play(p),
+                            Err(e) => {
+                                self.status = e;
+                                self.screen = Screen::Menu;
+                            }
+                        }
+                    }
+                    LibraryOutcome::OpenEdit(dir) => {
+                        self.open_edit_from_midi(&dir.join("song.mid"));
+                    }
+                    LibraryOutcome::Cancelled => {
+                        self.screen = Screen::Menu;
+                    }
+                    LibraryOutcome::Pending => {}
                 }
             }
         }
@@ -486,6 +559,7 @@ impl Shell {
             Screen::VideoPicker(_) => "video_picker",
             Screen::UrlInput(_) => "url_input",
             Screen::Importing(_) => "importing",
+            Screen::Library(_) => "library",
         }
     }
 
@@ -565,7 +639,8 @@ pub fn run_loop<B: ratatui::backend::Backend>(
                 | Screen::BackingPicker(_)
                 | Screen::VideoPicker(_)
                 | Screen::UrlInput(_)
-                | Screen::Importing(_) => {}
+                | Screen::Importing(_)
+                | Screen::Library(_) => {}
             }
         }
 
@@ -622,8 +697,11 @@ pub fn run_loop<B: ratatui::backend::Backend>(
                 }
             }
             Some(Err(msg)) => {
-                shell.status = format!("import failed: {msg}");
-                shell.screen = Screen::Menu;
+                // Keep the Importing screen up so its output tail stays visible
+                // next to the error; Esc dismisses it back to the menu. Status
+                // carries only the first line (the rest is shown in the pane).
+                let first = msg.lines().next().unwrap_or(&msg);
+                shell.status = format!("import failed: {first}");
             }
             None => {}
         }
@@ -651,6 +729,7 @@ fn draw(f: &mut Frame, shell: &Shell) {
         Screen::VideoPicker(picker) => picker.draw(f, f.area()),
         Screen::UrlInput(ui) => ui.draw(f, f.area()),
         Screen::Importing(imp) => imp.draw(f, f.area()),
+        Screen::Library(lib) => lib.draw(f, f.area()),
     }
 }
 
@@ -717,6 +796,13 @@ fn load_meta_backing(bundle_dir: &std::path::Path) -> Option<(PathBuf, u64)> {
     let meta = RecordingMeta::from_json(&json).ok()?;
     let backing = meta.backing?;
     Some((bundle_dir.join(&backing.file), backing.audio_start_us))
+}
+
+/// Read a bundle's recorded provenance from its `meta.json`; `None` when there
+/// is no manifest, it fails to parse, or it predates the `origin` field.
+fn load_meta_origin(bundle_dir: &std::path::Path) -> Option<TrackOrigin> {
+    let json = std::fs::read_to_string(bundle_dir.join("meta.json")).ok()?;
+    RecordingMeta::from_json(&json).ok()?.origin
 }
 
 /// Find the MIDI of the most recent recording under `recordings/`.
@@ -919,6 +1005,141 @@ mod tests {
             expected_count,
             "editor is pre-populated with the saved notes"
         );
+    }
+
+    // ── track library (issue #153) ──────────────────────────────────────────
+
+    /// Save a chart into a temp library root, then browse it through the shell's
+    /// Library screen and open it in Edit — the save→list→load round trip,
+    /// driven via the same render/key machinery the live shell uses.
+    #[test]
+    fn library_save_list_load_round_trip() {
+        use crate::library_screen::LibraryScreen;
+
+        let mut tl = Timeline::new();
+        tl.insert(make_note(60, 0, 500_000));
+        tl.insert(make_note(64, 500_000, 500_000));
+        let expected = tl.len();
+
+        let root = std::env::temp_dir().join(format!(
+            "rockcraft_lib_rt_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+
+        // Save: a named bundle lands under the library root.
+        let edit = EditScreen::from_timeline(tl, Grid::default_120());
+        let dir = edit.save_to_library(&root, "My Song").expect("save");
+        assert!(dir.join("song.mid").exists(), "bundle midi written");
+        assert!(dir.join("meta.json").exists(), "bundle meta written");
+
+        // List + render: the browser shows the saved track (snapshot machinery).
+        let mut shell = make_shell();
+        shell.screen = Screen::Library(LibraryScreen::new(std::slice::from_ref(&root)));
+        let dump = shell.render_to_string(80, 24);
+        assert!(
+            dump.contains("my-song"),
+            "library render must list the saved track, got:\n{dump}"
+        );
+
+        // Load: `e` opens the highlighted bundle in the editor, pre-populated.
+        shell.on_key(KeyCode::Char('e'));
+        assert_eq!(shell.screen_name(), "edit");
+        assert_eq!(
+            shell.edit_note_count(),
+            Some(expected),
+            "opened bundle carries its saved notes"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Opening a library entry in Play enters the Play screen.
+    #[test]
+    fn library_open_in_play() {
+        use crate::library_screen::LibraryScreen;
+
+        let mut tl = Timeline::new();
+        tl.insert(make_note(60, 0, 500_000));
+        let root = std::env::temp_dir().join(format!(
+            "rockcraft_lib_play_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let edit = EditScreen::from_timeline(tl, Grid::default_120());
+        edit.save_to_library(&root, "play me").expect("save");
+
+        let mut shell = make_shell();
+        shell.screen = Screen::Library(LibraryScreen::new(std::slice::from_ref(&root)));
+        shell.on_key(KeyCode::Enter); // Enter opens in Play
+        assert_eq!(shell.screen_name(), "play");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The menu lists "Library…" and Enter on it opens the Library browser.
+    #[test]
+    fn library_menu_item_opens_browser() {
+        let mut shell = make_shell();
+        shell.set_has_fetch_cmd(false);
+        let items = shell.menu_items();
+        let idx = items
+            .iter()
+            .position(|s| *s == "Library…")
+            .expect("Library menu item present");
+        for _ in 0..idx {
+            shell.on_key(KeyCode::Down);
+        }
+        shell.on_key(KeyCode::Enter);
+        assert_eq!(shell.screen_name(), "library");
+    }
+
+    /// In the editor, Shift-S opens the save-to-library name overlay; typing a
+    /// name and pressing Enter writes the bundle and clears the dirty flag.
+    #[test]
+    fn editor_shift_s_saves_to_library() {
+        // Point the library root at a temp dir for the duration of this test.
+        let root = std::env::temp_dir().join(format!(
+            "rockcraft_lib_shiftS_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::env::set_var("ROCKCRAFT_LIBRARY_DIR", &root);
+
+        let mut shell = make_shell();
+        shell.activate_edit();
+        shell.on_key(KeyCode::Char('a')); // add a note → dirty
+
+        shell.on_key(KeyCode::Char('S')); // open name overlay
+        if let Screen::Edit(e) = &shell.screen {
+            assert!(e.is_naming(), "Shift-S opens the name overlay");
+        } else {
+            panic!("expected edit screen");
+        }
+        for c in "demo".chars() {
+            shell.on_key(KeyCode::Char(c));
+        }
+        shell.on_key(KeyCode::Enter); // submit → save
+
+        if let Screen::Edit(e) = &shell.screen {
+            assert!(!e.is_naming(), "overlay closes after save");
+            assert!(!e.is_dirty(), "save clears the dirty flag");
+        } else {
+            panic!("expected edit screen");
+        }
+        assert!(
+            root.join("demo").join("song.mid").exists(),
+            "named bundle written under the library root"
+        );
+
+        std::env::remove_var("ROCKCRAFT_LIBRARY_DIR");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     // ── control-server wiring (M4-F) ─────────────────────────────────────
@@ -1273,7 +1494,12 @@ mod tests {
         shell.set_has_fetch_cmd(true);
 
         // Navigate to "Import from URL…" (index 6 when fetch cmd is present).
-        for _ in 0..6 {
+        let idx = shell
+            .menu_items()
+            .iter()
+            .position(|s| *s == "Import from URL…")
+            .expect("URL import item present");
+        for _ in 0..idx {
             shell.on_key(KeyCode::Down);
         }
         shell.on_key(KeyCode::Enter);
@@ -1287,7 +1513,12 @@ mod tests {
         let mut shell = make_shell();
         shell.set_has_fetch_cmd(true);
 
-        for _ in 0..6 {
+        let idx = shell
+            .menu_items()
+            .iter()
+            .position(|s| *s == "Import from URL…")
+            .expect("URL import item present");
+        for _ in 0..idx {
             shell.on_key(KeyCode::Down);
         }
         shell.on_key(KeyCode::Enter);
@@ -1304,7 +1535,12 @@ mod tests {
         let mut shell = make_shell();
         shell.set_has_fetch_cmd(true);
 
-        for _ in 0..6 {
+        let idx = shell
+            .menu_items()
+            .iter()
+            .position(|s| *s == "Import from URL…")
+            .expect("URL import item present");
+        for _ in 0..idx {
             shell.on_key(KeyCode::Down);
         }
         shell.on_key(KeyCode::Enter);
@@ -1324,7 +1560,12 @@ mod tests {
         let mut shell = make_shell();
         shell.set_has_fetch_cmd(true);
 
-        for _ in 0..6 {
+        let idx = shell
+            .menu_items()
+            .iter()
+            .position(|s| *s == "Import from URL…")
+            .expect("URL import item present");
+        for _ in 0..idx {
             shell.on_key(KeyCode::Down);
         }
         shell.on_key(KeyCode::Enter);

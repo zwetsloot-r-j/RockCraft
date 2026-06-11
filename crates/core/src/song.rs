@@ -19,6 +19,35 @@ pub struct BackingTrack {
     pub audio_start_us: u64,
 }
 
+/// Where a chart bundle came from, used by the library browser to label entries.
+///
+/// Optional in `meta.json` (`#[serde(default)]` → `None`) so older bundles
+/// written before this field existed still deserialize.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrackOrigin {
+    /// Captured live from the piano (Record screen).
+    Recorded,
+    /// Authored from scratch in the composer.
+    Composed,
+    /// A recording/import opened in the composer and re-saved.
+    Edited,
+    /// Produced by the video-import pipeline.
+    Imported,
+}
+
+impl TrackOrigin {
+    /// A short human label for the library list.
+    pub fn label(self) -> &'static str {
+        match self {
+            TrackOrigin::Recorded => "recorded",
+            TrackOrigin::Composed => "composed",
+            TrackOrigin::Edited => "edited",
+            TrackOrigin::Imported => "imported",
+        }
+    }
+}
+
 /// The manifest serialised as `meta.json` inside a recording bundle.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordingMeta {
@@ -33,6 +62,10 @@ pub struct RecordingMeta {
     /// Composer key signature. `None` for legacy/piano recordings.
     #[serde(default)]
     pub key: Option<Key>,
+    /// Where the bundle came from. `None` for legacy bundles written before the
+    /// field existed; the library browser then shows it as unknown.
+    #[serde(default)]
+    pub origin: Option<TrackOrigin>,
     /// Schema version; always written as `1`. Kept for forward-compat.
     #[serde(default = "default_version")]
     pub version: u32,
@@ -62,6 +95,7 @@ impl RecordingMeta {
             backing: None,
             grid: None,
             key: None,
+            origin: None,
             version: 1,
         }
     }
@@ -121,6 +155,7 @@ mod tests {
             }),
             grid: None,
             key: None,
+            origin: None,
             version: 1,
         };
         let json = meta.to_json();
@@ -139,6 +174,7 @@ mod tests {
                 root_pc: 7,
                 scale: Scale::NaturalMinor,
             }),
+            origin: None,
             version: 1,
         };
         let json = meta.to_json();
