@@ -2,15 +2,18 @@
 
 > Milestone: M2 · Issue: #23 · Suggested tier: sonnet
 > Branch: `claude/tauri-note-highway`
-> Depends on: M2-tauri-scaffold (#22, **merged** — `tauri-app/` exists)
+> Depends on: M2-tauri-scaffold (#22, **merged**) **and M7-tauri-0-solid-swap
+> (#171 — the frontend is SolidJS; do not start before it lands)**
 > Follow-up: M7-tauri-H-play-live (#168) wires this screen to real bundles
 
 ## Goal
 
 Implement the **Spectrum Live** note-highway screen (Design D from
-`design/note_highway/`) inside `tauri-app/` as a fully animated React screen.
-The canvas engine is ported from the design prototype; data is supplied by a
-mock song fixture (live core integration is a follow-up).
+`design/note_highway/`) inside `tauri-app/` as a fully animated **Solid**
+screen. The canvas engine is ported from the design prototype; data is
+supplied by a mock song fixture (live core integration is a follow-up). The
+prototype components are React JSX — translate per the conventions in
+`tauri-app/CONVENTIONS.md` (from #171); the translation is mechanical.
 
 ## Context
 
@@ -111,17 +114,21 @@ constructor parameters.
 
 ```tsx
 export function HighwayScreen() {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const engRef = useRef<HighwayCanvas | null>(null);
-  const [, forceUpdate] = useReducer((x) => x + 1, 0);
-  // mount engine, RAF for header state updates (throttled ~9 fps)
-  // unmount: eng.stop()
+  let canvasEl!: HTMLCanvasElement;
+  let eng: HighwayCanvas | null = null;
+  const [frame, setFrame] = createSignal(0); // bumped ~9 fps for header reads
+  onMount(() => {
+    eng = new HighwayCanvas(canvasEl, cfgFusion, SONG);
+    eng.start();
+    // interval (~110 ms): setFrame(f => f + 1) so the header re-reads eng
+  });
+  onCleanup(() => eng?.stop());
   return (
-    <div style={{ height: "100vh", display: "flex", flexDirection: "column",
-                  background: "#0f1016", fontFamily: "'Space Grotesk', system-ui, sans-serif" }}>
-      <HighwayHeader engRef={engRef} song={SONG} />
-      <div style={{ flex: "1 1 auto", minHeight: 0, position: "relative" }}>
-        <canvas ref={canvasRef} style={{ width: "100%", height: "100%", display: "block" }} />
+    <div style={{ height: "100vh", display: "flex", "flex-direction": "column",
+                  background: "#0f1016", "font-family": "'Space Grotesk', system-ui, sans-serif" }}>
+      <HighwayHeader eng={() => eng} frame={frame} song={SONG} />
+      <div style={{ flex: "1 1 auto", "min-height": 0, position: "relative" }}>
+        <canvas ref={canvasEl} style={{ width: "100%", height: "100%", display: "block" }} />
       </div>
     </div>
   );
@@ -130,9 +137,11 @@ export function HighwayScreen() {
 
 ### `HighwayHeader.tsx`
 
-Faithfully reproduce the `FusionProto` header from the design. Reads
-`engRef.current` for `score`, `combo`; derives bar/beat/chord from
-`performance.now() - eng.t0` modulo `SONG.LOOP`. The 12-dot color wheel uses
+Faithfully reproduce the `FusionProto` header from the design. Reads the
+engine accessor for `score`, `combo` each time `frame()` bumps (read
+`props.frame()` in the JSX so the throttle signal drives the updates);
+derives bar/beat/chord from `performance.now() - eng.t0` modulo
+`SONG.LOOP`. The 12-dot color wheel uses
 `oklch(0.72 0.16 ${(i * 30 + 8) % 360})` for i in 0..11, rendered as 7×7 px
 rounded squares.
 

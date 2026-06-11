@@ -2,7 +2,8 @@
 
 > Milestone: M7 · Issue: #161 · Suggested tier: opus
 > Branch: `claude/tauri-ipc-bridge`
-> Depends on: M2-tauri-scaffold (#22, merged)
+> Depends on: M2-tauri-scaffold (#22, merged), M7-tauri-0-solid-swap (#171 —
+> the frontend is SolidJS)
 
 ## Goal
 
@@ -107,8 +108,9 @@ TypeScript: `npx tsc --noEmit` (strict) covers the type mirrors.
 - Do not start audio (`crates/audio`) or MIDI (`crates/midi`) — effects are
   emitted, not yet sounded (#166/#167).
 - Do not depend on `rockcraft-control`; mirror its vocabulary only.
-- Do not add frontend state libraries (no redux/zustand) — `useState` +
-  event listeners.
+- Do not add frontend state libraries — Solid's own `createSignal`/
+  `createStore` + event listeners (per `tauri-app/CONVENTIONS.md`). The
+  snapshot mirror is a `createStore` updated from the `snapshot` event.
 
 ## Acceptance
 

@@ -2,7 +2,8 @@
 
 > Milestone: M7 · Issue: #162 · Suggested tier: sonnet
 > Branch: `claude/tauri-shell-menu`
-> Depends on: M2-tauri-scaffold (#22, merged) · coordinates with #23/#24
+> Depends on: M2-tauri-scaffold (#22, merged), M7-tauri-0-solid-swap (#171 —
+> the frontend is SolidJS) · coordinates with #23/#24
 
 ## Goal
 
@@ -28,7 +29,7 @@ slot their screens into this router instead of inventing navigation.
 
 ```
 shell/
-  Router.tsx     # const [screen, setScreen] = useState<Screen>({kind:"menu"})
+  Router.tsx     # const [screen, setScreen] = createSignal<Screen>({kind:"menu"})
   screens.ts     # type Screen = { kind: "menu" } | { kind: "record" } |
                  #   { kind: "play" } | { kind: "edit" } |
                  #   { kind: "backing-picker" } | { kind: "video-picker" } |
@@ -39,7 +40,9 @@ shell/
                  # "Esc to menu"
 ```
 
-`Router.tsx` provides `{ screen, navigate }` via React context. Global
+`Router.tsx` provides `{ screen, navigate }` via Solid context
+(`createContext`/`useContext`), with the active screen rendered through a
+`<Switch>`/`<Match>` over `screen().kind`. Global
 `keydown` listener: `Escape` navigates to the menu from any non-menu screen
 (menu itself: Escape does nothing — Quit is an explicit item, unlike the
 TUI's `q`, because accidental window-close is worse on desktop).
@@ -75,7 +78,8 @@ acceptance below.
 ## Scope boundaries (do NOT)
 
 - Do not implement any destination screen (library, edit, import, …).
-- Do not add a routing library — `useState` + context only.
+- Do not add a routing library (no `@solidjs/router`) — a signal + context
+  only.
 - Do not modify anything in `crates/`.
 - Do not call IPC commands (the menu is purely frontend in this issue).
 
