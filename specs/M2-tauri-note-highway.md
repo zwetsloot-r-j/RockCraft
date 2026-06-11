@@ -2,7 +2,8 @@
 
 > Milestone: M2 · Issue: #23 · Suggested tier: sonnet
 > Branch: `claude/tauri-note-highway`
-> Depends on: M2-tauri-scaffold (#22 must be merged first)
+> Depends on: M2-tauri-scaffold (#22, **merged** — `tauri-app/` exists)
+> Follow-up: M7-tauri-H-play-live (#168) wires this screen to real bundles
 
 ## Goal
 
@@ -12,6 +13,29 @@ The canvas engine is ported from the design prototype; data is supplied by a
 mock song fixture (live core integration is a follow-up).
 
 ## Context
+
+### How this relates to the live TUI (updated 2026-06)
+
+This spec was written before the TUI play screen matured. The mock-only scope
+below is **unchanged**, but port with the live wiring (#168,
+`specs/M7-tauri-H-play-live.md`) in mind:
+
+- The TUI play screen (`crates/tui/src/play.rs`) drives time with
+  `core::PlayClock` (pausable, injected `advance(dt_us)`) and gates steps
+  with `core::WaitGate` (wait mode) — the engine's internal
+  `performance.now() - t0` clock will be **replaced by an external time
+  source** in #168. Keep the engine's clock behind one small accessor so
+  that swap is local.
+- The engine's built-in `runScoring` is demo-only; real judgments come from
+  `core::scoring` (perfect 50 ms / good 150 ms) off MIDI timestamps. Keep
+  scoring encapsulated for the same reason.
+- Core's `NoteSpan` is `(pitch, start_us, end_us)` in microseconds with no
+  hand info; the fixture's `{note, start, end, hand}` ms shape is the design
+  prototype's. Fine for the mock — `types.ts` documents the mapping in a
+  comment so #168 converts at the boundary instead of editing the engine.
+- The app shell/router lands separately (#162, `specs/M7-tauri-B-shell-menu.md`).
+  If it's present on `main`, mount the screen as the `play` route instead of
+  replacing `App.tsx` wholesale.
 
 Design reference files:
 
@@ -133,7 +157,8 @@ before PR is opened.
 
 ## Scope boundaries (do NOT)
 
-- Do not wire to live Tauri IPC / real MIDI data — mock song only.
+- Do not wire to live Tauri IPC / real MIDI data — mock song only
+  (live wiring is #168; the IPC bridge itself is #161).
 - Do not implement the record screen (separate issue).
 - Do not modify anything in `crates/`.
 - Do not add audio playback.

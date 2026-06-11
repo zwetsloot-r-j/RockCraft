@@ -2,7 +2,8 @@
 
 > Milestone: M2 · Issue: #24 · Suggested tier: sonnet
 > Branch: `claude/tauri-record-screen`
-> Depends on: M2-tauri-scaffold (#22 must be merged first)
+> Depends on: M2-tauri-scaffold (#22, **merged** — `tauri-app/` exists)
+> Follow-up: M7-tauri-I-record-live (#169) wires this screen to live MIDI + saving
 
 ## Goal
 
@@ -14,6 +15,30 @@ All data is mocked from the Ember Lantern take fixture; live MIDI hookup is a
 follow-up.
 
 ## Context
+
+### How this relates to the live TUI (updated 2026-06)
+
+This spec predates the TUI record screen's current state. The mock-only scope
+below is **unchanged**, but know what the controls will eventually mean so
+the port stays wirable (#169, `specs/M7-tauri-I-record-live.md`):
+
+- **Real today** in core/TUI (`crates/tui/src/record.rs`, `core::Composer`):
+  recording to an `EventBuffer`, saving bundles to
+  `recordings/take-<timestamp>/` (`song.mid` + `meta.json` + backing copy),
+  recording **with a backing track** (origin anchored to backing start),
+  metronome (`toggle_metronome`), count-in (`start_count_in_record`),
+  undo/redo.
+- **Visual-only stubs with no core action yet**: Trim, Quantize, Punch-in,
+  the CLEF/SPELL pickers, and the note inspector's Nudge/Snap buttons. Build
+  them as the spec says, but keep them clearly separable — #169 disables the
+  unwired ones rather than faking behaviour.
+- The SNAP picker below shows `1/8 · 1/16 · 1/32`; core's
+  `Subdivision` also has `Quarter` and two triplet values
+  (`crates/core/src/grid.rs`). Keep the segmented control's value list in
+  one constant so #169 can extend it without layout surgery.
+- The app shell/router lands separately (#162). If present on `main`, mount
+  this as the `record` route instead of hand-rolling the two-button switcher
+  in `App.tsx`.
 
 Design reference files:
 
@@ -152,7 +177,8 @@ below.
 
 ## Scope boundaries (do NOT)
 
-- Do not wire to live Tauri IPC / real MIDI — mock take fixture only.
+- Do not wire to live Tauri IPC / real MIDI — mock take fixture only
+  (live wiring is #169; the IPC bridge itself is #161).
 - Do not implement the note highway (separate issue).
 - Do not modify anything in `crates/`.
 - Do not implement drag-edit of notes on the canvas (inspector Nudge/Snap
