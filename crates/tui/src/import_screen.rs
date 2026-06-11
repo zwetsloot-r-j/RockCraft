@@ -612,28 +612,48 @@ mod tests {
 
     #[test]
     fn importing_screen_no_fetch_cmd_url_fails() {
-        // Without ROCKCRAFT_FETCH_CMD set and no local fetch.sh, a URL import
-        // must surface a clear error.
-        // Remove env var for isolation.
-        let prev = std::env::var("ROCKCRAFT_FETCH_CMD").ok();
+        // With no fetch command available, a URL import must surface a clear
+        // error — without ever spawning a fetch hook or touching the network.
+        //
+        // Isolation matters here: the pipeline resolves the fetch command from
+        // `ROCKCRAFT_FETCH_CMD`, then falls back to `scripts/local/fetch.sh`
+        // under the workspace root. On a developer machine that has set up
+        // video import, that private (gitignored) script exists, so merely
+        // clearing the env var is not enough — the probe would find the real
+        // hook and the test would actually run yt-dlp against example.com.
+        //
+        // We therefore also point `ROCKCRAFT_WORKSPACE` at an empty temp dir so
+        // the `scripts/local/fetch.sh` probe is guaranteed to find nothing,
+        // exercising the genuine "no fetch command configured" path regardless
+        // of ambient developer state.
+        let empty_workspace = temp_dir("no_fetch_cmd_workspace");
+
+        let prev_cmd = std::env::var("ROCKCRAFT_FETCH_CMD").ok();
+        let prev_ws = std::env::var("ROCKCRAFT_WORKSPACE").ok();
         unsafe {
             std::env::remove_var("ROCKCRAFT_FETCH_CMD");
+            std::env::set_var("ROCKCRAFT_WORKSPACE", &empty_workspace);
         }
 
         let mut screen =
             ImportingScreen::start(ImportInput::Url("https://example.com/video.mp4".into()));
         std::thread::sleep(std::time::Duration::from_millis(200));
         let outcome = screen.poll();
-        assert!(
-            matches!(outcome, Some(ImportOutcome::Failed(_))),
-            "expected Failed when no fetch command is available"
-        );
+        let failed = matches!(outcome, Some(ImportOutcome::Failed(_)));
 
-        // Restore env.
-        if let Some(v) = prev {
-            unsafe {
-                std::env::set_var("ROCKCRAFT_FETCH_CMD", v);
+        // Restore env before asserting so a failure can't leak state.
+        unsafe {
+            match prev_cmd {
+                Some(v) => std::env::set_var("ROCKCRAFT_FETCH_CMD", v),
+                None => std::env::remove_var("ROCKCRAFT_FETCH_CMD"),
+            }
+            match prev_ws {
+                Some(v) => std::env::set_var("ROCKCRAFT_WORKSPACE", v),
+                None => std::env::remove_var("ROCKCRAFT_WORKSPACE"),
             }
         }
+        fs::remove_dir_all(&empty_workspace).ok();
+
+        assert!(failed, "expected Failed when no fetch command is available");
     }
 }
