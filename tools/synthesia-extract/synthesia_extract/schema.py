@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 # Bump when the extraction algorithm changes in a way reviewers should notice.
-EXTRACTOR_VERSION = "synthesia-extract 0.1.0"
+EXTRACTOR_VERSION = "synthesia-extract 0.2.0"
 
 
 class Hand(enum.Enum):
@@ -60,10 +60,12 @@ class ExtractedNote:
 class SourceMeta:
     """Provenance/diagnostics. Mirrors ``rockcraft_import::schema::SourceMeta``.
 
-    ``audio_fusion`` is a sidecar-only diagnostic recording what the M6-F audio
-    pass did (``"applied: ..."`` / ``"skipped: ..."``). The Rust deserializer
-    does not ``deny_unknown_fields``, so it ignores this field — it exists for
-    logs and the M6-E review step, not for the Rust contract.
+    ``audio_fusion`` and ``noise_filter`` are sidecar-only diagnostics recording
+    what the M6-F audio pass and the visual noise-rejection stages did
+    (``"applied: ..."`` / ``"skipped: ..."`` / ``"ghosts dropped N ..."``). The
+    Rust deserializer does not ``deny_unknown_fields``, so it ignores these
+    fields — they exist for logs and the M6-E review step, not for the Rust
+    contract.
     """
 
     extractor_version: str = EXTRACTOR_VERSION
@@ -71,6 +73,7 @@ class SourceMeta:
     fps: Optional[float] = None
     scroll_px_per_s: Optional[float] = None
     audio_fusion: Optional[str] = None
+    noise_filter: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {"extractor_version": self.extractor_version}
@@ -82,6 +85,8 @@ class SourceMeta:
             out["scroll_px_per_s"] = float(self.scroll_px_per_s)
         if self.audio_fusion is not None:
             out["audio_fusion"] = str(self.audio_fusion)
+        if self.noise_filter is not None:
+            out["noise_filter"] = str(self.noise_filter)
         return out
 
 

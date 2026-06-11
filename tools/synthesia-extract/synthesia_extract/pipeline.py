@@ -15,8 +15,10 @@ Stages:
 3. :func:`estimate_scroll` — vertical cross-correlation of the falling region
    across frames -> scroll speed (px/s).
 4. :func:`build_roll` — accumulate per-pitch song-time coverage + colour.
-5. :func:`extract_notes` / :func:`assign_hands` — threshold coverage into notes,
-   map dominant colours to Left/Right.
+5. :func:`extract_notes` — threshold coverage into notes; then
+   :func:`suppress_neighbor_ghosts` and :func:`filter_color_modes` reject
+   what isn't a falling bar (halo bleed, animated-artwork noise).
+6. :func:`assign_hands` — map dominant colours to Left/Right.
 """
 
 from __future__ import annotations
@@ -737,6 +739,121 @@ def extract_notes(
     return raws
 
 
+def suppress_neighbor_ghosts(
+    raws: list[_RawNote],
+    *,
+    brightness_ratio: float = 1.2,
+    chroma_tol: float = 0.10,
+    min_overlap: float = 0.5,
+) -> tuple[list[_RawNote], int]:
+    """Drop *ghost* notes: a bar's glow bleeding into the adjacent lane.
+
+    Rendered bars (and compressed video) bloom a halo past their own lane, so a
+    strong note often drags a faint copy of itself 1–2 semitones away.  A ghost
+    is recognisable by all three of: it overlaps a neighbouring-lane note in
+    time, that neighbour is much *brighter* (the halo is an attenuated fringe),
+    and the two share a chroma direction (a halo has its parent's colour — a
+    genuinely different-coloured neighbouring note, e.g. the other hand in a
+    close interval, is never suppressed).  Returns ``(survivors, n_dropped)``.
+    """
+    n = len(raws)
+    if n < 2:
+        return raws, 0
+    colors = np.array([r.color for r in raws], dtype=np.float64)
+    brightness = colors.mean(axis=1)
+    chroma = colors / np.maximum(np.linalg.norm(colors, axis=1, keepdims=True), 1e-6)
+    by_pitch: dict[int, list[int]] = {}
+    for i, r in enumerate(raws):
+        by_pitch.setdefault(r.pitch, []).append(i)
+
+    keep = np.ones(n, dtype=bool)
+    for i, r in enumerate(raws):
+        s, e = r.start_us, r.start_us + r.dur_us
+        for dp in (-2, -1, 1, 2):
+            for j in by_pitch.get(r.pitch + dp, ()):
+                other = raws[j]
+                overlap = min(e, other.start_us + other.dur_us) - max(s, other.start_us)
+                if (
+                    overlap > min_overlap * r.dur_us
+                    and brightness[j] > brightness_ratio * brightness[i]
+                    and float(np.linalg.norm(chroma[i] - chroma[j])) <= chroma_tol
+                ):
+                    keep[i] = False
+                    break
+            if not keep[i]:
+                break
+    survivors = [r for r, k in zip(raws, keep) if k]
+    return survivors, n - len(survivors)
+
+
+def filter_color_modes(
+    raws: list[_RawNote],
+    *,
+    radius: float = 0.12,
+    min_mode_frac: float = 0.10,
+    max_modes: int = 4,
+    min_notes: int = 24,
+) -> tuple[list[_RawNote], str]:
+    """Keep only notes whose colour belongs to a tight, coverage-strong mode;
+    return ``(survivors, diagnostic)``.
+
+    Real falling bars are rendered in a handful of solid colours (per hand, or
+    one translucent colour tinted per scene), so their *full* colours —
+    brightness included, since a translucent bar over any backdrop stays bright
+    — pile into modes that are simultaneously *tight* (every note near one
+    colour) and *strong* (a large share of the total vote mass).  Bright
+    animated artwork — characters, sparkles, flashes — is colour-diverse: its
+    false notes scatter across colour space and never form such a mode.
+    Dropping the diffuse residue removes them while leaving any solid-colour
+    bar population (however styled) untouched.
+
+    Fail-safes: clips with too few notes to support the statistics pass through
+    unfiltered, as does a population with no qualifying mode at all (we cannot
+    tell signal from noise — never destroy the chart on a hunch).
+    """
+    if len(raws) < min_notes:
+        return raws, f"skipped: only {len(raws)} notes"
+    colors = np.array([r.color for r in raws], dtype=np.float64) / 255.0
+    # Vote mass: how much evidence the roll accumulated for this note.
+    weight = np.array([r.coverage * r.dur_us for r in raws], dtype=np.float64)
+    total = float(weight.sum())
+    if total <= 0:
+        return raws, "skipped: zero weight"
+
+    remaining = np.ones(len(raws), dtype=bool)
+    keep = np.zeros(len(raws), dtype=bool)
+    rng = np.random.default_rng(0)
+    modes = 0
+    for _ in range(max_modes):
+        idx = np.where(remaining)[0]
+        if idx.size == 0:
+            break
+        # Densest ball: try a bounded sample of the remaining notes as centres
+        # and take the one capturing the most weight (O(sample * n), no O(n^2)).
+        cand = idx if idx.size <= 256 else rng.choice(idx, 256, replace=False)
+        d = np.linalg.norm(colors[idx][None, :] - colors[cand][:, None], axis=2)
+        captured = ((d <= radius) * weight[idx][None, :]).sum(axis=1)
+        center = colors[cand[int(captured.argmax())]]
+        # A few mean-shift steps to settle on the mode's true centre.
+        for _ in range(3):
+            member = np.linalg.norm(colors[idx] - center, axis=1) <= radius
+            if not member.any():
+                break
+            center = np.average(colors[idx][member], axis=0, weights=weight[idx][member])
+        member = np.linalg.norm(colors[idx] - center, axis=1) <= radius
+        if float(weight[idx][member].sum()) / total < min_mode_frac:
+            break  # strongest remaining mode is weak -> the rest is residue
+        keep[idx[member]] = True
+        remaining[idx[member]] = False
+        modes += 1
+
+    if modes == 0:
+        return raws, "skipped: no qualifying colour mode"
+    survivors = [r for r, k in zip(raws, keep) if k]
+    dropped = len(raws) - len(survivors)
+    return survivors, f"kept {modes} mode(s), dropped {dropped}/{len(raws)} notes"
+
+
 def assign_hands(raws: list[_RawNote]) -> list[ExtractedNote]:
     """Cluster bar colours into up to two hands and map them to Left/Right.
 
@@ -879,6 +996,12 @@ def extract_chart(
         us_per_px,
         threshold=0.6,
         min_run_px=max(3, int(round(0.04 * scroll))),
+    )
+    n_extracted = len(raws)
+    raws, n_ghosts = suppress_neighbor_ghosts(raws)
+    raws, color_diag = filter_color_modes(raws)
+    source.noise_filter = (
+        f"extracted {n_extracted}; ghosts dropped {n_ghosts}; colour modes: {color_diag}"
     )
     notes = assign_hands(raws)
 

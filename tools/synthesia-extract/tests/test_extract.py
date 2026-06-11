@@ -211,6 +211,51 @@ def test_overlay_black_pattern_calibration():
 
 
 # --------------------------------------------------------------------------- #
+# Animated-background noise rejection (issue #151)
+# --------------------------------------------------------------------------- #
+def test_animated_background_noise_rejected():
+    """A fully animated music-video backdrop — bright, lane-narrow shapes
+    falling at near-scroll speed — defeats every per-pixel gate and must be
+    rejected by the note-level colour-mode filter instead."""
+    cfg = SynthConfig()
+    notes, _ = c_major_demo(cfg)
+    frames, _ = render_overlay_frames(notes, cfg, animated_blobs=8)
+    chart = extract_chart(frames, cfg.fps, title="animated-overlay")
+
+    tol = _frame_tol_us(cfg, frames=2)
+    got_pitches = sorted(n.pitch for n in chart.notes)
+    want_pitches = sorted(n.pitch for n in notes)
+    assert got_pitches == want_pitches
+
+    for gt in notes:
+        m = _match(chart.notes, gt.pitch, gt.start_us)
+        assert m is not None, f"missing note pitch={gt.pitch}"
+        assert abs(m.start_us - gt.start_us) <= tol, f"onset off for {gt}"
+        assert abs(m.dur_us - gt.dur_us) <= tol, f"dur off for {gt}"
+    # The diagnostic records that the filter actually engaged.
+    assert "dropped" in chart.source.noise_filter
+
+
+def test_bar_glow_ghosts_suppressed():
+    """Bar bloom bleeding into neighbouring lanes must not become ghost notes
+    one or two semitones away from every real note."""
+    cfg = SynthConfig()
+    notes, _ = c_major_demo(cfg)
+    frames, _ = render_overlay_frames(notes, cfg, glow=0.35)
+    chart = extract_chart(frames, cfg.fps)
+    assert sorted(n.pitch for n in chart.notes) == sorted(n.pitch for n in notes)
+
+
+def test_animated_background_with_glow():
+    """Both failure classes at once: the full animated-music-video source."""
+    cfg = SynthConfig()
+    notes, _ = c_major_demo(cfg)
+    frames, _ = render_overlay_frames(notes, cfg, animated_blobs=8, glow=0.35)
+    chart = extract_chart(frames, cfg.fps)
+    assert sorted(n.pitch for n in chart.notes) == sorted(n.pitch for n in notes)
+
+
+# --------------------------------------------------------------------------- #
 # JSON wire format (must match crates/import schema)
 # --------------------------------------------------------------------------- #
 def test_json_schema_shape():
