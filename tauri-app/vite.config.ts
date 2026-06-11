@@ -1,5 +1,5 @@
 import { defineConfig } from "vite";
-import react from "@vitejs/plugin-react";
+import solid from "vite-plugin-solid";
 
 // @tauri-apps/cli runs `npm run dev` (vite) on a fixed port; Tauri's
 // devUrl in tauri.conf.json must match. HMR over the same host keeps the
@@ -8,7 +8,7 @@ const host = process.env.TAURI_DEV_HOST;
 
 // https://vitejs.dev/config/
 export default defineConfig({
-  plugins: [react()],
+  plugins: [solid()],
   // Vite options tailored for Tauri development.
   clearScreen: false,
   server: {

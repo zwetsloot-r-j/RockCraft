@@ -4,14 +4,14 @@ export default function App() {
       style={{
         height: "100vh",
         display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
+        "align-items": "center",
+        "justify-content": "center",
         background: "#0f1016",
         color: "#e7e8ef",
-        fontFamily: "system-ui, sans-serif",
-        fontSize: 28,
-        fontWeight: 600,
-        letterSpacing: -0.5,
+        "font-family": "system-ui, sans-serif",
+        "font-size": "28px",
+        "font-weight": 600,
+        "letter-spacing": "-0.5px",
       }}
     >
       RockCraft
