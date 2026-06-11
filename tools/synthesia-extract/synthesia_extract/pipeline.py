@@ -746,16 +746,19 @@ def extract_notes(
         for a, b in runs:
             if b - a < min_run_px:
                 continue
-            # Colour comes from the high-coverage core bins only: extension
-            # bins are weakly attested (their pixels are part background) and
-            # would tint the note's colour away from its ink.
-            core = on[a:b] if hysteresis_low is not None else np.ones(b - a, dtype=bool)
+            # Colour comes from the strongest-evidence bins only (near the
+            # run's own coverage peak): bridged-gap and weakly-attested bins
+            # are part background, and unrelated same-lane evidence welded
+            # onto the run (animated artwork) sits at lower coverage than the
+            # bar core — neither may tint the note away from its ink.
+            seg_cov = coverage[a:b]
+            core = seg_cov >= max(threshold, 0.8 * float(seg_cov.max()))
             core_votes = float(votes[pi, a:b][core].sum())
             total_votes = float(votes[pi, a:b].sum())
             if total_votes <= 0 or core_votes <= 0:
                 continue
             color = color_sum[pi, a:b][core].sum(axis=0) / core_votes
-            cov = float(np.clip(coverage[a:b].mean(), 0.0, 1.0))
+            cov = float(np.clip(seg_cov.mean(), 0.0, 1.0))
             raws.append(
                 _RawNote(
                     pitch=pitch,
@@ -814,6 +817,20 @@ def suppress_neighbor_ghosts(
                 break
     survivors = [r for r, k in zip(raws, keep) if k]
     return survivors, n - len(survivors)
+
+
+def _is_satellite(
+    center: np.ndarray, accepted: list[np.ndarray], satellite_dist: float
+) -> bool:
+    """A small mode counts as a satellite of its nearest accepted mode only if
+    it is both *near* it in colour space (the same ink under a different scene
+    tint) and *comparably bright* — a same-chroma mode at a fraction of the
+    anchor's brightness is residual halo bleed (ghosts), not a tint: scene
+    tints shift hue, never cost half the ink's brightness."""
+    nearest = min(accepted, key=lambda c: float(np.linalg.norm(center - c)))
+    if float(np.linalg.norm(center - nearest)) > satellite_dist:
+        return False
+    return float(center.mean()) >= 0.7 * float(nearest.mean())
 
 
 def filter_color_modes(
@@ -887,9 +904,7 @@ def filter_color_modes(
             break  # strongest remaining mode is a speck -> the rest is residue
         if frac >= min_mode_frac:
             primaries += 1
-        elif accepted_centers and min(
-            float(np.linalg.norm(center - c)) for c in accepted_centers
-        ) <= satellite_dist:
+        elif accepted_centers and _is_satellite(center, accepted_centers, satellite_dist):
             satellites += 1
         else:
             # Tight but weak and far from every bar ink: noise. Carve it out
@@ -1042,8 +1057,13 @@ def extract_chart(
     votes, totals, color_sum, pitches, us_per_px = build_roll(
         frames, fps, kb, scroll, plate=bg, max_run_w=max_run_w
     )
-    # 40 ms is shorter than any playable tutorial note; in pixels it scales
-    # with the scroll speed.
+    # 25 ms is shorter than any playable tutorial note; in pixels it scales
+    # with the scroll speed.  The run gate is deliberately permissive — the
+    # eval-harness sweep showed the note-level noise filters downstream absorb
+    # what it admits, while a tighter gate costs real fast notes.  (Lowering
+    # the coverage threshold below 0.6 scores higher still on busy real
+    # sources, but lets bright artwork weld onto a bar's run in its own lane,
+    # corrupting that note's timing — not worth it.)
     raws = extract_notes(
         votes,
         totals,
@@ -1052,7 +1072,7 @@ def extract_chart(
         us_per_px,
         threshold=0.6,
         hysteresis_low=0.42,
-        min_run_px=max(3, int(round(0.04 * scroll))),
+        min_run_px=max(3, int(round(0.025 * scroll))),
     )
     n_extracted = len(raws)
     raws, n_ghosts = suppress_neighbor_ghosts(raws)

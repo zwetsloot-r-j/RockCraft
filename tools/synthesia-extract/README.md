@@ -72,14 +72,21 @@ python eval.py --chart chart.json --ref reference.json --tol-ms 150
 
 The bundled transcriber (`synthesia_extract.audio`) is **self-contained
 classical DSP** (per-pitch FFT band-pass → amplitude envelope → onsets +
-velocity), so it needs no ML weights and stays hermetic in CI. For real-world
-accuracy you can drop in a learned piano-transcription model — e.g.
-[`basic-pitch`](https://github.com/spotify/basic-pitch) or an
-Onsets-and-Frames implementation — behind the same `TranscribedNote` interface
-(`pitch`, `start_us`, `dur_us`, `velocity`); a learned model reports absolute
-MIDI velocity and would set `REFERENCE_PEAK_AMPLITUDE`/`_ENVELOPE_PEAK_CAL` to
-`1.0`. Such a model is an **optional** extra (heavy TF/Torch deps) and is *not*
-in `requirements.txt`; the fusion path works without it.
+velocity), so it needs no ML weights and stays hermetic in CI.
+
+For real-world accuracy, the fusion pass **automatically upgrades** to
+[`basic-pitch`](https://github.com/spotify/basic-pitch) whenever it is
+importable (`transcribe_learned`, same `TranscribedNote` interface): a learned
+model hears through pedal sustain and dense polyphony the DSP band-pass
+cannot, which directly improves merged-note splitting and velocities. It is an
+**optional** extra and *not* in `requirements.txt`; the fusion path works
+without it. On Python ≥3.12 (where basic-pitch's TensorFlow pin has no
+wheels), install it against the ONNX runtime:
+
+```bash
+pip install basic-pitch --no-deps
+pip install onnxruntime librosa pretty-midi scipy scikit-learn mir_eval resampy
+```
 
 ## Setup
 

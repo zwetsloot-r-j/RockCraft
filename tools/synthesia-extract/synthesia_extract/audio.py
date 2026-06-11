@@ -308,6 +308,41 @@ def transcribe(
 
 
 # --------------------------------------------------------------------------- #
+# Optional learned transcriber (basic-pitch) behind the same interface
+# --------------------------------------------------------------------------- #
+def transcribe_learned(audio_path: str) -> Optional[list[TranscribedNote]]:
+    """Transcribe with basic-pitch when it is installed; ``None`` otherwise.
+
+    A learned model hears through pedal sustain and dense polyphony far better
+    than the classical band-pass transcriber, which directly improves the
+    fusion pass's merged-note splitting and velocities.  It is a heavy
+    *optional* dependency (not in ``requirements.txt`` — see the README's
+    transcription-dependency note); without it, callers fall back to
+    :func:`transcribe` and everything still works.
+    """
+    try:
+        from basic_pitch import ICASSP_2022_MODEL_PATH
+        from basic_pitch.inference import predict
+    except Exception:
+        return None
+    try:
+        _output, _midi, note_events = predict(str(audio_path), ICASSP_2022_MODEL_PATH)
+    except Exception:
+        return None
+    out = [
+        TranscribedNote(
+            pitch=int(p),
+            start_us=int(round(s * 1e6)),
+            dur_us=max(1, int(round((e - s) * 1e6))),
+            velocity=int(np.clip(round(a * 127.0), _MIN_VELOCITY, _MAX_VELOCITY)),
+        )
+        for (s, e, p, a, _bends) in note_events
+    ]
+    out.sort(key=lambda t: (t.start_us, t.pitch))
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # Clock alignment + merged-note splitting
 # --------------------------------------------------------------------------- #
 def estimate_global_offset(
@@ -519,6 +554,7 @@ def fuse_chart(
     samples: np.ndarray,
     sample_rate: int,
     *,
+    audio_path: Optional[str] = None,
     frame_uncertainty_us: Optional[int] = None,
     match_tol_us: Optional[int] = None,
 ) -> ExtractedChart:
@@ -528,6 +564,11 @@ def fuse_chart(
     except for ``source.audio_fusion`` explaining the skip.  Defaults for the
     timing windows derive from the chart's fps (one frame of uncertainty, a
     two-frame match window) so callers usually pass only the audio.
+
+    When ``audio_path`` is given *and* basic-pitch is installed, transcription
+    uses the learned model (:func:`transcribe_learned`); otherwise the bundled
+    DSP transcriber.  The suitability gate applies either way — fusion never
+    runs on full-mix audio.
     """
     samples, sample_rate = _decimate_for_transcription(samples, sample_rate)
     suitable, reason = assess_suitability(samples, sample_rate)
@@ -542,13 +583,18 @@ def fuse_chart(
     if match_tol_us is None:
         match_tol_us = 2 * frame_us
 
-    # Transcribe the chart's pitches plus the lower pitches whose harmonics
-    # land in them — the split pass needs those to recognise harmonic bleed.
-    pitches = {n.pitch for n in chart.notes}
-    pitches |= {
-        p - i for p in pitches for i in _HARMONIC_INTERVALS if p - i >= 21
-    }
-    transcribed = transcribe(samples, sample_rate, sorted(pitches))
+    backend = "dsp"
+    transcribed = transcribe_learned(audio_path) if audio_path is not None else None
+    if transcribed is not None:
+        backend = "learned"
+    else:
+        # Transcribe the chart's pitches plus the lower pitches whose harmonics
+        # land in them — the split pass needs those to recognise harmonic bleed.
+        pitches = {n.pitch for n in chart.notes}
+        pitches |= {
+            p - i for p in pitches for i in _HARMONIC_INTERVALS if p - i >= 21
+        }
+        transcribed = transcribe(samples, sample_rate, sorted(pitches))
 
     # Align the visual clock to the audio clock before any per-note matching:
     # the constant lead/lag would otherwise eat into every match tolerance.
@@ -576,7 +622,7 @@ def fuse_chart(
         match_tol_us=match_tol_us,
     )
     chart.source.audio_fusion = (
-        f"applied: {reason}; offset {offset_us / 1000:+.0f} ms; "
+        f"applied ({backend}): {reason}; offset {offset_us / 1000:+.0f} ms; "
         f"split {n_split} merged notes; {matched}/{len(fused_notes)} notes matched"
     )
     return ExtractedChart(notes=fused_notes, source=chart.source)

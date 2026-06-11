@@ -125,7 +125,7 @@ def main(argv: list[str] | None = None) -> int:
         except (FileNotFoundError, ValueError, OSError) as e:
             print(f"error: could not read audio: {e}", file=sys.stderr)
             return 2
-        chart = fuse_chart(chart, samples, sample_rate)
+        chart = fuse_chart(chart, samples, sample_rate, audio_path=args.audio)
         print(f"audio-fusion: {chart.source.audio_fusion}", file=sys.stderr)
 
     json_str = chart.to_json(indent=2)

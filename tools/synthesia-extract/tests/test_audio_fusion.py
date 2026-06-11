@@ -468,3 +468,44 @@ def test_split_pedal_sustained_repeats():
     sixty = [n for n in fused.notes if n.pitch == 60]
     assert len(sixty) == 2, fused.source.audio_fusion
     assert abs(sixty[1].start_us - 550_000) <= 40_000
+
+
+def test_learned_transcriber_adapter(monkeypatch, tmp_path):
+    """When basic-pitch is importable, fuse_chart uses it (events mapped onto
+    TranscribedNote); when not, it falls back to the DSP transcriber."""
+    import types
+
+    fake = types.ModuleType("basic_pitch")
+    fake.ICASSP_2022_MODEL_PATH = "fake-model"
+    inference = types.ModuleType("basic_pitch.inference")
+
+    def predict(path, model):
+        assert model == "fake-model"
+        # (start_s, end_s, pitch, amplitude, pitch_bends)
+        return None, None, [(0.10, 0.40, 60, 0.75, None), (0.60, 0.90, 60, 0.4, None)]
+
+    inference.predict = predict
+    monkeypatch.setitem(sys.modules, "basic_pitch", fake)
+    monkeypatch.setitem(sys.modules, "basic_pitch.inference", inference)
+
+    events = audio.transcribe_learned("ignored.wav")
+    assert [(t.pitch, t.start_us, t.velocity) for t in events] == [
+        (60, 100_000, 95),
+        (60, 600_000, 51),
+    ]
+
+    # End-to-end: the learned events split a merged visual note even though the
+    # *samples* are a plain clean tone (suitability still gated on samples).
+    truth = [SynthNote(60, 100_000, 300_000, "Right", velocity=95)]
+    track = render_audio(truth, sample_rate=DEFAULT_SAMPLE_RATE, total_s=1.2)
+    merged = [SynthNote(60, 100_000, 800_000, "Right")]
+    fused = audio.fuse_chart(
+        _visual_chart(merged), track, DEFAULT_SAMPLE_RATE, audio_path="ignored.wav"
+    )
+    assert "applied (learned)" in fused.source.audio_fusion
+    assert len([n for n in fused.notes if n.pitch == 60]) == 2
+
+
+def test_learned_transcriber_absent_falls_back(monkeypatch):
+    monkeypatch.setitem(sys.modules, "basic_pitch", None)  # import -> ImportError
+    assert audio.transcribe_learned("x.wav") is None
