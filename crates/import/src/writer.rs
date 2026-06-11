@@ -4,7 +4,7 @@ use midly::{
     num::{u15, u28, u4, u7},
     Header, MidiMessage, Smf, Timing, Track, TrackEvent, TrackEventKind,
 };
-use rockcraft_core::{NoteEvent, NoteEventKind, RecordingMeta};
+use rockcraft_core::{BackingTrack, NoteEvent, NoteEventKind, RecordingMeta};
 
 use crate::{error::ImportError, parser::chart_to_timeline, schema::ExtractedChart};
 
@@ -33,6 +33,21 @@ pub fn import_output_dir() -> PathBuf {
 /// the workspace source tree but outside the gitignored `import-out` root —
 /// this prevents accidentally committing extracted data.
 pub fn write_chart_bundle(chart: &ExtractedChart, dir: &Path) -> Result<PathBuf, ImportError> {
+    write_chart_bundle_with_backing(chart, dir, None)
+}
+
+/// Like [`write_chart_bundle`], but records an optional `backing` track in the
+/// bundle's `meta.json`.
+///
+/// The `BackingTrack::file` is a bundle-relative filename (e.g. `"backing.wav"`)
+/// — the audio file itself must already live next to `song.mid` in `dir`. Used
+/// by the import pipeline to attach the source video's audio as the default
+/// backing track (issue #152). `None` is equivalent to [`write_chart_bundle`].
+pub fn write_chart_bundle_with_backing(
+    chart: &ExtractedChart,
+    dir: &Path,
+    backing: Option<BackingTrack>,
+) -> Result<PathBuf, ImportError> {
     guard_path(dir)?;
 
     let timeline = chart_to_timeline(chart)?;
@@ -43,7 +58,9 @@ pub fn write_chart_bundle(chart: &ExtractedChart, dir: &Path) -> Result<PathBuf,
     let midi_bytes = events_to_smf_bytes(&events);
     std::fs::write(dir.join("song.mid"), &midi_bytes)?;
 
-    let meta = RecordingMeta::new_midi_only("song.mid");
+    let mut meta = RecordingMeta::new_midi_only("song.mid");
+    meta.backing = backing;
+    meta.origin = Some(rockcraft_core::TrackOrigin::Imported);
     std::fs::write(dir.join("meta.json"), meta.to_json())?;
 
     Ok(dir.to_path_buf())

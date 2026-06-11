@@ -156,6 +156,7 @@ impl RecordScreen {
             backing: backing_meta,
             grid: None,
             key: None,
+            origin: Some(rockcraft_core::TrackOrigin::Recorded),
             version: 1,
         };
         std::fs::write(bundle_dir.join("meta.json"), meta.to_json())?;
@@ -317,6 +318,7 @@ mod tests {
             }),
             grid: None,
             key: None,
+            origin: None,
             version: 1,
         };
         let back = RecordingMeta::from_json(&meta.to_json()).unwrap();
