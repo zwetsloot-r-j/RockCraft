@@ -15,6 +15,7 @@
 //! the backing track follows the transport via [`audio::sync_backing`].
 
 mod audio;
+mod control;
 mod import;
 mod library;
 mod midi;
@@ -39,7 +40,7 @@ use crate::state::{ActionReply, AppState, SaveDest};
 const TICK_PERIOD: std::time::Duration = std::time::Duration::from_millis(4);
 
 /// Event name carrying a fresh [`ComposerSnapshot`] to the webview.
-const EVENT_SNAPSHOT: &str = "snapshot";
+pub(crate) const EVENT_SNAPSHOT: &str = "snapshot";
 /// Event name carrying a batch of effects to the webview.
 const EVENT_EFFECTS: &str = "effects";
 /// Event name carrying a serialised [`NoteEvent`] to the webview.
@@ -343,6 +344,10 @@ pub fn run() {
         ])
         .setup(|app| {
             spawn_tick_thread(app.handle().clone());
+            // Optional localhost control socket (default-off; `--control` or
+            // ROCKCRAFT_CONTROL_ADDR). Drives the same live composer over the
+            // existing rockcraft-control protocol — see `control`.
+            control::maybe_start(app.handle());
             Ok(())
         })
         .run(tauri::generate_context!())
