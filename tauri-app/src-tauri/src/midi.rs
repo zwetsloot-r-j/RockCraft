@@ -23,8 +23,6 @@ pub enum InputSource {
     Live(LiveInput),
     /// Computer-keyboard mock — present when no hardware port was found.
     Mock(MockKeyboard),
-    /// Placeholder while the service is being initialised (never stored long).
-    None,
 }
 
 impl InputSource {
@@ -33,7 +31,6 @@ impl InputSource {
         match self {
             InputSource::Live(l) => l.events(),
             InputSource::Mock(m) => m.events(),
-            InputSource::None => Vec::new(),
         }
     }
 
@@ -42,7 +39,6 @@ impl InputSource {
         match self {
             InputSource::Live(_) => "live",
             InputSource::Mock(_) => "mock",
-            InputSource::None => "none",
         }
     }
 
@@ -50,8 +46,14 @@ impl InputSource {
     pub fn port_name(&self) -> Option<String> {
         match self {
             InputSource::Live(l) => Some(l.port_name().to_string()),
-            _ => None,
+            InputSource::Mock(_) => None,
         }
+    }
+
+    /// Returns `true` when a live hardware device is active (mock keys must not
+    /// inject fake events in this case).
+    pub fn is_live(&self) -> bool {
+        matches!(self, InputSource::Live(_))
     }
 }
 
@@ -152,7 +154,7 @@ pub fn mock_key(state: &MidiState, key: char, down: bool) -> Result<(), String> 
             // key-down here.  Key-up is a no-op (the note-off is already queued).
             Ok(())
         }
-        InputSource::Live(_) | InputSource::None => {
+        InputSource::Live(_) => {
             Err("mock_key is not available while a live MIDI device is connected".to_string())
         }
     }
@@ -214,18 +216,27 @@ mod tests {
     }
 
     #[test]
-    fn mock_key_on_live_source_returns_err() {
-        // We cannot open a real MIDI device in CI, so simulate a Live source
-        // by checking the error path through the mock; instead we just verify
-        // the None variant also returns Err.
-        let state = MidiState {
-            source: Mutex::new(InputSource::None),
-        };
-        let result = mock_key(&state, '1', true);
+    fn mock_key_unmapped_key_ok_and_silent() {
+        // Unmapped keys ('z') return Ok (the key is silently ignored by
+        // MockKeyboard::press which returns None, but mock_key still returns Ok).
+        let state = make_mock_state();
+        let result = mock_key(&state, 'z', true);
+        assert!(result.is_ok(), "mock_key on a mock source must return Ok");
+        // No events enqueued for unmapped key — drain is empty even after a
+        // small wait.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let mut src = state.source.lock().unwrap();
         assert!(
-            result.is_err(),
-            "mock_key on None/Live source must return Err"
+            src.drain_events().is_empty(),
+            "unmapped key must not enqueue any events"
         );
+    }
+
+    #[test]
+    fn is_live_false_for_mock() {
+        // The is_live guard used by mock_key is false for a Mock source.
+        let kb = MockKeyboard::new();
+        assert!(!InputSource::Mock(kb).is_live());
     }
 
     #[test]
@@ -248,14 +259,8 @@ mod tests {
         // Advance so both events are due.
         src.advance(600_000);
 
-        let state = MidiState {
-            source: Mutex::new(InputSource::Mock(MockKeyboard::new())),
-        };
-        // Replace mock source with scripted by draining and feeding manually.
-        // (ScriptedSource doesn't implement the same Mutex wrapper, but we can
-        // test drain_and_ingest indirectly via the mock after pressing a key.)
-        //
-        // Test the composer ingest path directly:
+        // Test the composer ingest path directly (ScriptedSource feeds events
+        // directly; no MidiState wrapper needed here):
         let mut composer = Composer::new();
         // Switch to StepRecord so ingest places notes.
         composer
