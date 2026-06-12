@@ -92,8 +92,25 @@ label and a brief comment, e.g.
   Vibe `vibe/*`).
 - Stay within the spec's scope boundaries either way.
 
-**5. Finish.** Ensure the gate passes locally, open ONE PR against `main` whose
-description contains `Closes #N`. Do not self-merge — a human reviews.
+**5. Finish — sync, gate, self-merge.**
+- **Sync with main:** `git fetch origin && git merge origin/main` into your
+  branch. Resolve any conflicts yourself, here, while you have full context of
+  your change.
+- **Re-run the full gate locally.** If it fails because of your code, fix it.
+  If `main` itself is broken (someone else's merge), STOP — comment on the
+  issue and do not merge.
+- **Open ONE PR** against `main` whose description contains `Closes #N`
+  (plain text on its own line, not in a code span). Wait for CI:
+  `gh pr checks --watch`.
+- **Squash-merge it yourself:** `gh pr merge --squash --delete-branch`.
+  Branch protection enforces a green `fmt · clippy · test` and an up-to-date
+  branch; if the merge is rejected because `main` moved, repeat from the sync
+  step.
+- **Exception:** issues labeled `needs-review` — open the PR but do NOT merge;
+  a human reviews those before merge.
+
+Human review is post-merge: merged PRs are skimmed after the fact and reverted
+if needed. Keep PRs small and scoped to one issue so a revert is clean.
 
 Take **one** issue per run unless explicitly told to batch.
 
