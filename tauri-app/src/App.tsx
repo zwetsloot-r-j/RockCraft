@@ -11,6 +11,7 @@ import { Placeholder } from "./shell/Placeholder";
 import { MenuScreen } from "./screens/menu/MenuScreen";
 import { HighwayScreen } from "./screens/highway/HighwayScreen";
 import { RecordScreen } from "./screens/record/RecordScreen";
+import { LibraryScreen } from "./screens/library/LibraryScreen";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { onSnapshot, queryState, runAction } from "./ipc/bridge";
 import type { ComposerSnapshot } from "./ipc/types";
@@ -28,6 +29,9 @@ function AppShell(): JSX.Element {
       </Match>
       <Match when={screen().kind === "play"}>
         <HighwayScreen />
+      </Match>
+      <Match when={screen().kind === "library"}>
+        <LibraryScreen />
       </Match>
       {/* Temporary IPC-bridge proof (#161): the "edit" screen renders the debug
           strip until the real edit screen lands. Reachable from the menu via

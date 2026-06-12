@@ -10,6 +10,7 @@
 //! The command bodies live in [`state`] as `&AppState` free functions for
 //! headless unit testing; the `#[tauri::command]` wrappers below are thin shims.
 
+mod library;
 mod state;
 
 use std::time::Instant;
@@ -61,6 +62,15 @@ fn query_help() -> serde_json::Value {
     state::query_help()
 }
 
+/// Scan the default library roots and return a list of bundle DTOs.
+///
+/// Calls [`library::scan_library_inner`] with [`rockcraft_midi::bundle::default_scan_roots`].
+/// Missing roots are silently skipped.
+#[tauri::command]
+fn scan_library() -> Vec<library::LibraryEntryDto> {
+    library::scan_library_inner(&rockcraft_midi::bundle::default_scan_roots())
+}
+
 /// Spawn the transport-advance thread.
 ///
 /// Every [`TICK_PERIOD`] it measures the wall-clock delta since the last tick,
@@ -102,7 +112,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             run_action,
             query_state,
-            query_help
+            query_help,
+            scan_library
         ])
         .setup(|app| {
             spawn_tick_thread(app.handle().clone());

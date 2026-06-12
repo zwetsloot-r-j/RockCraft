@@ -28,6 +28,8 @@ target
 # screen reads/writes bundles here; commit curated fixtures/ explicitly instead.
 /library/
 **/library/
+# Exception: the Tauri library-screen source directory shares the name.
+!/tauri-app/src/screens/library/
 
 # Windows-side build output (native midir/TUI work; WSL uses /target)
 /target-win/
