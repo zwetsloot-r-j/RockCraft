@@ -17,6 +17,8 @@ import type {
   ComposerSnapshot,
   Effect,
   LibraryEntryDto,
+  SaveBundleResult,
+  SaveDest,
 } from "./types";
 
 /** Event name the backend emits a fresh {@link ComposerSnapshot} on. */
@@ -73,6 +75,42 @@ export function onEffects(cb: (effects: Effect[]) => void): Promise<UnlistenFn> 
  */
 export function scanLibrary(): Promise<LibraryEntryDto[]> {
   return invoke<LibraryEntryDto[]>("scan_library");
+}
+
+// ── Bundle save / load ───────────────────────────────────────────────────
+
+/**
+ * Save the current composer timeline to a bundle.
+ *
+ * `dest` selects the target:
+ * - `{ kind: "quick_save" }` → `recordings/take-<stamp>/`
+ * - `{ kind: "library", name: "..." }` → `<library_root>/<slug>/`
+ *
+ * Resolves to the bundle directory path on success, or rejects with a string
+ * error. Clears the backend's dirty flag on success.
+ */
+export function saveBundle(dest: SaveDest): Promise<SaveBundleResult> {
+  return invoke<SaveBundleResult>("save_bundle", { dest });
+}
+
+/**
+ * Load a bundle from `dir` into the composer, replacing its current timeline.
+ *
+ * Reads `song.mid` (required) and `meta.json` (optional). Resolves to the new
+ * composer snapshot so the UI can refresh immediately. Clears the dirty flag.
+ */
+export function loadBundle(dir: string): Promise<ComposerSnapshot> {
+  return invoke<ComposerSnapshot>("load_bundle", { dir });
+}
+
+/**
+ * Query whether the current timeline has unsaved changes.
+ *
+ * The `dirty` flag is also returned in every `ActionReply`; this function is
+ * mainly useful for an initial query on screen mount.
+ */
+export function queryDirty(): Promise<boolean> {
+  return invoke<boolean>("query_dirty");
 }
 
 // ── Audio commands ────────────────────────────────────────────────────────

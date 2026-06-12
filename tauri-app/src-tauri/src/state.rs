@@ -13,24 +13,54 @@
 use std::sync::Mutex;
 
 use rockcraft_core::{
-    action_from_name, action_help, ActionError, Composer, ComposerSnapshot, Effect,
+    action_from_name, action_help, ActionError, BackingTrack, Composer, ComposerSnapshot, Effect,
+    Grid, Key, NoteView, RecordingMeta, Scale, Timeline, TrackOrigin,
 };
-use serde::Serialize;
+use rockcraft_midi::{events_to_smf_bytes, smf_bytes_to_events};
+use serde::{Deserialize, Serialize};
 
-/// Tauri-managed state: the live composer behind a `Mutex`.
+/// Where to write a saved bundle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SaveDest {
+    /// Quick save — writes to `recordings/take-<timestamp>/`.
+    QuickSave,
+    /// Named save — writes to `<library_root>/<slug>/`.
+    Library { name: String },
+}
+
+/// Tauri-managed state: the live composer behind a `Mutex`, plus the extra
+/// frontend-only fields that core deliberately omits.
 ///
 /// One global editor instance for the app. The tick thread and every command
 /// lock it, mutate, clone the payloads they need, and release before doing any
 /// I/O (event emission), keeping the critical section tight.
 pub struct AppState {
     pub composer: Mutex<Composer>,
+    /// Current key; mirrored here so `save_bundle` can write `meta.json`
+    /// without adding a `Composer::key()` accessor to core.
+    pub key: Mutex<Key>,
+    /// Track provenance of the loaded/composed piece for `meta.json`.
+    pub origin: Mutex<TrackOrigin>,
+    /// Whether the timeline has unsaved changes.
+    pub dirty: Mutex<bool>,
+    /// Path to an attached backing file (bundle-relative when loaded from one).
+    pub backing_path: Mutex<Option<std::path::PathBuf>>,
 }
 
 impl AppState {
     /// A fresh, empty composer.
     pub fn new() -> Self {
+        let default_key = Key {
+            root_pc: 0,
+            scale: Scale::Major,
+        };
         Self {
             composer: Mutex::new(Composer::new()),
+            key: Mutex::new(default_key),
+            origin: Mutex::new(TrackOrigin::Composed),
+            dirty: Mutex::new(false),
+            backing_path: Mutex::new(None),
         }
     }
 }
@@ -47,10 +77,15 @@ impl Default for AppState {
 /// Mirrors the control protocol's `Response::Ok { effects, state }` shape, but
 /// always carries a snapshot — a Tauri command's caller always wants the latest
 /// state back.
+///
+/// `dirty` mirrors [`AppState::dirty`]: true when the timeline has unsaved
+/// changes. Included here so every action reply keeps the UI indicator in sync
+/// without a separate poll.
 #[derive(Debug, Clone, Serialize)]
 pub struct ActionReply {
     pub effects: Vec<Effect>,
     pub snapshot: ComposerSnapshot,
+    pub dirty: bool,
 }
 
 /// Apply a named action to the composer and return the effects + new snapshot.
@@ -60,6 +95,10 @@ pub struct ActionReply {
 /// `action_from_name` → `Composer::apply`. An [`ActionError`] (unknown name or
 /// bad params) is flattened to its `Display` string so the command layer can
 /// surface it as a plain `Err(String)` to the webview.
+///
+/// Any action that modifies the timeline sets the `dirty` flag in [`AppState`].
+/// The flag is detected via a note-count+content fingerprint: the same cheap
+/// approach the TUI's `EditScreen::dispatch` uses.
 pub fn run_action(
     state: &AppState,
     name: &str,
@@ -67,17 +106,241 @@ pub fn run_action(
 ) -> Result<ActionReply, String> {
     let action = action_from_name(name, params).map_err(|e: ActionError| e.to_string())?;
     let mut composer = state.composer.lock().expect("composer mutex poisoned");
+    let fp_before = timeline_fingerprint(composer.timeline());
     let effects = composer
         .apply(action)
         .map_err(|e: ActionError| e.to_string())?;
     let snapshot = composer.snapshot();
-    Ok(ActionReply { effects, snapshot })
+    drop(composer);
+    // Mark dirty if the timeline content changed.
+    if timeline_fingerprint_snapshot(&snapshot.notes) != fp_before {
+        let mut dirty = state.dirty.lock().expect("dirty mutex poisoned");
+        *dirty = true;
+    }
+    let dirty = *state.dirty.lock().expect("dirty mutex poisoned");
+    Ok(ActionReply {
+        effects,
+        snapshot,
+        dirty,
+    })
+}
+
+/// Cheap timeline fingerprint: a sum of (id, pitch, start_us, dur_us, vel) for
+/// all notes. A content change (add/remove/modify) will change the result.
+fn timeline_fingerprint(timeline: &Timeline) -> u64 {
+    timeline
+        .notes()
+        .map(|(id, n)| {
+            id.value()
+                .wrapping_add(n.pitch.value() as u64)
+                .wrapping_add(n.start_us)
+                .wrapping_add(n.dur_us)
+                .wrapping_add(n.velocity.value() as u64)
+        })
+        .fold(0u64, u64::wrapping_add)
+}
+
+/// Same fingerprint but over the snapshot's [`NoteView`] slice (used after
+/// releasing the composer lock).
+fn timeline_fingerprint_snapshot(notes: &[NoteView]) -> u64 {
+    notes
+        .iter()
+        .map(|n| {
+            n.id.wrapping_add(n.pitch as u64)
+                .wrapping_add(n.start_us)
+                .wrapping_add(n.dur_us)
+                .wrapping_add(n.velocity as u64)
+        })
+        .fold(0u64, u64::wrapping_add)
+}
+
+/// Save the current composer timeline to a bundle.
+///
+/// For [`SaveDest::QuickSave`] the bundle lands in `recordings/take-<stamp>/`.
+/// For [`SaveDest::Library`] it goes into `<library_root>/<slug>/` (the
+/// `library/` directory next to the binary, or `$ROCKCRAFT_LIBRARY_DIR`).
+/// Clears the dirty flag on success; returns the bundle directory as a string.
+///
+/// Mirrors `EditScreen::save` / `save_to_library` from `crates/tui/src/edit.rs`.
+pub fn save_bundle(state: &AppState, dest: SaveDest) -> Result<String, String> {
+    let composer = state.composer.lock().expect("composer mutex poisoned");
+    let timeline = composer.timeline().clone();
+    let grid = composer.grid();
+    let backing_offset_us = composer.backing_offset_us();
+    drop(composer);
+
+    let key = *state.key.lock().expect("key mutex poisoned");
+    let origin = *state.origin.lock().expect("origin mutex poisoned");
+    let backing_path = state
+        .backing_path
+        .lock()
+        .expect("backing_path mutex poisoned")
+        .clone();
+
+    let bundle_dir = match &dest {
+        SaveDest::QuickSave => {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            std::path::PathBuf::from("recordings").join(format!("take-{stamp}"))
+        }
+        SaveDest::Library { name } => {
+            let slug = rockcraft_midi::bundle::slug(name);
+            if slug.is_empty() {
+                return Err("empty name — cannot save".to_string());
+            }
+            rockcraft_midi::bundle::library_root().join(slug)
+        }
+    };
+
+    write_bundle(
+        &bundle_dir,
+        &timeline,
+        grid,
+        key,
+        origin,
+        backing_path.as_deref(),
+        backing_offset_us,
+    )
+    .map_err(|e| e.to_string())?;
+
+    // Clear dirty flag after a successful save.
+    let mut dirty = state.dirty.lock().expect("dirty mutex poisoned");
+    *dirty = false;
+
+    Ok(bundle_dir.to_string_lossy().into_owned())
+}
+
+/// Write `song.mid` + `meta.json` (+ optional backing copy) into `bundle_dir`.
+fn write_bundle(
+    bundle_dir: &std::path::Path,
+    timeline: &Timeline,
+    grid: Grid,
+    key: Key,
+    origin: TrackOrigin,
+    backing_path: Option<&std::path::Path>,
+    backing_offset_us: u64,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(bundle_dir)?;
+    let bytes = events_to_smf_bytes(&timeline.to_events());
+    std::fs::write(bundle_dir.join("song.mid"), bytes)?;
+
+    let backing = if let Some(bpath) = backing_path {
+        let filename = crate::record_bundle_backing_filename(bpath);
+        std::fs::copy(bpath, bundle_dir.join(&filename))?;
+        Some(rockcraft_core::BackingTrack {
+            file: filename,
+            audio_start_us: backing_offset_us,
+        })
+    } else {
+        None
+    };
+
+    let meta = RecordingMeta {
+        midi_file: "song.mid".into(),
+        backing,
+        grid: Some(grid),
+        key: Some(key),
+        origin: Some(origin),
+        version: 1,
+    };
+    std::fs::write(bundle_dir.join("meta.json"), meta.to_json())?;
+    Ok(())
+}
+
+/// Load a bundle directory into the composer, replacing its current timeline.
+///
+/// Reads `song.mid` (required) and `meta.json` (optional; fallback to defaults
+/// when absent). Mirrors `app.rs::open_edit_from_midi`.  Returns the new
+/// composer snapshot so the frontend can refresh immediately.
+pub fn load_bundle(state: &AppState, dir: &str) -> Result<ComposerSnapshot, String> {
+    let bundle_dir = std::path::PathBuf::from(dir);
+
+    // Load the MIDI file (required).
+    let midi_path = bundle_dir.join("song.mid");
+    let bytes = std::fs::read(&midi_path).map_err(|e| format!("read song.mid: {e}"))?;
+    let events = smf_bytes_to_events(&bytes).map_err(|e| format!("parse song.mid: {e}"))?;
+    let timeline = Timeline::from_events(&events);
+
+    // Load the meta (optional — legacy bundles have no meta.json).
+    let (grid, key, origin, backing_path, backing_offset_us) =
+        match std::fs::read_to_string(bundle_dir.join("meta.json")) {
+            Ok(json) => match RecordingMeta::from_json(&json) {
+                Ok(meta) => {
+                    let grid = meta.grid.unwrap_or_else(Grid::default_120);
+                    let key = meta.key.unwrap_or(Key {
+                        root_pc: 0,
+                        scale: Scale::Major,
+                    });
+                    let origin = meta.origin.unwrap_or(TrackOrigin::Edited);
+                    let (bpath, boffset) = meta
+                        .backing
+                        .map(|b| {
+                            // Resolve the bundle-relative filename to an absolute path.
+                            let abs = bundle_dir.join(&b.file);
+                            (Some(abs), b.audio_start_us)
+                        })
+                        .unwrap_or((None, 0));
+                    (grid, key, origin, bpath, boffset)
+                }
+                Err(_) => (
+                    Grid::default_120(),
+                    Key {
+                        root_pc: 0,
+                        scale: Scale::Major,
+                    },
+                    TrackOrigin::Edited,
+                    None,
+                    0,
+                ),
+            },
+            Err(_) => (
+                Grid::default_120(),
+                Key {
+                    root_pc: 0,
+                    scale: Scale::Major,
+                },
+                TrackOrigin::Edited,
+                None,
+                0,
+            ),
+        };
+
+    // Replace the composer.
+    {
+        let mut composer = state.composer.lock().expect("composer mutex poisoned");
+        *composer = Composer::from_timeline(timeline, grid);
+        composer.set_key(key);
+        composer.set_backing_offset_us(backing_offset_us);
+    }
+
+    // Update the side-channel state.
+    *state.key.lock().expect("key mutex poisoned") = key;
+    *state.origin.lock().expect("origin mutex poisoned") = origin;
+    *state.dirty.lock().expect("dirty mutex poisoned") = false;
+    *state
+        .backing_path
+        .lock()
+        .expect("backing_path mutex poisoned") = backing_path;
+
+    // Return the fresh snapshot.
+    let composer = state.composer.lock().expect("composer mutex poisoned");
+    Ok(composer.snapshot())
 }
 
 /// Current composer snapshot — mirrors `query state`.
 pub fn query_state(state: &AppState) -> ComposerSnapshot {
-    let composer = state.composer.lock().expect("composer mutex poisoned");
-    composer.snapshot()
+    state
+        .composer
+        .lock()
+        .expect("composer mutex poisoned")
+        .snapshot()
+}
+
+/// Current dirty flag.
+pub fn query_dirty(state: &AppState) -> bool {
+    *state.dirty.lock().expect("dirty mutex poisoned")
 }
 
 /// The full, self-describing action catalog — mirrors `query help`.
@@ -191,5 +454,106 @@ mod tests {
             .collect();
         assert!(names.contains(&"add_note"));
         assert!(names.contains(&"resize_note"));
+    }
+
+    #[test]
+    fn add_note_marks_dirty() {
+        let state = AppState::new();
+        assert!(!query_dirty(&state), "fresh state is not dirty");
+        run_action(&state, "add_note", &json!({})).expect("add_note applies");
+        assert!(query_dirty(&state), "add_note must mark dirty");
+    }
+
+    #[test]
+    fn save_bundle_round_trip() {
+        // Build a composer with two notes.
+        let state = AppState::new();
+        run_action(&state, "add_note", &json!({})).expect("add_note 1");
+        run_action(&state, "cursor_right", &json!({})).expect("cursor_right");
+        run_action(&state, "cursor_up", &json!({})).expect("cursor_up");
+        run_action(&state, "add_note", &json!({})).expect("add_note 2");
+
+        let snap_before = query_state(&state);
+        assert_eq!(snap_before.notes.len(), 2);
+
+        // Write the bundle directly into a temp directory (bypasses library root).
+        let bundle_dir = std::env::temp_dir().join(format!(
+            "rockcraft-rt-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        {
+            let composer = state.composer.lock().unwrap();
+            write_bundle(
+                &bundle_dir,
+                composer.timeline(),
+                composer.grid(),
+                *state.key.lock().unwrap(),
+                *state.origin.lock().unwrap(),
+                None,
+                0,
+            )
+            .expect("write_bundle should succeed");
+        }
+        // Mark clean so we can test dirty after load.
+        *state.dirty.lock().unwrap() = false;
+
+        // Verify meta.json deserializes as RecordingMeta.
+        let meta_json =
+            std::fs::read_to_string(bundle_dir.join("meta.json")).expect("meta.json should exist");
+        let meta = RecordingMeta::from_json(&meta_json).expect("meta.json should parse");
+        assert_eq!(meta.midi_file, "song.mid");
+        assert!(meta.grid.is_some(), "meta should carry grid");
+        assert!(meta.key.is_some(), "meta should carry key");
+
+        // Load back and check round-trip.
+        let dir_str = bundle_dir.to_string_lossy().into_owned();
+        let snap_after = load_bundle(&state, &dir_str).expect("load_bundle should succeed");
+        assert_eq!(
+            snap_after.notes.len(),
+            snap_before.notes.len(),
+            "loaded note count must match saved note count"
+        );
+        let mut pitches_before: Vec<u8> = snap_before.notes.iter().map(|n| n.pitch as u8).collect();
+        let mut pitches_after: Vec<u8> = snap_after.notes.iter().map(|n| n.pitch as u8).collect();
+        pitches_before.sort_unstable();
+        pitches_after.sort_unstable();
+        assert_eq!(pitches_before, pitches_after, "pitches must round-trip");
+
+        // Dirty cleared after load.
+        assert!(!query_dirty(&state), "dirty flag must be clear after load");
+
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&bundle_dir);
+    }
+
+    #[test]
+    fn legacy_load_no_meta_uses_defaults() {
+        // A bundle with only song.mid (no meta.json) should load with default grid.
+        let tmp = std::env::temp_dir().join(format!(
+            "rockcraft-legacy-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Write a minimal MIDI file (just a note-on/off pair).
+        let state = AppState::new();
+        run_action(&state, "add_note", &json!({})).expect("add_note");
+        let composer = state.composer.lock().unwrap();
+        let bytes = rockcraft_midi::events_to_smf_bytes(&composer.timeline().to_events());
+        drop(composer);
+        std::fs::write(tmp.join("song.mid"), bytes).unwrap();
+        // No meta.json written.
+
+        // Load should succeed with default grid.
+        let snap = load_bundle(&state, &tmp.to_string_lossy()).expect("legacy load should succeed");
+        assert_eq!(snap.notes.len(), 1, "legacy bundle note count");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
