@@ -17,6 +17,7 @@
 mod audio;
 mod library;
 mod midi;
+mod record;
 mod state;
 
 use std::sync::Mutex;
@@ -27,6 +28,7 @@ use tauri::{Emitter, Manager, State};
 
 use crate::audio::AudioState;
 use crate::midi::{MidiState, MidiStatus};
+use crate::record::RecordState;
 use crate::state::{ActionReply, AppState};
 
 /// Tick cadence for the transport-advance thread (~4 ms ≈ 250 Hz).
@@ -164,12 +166,19 @@ fn spawn_tick_thread(app: tauri::AppHandle) {
             let midi_state = app.state::<MidiState>();
             let audio = app.state::<AudioState>();
             let prev_transport = app.state::<PrevTransport>();
+            let record_state = app.state::<RecordState>();
 
-            // Drain pending MIDI events, ingest into composer, emit to webview.
-            let (midi_events, midi_effects) = {
+            // Drain pending MIDI events, ingest into composer, emit to webview,
+            // and also push into the active recording session (if any).
+            let (midi_events, raw_events, midi_effects) = {
                 let mut composer = app_state.composer.lock().expect("composer mutex poisoned");
-                crate::midi::drain_and_ingest(&midi_state, &mut composer)
+                crate::midi::drain_and_ingest_raw(&midi_state, &mut composer)
             };
+            // Feed raw (pre-rebase) events into the record session so timestamps
+            // are preserved for backing-offset calculation.
+            for ev in &raw_events {
+                record_state.push(*ev);
+            }
             for ev in &midi_events {
                 let _ = app.emit(EVENT_MIDI, ev);
             }
@@ -222,9 +231,11 @@ fn spawn_tick_thread(app: tauri::AppHandle) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState::new())
         .manage(AudioState::new())
         .manage(MidiState::new())
+        .manage(RecordState::new())
         .manage(PrevTransport::default())
         .invoke_handler(tauri::generate_handler![
             run_action,
@@ -236,6 +247,10 @@ pub fn run() {
             audio::attach_backing,
             audio::detach_backing,
             audio::audio_status,
+            record::record_start,
+            record::record_stop,
+            record::record_save,
+            record::record_status,
         ])
         .setup(|app| {
             spawn_tick_thread(app.handle().clone());

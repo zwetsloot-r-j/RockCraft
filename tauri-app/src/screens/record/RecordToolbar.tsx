@@ -1,11 +1,15 @@
 // RecordToolbar.tsx — the 58 px bottom transport + edit bar (Design E, from
 // B · Console with C's notation-view pickers). Transport + Trim/Delete/Quantize/
-// Punch-in/Undo/Redo + CLEF/SPELL/SNAP segmented controls. The edit tools and
-// pickers are visual-only here; #169 wires the ones with a core action and
-// disables the rest. SNAP options live in one constant so #169 can extend the
-// list (core's Subdivision also has Quarter + triplets) without layout surgery.
+// Punch-in/Undo/Redo + CLEF/SPELL/SNAP segmented controls.
+//
+// #169 wiring:
+// - Record (●) starts/stops the recording session.
+// - Stop (■) stops recording and discards (same as record toggle).
+// - Save shortcut is "s" in RecordScreen; no toolbar button yet.
+// - Trim / Quantize / Punch-in render disabled (no core action yet).
+// - Delete / Undo / Redo remain visual-only here.
 
-import type { Accessor, JSX } from "solid-js";
+import { type Accessor, type JSX } from "solid-js";
 import { RoundBtn } from "./ui/RoundBtn";
 import { Seg } from "./ui/Seg";
 import { REC } from "./ui/theme";
@@ -27,6 +31,14 @@ export interface RecordToolbarProps {
   onClef: (v: Clef) => void;
   spelling: Accessor<Spelling>;
   onSpelling: (v: Spelling) => void;
+  /** Whether a recording session is currently active. */
+  recording: Accessor<boolean>;
+  /** Called when the record button is pressed (starts session). */
+  onRecord: () => void;
+  /** Called when the stop button is pressed (ends session). */
+  onStop: () => void;
+  /** Called when the save button is pressed. */
+  onSave: () => void;
 }
 
 export function RecordToolbar(props: RecordToolbarProps): JSX.Element {
@@ -52,17 +64,33 @@ export function RecordToolbar(props: RecordToolbarProps): JSX.Element {
           bg="rgba(255,77,87,0.16)"
           glow
           size={38}
-          title="Stop"
+          title="Stop recording"
+          onClick={props.onStop}
+        />
+        {/* Record toggle: lit red when active */}
+        <RoundBtn
+          icon="record"
+          fill="fill"
+          color={props.recording() ? REC : "#dfe2ea"}
+          bg={props.recording() ? "rgba(255,77,87,0.20)" : "rgba(255,255,255,0.06)"}
+          glow={props.recording()}
+          size={38}
+          title={props.recording() ? "Stop recording" : "Start recording"}
+          onClick={props.recording() ? props.onStop : props.onRecord}
+          active={props.recording()}
         />
         <RoundBtn icon="play" fill="fill" size={32} title="Play take" />
         <RoundBtn icon="loop" size={32} title="Loop" />
       </div>
       <VRule />
       <div style={{ display: "flex", "align-items": "center", gap: "2px" }}>
-        <ToolBtn icon="scissors" label="Trim" />
+        {/* Disabled: no core action yet */}
+        <ToolBtn icon="scissors" label="Trim" disabled title="Trim — not yet wired" />
         <ToolBtn icon="trash" label="Delete" danger />
-        <ToolBtn icon="magnet" label="Quantize" />
-        <ToolBtn icon="target" label="Punch-in" />
+        {/* Disabled: no core action yet */}
+        <ToolBtn icon="magnet" label="Quantize" disabled title="Quantize — not yet wired" />
+        {/* Disabled: no core action yet */}
+        <ToolBtn icon="target" label="Punch-in" disabled title="Punch-in — not yet wired" />
         <ToolBtn icon="undo" label="Undo" />
         <ToolBtn icon="redo" label="Redo" />
       </div>

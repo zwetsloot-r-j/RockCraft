@@ -9,15 +9,20 @@ export interface ToolBtnProps {
   label?: string;
   active?: boolean;
   danger?: boolean;
+  /** When true the button is rendered dimmed and non-interactive. */
+  disabled?: boolean;
+  title?: string;
   onClick?: () => void;
 }
 
 export function ToolBtn(props: ToolBtnProps): JSX.Element {
-  const col = (): string => (props.danger ? REC : props.active ? OK : "#c7cad6");
+  const col = (): string =>
+    props.disabled ? "#4a4d5c" : props.danger ? REC : props.active ? OK : "#c7cad6";
   return (
     <button
-      onClick={() => props.onClick?.()}
-      title={props.label}
+      onClick={() => !props.disabled && props.onClick?.()}
+      title={props.title ?? props.label}
+      disabled={props.disabled}
       style={{
         display: "flex",
         "flex-direction": "column",
@@ -28,8 +33,9 @@ export function ToolBtn(props: ToolBtnProps): JSX.Element {
         "border-radius": "8px",
         background: props.active ? `${col()}1a` : "transparent",
         color: col(),
-        cursor: "pointer",
+        cursor: props.disabled ? "default" : "pointer",
         "min-width": "46px",
+        opacity: props.disabled ? "0.38" : "1",
       }}
     >
       <Icon d={props.icon} size={17} stroke={col()} />
@@ -39,7 +45,7 @@ export function ToolBtn(props: ToolBtnProps): JSX.Element {
             "font-size": "9px",
             "letter-spacing": "0.3px",
             "font-family": MONO,
-            color: props.active ? col() : "#8a8e9c",
+            color: props.active ? col() : props.disabled ? "#4a4d5c" : "#8a8e9c",
           }}
         >
           {props.label}

@@ -71,7 +71,7 @@ export class RecordCanvas {
   private song: Song;
 
   private t0 = performance.now();
-  /** ms elapsed into the current loop (read by the chrome). */
+  /** ms elapsed since session start (live mode) or into fixture loop (demo mode). */
   tNow = 0;
   private lastNow = 0;
   /** 0..1 smoothed meter value (read by the chrome). */
@@ -85,6 +85,14 @@ export class RecordCanvas {
   private keyGlow: Record<number, Glow> = {};
   private pMin: number;
   private pMax: number;
+
+  // ── Live mode ───────────────────────────────────────────────────────────────
+  /** When non-null the canvas is in live mode; `t0` is the session start. */
+  private sessionStart: number | null = null;
+  /** Notes accumulated from live MIDI events (used instead of `song.notes`). */
+  private liveNotes: TakeNote[] = [];
+  /** Per-note start time for open (held) live notes. */
+  private openNotes = new Map<number, number>();
 
   private ro: ResizeObserver;
   private raf: number | null = null;
@@ -126,9 +134,82 @@ export class RecordCanvas {
     this.resize();
   }
 
-  /** ms elapsed into the current loop. */
+  /** ms elapsed into the current loop (demo) or since session start (live). */
   get now(): number {
     return this.tNow;
+  }
+
+  // ── Live session control ─────────────────────────────────────────────────────
+
+  /**
+   * Switch to live mode.  The session clock resets to 0 and the canvas
+   * starts accumulating notes from {@link noteOn}/{@link noteOff} calls
+   * instead of looping the fixture.
+   */
+  startSession(): void {
+    this.sessionStart = performance.now();
+    this.t0 = this.sessionStart;
+    this.liveNotes = [];
+    this.openNotes.clear();
+    this.tNow = 0;
+    this.lastNow = 0;
+    this.held.clear();
+  }
+
+  /**
+   * Stop live mode and return to fixture-loop demo mode.
+   * Open notes are closed at the current clock position.
+   */
+  stopSession(): void {
+    if (this.sessionStart == null) return;
+    const now = this.tNow;
+    // Close any open notes.
+    for (const [note, start] of this.openNotes) {
+      this.liveNotes.push({ note, start, end: now, hand: "R", vel: 80 });
+    }
+    this.openNotes.clear();
+    this.sessionStart = null;
+    // Resume fixture loop from current wall-clock position.
+    this.t0 = performance.now();
+    this.lastNow = 0;
+  }
+
+  /** Ingest a note-on from a MIDI event. */
+  noteOn(note: number, velocity: number): void {
+    const now = this.tNow;
+    this.openNotes.set(note, now);
+    // Fire sparkles/glow immediately.
+    const fakeTn: TakeNote = { note, start: now, end: now + 500, hand: "R", vel: velocity };
+    this.fire(fakeTn);
+    // Update level.
+    this.level = Math.min(1, this.level + velocity / 127);
+  }
+
+  /** Ingest a note-off from a MIDI event. */
+  noteOff(note: number): void {
+    const start = this.openNotes.get(note);
+    if (start == null) return;
+    this.openNotes.delete(note);
+    const end = this.tNow;
+    this.liveNotes.push({ note, start, end, hand: "R", vel: 80 });
+    // Trim liveNotes to keep only the last `window` ms worth of data.
+    const horizon = end - this.cfg.window * 4;
+    if (horizon > 0) {
+      const keep = this.liveNotes.findIndex((n) => n.end >= horizon);
+      if (keep > 0) this.liveNotes.splice(0, keep);
+    }
+  }
+
+  /** The active note list: live notes + any still-open notes, or fixture. */
+  private get activeNotes(): TakeNote[] {
+    if (this.sessionStart == null) return this.song.notes;
+    // Merge closed notes with open (currently held) notes.
+    const now = this.tNow;
+    const open: TakeNote[] = [];
+    for (const [note, start] of this.openNotes) {
+      open.push({ note, start, end: now, hand: "R", vel: 80 });
+    }
+    return [...this.liveNotes, ...open];
   }
 
   private resize(): void {
@@ -183,7 +264,8 @@ export class RecordCanvas {
   private clockNow(): number {
     if (this.cfg.paused) return this.tNow; // freeze when paused
     const elapsed = performance.now() - this.t0;
-    return elapsed % this.song.LOOP;
+    if (this.sessionStart != null) return elapsed; // live mode: monotonic
+    return elapsed % this.song.LOOP; // demo mode: looping fixture
   }
 
   // ── shared updates ──────────────────────────────────────────────────────
@@ -192,15 +274,20 @@ export class RecordCanvas {
     const wrapped = now < this.lastNow;
     this.held.clear();
     let lvl = 0;
-    for (const nt of this.song.notes) {
+    const notes = this.activeNotes;
+    for (const nt of notes) {
       if (nt.start <= now && now < nt.end) {
         this.held.add(nt.note);
         lvl += nt.vel;
       }
-      const crossed = wrapped
-        ? nt.start > this.lastNow || nt.start <= now
-        : nt.start > this.lastNow && nt.start <= now;
-      if (crossed && !this.cfg.paused) this.fire(nt);
+      // In live mode the open-note ends are always ≥ now, so no "crossed"
+      // logic needed there; only fire sparks for newly closed notes below.
+      if (this.sessionStart == null) {
+        const crossed = wrapped
+          ? nt.start > this.lastNow || nt.start <= now
+          : nt.start > this.lastNow && nt.start <= now;
+        if (crossed && !this.cfg.paused) this.fire(nt);
+      }
     }
     this.level = lerp(this.level, clamp(lvl / 180, 0, 1), 0.25);
     this.lastNow = now;
@@ -269,7 +356,7 @@ export class RecordCanvas {
     ctx.fillStyle = "rgba(255,255,255,0.014)";
     for (const k of this.kl.whites) if ((k.wi ?? 0) % 2 === 0) ctx.fillRect(k.x, top, k.w, H);
 
-    for (const nt of this.song.notes) {
+    for (const nt of this.activeNotes) {
       if (nt.start > now) continue; // not recorded yet
       const lane = this.kl.byNote[nt.note];
       if (!lane) continue;
@@ -418,7 +505,7 @@ export class RecordCanvas {
 
     const headRx = lineGap * 0.62;
     const headRy = lineGap * 0.46;
-    for (const nt of this.song.notes) {
+    for (const nt of this.activeNotes) {
       if (nt.start > now) continue;
       const x = xOfTime(nt.start);
       const y = yOf(nt.note);
@@ -549,7 +636,7 @@ export class RecordCanvas {
     for (let b = 0; b < this.song.BARS; b++) ctx.fillText(`${b + 1}`, xOf(b * BAR) + 4, T - 6);
 
     // recorded notes (only up to playhead)
-    for (const nt of this.song.notes) {
+    for (const nt of this.activeNotes) {
       if (nt.start > now) continue;
       const x = xOf(nt.start);
       const xe = xOf(Math.min(nt.end, now));

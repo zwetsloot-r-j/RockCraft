@@ -104,3 +104,51 @@ export function detachBacking(): Promise<void> {
 export function audioStatus(): Promise<AudioStatus> {
   return invoke<AudioStatus>("audio_status");
 }
+
+// ── Record commands ───────────────────────────────────────────────────────────
+
+/** Status of the live-recording session. */
+export interface RecordStatus {
+  /** Whether a session is currently active. */
+  active: boolean;
+  /** Elapsed time in microseconds (0 when inactive). */
+  elapsed_us: number;
+  /** Number of MIDI events captured so far (0 when inactive). */
+  event_count: number;
+}
+
+/**
+ * Start a new live-recording session.
+ *
+ * Pass `backing` (absolute path) to start backing audio immediately and
+ * anchor the MIDI origin to the backing start time.
+ *
+ * Rejects if a session is already active or the backing file is missing.
+ */
+export function recordStart(backing?: string): Promise<void> {
+  return invoke<void>("record_start", { backing: backing ?? null });
+}
+
+/**
+ * Stop the current recording session without saving.
+ *
+ * The captured buffer is discarded. No-op when inactive.
+ */
+export function recordStop(): Promise<void> {
+  return invoke<void>("record_stop");
+}
+
+/**
+ * Save the current session as a take bundle.
+ *
+ * Returns the bundle directory path (e.g. `recordings/take-1234567/`).
+ * Rejects if no session is active or the buffer is empty.
+ */
+export function recordSave(): Promise<string> {
+  return invoke<string>("record_save");
+}
+
+/** Poll the current recording status. */
+export function recordStatus(): Promise<RecordStatus> {
+  return invoke<RecordStatus>("record_status");
+}

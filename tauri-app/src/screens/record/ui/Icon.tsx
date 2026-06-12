@@ -26,6 +26,7 @@ export const P: Record<string, string> = {
   cursor: "M5 3l14 7-6 2-2 6z",
   plus: "M12 5v14M5 12h14",
   minus: "M5 12h14",
+  record: "M12 2a10 10 0 100 20 10 10 0 000-20z",
 };
 
 export interface IconProps {

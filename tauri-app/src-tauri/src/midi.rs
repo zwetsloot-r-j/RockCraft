@@ -160,6 +160,22 @@ pub fn drain_and_ingest(
     midi: &MidiState,
     composer: &mut Composer,
 ) -> (Vec<NoteEventPayload>, Vec<rockcraft_core::Effect>) {
+    let (payloads, _raw, effects) = drain_and_ingest_raw(midi, composer);
+    (payloads, effects)
+}
+
+/// Like [`drain_and_ingest`] but also returns the raw [`NoteEvent`]s.
+///
+/// The raw events are passed to the recording session so their original
+/// timestamps (needed for backing-offset calculation) are preserved.
+pub fn drain_and_ingest_raw(
+    midi: &MidiState,
+    composer: &mut Composer,
+) -> (
+    Vec<NoteEventPayload>,
+    Vec<NoteEvent>,
+    Vec<rockcraft_core::Effect>,
+) {
     let events = midi
         .source
         .lock()
@@ -167,12 +183,14 @@ pub fn drain_and_ingest(
         .drain_events();
     let mut all_effects = Vec::new();
     let mut payloads = Vec::with_capacity(events.len());
+    let mut raw = Vec::with_capacity(events.len());
     for ev in events {
+        raw.push(ev);
         let effects = composer.ingest(ev);
         all_effects.extend(effects);
         payloads.push(NoteEventPayload::from(ev));
     }
-    (payloads, all_effects)
+    (payloads, raw, all_effects)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
