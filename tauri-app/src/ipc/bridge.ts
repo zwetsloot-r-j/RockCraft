@@ -74,3 +74,33 @@ export function onEffects(cb: (effects: Effect[]) => void): Promise<UnlistenFn> 
 export function scanLibrary(): Promise<LibraryEntryDto[]> {
   return invoke<LibraryEntryDto[]>("scan_library");
 }
+
+// ── Audio commands ────────────────────────────────────────────────────────
+
+/** Audio status returned by {@link audioStatus}. */
+export interface AudioStatus {
+  /** Whether an audio output device is available on this machine. */
+  device: boolean;
+  /** The backing file name (no path) if one is attached; null otherwise. */
+  backing: string | null;
+}
+
+/**
+ * Attach a backing-track audio file (mp3/wav/ogg/flac).
+ *
+ * The file must already exist on disk (use the native file dialog before
+ * calling this). Rejects with an error string if the file is missing.
+ */
+export function attachBacking(path: string): Promise<void> {
+  return invoke<void>("attach_backing", { path });
+}
+
+/** Detach the current backing track (stops playback). */
+export function detachBacking(): Promise<void> {
+  return invoke<void>("detach_backing");
+}
+
+/** Poll current audio status (device availability + backing file name). */
+export function audioStatus(): Promise<AudioStatus> {
+  return invoke<AudioStatus>("audio_status");
+}
