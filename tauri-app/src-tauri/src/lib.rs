@@ -117,6 +117,13 @@ fn scan_library() -> Vec<library::LibraryEntryDto> {
     library::scan_library_inner(&rockcraft_midi::bundle::default_scan_roots())
 }
 
+/// Absolute directory of the newest bundle across the default scan roots, or
+/// `None` when no bundles exist. Backs the menu's "Play/Edit last recording".
+#[tauri::command]
+fn latest_recording() -> Option<String> {
+    library::latest_recording_inner(&rockcraft_midi::bundle::default_scan_roots())
+}
+
 /// Save the current composer timeline to a bundle.
 ///
 /// `dest` selects the target:
@@ -314,6 +321,7 @@ pub fn run() {
             query_state,
             query_help,
             scan_library,
+            latest_recording,
             save_bundle,
             load_bundle,
             query_dirty,

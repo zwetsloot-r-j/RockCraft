@@ -6,7 +6,8 @@
 // Live MIDI wiring (#169):
 // - onMidiEvent feeds RecordCanvas; recording session managed via record_start /
 //   record_stop / record_save Tauri commands.
-// - The Ember Lantern fixture is kept as the no-session demo fallback.
+// - The screen starts idle on an empty take (#187 retired the demo fixture);
+//   live MIDI fills it in.
 // - "s" saves, Esc confirms-if-unsaved then navigates to menu.
 // - "Choose backing track" opens a native file dialog and attaches audio.
 
@@ -17,7 +18,7 @@ import { RecordCanvas } from "./RecordCanvas";
 import { RecordHeader } from "./RecordHeader";
 import { RecordToolbar, type Clef, type Snap, type Spelling } from "./RecordToolbar";
 import { NoteInspector } from "./NoteInspector";
-import { RSONG } from "./song";
+import { EMPTY_TAKE } from "./emptyTake";
 import { DISP } from "./ui/theme";
 import { onMidiEvent } from "../../ipc/midi";
 import {
@@ -140,7 +141,7 @@ export function RecordScreen(): JSX.Element {
     const e = new RecordCanvas(
       canvasEl,
       { viz: "ribbons+staff", glow: 0.5, window: 2200, kbRatio: 0.14 },
-      RSONG,
+      EMPTY_TAKE,
     );
     e.start();
     setEng(e);
@@ -205,7 +206,7 @@ export function RecordScreen(): JSX.Element {
       <RecordHeader
         eng={eng}
         frame={frame}
-        song={RSONG}
+        song={EMPTY_TAKE}
         metro={metro}
         onMetro={setMetro}
         count={count}
