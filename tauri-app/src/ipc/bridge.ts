@@ -8,6 +8,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { open as dialogOpen } from "@tauri-apps/plugin-dialog";
 
 import type {
   ActionInfo,
@@ -103,4 +104,75 @@ export function detachBacking(): Promise<void> {
 /** Poll current audio status (device availability + backing file name). */
 export function audioStatus(): Promise<AudioStatus> {
   return invoke<AudioStatus>("audio_status");
+}
+
+// ── Import commands ────────────────────────────────────────────────────────
+
+/**
+ * Import input DTO — mirrors `import::ImportInputDto` on the Rust side.
+ * The tag is `"kind"` and the content is `"value"`.
+ */
+export type ImportInputDto =
+  | { kind: "File"; value: string }
+  | { kind: "Url"; value: string };
+
+/**
+ * Progress event payload emitted by the backend during an import.
+ * Mirrors `import::ImportProgressEvent`.
+ */
+export interface ImportProgressEvent {
+  stage: "fetching" | "extracting" | "writing" | "done" | "failed";
+  /** Fraction 0–1; only meaningful for `"extracting"`. */
+  progress?: number;
+  /** A single log line from the pipeline. */
+  log?: string;
+  /** Absolute path to the bundle directory; only present on `"done"`. */
+  bundle_dir?: string;
+  /** Human-readable error; only present on `"failed"`. */
+  error?: string;
+}
+
+/**
+ * Open a native file-picker dialog filtered to video files.
+ * Returns the selected path, or `null` if the user cancelled.
+ *
+ * Video extensions: mp4 mkv avi mov webm flv wmv m4v (TUI parity).
+ */
+export async function openVideoFilePicker(): Promise<string | null> {
+  const selected = await dialogOpen({
+    multiple: false,
+    filters: [
+      {
+        name: "Video files",
+        extensions: ["mp4", "mkv", "avi", "mov", "webm", "flv", "wmv", "m4v"],
+      },
+    ],
+  });
+  if (selected === null || selected === undefined) return null;
+  // `open()` returns a string when `multiple: false`.
+  return typeof selected === "string" ? selected : null;
+}
+
+/** Returns `true` when a fetch command is configured for URL imports. */
+export function importUrlAvailable(): Promise<boolean> {
+  return invoke<boolean>("import_url_available");
+}
+
+/**
+ * Start an import. Returns `Err("import already running")` if a concurrent
+ * import is in progress; otherwise spawns the pipeline thread and resolves
+ * immediately.
+ */
+export function importStart(input: ImportInputDto): Promise<void> {
+  return invoke<void>("import_start", { input });
+}
+
+/**
+ * Subscribe to `import_progress` events. Returns the unlisten function; call
+ * it in `onCleanup`.
+ */
+export function onImportProgress(
+  cb: (ev: ImportProgressEvent) => void,
+): Promise<import("@tauri-apps/api/event").UnlistenFn> {
+  return listen<ImportProgressEvent>("import_progress", (e) => cb(e.payload));
 }
