@@ -131,8 +131,17 @@ third-party deps yet). Next: **M0 "Echo"** — `midir` reads the piano, a
 ## Driving a running instance (agent control)
 
 A running RockCraft exposes a **localhost WebSocket control interface** so an
-agent can edit the composer programmatically — the same `core::Action`s the
-keyboard triggers. To drive it:
+agent can drive it programmatically. Two tiers share one socket:
+
+- **Composer actions** (`run_action`) — the `core::Action`s the keyboard
+  triggers (edit the pure `Composer`).
+- **Host commands** (`run_command`) — app-level workflows that do I/O
+  (play / record / import / library / backing). These are **not** `core::Action`s
+  and must never become them — `core` forbids I/O. They live in
+  `crates/control/src/host.rs` and each frontend dispatches them over its own
+  services via the `HostServices` trait.
+
+To drive it:
 
 1. **Start it.** `cargo run --bin rockcraft-tui -- --control`. The bound address
    is printed to **stderr** (`Control server listening on ws://127.0.0.1:<PORT>`).
@@ -142,8 +151,18 @@ keyboard triggers. To drive it:
    you with an unsolicited `hello` banner naming the request verbs and the query
    kinds.
 3. **Discover, then act.** Send `{"type":"query","what":"Help"}` first — it
-   returns every action with its parameter schema and a description (the live,
-   drift-proof catalog). Then `run_action` and read back the `state` snapshot.
+   returns **both** tiers (`actions` and `commands`) with parameter schemas and
+   descriptions. Then `run_action` / `run_command` and read back the result.
+
+**Single source of truth — do not hand-maintain command tables.** The live
+vocabulary is `core::action_names()`/`action_help()` (actions) and
+`control::host_command_names()`/`host_command_help()` + the `HostCommand` enum
+(host commands); `query help` serves both. When you **add a host command**, add
+the `HostCommand` variant, its `dispatch` arm, and the `HostServices` method —
+the trait's exhaustive `match` makes the compiler reject anything less, so a
+command can't drift behind the UI. Parity tests in `crates/control/src` enforce
+names ↔ variants ↔ help. Docs (`docs/AGENT-CONTROL.md`, the table in
+`specs/M8-A-host-command-tier.md`) are pointers, not the authority.
 
 Full protocol reference: [`docs/AGENT-CONTROL.md`](docs/AGENT-CONTROL.md). A
 guided session exercising every action, with the equivalent TUI keystroke per

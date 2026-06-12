@@ -520,30 +520,46 @@ impl Shell {
         }
     }
 
-    /// Apply one remote [`Request`] against the composer the app owns.
+    /// Apply one remote [`Request`] against the app.
     ///
-    /// `Query::Render` is intercepted here and rendered from the full shell
-    /// (not just the composer) using the last known terminal size. All other
-    /// requests are forwarded to the active screen; outside the editor they are
-    /// rejected with an error echoing the request id.
+    /// Routing by tier:
+    /// - `Query::Render` renders the full shell (not just the composer) at the
+    ///   last known terminal size.
+    /// - `Query::Help` returns the combined action + host-command catalog; it is
+    ///   answered from any screen since the catalog is static.
+    /// - `RunCommand` drives the shell's own services (play / record / import /
+    ///   library / backing) via [`HostServices`](rockcraft_control::HostServices),
+    ///   independent of the active screen.
+    /// - Everything else (`run_action`, `query state|actions`, subscribe) needs
+    ///   the composer, which only the editor owns; outside it they are rejected
+    ///   with an error echoing the request id.
     fn handle_remote(&mut self, req: Request) -> Response {
-        // Render queries need the shell, not just the composer.
-        if let Request::Query {
-            id,
-            what: QueryKind::Render,
-        } = &req
-        {
-            let (w, h) = self.terminal_size;
-            return Response::Render {
-                id: *id,
-                text: self.render_to_string(w, h),
-            };
-        }
-        match &mut self.screen {
-            Screen::Edit(edit) => edit.apply_remote(req),
-            _ => Response::Err {
-                id: req.id(),
-                error: "unavailable: open the editor to accept control commands".into(),
+        match req {
+            Request::Query {
+                id,
+                what: QueryKind::Render,
+            } => {
+                let (w, h) = self.terminal_size;
+                Response::Render {
+                    id,
+                    text: self.render_to_string(w, h),
+                }
+            }
+            Request::Query {
+                id,
+                what: QueryKind::Help,
+            } => rockcraft_control::help_response(id),
+            Request::RunCommand {
+                id,
+                command,
+                params,
+            } => rockcraft_control::run_host_command(self, id, &command, &params),
+            other => match &mut self.screen {
+                Screen::Edit(edit) => edit.apply_remote(other),
+                _ => Response::Err {
+                    id: other.id(),
+                    error: "unavailable: open the editor to accept control commands".into(),
+                },
             },
         }
     }
@@ -566,6 +582,148 @@ impl Shell {
     /// Whether the shell has been asked to quit.
     pub fn is_quit(&self) -> bool {
         self.should_quit
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Host-command tier (M8-A): app-level workflows over the control protocol.
+// ---------------------------------------------------------------------------
+
+/// Drive the TUI's app-level workflows from the host-command tier.
+///
+/// Each method maps a [`HostCommand`](rockcraft_control::HostCommand) onto the
+/// same shell transitions a keypress would trigger (open Play, start Record,
+/// run the import pipeline, …), so a remote agent drives a full session — not
+/// just composer edits. Preconditions that aren't met return `Err(message)`
+/// (e.g. "save" with no open composition), surfaced to the client as a protocol
+/// error rather than a panic.
+impl rockcraft_control::HostServices for Shell {
+    fn play_load(&mut self, dir: &str) -> rockcraft_control::HostResult {
+        let dir = PathBuf::from(dir);
+        let midi = dir.join("song.mid");
+        let play = load_play_screen(&midi, self.synth.clone())?;
+        self.status = format!("playing {}", dir.display());
+        self.screen = Screen::Play(play);
+        Ok(serde_json::json!({ "loaded": dir.to_string_lossy() }))
+    }
+
+    fn play_stop(&mut self) -> rockcraft_control::HostResult {
+        let was_playing = matches!(self.screen, Screen::Play(_));
+        if let Screen::Play(play) = &self.screen {
+            // Release backing/synth (mirrors Tab/Esc leaving the Play screen).
+            play.leave();
+        }
+        if was_playing {
+            self.status = "stopped".into();
+            self.screen = Screen::Menu;
+        }
+        Ok(serde_json::json!({ "stopped": was_playing }))
+    }
+
+    fn record_start(&mut self, backing: Option<&str>) -> rockcraft_control::HostResult {
+        let backing = backing
+            .map(PathBuf::from)
+            .or_else(|| self.backing_path.clone());
+        self.screen = Screen::Record(RecordScreen::with_backing(backing));
+        self.status = "recording".into();
+        Ok(serde_json::Value::Null)
+    }
+
+    fn record_stop(&mut self) -> rockcraft_control::HostResult {
+        match &mut self.screen {
+            Screen::Record(rec) => {
+                rec.stop_backing();
+                if let Some(s) = &self.synth {
+                    s.all_off();
+                }
+                self.status = "recording stopped".into();
+                self.screen = Screen::Menu;
+                Ok(serde_json::Value::Null)
+            }
+            _ => Err("no active record session".into()),
+        }
+    }
+
+    fn record_save(&mut self) -> rockcraft_control::HostResult {
+        match &mut self.screen {
+            Screen::Record(rec) => {
+                let path = rec.save().map_err(|e| e.to_string())?;
+                self.status = format!("saved {}", path.display());
+                Ok(serde_json::json!({ "saved": path.to_string_lossy() }))
+            }
+            _ => Err("no active record session".into()),
+        }
+    }
+
+    fn backing_attach(&mut self, path: &str) -> rockcraft_control::HostResult {
+        let p = PathBuf::from(path);
+        if !p.exists() {
+            return Err(format!("backing file not found: {path}"));
+        }
+        // Session-level backing: forwarded to each Record/Compose screen opened
+        // afterwards (mirrors the "Choose backing track" menu entry).
+        self.backing_path = Some(p);
+        Ok(serde_json::json!({ "backing": path }))
+    }
+
+    fn backing_detach(&mut self) -> rockcraft_control::HostResult {
+        self.backing_path = None;
+        Ok(serde_json::Value::Null)
+    }
+
+    fn import_url(&mut self, url: &str) -> rockcraft_control::HostResult {
+        if !self.has_fetch_cmd {
+            return Err("no fetch command configured (set ROCKCRAFT_FETCH_CMD)".into());
+        }
+        self.screen = Screen::Importing(ImportingScreen::start(ImportInput::Url(url.to_string())));
+        self.status = format!("importing {url}");
+        Ok(serde_json::Value::Null)
+    }
+
+    fn library_scan(&mut self) -> rockcraft_control::HostResult {
+        let bundles: Vec<serde_json::Value> = crate::library::list_library(&default_scan_roots())
+            .into_iter()
+            .map(|e| {
+                serde_json::json!({
+                    "name": e.name,
+                    "dir": e.dir.to_string_lossy(),
+                    "note_count": e.note_count,
+                    "duration_us": e.duration_us,
+                    "origin": e.origin.map(|o| o.label()),
+                    "has_backing": e.has_backing,
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({ "bundles": bundles }))
+    }
+
+    fn library_save(&mut self, name: &str) -> rockcraft_control::HostResult {
+        match &mut self.screen {
+            Screen::Edit(edit) => {
+                let path = edit
+                    .save_to_library(&library_root(), name)
+                    .map_err(|e| e.to_string())?;
+                edit.mark_clean();
+                self.status = format!("saved {}", path.display());
+                Ok(serde_json::json!({ "saved": path.to_string_lossy() }))
+            }
+            _ => Err("open the composer to save to the library".into()),
+        }
+    }
+
+    fn library_load(&mut self, dir: &str) -> rockcraft_control::HostResult {
+        let midi = PathBuf::from(dir).join("song.mid");
+        if !midi.exists() {
+            return Err(format!("no song.mid in {dir}"));
+        }
+        self.open_edit_from_midi(&midi);
+        match &self.screen {
+            Screen::Edit(edit) => {
+                Ok(serde_json::json!({ "loaded": dir, "note_count": edit.note_count() }))
+            }
+            // open_edit_from_midi sets `status` on a read/parse failure.
+            _ => Err(self.status.clone()),
+        }
     }
 }
 
@@ -1241,6 +1399,121 @@ mod tests {
                 assert!(error.starts_with("unavailable:"), "got {error}");
             }
             other => panic!("expected Err, got {other:?}"),
+        }
+    }
+
+    // ── Host-command tier (M8-A) ─────────────────────────────────────────────
+
+    /// Run one `run_command` request through the shell's remote handler.
+    fn run_command(shell: &mut Shell, json: &str) -> Response {
+        let (cmd, mut reply_rx) = remote(json);
+        let (tx, rx) = mpsc::channel::<RemoteCommand>(4);
+        shell.set_command_receiver(rx);
+        tx.try_send(cmd).expect("queue command");
+        shell.drain_remote_commands();
+        reply_rx.try_recv().expect("command reply")
+    }
+
+    /// Unlike `run_action`, a host command is dispatched from any screen — here
+    /// `record_start` from the menu starts a record session (screen transition),
+    /// proving the host tier drives app-level workflows, not just the composer.
+    #[test]
+    fn run_command_drives_app_workflow_from_menu() {
+        let mut shell = make_shell(); // stays on the menu
+        assert_eq!(shell.screen_name(), "menu");
+
+        let resp = run_command(
+            &mut shell,
+            r#"{"type":"run_command","id":3,"command":"record_start"}"#,
+        );
+        match resp {
+            Response::CommandOk { id, .. } => assert_eq!(id, Some(3)),
+            other => panic!("expected CommandOk, got {other:?}"),
+        }
+        assert_eq!(shell.screen_name(), "record", "record_start opened Record");
+    }
+
+    /// `library_scan` answers with a `CommandOk` carrying a (possibly empty)
+    /// `bundles` array — and works from the menu, no editor required.
+    #[test]
+    fn run_command_library_scan_returns_listing() {
+        let mut shell = make_shell();
+        let resp = run_command(
+            &mut shell,
+            r#"{"type":"run_command","command":"library_scan"}"#,
+        );
+        match resp {
+            Response::CommandOk {
+                data: Some(data), ..
+            } => {
+                assert!(
+                    data.get("bundles").is_some_and(|b| b.is_array()),
+                    "got {data}"
+                );
+            }
+            other => panic!("expected CommandOk with bundles, got {other:?}"),
+        }
+    }
+
+    /// An unmet precondition (`library_save` with no open composition) surfaces
+    /// as a `command_failed:` protocol error, not a panic.
+    #[test]
+    fn run_command_precondition_failure_is_an_error() {
+        let mut shell = make_shell();
+        let resp = run_command(
+            &mut shell,
+            r#"{"type":"run_command","id":8,"command":"library_save","params":{"name":"x"}}"#,
+        );
+        match resp {
+            Response::Err { id, error } => {
+                assert_eq!(id, Some(8));
+                assert!(error.starts_with("command_failed:"), "got {error}");
+            }
+            other => panic!("expected Err, got {other:?}"),
+        }
+    }
+
+    /// An unknown command name is a protocol error echoing the request id.
+    #[test]
+    fn run_command_unknown_is_rejected() {
+        let mut shell = make_shell();
+        let resp = run_command(
+            &mut shell,
+            r#"{"type":"run_command","id":5,"command":"frobnicate"}"#,
+        );
+        match resp {
+            Response::Err { id, error } => {
+                assert_eq!(id, Some(5));
+                assert!(error.starts_with("unknown_command:"), "got {error}");
+            }
+            other => panic!("expected Err, got {other:?}"),
+        }
+    }
+
+    /// `query help` is answered from any screen and lists **both** tiers: the
+    /// composer actions and the host commands.
+    #[test]
+    fn query_help_lists_both_tiers_from_menu() {
+        let mut shell = make_shell(); // on the menu, no composer
+        let (cmd, mut reply_rx) = remote(r#"{"type":"query","id":1,"what":"Help"}"#);
+        let (tx, rx) = mpsc::channel::<RemoteCommand>(4);
+        shell.set_command_receiver(rx);
+        tx.try_send(cmd).unwrap();
+        shell.drain_remote_commands();
+        match reply_rx.try_recv().expect("help reply") {
+            Response::Help {
+                actions, commands, ..
+            } => {
+                assert!(
+                    actions.iter().any(|a| a.name == "add_note"),
+                    "lists actions"
+                );
+                assert!(
+                    commands.iter().any(|c| c.name == "play_load"),
+                    "lists host commands"
+                );
+            }
+            other => panic!("expected Help, got {other:?}"),
         }
     }
 

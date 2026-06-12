@@ -21,19 +21,32 @@
 //!   reads the same shared composer, so a remote `play_*` action sounds and
 //!   scrolls without any extra wiring here.
 //!
-//! Scope is the **existing** protocol only — no new actions or verbs. App-level
-//! workflow commands (play/record/import/library/backing) are the separate
-//! M8-A host-command tier.
+//! ## Host-command tier (M8-A)
+//!
+//! Beyond composer `run_action`s, this module also dispatches the **host-command
+//! tier** — app-level workflows (play / record / import / library / backing)
+//! that do I/O and so can never be `core::Action`s. [`TauriHost`] implements
+//! [`rockcraft_control::HostServices`] over the backend's existing services
+//! (the same functions the IPC commands call), and a `run_command` request is
+//! routed through [`rockcraft_control::run_host_command`]. `query help` lists
+//! both tiers, so an agent drives a full desktop session over the socket.
 //!
 //! [`Composer`]: rockcraft_core::Composer
 
 use std::net::SocketAddr;
 
-use rockcraft_control::{handle, CommandServer, RemoteCommand, Request, Response};
+use rockcraft_control::{
+    handle, run_host_command, CommandServer, HostResult, HostServices, RemoteCommand, Request,
+    Response,
+};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::mpsc;
 
-use crate::state::AppState;
+use crate::audio::AudioState;
+use crate::import::{ImportInputDto, ImportRunning};
+use crate::play::PlayState;
+use crate::record::RecordState;
+use crate::state::{AppState, SaveDest};
 use crate::EVENT_SNAPSHOT;
 
 /// Default bind address: an OS-assigned loopback port. Override with
@@ -124,20 +137,38 @@ fn spawn_applier(app: AppHandle, mut cmd_rx: mpsc::Receiver<RemoteCommand>) {
         .name("rockcraft-control-apply".into())
         .spawn(move || {
             while let Some(cmd) = cmd_rx.blocking_recv() {
-                let mutating = matches!(cmd.req, Request::RunAction { .. });
-                let response = apply_request(&app.state::<AppState>(), cmd.req);
-                // Keep the webview in sync with agent-driven edits, mirroring the
-                // IPC run_action emit. Only after a mutating action — queries must
-                // not spam the webview with redundant snapshots.
-                if mutating {
-                    if let Response::Ok {
-                        state: Some(snapshot),
-                        ..
-                    } = &response
-                    {
-                        let _ = app.emit(EVENT_SNAPSHOT, snapshot);
+                let response = match cmd.req {
+                    // Host-command tier: drive the backend's services (the
+                    // command bodies emit their own `snapshot` when they change
+                    // the composer, e.g. `library_load`).
+                    Request::RunCommand {
+                        id,
+                        command,
+                        params,
+                    } => {
+                        let mut host = TauriHost { app: &app };
+                        run_host_command(&mut host, id, &command, &params)
                     }
-                }
+                    // Composer action / query tier.
+                    other => {
+                        let mutating = matches!(other, Request::RunAction { .. });
+                        let response = apply_request(&app.state::<AppState>(), other);
+                        // Keep the webview in sync with agent-driven edits,
+                        // mirroring the IPC run_action emit. Only after a
+                        // mutating action — queries must not spam the webview
+                        // with redundant snapshots.
+                        if mutating {
+                            if let Response::Ok {
+                                state: Some(snapshot),
+                                ..
+                            } = &response
+                            {
+                                let _ = app.emit(EVENT_SNAPSHOT, snapshot);
+                            }
+                        }
+                        response
+                    }
+                };
                 // The client may have gone away; a failed reply is not fatal.
                 let _ = cmd.reply.send(response);
             }
@@ -152,6 +183,102 @@ fn spawn_applier(app: AppHandle, mut cmd_rx: mpsc::Receiver<RemoteCommand>) {
 fn apply_request(state: &AppState, req: Request) -> Response {
     let mut composer = state.composer.lock().expect("composer mutex poisoned");
     handle(&mut composer, req)
+}
+
+/// Adapter that implements [`HostServices`] over the Tauri backend.
+///
+/// Holds only an [`AppHandle`]; each method fetches the managed state it needs
+/// (`app.state::<T>()`) and calls the **same** service functions the IPC
+/// commands call, so socket-driven workflows and webview-driven ones share one
+/// implementation. Service errors are surfaced as `Err(String)`, becoming a
+/// `command_failed:` protocol error rather than a panic.
+struct TauriHost<'a> {
+    app: &'a AppHandle,
+}
+
+impl HostServices for TauriHost<'_> {
+    fn play_load(&mut self, dir: &str) -> HostResult {
+        let info = crate::play::play_load(
+            self.app.state::<PlayState>(),
+            self.app.state::<AudioState>(),
+            dir.to_string(),
+        )?;
+        serde_json::to_value(info).map_err(|e| e.to_string())
+    }
+
+    fn play_stop(&mut self) -> HostResult {
+        let summary = crate::play::play_finish(
+            self.app.state::<PlayState>(),
+            self.app.state::<AudioState>(),
+        );
+        serde_json::to_value(summary).map_err(|e| e.to_string())
+    }
+
+    fn record_start(&mut self, backing: Option<&str>) -> HostResult {
+        crate::record::record_start(
+            self.app.state::<RecordState>(),
+            self.app.state::<AudioState>(),
+            backing.map(|s| s.to_string()),
+        )?;
+        Ok(serde_json::Value::Null)
+    }
+
+    fn record_stop(&mut self) -> HostResult {
+        crate::record::record_stop(self.app.state::<RecordState>());
+        Ok(serde_json::Value::Null)
+    }
+
+    fn record_save(&mut self) -> HostResult {
+        let path = crate::record::record_save(self.app.state::<RecordState>())?;
+        Ok(serde_json::json!({ "saved": path }))
+    }
+
+    fn backing_attach(&mut self, path: &str) -> HostResult {
+        crate::audio::attach_backing(self.app.state::<AudioState>(), path.to_string())?;
+        Ok(serde_json::json!({ "backing": path }))
+    }
+
+    fn backing_detach(&mut self) -> HostResult {
+        crate::audio::detach_backing(self.app.state::<AudioState>());
+        Ok(serde_json::Value::Null)
+    }
+
+    fn import_url(&mut self, url: &str) -> HostResult {
+        crate::import::import_start(
+            self.app.clone(),
+            self.app.state::<ImportRunning>(),
+            ImportInputDto::Url(url.to_string()),
+        )?;
+        Ok(serde_json::Value::Null)
+    }
+
+    fn library_scan(&mut self) -> HostResult {
+        let bundles =
+            crate::library::scan_library_inner(&rockcraft_midi::bundle::default_scan_roots());
+        serde_json::to_value(bundles)
+            .map(|b| serde_json::json!({ "bundles": b }))
+            .map_err(|e| e.to_string())
+    }
+
+    fn library_save(&mut self, name: &str) -> HostResult {
+        let state = self.app.state::<AppState>();
+        let path = crate::state::save_bundle(
+            &state,
+            SaveDest::Library {
+                name: name.to_string(),
+            },
+        )?;
+        Ok(serde_json::json!({ "saved": path }))
+    }
+
+    fn library_load(&mut self, dir: &str) -> HostResult {
+        let state = self.app.state::<AppState>();
+        let snapshot = crate::state::load_bundle(&state, dir)?;
+        // Loading replaces the composer timeline — refresh the webview, the same
+        // way the IPC `load_bundle` path's caller does.
+        let _ = self.app.emit(EVENT_SNAPSHOT, &snapshot);
+        serde_json::to_value(snapshot).map_err(|e| e.to_string())
+    }
 }
 
 #[cfg(test)]

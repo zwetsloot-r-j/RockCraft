@@ -164,7 +164,11 @@ mod tests {
             what: QueryKind::Help,
         };
         match handle(&mut c, req) {
-            Response::Help { id, actions } => {
+            Response::Help {
+                id,
+                actions,
+                commands,
+            } => {
                 assert_eq!(id, Some(9));
                 // Same coverage as the name list, but now with params + prose.
                 assert_eq!(actions.len(), action_names().len());
@@ -177,6 +181,12 @@ mod tests {
                     .expect("set_cursor described");
                 let param_names: Vec<&str> = set_cursor.params.iter().map(|p| p.name).collect();
                 assert_eq!(param_names, vec!["pitch", "step"]);
+                // The host-command tier is catalogued alongside the actions.
+                assert_eq!(commands.len(), crate::host::host_command_names().len());
+                assert!(
+                    commands.iter().any(|c| c.name == "play_load"),
+                    "help lists host commands too"
+                );
             }
             other => panic!("expected Help, got {other:?}"),
         }
@@ -194,6 +204,7 @@ mod tests {
             } => {
                 assert_eq!(protocol, "rockcraft-control/1");
                 assert!(requests.contains(&"run_action"));
+                assert!(requests.contains(&"run_command"));
                 assert!(requests.contains(&"query"));
                 assert!(queries.contains(&"Help"));
                 assert!(hint.contains("Help"), "hint points at the help query");
