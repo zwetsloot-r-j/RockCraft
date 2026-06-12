@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use rockcraft_midi::bundle::{default_scan_roots, list_library, LibraryEntry};
+use rockcraft_midi::bundle::{list_library, LibraryEntry};
 use serde::Serialize;
 
 /// Serialisable mirror of [`LibraryEntry`].
