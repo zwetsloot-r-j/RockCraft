@@ -140,10 +140,9 @@ export const NORMAL_BINDINGS: Binding[] = [
 ];
 
 /**
- * Chord-mode keymap — a port of `edit.rs::chord_key_to_action()`. Live only
- * while a chord preview is open; the full selector UX (degree readout etc.) is
- * #165. For now we wire the actions so the keys behave correctly when #165
- * lands and so Esc always cancels (never wedges the screen).
+ * Chord-mode keymap — a port of `edit.rs::chord_key_to_action()`. Live while a
+ * chord preview is open; the selector overlay (ChordSelectorPanel) shows the
+ * current degree, kind, and preview pitches (#165).
  */
 export const CHORD_BINDINGS: Binding[] = [
   { keys: ["1"], action: { name: "set_chord_degree", params: { degree: 1 } } },
@@ -163,7 +162,10 @@ export const CHORD_BINDINGS: Binding[] = [
 /** What `resolveKey` decided to do with a `KeyboardEvent`. */
 export type KeyResolution =
   | { kind: "action"; dispatch: ActionDispatch }
-  /** Esc / chord key with an active overlay: dispatch, and swallow the event. */
+  /**
+   * Chord key or a special modal key: dispatch and swallow (prevent bubbling so
+   * the router's global Esc or other shell handlers don't fire).
+   */
   | { kind: "action-swallow"; dispatch: ActionDispatch }
   /** Swallow the event but dispatch nothing (chord mode owns the keyboard). */
   | { kind: "swallow" }
@@ -181,11 +183,10 @@ function lookup(bindings: Binding[], key: string): ActionDispatch | undefined {
  * Resolve a key to an action, mirroring `edit.rs::on_key`'s routing:
  *
  * - While a chord preview is open the chord keymap owns the keyboard; any other
- *   key is swallowed (do nothing) so the screen isn't wedged before #165. Esc
- *   cancels the chord.
+ *   key is swallowed (the ChordSelectorPanel holds focus). Esc cancels the chord.
  * - Otherwise the normal keymap applies. Esc clears an active selection (and is
- *   swallowed); with no selection it is ignored so the router's global Esc can
- *   return to the menu.
+ *   swallowed); with no selection it is passed through so the EditScreen can
+ *   show the dirty-exit prompt or let the router return to the menu.
  *
  * @param key             `KeyboardEvent.key`.
  * @param chordActive     whether `snapshot.chord_preview` is non-null.

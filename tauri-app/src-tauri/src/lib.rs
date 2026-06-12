@@ -15,6 +15,7 @@
 //! the backing track follows the transport via [`audio::sync_backing`].
 
 mod audio;
+mod import;
 mod library;
 mod midi;
 mod play;
@@ -27,9 +28,10 @@ use rockcraft_core::ComposerSnapshot;
 use tauri::{Emitter, Manager, State};
 
 use crate::audio::AudioState;
+use crate::import::ImportRunning;
 use crate::midi::{MidiState, MidiStatus};
 use crate::play::PlayState;
-use crate::state::{ActionReply, AppState};
+use crate::state::{ActionReply, AppState, SaveDest};
 
 /// Tick cadence for the transport-advance thread (~4 ms ≈ 250 Hz).
 const TICK_PERIOD: std::time::Duration = std::time::Duration::from_millis(4);
@@ -113,6 +115,38 @@ fn scan_library() -> Vec<library::LibraryEntryDto> {
     library::scan_library_inner(&rockcraft_midi::bundle::default_scan_roots())
 }
 
+/// Save the current composer timeline to a bundle.
+///
+/// `dest` selects the target:
+/// - `{ "kind": "quick_save" }` → `recordings/take-<stamp>/`
+/// - `{ "kind": "library", "name": "..." }` → `<library_root>/<slug>/`
+///
+/// Returns the bundle directory path on success, or an error string.
+/// Clears the dirty flag on success.
+#[tauri::command]
+fn save_bundle(state: State<'_, AppState>, dest: SaveDest) -> Result<String, String> {
+    state::save_bundle(&state, dest)
+}
+
+/// Load a bundle from `dir` into the composer, replacing its current timeline.
+///
+/// Reads `song.mid` (required) and `meta.json` (optional). Returns the new
+/// composer snapshot so the frontend can refresh immediately, or an error string.
+/// Clears the dirty flag after loading.
+#[tauri::command]
+fn load_bundle(
+    state: State<'_, AppState>,
+    dir: String,
+) -> Result<rockcraft_core::ComposerSnapshot, String> {
+    state::load_bundle(&state, &dir)
+}
+
+/// Return whether the current timeline has unsaved changes.
+#[tauri::command]
+fn query_dirty(state: State<'_, AppState>) -> bool {
+    state::query_dirty(&state)
+}
+
 /// Return the current MIDI input status (`kind` + optional `port` name).
 #[tauri::command]
 fn midi_status(midi: State<'_, MidiState>) -> MidiStatus {
@@ -143,6 +177,19 @@ impl Default for PrevTransport {
     fn default() -> Self {
         Self(Mutex::new(TransportSnapshot::default()))
     }
+}
+
+/// Derive the bundle-relative filename for a backing audio file.
+///
+/// Mirrors `crates/tui/src/record.rs::bundle_backing_filename`.
+/// The result is always `"backing.<ext>"` where `<ext>` is the source
+/// file's extension (lowercased), or `"backing.audio"` when there is none.
+pub(crate) fn record_bundle_backing_filename(path: &std::path::Path) -> String {
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "audio".to_string());
+    format!("backing.{ext}")
 }
 
 /// Spawn the transport-advance thread.
@@ -243,16 +290,21 @@ fn spawn_tick_thread(app: tauri::AppHandle) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState::new())
         .manage(AudioState::new())
         .manage(MidiState::new())
         .manage(PrevTransport::default())
         .manage(PlayState::default())
+        .manage(ImportRunning::default())
         .invoke_handler(tauri::generate_handler![
             run_action,
             query_state,
             query_help,
             scan_library,
+            save_bundle,
+            load_bundle,
+            query_dirty,
             midi_status,
             mock_key,
             audio::attach_backing,
@@ -262,6 +314,8 @@ pub fn run() {
             play::play_set_wait,
             play::play_toggle_hear_song,
             play::play_finish,
+            import::import_url_available,
+            import::import_start,
         ])
         .setup(|app| {
             spawn_tick_thread(app.handle().clone());

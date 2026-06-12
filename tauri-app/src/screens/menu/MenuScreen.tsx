@@ -1,32 +1,42 @@
-import { createSignal, For, onCleanup, onMount, type JSX } from "solid-js";
+import {
+  createSignal,
+  For,
+  onCleanup,
+  onMount,
+  type JSX,
+} from "solid-js";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useRouter } from "../../shell/Router";
-import type { Screen } from "../../shell/screens";
+import {
+  importUrlAvailable,
+  importStart,
+  openVideoFilePicker,
+} from "../../ipc/bridge";
 
-// ── Menu items ────────────────────────────────────────────────────────────
+// ── Menu item definitions ─────────────────────────────────────────────────
 
+/** A menu item entry (label + action). */
 interface MenuItem {
   label: string;
-  screen: Screen | null; // null = handled inline (Quit)
+  /** Unique key for keyboard navigation identification. */
+  key: string;
+  /** True if the item should be hidden (not just disabled). */
+  hidden?: boolean;
   disabled?: boolean;
   disabledTitle?: string;
 }
 
-const MENU_ITEMS: MenuItem[] = [
-  { label: "Record", screen: { kind: "record" } },
-  { label: "Play last recording", screen: { kind: "play" } },
-  { label: "Compose (new)", screen: { kind: "edit" } },
-  { label: "Edit last recording", screen: { kind: "edit" } },
-  { label: "Library…", screen: { kind: "library" } },
-  { label: "Choose backing track", screen: { kind: "backing-picker" } },
-  { label: "Import from video file…", screen: { kind: "video-picker" } },
-  {
-    label: "Import from URL…",
-    screen: { kind: "url-input" },
-    disabled: true,
-    disabledTitle: "no fetch command configured",
-  },
-  { label: "Quit", screen: null },
+// The static part of the menu (order preserved; dynamic items managed below).
+const STATIC_ITEMS: MenuItem[] = [
+  { label: "Record", key: "record" },
+  { label: "Play last recording", key: "play" },
+  { label: "Compose (new)", key: "compose" },
+  { label: "Edit last recording", key: "edit" },
+  { label: "Library…", key: "library" },
+  { label: "Choose backing track", key: "backing-picker" },
+  { label: "Import from video file…", key: "video-import" },
+  { label: "Import from URL…", key: "url-import" },
+  { label: "Quit", key: "quit" },
 ];
 
 // ── Component ─────────────────────────────────────────────────────────────
@@ -34,19 +44,69 @@ const MENU_ITEMS: MenuItem[] = [
 export function MenuScreen(): JSX.Element {
   const { navigate } = useRouter();
   const [selected, setSelected] = createSignal(0);
+  /** Whether a fetch command is configured (controls URL import visibility). */
+  const [urlAvailable, setUrlAvailable] = createSignal<boolean>(false);
 
-  function activate(idx: number): void {
-    const item = MENU_ITEMS[idx];
-    if (!item || item.disabled) return;
-    if (item.screen === null) {
-      void getCurrentWindow().close();
-    } else {
-      navigate(item.screen);
+  // Query URL availability on mount.
+  onMount(() => {
+    importUrlAvailable()
+      .then((v) => setUrlAvailable(v))
+      .catch(() => {
+        /* backend not yet available — leave as false */
+      });
+  });
+
+  /** Visible items depend on urlAvailable. */
+  function visibleItems(): MenuItem[] {
+    return STATIC_ITEMS.filter((item) => {
+      if (item.key === "url-import" && !urlAvailable()) return false;
+      return true;
+    });
+  }
+
+  async function activate(key: string): Promise<void> {
+    switch (key) {
+      case "record":
+        navigate({ kind: "record" });
+        break;
+      case "play":
+        navigate({ kind: "play" });
+        break;
+      case "compose":
+        navigate({ kind: "edit" });
+        break;
+      case "edit":
+        navigate({ kind: "edit" });
+        break;
+      case "library":
+        navigate({ kind: "library" });
+        break;
+      case "backing-picker":
+        navigate({ kind: "backing-picker" });
+        break;
+      case "video-import": {
+        const path = await openVideoFilePicker();
+        if (path) {
+          navigate({ kind: "importing" });
+          importStart({ kind: "File", value: path }).catch(() => {
+            // import_start error (e.g. "already running") — navigate back.
+            navigate({ kind: "menu" });
+          });
+        }
+        break;
+      }
+      case "url-import":
+        navigate({ kind: "url-input" });
+        break;
+      case "quit":
+        void getCurrentWindow().close();
+        break;
     }
   }
 
   function moveSelection(delta: number): void {
-    const count = MENU_ITEMS.length;
+    const items = visibleItems();
+    const count = items.length;
     setSelected((s) => ((s + delta) % count + count) % count);
   }
 
@@ -64,7 +124,7 @@ export function MenuScreen(): JSX.Element {
         break;
       case "Enter":
         e.preventDefault();
-        activate(selected());
+        void activate(visibleItems()[selected()]?.key ?? "");
         break;
       default:
         break;
@@ -109,7 +169,7 @@ export function MenuScreen(): JSX.Element {
           gap: "2px",
         }}
       >
-        <For each={MENU_ITEMS}>
+        <For each={visibleItems()}>
           {(item, idx) => {
             const isSelected = () => selected() === idx();
             return (
@@ -136,7 +196,7 @@ export function MenuScreen(): JSX.Element {
                     : "none",
                 }}
                 onMouseEnter={() => setSelected(idx())}
-                onClick={() => activate(idx())}
+                onClick={() => void activate(item.key)}
               >
                 {item.label}
               </div>

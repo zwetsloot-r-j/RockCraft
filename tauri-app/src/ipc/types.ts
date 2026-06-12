@@ -92,11 +92,29 @@ export type Effect =
 
 /**
  * The result of a successful `run_action` — mirror of `state::ActionReply`.
+ *
+ * `dirty` mirrors the backend's `AppState::dirty` flag: true when the timeline
+ * has unsaved changes since the last save or load.
  */
 export interface ActionReply {
   effects: Effect[];
   snapshot: ComposerSnapshot;
+  dirty: boolean;
 }
+
+/**
+ * Where to save a bundle — mirror of `state::SaveDest`.
+ * Serde serializes as a tagged union (`kind` tag, snake_case).
+ */
+export type SaveDest =
+  | { kind: "quick_save" }
+  | { kind: "library"; name: string };
+
+/**
+ * Result of a successful `save_bundle` — the bundle directory as a string.
+ * On error the command rejects with a string message.
+ */
+export type SaveBundleResult = string;
 
 /** One action parameter — mirror of `action::ParamInfo`. */
 export interface ParamInfo {
