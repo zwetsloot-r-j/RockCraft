@@ -168,19 +168,8 @@ pub fn drain(midi: &MidiState) -> Vec<NoteEvent> {
 }
 
 /// Drain pending events, feed each one into the composer, and return
-/// serialisable payloads (for `midi_event` emission) plus accumulated effects.
-pub fn drain_and_ingest(
-    midi: &MidiState,
-    composer: &mut Composer,
-) -> (Vec<NoteEventPayload>, Vec<rockcraft_core::Effect>) {
-    let (payloads, _raw, effects) = drain_and_ingest_raw(midi, composer);
-    (payloads, effects)
-}
-
-/// Like [`drain_and_ingest`] but also returns the raw [`NoteEvent`]s.
-///
-/// The raw events are passed to the recording session so their original
-/// timestamps (needed for backing-offset calculation) are preserved.
+/// serialisable payloads (for `midi_event` emission), raw [`NoteEvent`]s
+/// (for the recording session), and accumulated effects.
 pub fn drain_and_ingest_raw(
     midi: &MidiState,
     composer: &mut Composer,

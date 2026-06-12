@@ -32,9 +32,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use rockcraft_core::{
-    BackingTrack, EventBuffer, NoteEvent, NoteEventKind, RecordingMeta, TrackOrigin,
-};
+use rockcraft_core::{BackingTrack, EventBuffer, NoteEvent, RecordingMeta, TrackOrigin};
 use rockcraft_midi::events_to_smf_bytes;
 use tauri::State;
 
@@ -178,34 +176,6 @@ impl RecordState {
         if let Some(ref mut session) = *guard {
             session.push(ev);
         }
-    }
-
-    /// `true` when a session is currently active.
-    pub fn is_active(&self) -> bool {
-        self.session
-            .lock()
-            .expect("record session mutex poisoned")
-            .is_some()
-    }
-
-    /// Elapsed recording time in microseconds, 0 when inactive.
-    pub fn elapsed_us(&self) -> u64 {
-        self.session
-            .lock()
-            .expect("record session mutex poisoned")
-            .as_ref()
-            .map(|s| s.elapsed_us())
-            .unwrap_or(0)
-    }
-
-    /// Number of captured events, 0 when inactive.
-    pub fn event_count(&self) -> usize {
-        self.session
-            .lock()
-            .expect("record session mutex poisoned")
-            .as_ref()
-            .map(|s| s.event_count())
-            .unwrap_or(0)
     }
 }
 
@@ -497,16 +467,19 @@ mod tests {
     #[test]
     fn record_state_inactive_by_default() {
         let state = RecordState::new();
-        assert!(!state.is_active());
-        assert_eq!(state.elapsed_us(), 0);
-        assert_eq!(state.event_count(), 0);
+        let session = state.session.lock().unwrap();
+        assert!(session.is_none(), "session should be None on startup");
     }
 
     #[test]
     fn record_state_push_ignored_when_inactive() {
         let state = RecordState::new();
         state.push(on_ev(0)); // must not panic
-        assert_eq!(state.event_count(), 0);
+        let session = state.session.lock().unwrap();
+        assert!(
+            session.is_none(),
+            "push with no session must not create a session"
+        );
     }
 
     // ── save integration: round-trip ─────────────────────────────────────────
@@ -514,8 +487,6 @@ mod tests {
     #[test]
     fn save_bundle_round_trip() {
         use rockcraft_midi::smf_bytes_to_events;
-        use std::path::Path;
-
         let tmp = tempfile::tempdir().expect("tempdir");
         // Patch RECORDINGS_DIR: we write into the tempdir directly.
         let bundle_dir = tmp.path().join("take-test");
