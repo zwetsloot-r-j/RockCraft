@@ -24,6 +24,7 @@ tauri-build = { version = "2", features = [] }
 rockcraft-core = { workspace = true }
 rockcraft-midi = { workspace = true }
 rockcraft-audio = { workspace = true }
+rockcraft-import = { workspace = true }
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 serde = { workspace = true }

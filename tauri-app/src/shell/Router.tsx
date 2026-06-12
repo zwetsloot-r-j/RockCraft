@@ -33,9 +33,9 @@ export function useRouter(): RouterContext {
 // ── Screens that accept instrument (MIDI note) input ──────────────────────
 
 function screenWantsInstrumentInput(s: Screen): boolean {
-  // StepRecord / LiveRecord input modes are active on the edit screen.
-  // Play/record screens (#168/#169) will add themselves here when they land.
-  return s.kind === "edit";
+  // StepRecord / LiveRecord input modes are active on the edit screen; the
+  // play screen (#168) scores live mock-key strikes against the chart.
+  return s.kind === "edit" || s.kind === "play";
 }
 
 // ── Router component ───────────────────────────────────────────────────────
@@ -62,8 +62,14 @@ export function Router(props: RouterProps): JSX.Element {
   }
 
   // Global Escape: return to menu from any non-menu screen.
+  // The importing screen manages its own Escape (only after failure) — skip it
+  // here so the pipeline is never aborted mid-run from this global handler.
   function onKeydown(e: KeyboardEvent): void {
-    if (e.key === "Escape" && screen().kind !== "menu") {
+    if (
+      e.key === "Escape" &&
+      screen().kind !== "menu" &&
+      screen().kind !== "importing"
+    ) {
       navigate({ kind: "menu" });
       return;
     }

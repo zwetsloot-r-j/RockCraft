@@ -15,8 +15,10 @@
 //! the backing track follows the transport via [`audio::sync_backing`].
 
 mod audio;
+mod import;
 mod library;
 mod midi;
+mod play;
 mod record;
 mod state;
 
@@ -27,9 +29,11 @@ use rockcraft_core::ComposerSnapshot;
 use tauri::{Emitter, Manager, State};
 
 use crate::audio::AudioState;
+use crate::import::ImportRunning;
 use crate::midi::{MidiState, MidiStatus};
+use crate::play::PlayState;
 use crate::record::RecordState;
-use crate::state::{ActionReply, AppState};
+use crate::state::{ActionReply, AppState, SaveDest};
 
 /// Tick cadence for the transport-advance thread (~4 ms ≈ 250 Hz).
 const TICK_PERIOD: std::time::Duration = std::time::Duration::from_millis(4);
@@ -40,6 +44,8 @@ const EVENT_SNAPSHOT: &str = "snapshot";
 const EVENT_EFFECTS: &str = "effects";
 /// Event name carrying a serialised [`NoteEvent`] to the webview.
 const EVENT_MIDI: &str = "midi_event";
+/// Event name carrying a live [`play::PlayStateEvent`] to the highway (#168).
+const EVENT_PLAY_STATE: &str = "play_state";
 
 /// Apply a named action and return its effects plus the new snapshot.
 ///
@@ -111,6 +117,38 @@ fn scan_library() -> Vec<library::LibraryEntryDto> {
     library::scan_library_inner(&rockcraft_midi::bundle::default_scan_roots())
 }
 
+/// Save the current composer timeline to a bundle.
+///
+/// `dest` selects the target:
+/// - `{ "kind": "quick_save" }` → `recordings/take-<stamp>/`
+/// - `{ "kind": "library", "name": "..." }` → `<library_root>/<slug>/`
+///
+/// Returns the bundle directory path on success, or an error string.
+/// Clears the dirty flag on success.
+#[tauri::command]
+fn save_bundle(state: State<'_, AppState>, dest: SaveDest) -> Result<String, String> {
+    state::save_bundle(&state, dest)
+}
+
+/// Load a bundle from `dir` into the composer, replacing its current timeline.
+///
+/// Reads `song.mid` (required) and `meta.json` (optional). Returns the new
+/// composer snapshot so the frontend can refresh immediately, or an error string.
+/// Clears the dirty flag after loading.
+#[tauri::command]
+fn load_bundle(
+    state: State<'_, AppState>,
+    dir: String,
+) -> Result<rockcraft_core::ComposerSnapshot, String> {
+    state::load_bundle(&state, &dir)
+}
+
+/// Return whether the current timeline has unsaved changes.
+#[tauri::command]
+fn query_dirty(state: State<'_, AppState>) -> bool {
+    state::query_dirty(&state)
+}
+
 /// Return the current MIDI input status (`kind` + optional `port` name).
 #[tauri::command]
 fn midi_status(midi: State<'_, MidiState>) -> MidiStatus {
@@ -143,6 +181,19 @@ impl Default for PrevTransport {
     }
 }
 
+/// Derive the bundle-relative filename for a backing audio file.
+///
+/// Mirrors `crates/tui/src/record.rs::bundle_backing_filename`.
+/// The result is always `"backing.<ext>"` where `<ext>` is the source
+/// file's extension (lowercased), or `"backing.audio"` when there is none.
+pub(crate) fn record_bundle_backing_filename(path: &std::path::Path) -> String {
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "audio".to_string());
+    format!("backing.{ext}")
+}
+
 /// Spawn the transport-advance thread.
 ///
 /// Every [`TICK_PERIOD`] it measures the wall-clock delta since the last tick,
@@ -166,7 +217,26 @@ fn spawn_tick_thread(app: tauri::AppHandle) {
             let midi_state = app.state::<MidiState>();
             let audio = app.state::<AudioState>();
             let prev_transport = app.state::<PrevTransport>();
+            let play_state = app.state::<PlayState>();
             let record_state = app.state::<RecordState>();
+
+            // When a play session is active (#168), MIDI feeds the highway, not
+            // the composer: drain raw events, drive the session, emit play_state.
+            // Scoring/wait/clock all run off the injected `dt_us`, never the
+            // render loop. The composer path is skipped entirely this tick.
+            let play_active = play_state.0.lock().expect("play state poisoned").is_some();
+            if play_active {
+                let raw = crate::midi::drain(&midi_state);
+                for ev in &raw {
+                    let _ = app.emit(EVENT_MIDI, crate::midi::NoteEventPayload::from(*ev));
+                    // Feed record session even during play mode.
+                    record_state.push(*ev);
+                }
+                if let Some(snapshot) = crate::play::tick_play(&play_state, &audio, &raw, dt_us) {
+                    let _ = app.emit(EVENT_PLAY_STATE, &snapshot);
+                }
+                continue;
+            }
 
             // Drain pending MIDI events, ingest into composer, emit to webview,
             // and also push into the active recording session (if any).
@@ -237,11 +307,16 @@ pub fn run() {
         .manage(MidiState::new())
         .manage(RecordState::new())
         .manage(PrevTransport::default())
+        .manage(PlayState::default())
+        .manage(ImportRunning::default())
         .invoke_handler(tauri::generate_handler![
             run_action,
             query_state,
             query_help,
             scan_library,
+            save_bundle,
+            load_bundle,
+            query_dirty,
             midi_status,
             mock_key,
             audio::attach_backing,
@@ -251,6 +326,12 @@ pub fn run() {
             record::record_stop,
             record::record_save,
             record::record_status,
+            play::play_load,
+            play::play_set_wait,
+            play::play_toggle_hear_song,
+            play::play_finish,
+            import::import_url_available,
+            import::import_start,
         ])
         .setup(|app| {
             spawn_tick_thread(app.handle().clone());

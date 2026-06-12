@@ -5,14 +5,20 @@
 // throttle signal drives the updates); derives bar/beat/chord from
 // performance.now() - eng.t0 modulo SONG.LOOP.
 
-import { For } from "solid-js";
+import { For, Show } from "solid-js";
 import type { HighwayCanvas } from "./HighwayCanvas";
+import type { PlayStateEvent } from "../../ipc/types";
 import type { SongData } from "./types";
 
 interface HighwayHeaderProps {
   eng: () => HighwayCanvas | null;
   frame: () => number;
   song: SongData;
+  /** Live mode (#168): read score/combo/clock from `playState`, not the eng. */
+  live?: boolean;
+  playState?: () => PlayStateEvent | null;
+  hearSong?: () => boolean;
+  waitMode?: () => boolean;
 }
 
 // 12-dot pitch-class color wheel.
@@ -25,21 +31,29 @@ const monoFont = "'IBM Plex Mono', monospace";
 
 export function HighwayHeader(props: HighwayHeaderProps) {
   // Derived reads — each touches props.frame() so the throttle signal drives them.
-  const clock = () => {
-    props.frame();
+  // In live mode (#168) the song time and score/combo come from the backend
+  // `play_state` (the real clock + scoring), not the demo engine's mock fields.
+  const nowMs = (): number => {
+    if (props.live) return (props.playState?.()?.time_us ?? 0) / 1000;
     const eng = props.eng();
     const elapsed = eng ? performance.now() - eng.t0 : 0;
-    const now = elapsed % props.song.LOOP;
+    return elapsed % props.song.LOOP;
+  };
+  const clock = () => {
+    props.frame();
+    const now = nowMs();
     const bar = Math.floor(now / props.song.BAR);
     const beat = Math.floor((now % props.song.BAR) / props.song.BEAT);
     return { bar, beat, chord: props.song.chords[bar] };
   };
   const combo = () => {
     props.frame();
+    if (props.live) return props.playState?.()?.combo ?? 0;
     return props.eng()?.combo ?? 0;
   };
   const score = () => {
     props.frame();
+    if (props.live) return props.playState?.()?.score ?? 0;
     return props.eng()?.score ?? 0;
   };
   const mult = () => 1 + Math.floor(combo() / 8);
@@ -87,6 +101,41 @@ export function HighwayHeader(props: HighwayHeaderProps) {
           </For>
         </div>
       </div>
+
+      <Show when={props.live}>
+        <div style={{ display: "flex", "align-items": "center", gap: "8px" }}>
+          <span
+            style={{
+              "font-size": "11px",
+              "font-family": monoFont,
+              padding: "2px 8px",
+              "border-radius": "6px",
+              background: props.hearSong?.()
+                ? "rgba(103,227,196,0.2)"
+                : "rgba(255,255,255,0.05)",
+              color: props.hearSong?.() ? "#67e3c4" : "#7c7f8e",
+            }}
+            title="m — hear the song"
+          >
+            ♪ m
+          </span>
+          <span
+            style={{
+              "font-size": "11px",
+              "font-family": monoFont,
+              padding: "2px 8px",
+              "border-radius": "6px",
+              background: props.waitMode?.()
+                ? "rgba(255,209,102,0.2)"
+                : "rgba(255,255,255,0.05)",
+              color: props.waitMode?.() ? "#ffd166" : "#7c7f8e",
+            }}
+            title="w — wait mode"
+          >
+            ⏸ w
+          </span>
+        </div>
+      </Show>
 
       <div style={{ flex: 1 }} />
 
