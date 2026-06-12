@@ -19,6 +19,7 @@ mod import;
 mod library;
 mod midi;
 mod play;
+mod record;
 mod state;
 
 use std::sync::Mutex;
@@ -31,6 +32,7 @@ use crate::audio::AudioState;
 use crate::import::ImportRunning;
 use crate::midi::{MidiState, MidiStatus};
 use crate::play::PlayState;
+use crate::record::RecordState;
 use crate::state::{ActionReply, AppState, SaveDest};
 
 /// Tick cadence for the transport-advance thread (~4 ms ≈ 250 Hz).
@@ -216,6 +218,7 @@ fn spawn_tick_thread(app: tauri::AppHandle) {
             let audio = app.state::<AudioState>();
             let prev_transport = app.state::<PrevTransport>();
             let play_state = app.state::<PlayState>();
+            let record_state = app.state::<RecordState>();
 
             // When a play session is active (#168), MIDI feeds the highway, not
             // the composer: drain raw events, drive the session, emit play_state.
@@ -226,6 +229,8 @@ fn spawn_tick_thread(app: tauri::AppHandle) {
                 let raw = crate::midi::drain(&midi_state);
                 for ev in &raw {
                     let _ = app.emit(EVENT_MIDI, crate::midi::NoteEventPayload::from(*ev));
+                    // Feed record session even during play mode.
+                    record_state.push(*ev);
                 }
                 if let Some(snapshot) = crate::play::tick_play(&play_state, &audio, &raw, dt_us) {
                     let _ = app.emit(EVENT_PLAY_STATE, &snapshot);
@@ -233,11 +238,17 @@ fn spawn_tick_thread(app: tauri::AppHandle) {
                 continue;
             }
 
-            // Drain pending MIDI events, ingest into composer, emit to webview.
-            let (midi_events, midi_effects) = {
+            // Drain pending MIDI events, ingest into composer, emit to webview,
+            // and also push into the active recording session (if any).
+            let (midi_events, raw_events, midi_effects) = {
                 let mut composer = app_state.composer.lock().expect("composer mutex poisoned");
-                crate::midi::drain_and_ingest(&midi_state, &mut composer)
+                crate::midi::drain_and_ingest_raw(&midi_state, &mut composer)
             };
+            // Feed raw (pre-rebase) events into the record session so timestamps
+            // are preserved for backing-offset calculation.
+            for ev in &raw_events {
+                record_state.push(*ev);
+            }
             for ev in &midi_events {
                 let _ = app.emit(EVENT_MIDI, ev);
             }
@@ -294,6 +305,7 @@ pub fn run() {
         .manage(AppState::new())
         .manage(AudioState::new())
         .manage(MidiState::new())
+        .manage(RecordState::new())
         .manage(PrevTransport::default())
         .manage(PlayState::default())
         .manage(ImportRunning::default())
@@ -310,6 +322,10 @@ pub fn run() {
             audio::attach_backing,
             audio::detach_backing,
             audio::audio_status,
+            record::record_start,
+            record::record_stop,
+            record::record_save,
+            record::record_status,
             play::play_load,
             play::play_set_wait,
             play::play_toggle_hear_song,

@@ -363,6 +363,24 @@ pub fn sync_backing(
     }
 }
 
+// ── Inner helpers (callable without a Tauri State wrapper) ──────────────────
+
+/// Attach a backing-track file, bypassing the path-existence check.
+///
+/// Intended for use by [`crate::record`] when starting a session with a
+/// backing track (the caller already verified the path exists).
+pub fn attach_backing_inner(state: &AudioState, path: PathBuf) {
+    state.send_backing(BackingMsg::Attach(path));
+}
+
+/// Start the backing track from position 0 immediately.
+///
+/// Called by [`crate::record`] when a recording session begins with a backing
+/// track so audio plays from the first moment of recording.
+pub fn play_backing_now(state: &AudioState) {
+    state.send_backing(BackingMsg::PlayAt(0));
+}
+
 // ── Tauri commands ───────────────────────────────────────────────────────────
 
 /// Audio status reported to the webview.

@@ -168,11 +168,16 @@ pub fn drain(midi: &MidiState) -> Vec<NoteEvent> {
 }
 
 /// Drain pending events, feed each one into the composer, and return
-/// serialisable payloads (for `midi_event` emission) plus accumulated effects.
-pub fn drain_and_ingest(
+/// serialisable payloads (for `midi_event` emission), raw [`NoteEvent`]s
+/// (for the recording session), and accumulated effects.
+pub fn drain_and_ingest_raw(
     midi: &MidiState,
     composer: &mut Composer,
-) -> (Vec<NoteEventPayload>, Vec<rockcraft_core::Effect>) {
+) -> (
+    Vec<NoteEventPayload>,
+    Vec<NoteEvent>,
+    Vec<rockcraft_core::Effect>,
+) {
     let events = midi
         .source
         .lock()
@@ -180,12 +185,14 @@ pub fn drain_and_ingest(
         .drain_events();
     let mut all_effects = Vec::new();
     let mut payloads = Vec::with_capacity(events.len());
+    let mut raw = Vec::with_capacity(events.len());
     for ev in events {
+        raw.push(ev);
         let effects = composer.ingest(ev);
         all_effects.extend(effects);
         payloads.push(NoteEventPayload::from(ev));
     }
-    (payloads, all_effects)
+    (payloads, raw, all_effects)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
