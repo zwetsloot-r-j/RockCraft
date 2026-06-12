@@ -56,6 +56,8 @@ function Field(props: { label: string; value: string }): JSX.Element {
 
 interface Props {
   snapshot: ComposerSnapshot;
+  /** Whether the timeline has unsaved changes (shows a dirty indicator). */
+  dirty?: boolean;
 }
 
 export function StatusBar(props: Props): JSX.Element {
@@ -121,6 +123,20 @@ export function StatusBar(props: Props): JSX.Element {
         />
       </Show>
 
+      <Show when={props.dirty}>
+        <span
+          style={{
+            color: "#f5c542",
+            "font-size": "11px",
+            "font-weight": 600,
+            "flex-shrink": 0,
+          }}
+          title="Unsaved changes"
+        >
+          ●
+        </span>
+      </Show>
+
       <span
         style={{
           "margin-left": "auto",
@@ -130,7 +146,7 @@ export function StatusBar(props: Props): JSX.Element {
         }}
       >
         a/x add·del · [/] size · +/- vel · m grab · c chord · v·y·p·D select ·
-        u/U undo · Space play · o loop
+        u/U undo · Space play · o loop · s save · ? help
       </span>
     </div>
   );

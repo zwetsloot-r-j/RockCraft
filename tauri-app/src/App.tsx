@@ -39,11 +39,12 @@ function AppShell(): JSX.Element {
       <Match when={screen().kind === "library"}>
         <LibraryScreen />
       </Match>
-      {/* Composer edit screen (#164): piano-roll grid + keymap over the IPC
-          bridge. Reachable from the menu via "Compose (new)" / "Edit last
-          recording". */}
+      {/* Composer edit screen (#164+#165): piano-roll grid + keymap over the
+          IPC bridge. Reachable from the menu via "Compose (new)" / "Edit last
+          recording", or from the library browser with a bundle `dir` payload. */}
       <Match when={screen().kind === "edit"}>
-        <EditScreen />
+        {/* Type-narrow to extract the optional `dir` field. */}
+        <EditScreen dir={screen().kind === "edit" ? (screen() as { kind: "edit"; dir?: string }).dir : undefined} />
       </Match>
       {/* URL input modal — only shown when a fetch command is configured. */}
       <Match when={screen().kind === "url-input"}>
