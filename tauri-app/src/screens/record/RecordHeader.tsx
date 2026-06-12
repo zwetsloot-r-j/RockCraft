@@ -21,10 +21,6 @@ export interface RecordHeaderProps {
   eng: Accessor<RecordCanvas | null>;
   frame: Accessor<number>;
   song: Song;
-  metro: Accessor<boolean>;
-  onMetro: (v: boolean) => void;
-  count: Accessor<boolean>;
-  onCount: (v: boolean) => void;
   /** Whether a recording session is currently active. */
   recording: Accessor<boolean>;
   /** Wall-clock ms when the session started (for timecode display). */
@@ -171,10 +167,12 @@ export function RecordHeader(props: RecordHeaderProps): JSX.Element {
         {backingName() ? "Change backing" : "Choose backing track"}
       </button>
 
-      <Toggle active={props.metro()} onClick={() => props.onMetro(!props.metro())} title="Metronome">
-        <Icon d="metro" size={13} stroke={props.metro() ? OK : "#6e7282"} /> {props.song.tempoBpm}
+      {/* Metronome / count-in have core actions but no path into the live
+          record session yet (#188) — shown disabled rather than faked. */}
+      <Toggle disabled title="Metronome — not yet wired">
+        <Icon d="metro" size={13} stroke="#6e7282" /> {props.song.tempoBpm}
       </Toggle>
-      <Toggle active={props.count()} onClick={() => props.onCount(!props.count())} title="Count-in">
+      <Toggle disabled title="Count-in — not yet wired">
         COUNT 1
       </Toggle>
 

@@ -8,18 +8,21 @@
 //   record_stop / record_save Tauri commands.
 // - The screen starts idle on an empty take (#187 retired the demo fixture);
 //   live MIDI fills it in.
-// - "s" saves, Esc confirms-if-unsaved then navigates to menu.
+// - "s" saves; Esc with unsaved input opens a Save/Discard/Cancel prompt (#188),
+//   else the shell navigates to the menu.
 // - "Choose backing track" opens a native file dialog and attaches audio.
 
-import { createSignal, type JSX, onCleanup, onMount } from "solid-js";
+import { createSignal, type JSX, onCleanup, onMount, Show } from "solid-js";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import "./record.css";
 import { RecordCanvas } from "./RecordCanvas";
 import { RecordHeader } from "./RecordHeader";
-import { RecordToolbar, type Clef, type Snap, type Spelling } from "./RecordToolbar";
+import { RecordToolbar, type Snap } from "./RecordToolbar";
 import { NoteInspector } from "./NoteInspector";
 import { EMPTY_TAKE } from "./emptyTake";
+import { nextExit, type ExitPhase } from "./exit";
 import { DISP } from "./ui/theme";
+import { useRouter } from "../../shell/Router";
 import { onMidiEvent } from "../../ipc/midi";
 import {
   recordStart,
@@ -32,16 +35,13 @@ import {
 const AUDIO_EXTENSIONS = ["mp3", "wav", "ogg", "flac", "m4a"];
 
 export function RecordScreen(): JSX.Element {
+  const { navigate } = useRouter();
   let canvasEl!: HTMLCanvasElement;
   const [eng, setEng] = createSignal<RecordCanvas | null>(null);
   // Bumped ~9 fps so the header/toolbar re-read engine clock/level/selection
   // without coupling chrome updates to the canvas rAF rate.
   const [frame, setFrame] = createSignal(0);
-  const [metro, setMetro] = createSignal(true);
-  const [count, setCount] = createSignal(true);
   const [snap, setSnap] = createSignal<Snap>("1/16");
-  const [clef, setClef] = createSignal<Clef>("Grand");
-  const [spelling, setSpelling] = createSignal<Spelling>("♯");
 
   // Session state
   const [recording, setRecording] = createSignal(false);
@@ -49,6 +49,8 @@ export function RecordScreen(): JSX.Element {
   const [toast, setToast] = createSignal<string | null>(null);
   const [backingPath, setBackingPath] = createSignal<string | null>(null);
   const [sessionStart, setSessionStart] = createSignal<number>(0);
+  // Whether the dirty-exit Save/Discard/Cancel prompt is shown (#188).
+  const [exitPrompt, setExitPrompt] = createSignal(false);
 
   function showToast(msg: string): void {
     setToast(msg);
@@ -83,15 +85,38 @@ export function RecordScreen(): JSX.Element {
     setRecording(false);
   }
 
-  async function saveRecording(): Promise<void> {
-    if (!recording() && !dirty()) return;
+  /** Save the take; returns whether it succeeded (or there was nothing to do). */
+  async function trySave(): Promise<boolean> {
+    if (!recording() && !dirty()) return true;
     try {
       const dir = await recordSave();
       setDirty(false);
       showToast(`Saved → ${dir}`);
+      return true;
     } catch (err) {
       showToast(`Save failed: ${err}`);
+      return false;
     }
+  }
+
+  async function saveRecording(): Promise<void> {
+    await trySave();
+  }
+
+  // ── Dirty-exit prompt (#188) ─────────────────────────────────────────────────
+
+  /** Save → stop → menu. Stays on the screen (with an error toast) if save fails. */
+  async function exitWithSave(): Promise<void> {
+    if (await trySave()) {
+      await stopRecording();
+      navigate({ kind: "menu" });
+    }
+  }
+
+  /** Discard the take: stop the session and return to the menu. */
+  async function exitDiscard(): Promise<void> {
+    await stopRecording();
+    navigate({ kind: "menu" });
   }
 
   // ── Backing file dialog ──────────────────────────────────────────────────────
@@ -115,25 +140,35 @@ export function RecordScreen(): JSX.Element {
 
   // ── Keyboard shortcuts ────────────────────────────────────────────────────────
 
-  async function handleKeyDown(e: KeyboardEvent): Promise<void> {
+  // Registered in the capture phase (see onMount) so the dirty-exit prompt can
+  // intercept Esc *before* the shell's global Esc→menu handler runs.
+  function handleKeyDown(e: KeyboardEvent): void {
+    const phase: ExitPhase = exitPrompt() ? "open" : "closed";
+
+    // Esc, and every key while the prompt is open, go through the pure helper.
+    if (e.key === "Escape" || phase === "open") {
+      const d = nextExit(phase, dirty(), e.key);
+      setExitPrompt(d.phase === "open");
+      if (d.intercept) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+      }
+      if (d.effect === "save") void exitWithSave();
+      else if (d.effect === "discard") void exitDiscard();
+      // effect "none" with intercept=false (clean-take Esc): the event is left
+      // to propagate to the shell, which navigates to the menu; onCleanup then
+      // stops the session if it is still recording.
+      return;
+    }
+
+    // Normal shortcuts (prompt closed).
     if (e.key === "s" || e.key === "S") {
       e.preventDefault();
-      await saveRecording();
-    } else if (e.key === "Escape") {
-      e.preventDefault();
-      if (dirty()) {
-        // For now just stop; a confirm dialog is a future enhancement.
-        await stopRecording();
-      } else {
-        await stopRecording();
-      }
+      void saveRecording();
     } else if (e.key === "r" || e.key === "R") {
       e.preventDefault();
-      if (recording()) {
-        await stopRecording();
-      } else {
-        await startRecording();
-      }
+      if (recording()) void stopRecording();
+      else void startRecording();
     }
   }
 
@@ -159,13 +194,14 @@ export function RecordScreen(): JSX.Element {
       }
     });
 
-    window.addEventListener("keydown", handleKeyDown);
+    // Capture phase: intercept Esc before the shell's global Esc→menu handler.
+    window.addEventListener("keydown", handleKeyDown, true);
 
     onCleanup(() => {
       window.clearInterval(frameId);
       e.stop();
       unlistenPromise.then((unlisten) => unlisten());
-      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("keydown", handleKeyDown, true);
       // Stop the session if the screen is unmounted while recording.
       if (recording()) {
         recordStop().catch(() => {});
@@ -207,10 +243,6 @@ export function RecordScreen(): JSX.Element {
         eng={eng}
         frame={frame}
         song={EMPTY_TAKE}
-        metro={metro}
-        onMetro={setMetro}
-        count={count}
-        onCount={setCount}
         recording={recording}
         sessionStart={sessionStart}
         backingPath={backingPath}
@@ -223,15 +255,94 @@ export function RecordScreen(): JSX.Element {
       <RecordToolbar
         snap={snap}
         onSnap={setSnap}
-        clef={clef}
-        onClef={setClef}
-        spelling={spelling}
-        onSpelling={setSpelling}
         recording={recording}
         onRecord={startRecording}
         onStop={stopRecording}
         onSave={saveRecording}
       />
+
+      {/* Dirty-exit confirm prompt (#188): Esc with unsaved input lands here. */}
+      <Show when={exitPrompt()}>
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(8,9,14,0.66)",
+            display: "flex",
+            "align-items": "center",
+            "justify-content": "center",
+            "z-index": 2000,
+          }}
+          onClick={() => setExitPrompt(false)}
+        >
+          <div
+            onClick={(ev) => ev.stopPropagation()}
+            style={{
+              "min-width": "320px",
+              padding: "22px 24px",
+              "border-radius": "14px",
+              background: "#1b1d28",
+              border: "1px solid rgba(255,255,255,0.12)",
+              "box-shadow": "0 20px 60px rgba(0,0,0,0.5)",
+              "text-align": "center",
+            }}
+          >
+            <div style={{ "font-size": "15px", "font-weight": 600, "margin-bottom": "6px" }}>
+              Unsaved take
+            </div>
+            <div style={{ "font-size": "12px", color: "#aeb2c2", "margin-bottom": "18px" }}>
+              Save this recording before leaving?
+            </div>
+            <div style={{ display: "flex", gap: "10px", "justify-content": "center" }}>
+              <button
+                onClick={() => void exitWithSave()}
+                style={{
+                  padding: "8px 16px",
+                  "border-radius": "8px",
+                  border: "1px solid rgba(91,231,196,0.4)",
+                  background: "rgba(91,231,196,0.14)",
+                  color: "#5be7c4",
+                  "font-family": DISP,
+                  "font-size": "12px",
+                  cursor: "pointer",
+                }}
+              >
+                Save (s)
+              </button>
+              <button
+                onClick={() => void exitDiscard()}
+                style={{
+                  padding: "8px 16px",
+                  "border-radius": "8px",
+                  border: "1px solid rgba(255,77,87,0.4)",
+                  background: "rgba(255,77,87,0.12)",
+                  color: "#ff7079",
+                  "font-family": DISP,
+                  "font-size": "12px",
+                  cursor: "pointer",
+                }}
+              >
+                Discard (d)
+              </button>
+              <button
+                onClick={() => setExitPrompt(false)}
+                style={{
+                  padding: "8px 16px",
+                  "border-radius": "8px",
+                  border: "1px solid rgba(255,255,255,0.14)",
+                  background: "rgba(255,255,255,0.05)",
+                  color: "#dfe2ea",
+                  "font-family": DISP,
+                  "font-size": "12px",
+                  cursor: "pointer",
+                }}
+              >
+                Cancel (Esc)
+              </button>
+            </div>
+          </div>
+        </div>
+      </Show>
     </div>
   );
 }

@@ -9,11 +9,18 @@ export interface SegProps<T extends string> {
   value: T;
   onChange: (value: T) => void;
   label?: string;
+  /** When true the control is rendered dimmed and non-interactive. */
+  disabled?: boolean;
+  /** Tooltip (typically the reason a disabled control is not yet wired). */
+  title?: string;
 }
 
 export function Seg<T extends string>(props: SegProps<T>): JSX.Element {
   return (
-    <div style={{ display: "flex", "align-items": "center", gap: "8px" }}>
+    <div
+      style={{ display: "flex", "align-items": "center", gap: "8px" }}
+      title={props.title}
+    >
       <Show when={props.label}>
         <span
           style={{
@@ -33,15 +40,17 @@ export function Seg<T extends string>(props: SegProps<T>): JSX.Element {
           "border-radius": "7px",
           padding: "2px",
           gap: "2px",
+          opacity: props.disabled ? "0.38" : "1",
         }}
       >
         <For each={props.options}>
           {(o) => (
             <button
-              onClick={() => props.onChange(o)}
+              disabled={props.disabled}
+              onClick={() => !props.disabled && props.onChange(o)}
               style={{
                 border: "none",
-                cursor: "pointer",
+                cursor: props.disabled ? "default" : "pointer",
                 padding: "3px 9px",
                 "border-radius": "5px",
                 "font-family": MONO,
