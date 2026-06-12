@@ -10,6 +10,7 @@
 //! The command bodies live in [`state`] as `&AppState` free functions for
 //! headless unit testing; the `#[tauri::command]` wrappers below are thin shims.
 
+mod midi;
 mod state;
 
 use std::time::Instant;
@@ -17,6 +18,7 @@ use std::time::Instant;
 use rockcraft_core::ComposerSnapshot;
 use tauri::{Emitter, Manager, State};
 
+use crate::midi::{MidiState, MidiStatus};
 use crate::state::{ActionReply, AppState};
 
 /// Tick cadence for the transport-advance thread (~4 ms ≈ 250 Hz).
@@ -26,6 +28,8 @@ const TICK_PERIOD: std::time::Duration = std::time::Duration::from_millis(4);
 const EVENT_SNAPSHOT: &str = "snapshot";
 /// Event name carrying a batch of effects to the webview.
 const EVENT_EFFECTS: &str = "effects";
+/// Event name carrying a serialised [`NoteEvent`] to the webview.
+const EVENT_MIDI: &str = "midi_event";
 
 /// Apply a named action and return its effects plus the new snapshot.
 ///
@@ -61,9 +65,24 @@ fn query_help() -> serde_json::Value {
     state::query_help()
 }
 
+/// Return the current MIDI input status (`kind` + optional `port` name).
+#[tauri::command]
+fn midi_status(midi: State<'_, MidiState>) -> MidiStatus {
+    crate::midi::midi_status(&midi)
+}
+
+/// Simulate a computer-key press (down=true) or release (down=false) on the
+/// mock keyboard. Returns `Err` when a real device is connected (mock keys must
+/// not inject fake events into live input).
+#[tauri::command]
+fn mock_key(midi: State<'_, MidiState>, key: char, down: bool) -> Result<(), String> {
+    crate::midi::mock_key(&midi, key, down)
+}
+
 /// Spawn the transport-advance thread.
 ///
 /// Every [`TICK_PERIOD`] it measures the wall-clock delta since the last tick,
+/// drains pending MIDI events (emitting `midi_event` and feeding the composer),
 /// calls [`state::tick_advance`] (a no-op unless playing), and — while the
 /// transport is playing — emits the moving `snapshot` (plus `effects` whenever
 /// a batch was produced). The composer lock is held only inside `tick_advance`
@@ -77,18 +96,30 @@ fn spawn_tick_thread(app: tauri::AppHandle) {
             let dt_us = now.duration_since(last).as_micros() as u64;
             last = now;
 
-            let state = app.state::<AppState>();
-            let effects = state::tick_advance(&state, dt_us);
-            let snapshot = state::query_state(&state);
+            let app_state = app.state::<AppState>();
+            let midi_state = app.state::<MidiState>();
+
+            // Drain pending MIDI events, ingest into composer, emit to webview.
+            let (midi_events, midi_effects) = {
+                let mut composer = app_state.composer.lock().expect("composer mutex poisoned");
+                crate::midi::drain_and_ingest(&midi_state, &mut composer)
+            };
+            for ev in &midi_events {
+                let _ = app.emit(EVENT_MIDI, ev);
+            }
+
+            let effects = state::tick_advance(&app_state, dt_us);
+            let all_effects: Vec<_> = midi_effects.into_iter().chain(effects).collect();
+            let snapshot = state::query_state(&app_state);
 
             // Push the snapshot while playing (so the highway scrolls) and on
             // any tick that produced effects. Idle-and-stopped ticks stay
             // silent so we don't spam the webview with identical snapshots.
-            if snapshot.playing || !effects.is_empty() {
+            if snapshot.playing || !all_effects.is_empty() || !midi_events.is_empty() {
                 let _ = app.emit(EVENT_SNAPSHOT, &snapshot);
             }
-            if !effects.is_empty() {
-                let _ = app.emit(EVENT_EFFECTS, &effects);
+            if !all_effects.is_empty() {
+                let _ = app.emit(EVENT_EFFECTS, &all_effects);
             }
         }
     });
@@ -99,10 +130,13 @@ fn spawn_tick_thread(app: tauri::AppHandle) {
 pub fn run() {
     tauri::Builder::default()
         .manage(AppState::new())
+        .manage(MidiState::new())
         .invoke_handler(tauri::generate_handler![
             run_action,
             query_state,
-            query_help
+            query_help,
+            midi_status,
+            mock_key
         ])
         .setup(|app| {
             spawn_tick_thread(app.handle().clone());
