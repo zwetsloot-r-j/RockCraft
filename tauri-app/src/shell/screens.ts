@@ -6,8 +6,10 @@
 export type Screen =
   | { kind: "menu" }
   | { kind: "record" }
-  | { kind: "play" }
-  | { kind: "edit" }
+  /** Play mode. `dir` carries the bundle directory when opened from the library. */
+  | { kind: "play"; dir?: string }
+  /** Edit mode. `dir` carries the bundle directory when opened from the library. */
+  | { kind: "edit"; dir?: string }
   | { kind: "backing-picker" }
   | { kind: "video-picker" }
   | { kind: "url-input" }

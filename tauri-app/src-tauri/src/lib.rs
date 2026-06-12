@@ -15,6 +15,7 @@
 //! the backing track follows the transport via [`audio::sync_backing`].
 
 mod audio;
+mod library;
 mod midi;
 mod state;
 
@@ -97,6 +98,15 @@ fn query_state(state: State<'_, AppState>) -> ComposerSnapshot {
 #[tauri::command]
 fn query_help() -> serde_json::Value {
     state::query_help()
+}
+
+/// Scan the default library roots and return a list of bundle DTOs.
+///
+/// Calls [`library::scan_library_inner`] with [`rockcraft_midi::bundle::default_scan_roots`].
+/// Missing roots are silently skipped.
+#[tauri::command]
+fn scan_library() -> Vec<library::LibraryEntryDto> {
+    library::scan_library_inner(&rockcraft_midi::bundle::default_scan_roots())
 }
 
 /// Return the current MIDI input status (`kind` + optional `port` name).
@@ -220,6 +230,7 @@ pub fn run() {
             run_action,
             query_state,
             query_help,
+            scan_library,
             midi_status,
             mock_key,
             audio::attach_backing,

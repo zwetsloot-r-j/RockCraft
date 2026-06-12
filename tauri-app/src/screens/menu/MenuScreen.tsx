@@ -17,6 +17,7 @@ const MENU_ITEMS: MenuItem[] = [
   { label: "Play last recording", screen: { kind: "play" } },
   { label: "Compose (new)", screen: { kind: "edit" } },
   { label: "Edit last recording", screen: { kind: "edit" } },
+  { label: "Library…", screen: { kind: "library" } },
   { label: "Choose backing track", screen: { kind: "backing-picker" } },
   { label: "Import from video file…", screen: { kind: "video-picker" } },
   {

@@ -1,8 +1,16 @@
-import type { JSX } from "solid-js";
+import { Show, type JSX } from "solid-js";
 import type { Screen } from "./screens";
 
 interface Props {
   screen: Screen;
+}
+
+/** Extract an optional bundle dir from screens that carry one. */
+function screenDir(s: Screen): string | undefined {
+  if (s.kind === "play" || s.kind === "edit") {
+    return s.dir;
+  }
+  return undefined;
 }
 
 export function Placeholder(props: Props): JSX.Element {
@@ -31,6 +39,25 @@ export function Placeholder(props: Props): JSX.Element {
         {props.screen.kind}
       </div>
       <div style={{ "font-size": "14px" }}>not ported yet</div>
+      <Show when={screenDir(props.screen)}>
+        {(dir) => (
+          <div
+            style={{
+              "font-size": "12px",
+              color: "#6a6e7c",
+              padding: "4px 10px",
+              border: "1px solid rgba(255,255,255,0.07)",
+              "border-radius": "6px",
+              "font-family": "monospace",
+              "max-width": "80%",
+              "overflow-wrap": "break-word",
+              "text-align": "center",
+            }}
+          >
+            {dir()}
+          </div>
+        )}
+      </Show>
       <div
         style={{
           "font-size": "12px",

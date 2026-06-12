@@ -16,6 +16,7 @@ import type {
   ActionReply,
   ComposerSnapshot,
   Effect,
+  LibraryEntryDto,
 } from "./types";
 
 /** Event name the backend emits a fresh {@link ComposerSnapshot} on. */
@@ -63,6 +64,15 @@ export function onSnapshot(
  */
 export function onEffects(cb: (effects: Effect[]) => void): Promise<UnlistenFn> {
   return listen<Effect[]>(EVENT_EFFECTS, (e) => cb(e.payload));
+}
+
+/**
+ * Scan the default library roots and return a list of bundle DTOs, sorted by
+ * name. Missing roots are silently skipped. Mirrors `scan_library` on the
+ * Rust backend.
+ */
+export function scanLibrary(): Promise<LibraryEntryDto[]> {
+  return invoke<LibraryEntryDto[]>("scan_library");
 }
 
 // ── Audio commands ────────────────────────────────────────────────────────

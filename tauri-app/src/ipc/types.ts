@@ -180,3 +180,25 @@ export type ActionName =
 
 /** JSON params object for an action invocation. */
 export type ActionParams = Record<string, unknown>;
+
+/**
+ * One row in the library browser — mirror of `library::LibraryEntryDto`.
+ * Source of truth: `tauri-app/src-tauri/src/library.rs`.
+ */
+export interface LibraryEntryDto {
+  /** Display name — bundle directory's file name. */
+  name: string;
+  /** Absolute path to the bundle directory as a UTF-8 string. */
+  dir: string;
+  /** Number of notes in `song.mid`. */
+  note_count: number;
+  /** Total chart duration in microseconds. */
+  duration_us: number;
+  /**
+   * Origin label: `"recorded"`, `"composed"`, `"edited"`, `"imported"`, or
+   * `null` for legacy bundles without a `meta.json`.
+   */
+  origin: string | null;
+  /** Whether the bundle declares a backing audio track. */
+  has_backing: boolean;
+}
