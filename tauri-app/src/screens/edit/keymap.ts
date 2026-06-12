@@ -47,15 +47,17 @@ export interface Binding {
  */
 export const NORMAL_BINDINGS: Binding[] = [
   // ── navigation ────────────────────────────────────────────────────────
-  // Visual layout: horizontal = pitch (keyboard), vertical = time (timeline).
-  // h/l move pitch; j/k move step. The TUI maps the axes onto its falling
-  // highway, so `h`→CursorDown (pitch −1) etc.; the action names are identical.
-  { keys: ["h", "ArrowLeft"], action: { name: "cursor_down" } }, // pitch −1
-  { keys: ["l", "ArrowRight"], action: { name: "cursor_up" } }, // pitch +1
-  { keys: ["j", "ArrowDown"], action: { name: "cursor_left" } }, // step −1
-  { keys: ["k", "ArrowUp"], action: { name: "cursor_right" } }, // step +1
-  { keys: ["H"], action: { name: "cursor_bar_left" } }, // one bar earlier
-  { keys: ["L"], action: { name: "cursor_bar_right" } }, // one bar later
+  // Visual layout (vertical, highway-aligned): horizontal = pitch (keyboard,
+  // low→high left→right), vertical = time (timeline, earlier→later bottom→top).
+  // h/l move pitch left/right; j/k move step down/up (k = ArrowUp = later in
+  // time). The action names are identical to the TUI's; only the on-screen axes
+  // differ, so `h`→CursorDown (pitch −1), `k`→CursorRight (step +1), etc.
+  { keys: ["h", "ArrowLeft"], action: { name: "cursor_down" } }, // pitch −1 (left)
+  { keys: ["l", "ArrowRight"], action: { name: "cursor_up" } }, // pitch +1 (right)
+  { keys: ["j", "ArrowDown"], action: { name: "cursor_left" } }, // step −1 (down/earlier)
+  { keys: ["k", "ArrowUp"], action: { name: "cursor_right" } }, // step +1 (up/later)
+  { keys: ["H"], action: { name: "cursor_bar_left" } }, // one bar earlier (down)
+  { keys: ["L"], action: { name: "cursor_bar_right" } }, // one bar later (up)
   { keys: ["w"], action: { name: "cursor_octave_up" } }, // octave +
   { keys: ["b"], action: { name: "cursor_octave_down" } }, // octave −
   { keys: ["J"], action: { name: "cursor_octave_down" } }, // alias for b
