@@ -49,12 +49,6 @@ impl InputSource {
             InputSource::Mock(_) => None,
         }
     }
-
-    /// Returns `true` when a live hardware device is active (mock keys must not
-    /// inject fake events in this case).
-    pub fn is_live(&self) -> bool {
-        matches!(self, InputSource::Live(_))
-    }
 }
 
 // ── MidiState ─────────────────────────────────────────────────────────────────
@@ -233,10 +227,9 @@ mod tests {
     }
 
     #[test]
-    fn is_live_false_for_mock() {
-        // The is_live guard used by mock_key is false for a Mock source.
+    fn mock_source_kind_str_is_mock() {
         let kb = MockKeyboard::new();
-        assert!(!InputSource::Mock(kb).is_live());
+        assert_eq!(InputSource::Mock(kb).kind_str(), "mock");
     }
 
     #[test]
