@@ -131,7 +131,7 @@ fn timeline_fingerprint(timeline: &Timeline) -> u64 {
     timeline
         .notes()
         .map(|(id, n)| {
-            id.value()
+            (id.value() as u64)
                 .wrapping_add(n.pitch.value() as u64)
                 .wrapping_add(n.start_us)
                 .wrapping_add(n.dur_us)
@@ -146,7 +146,8 @@ fn timeline_fingerprint_snapshot(notes: &[NoteView]) -> u64 {
     notes
         .iter()
         .map(|n| {
-            n.id.wrapping_add(n.pitch as u64)
+            (n.id as u64)
+                .wrapping_add(n.pitch as u64)
                 .wrapping_add(n.start_us)
                 .wrapping_add(n.dur_us)
                 .wrapping_add(n.velocity as u64)
@@ -229,7 +230,7 @@ fn write_bundle(
     let backing = if let Some(bpath) = backing_path {
         let filename = crate::record_bundle_backing_filename(bpath);
         std::fs::copy(bpath, bundle_dir.join(&filename))?;
-        Some(rockcraft_core::BackingTrack {
+        Some(BackingTrack {
             file: filename,
             audio_start_us: backing_offset_us,
         })
