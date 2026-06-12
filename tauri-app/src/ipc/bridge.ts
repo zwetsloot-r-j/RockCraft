@@ -83,6 +83,15 @@ export function scanLibrary(): Promise<LibraryEntryDto[]> {
   return invoke<LibraryEntryDto[]>("scan_library");
 }
 
+/**
+ * Absolute directory of the newest bundle across the default scan roots, or
+ * `null` when no bundles exist. Backs the menu's "Play/Edit last recording".
+ * Mirrors `latest_recording` (returns Rust `Option<String>`).
+ */
+export function latestRecording(): Promise<string | null> {
+  return invoke<string | null>("latest_recording");
+}
+
 // ── Bundle save / load ───────────────────────────────────────────────────
 
 /**

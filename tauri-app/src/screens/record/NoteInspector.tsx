@@ -5,7 +5,7 @@
 import { type Accessor, createMemo, For, type JSX, Show } from "solid-js";
 import type { RecordCanvas } from "./RecordCanvas";
 import { bbOf } from "./format";
-import { RSONG } from "./song";
+import { EMPTY_TAKE } from "./emptyTake";
 import { noteName, spectrumHue } from "./utils";
 import { DISP, MONO, OK } from "./ui/theme";
 
@@ -25,7 +25,7 @@ export function NoteInspector(props: NoteInspectorProps): JSX.Element {
       {(note) => {
         const hue = (): number => spectrumHue(note().note);
         const rows = (): [string, string | number][] => [
-          ["Beat", bbOf(note().start, RSONG)],
+          ["Beat", bbOf(note().start, EMPTY_TAKE)],
           ["Length", "♩ quarter"],
           ["Velocity", note().vel],
         ];

@@ -10,6 +10,7 @@ import { useRouter } from "../../shell/Router";
 import {
   importUrlAvailable,
   importStart,
+  latestRecording,
   openVideoFilePicker,
 } from "../../ipc/bridge";
 
@@ -46,6 +47,33 @@ export function MenuScreen(): JSX.Element {
   const [selected, setSelected] = createSignal(0);
   /** Whether a fetch command is configured (controls URL import visibility). */
   const [urlAvailable, setUrlAvailable] = createSignal<boolean>(false);
+  /** Transient inline notice (e.g. "no recordings yet"); null when hidden. */
+  const [notice, setNotice] = createSignal<string | null>(null);
+
+  let noticeTimer: number | undefined;
+  function showNotice(msg: string): void {
+    setNotice(msg);
+    if (noticeTimer !== undefined) window.clearTimeout(noticeTimer);
+    noticeTimer = window.setTimeout(() => setNotice(null), 4000);
+  }
+  onCleanup(() => {
+    if (noticeTimer !== undefined) window.clearTimeout(noticeTimer);
+  });
+
+  /**
+   * Open the newest bundle on `screen`, or show the no-recordings notice when
+   * the library is empty. Shared by "Play last recording" / "Edit last
+   * recording" so both route real bundles (never the retired demo fixture).
+   */
+  async function openLatest(screen: "play" | "edit"): Promise<void> {
+    try {
+      const dir = await latestRecording();
+      if (dir) navigate({ kind: screen, dir });
+      else showNotice("No recordings yet — record or import one first.");
+    } catch {
+      showNotice("No recordings yet — record or import one first.");
+    }
+  }
 
   // Query URL availability on mount.
   onMount(() => {
@@ -70,13 +98,13 @@ export function MenuScreen(): JSX.Element {
         navigate({ kind: "record" });
         break;
       case "play":
-        navigate({ kind: "play" });
+        await openLatest("play");
         break;
       case "compose":
         navigate({ kind: "edit" });
         break;
       case "edit":
-        navigate({ kind: "edit" });
+        await openLatest("edit");
         break;
       case "library":
         navigate({ kind: "library" });
@@ -204,6 +232,21 @@ export function MenuScreen(): JSX.Element {
           }}
         </For>
       </div>
+
+      {/* Transient inline notice (e.g. empty-library feedback). */}
+      {notice() && (
+        <div
+          style={{
+            "margin-top": "20px",
+            "max-width": "320px",
+            "text-align": "center",
+            "font-size": "13px",
+            color: "#b0b3c1",
+          }}
+        >
+          {notice()}
+        </div>
+      )}
     </div>
   );
 }

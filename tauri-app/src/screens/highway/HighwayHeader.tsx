@@ -3,7 +3,7 @@
 //
 // Reads the engine accessor for score/combo each time frame() bumps (the ~9 fps
 // throttle signal drives the updates); derives bar/beat/chord from
-// performance.now() - eng.t0 modulo SONG.LOOP.
+// performance.now() - eng.t0 modulo the loaded song's LOOP.
 
 import { For, Show } from "solid-js";
 import type { HighwayCanvas } from "./HighwayCanvas";
