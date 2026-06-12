@@ -3118,6 +3118,7 @@ name = "rockcraft-tauri"
 version = "0.1.0"
 dependencies = [
  "rockcraft-audio",
+ "rockcraft-control",
  "rockcraft-core",
  "rockcraft-import",
  "rockcraft-midi",
@@ -3127,6 +3128,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-dialog",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

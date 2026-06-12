@@ -29,6 +29,22 @@ If the address ends in `:0` (the default is `127.0.0.1:0`), the OS assigns the
 port; read the actual address from the stderr line above, or from the server's
 `local_addr()` when embedding the `rockcraft-control` crate directly.
 
+The **Tauri desktop app** exposes the same socket with the same opt-in
+(`--control` / `ROCKCRAFT_CONTROL_ADDR`), additive to its internal IPC commands.
+It drives the one live `Composer` the backend owns, so connecting to it is
+identical to connecting to the TUI — same banner, verbs, and `query help`
+catalog. A remote action is reflected in the desktop webview (the backend emits
+the same `snapshot` event the IPC path does).
+
+```bash
+# Same protocol, the desktop host instead of the TUI:
+cargo run --bin rockcraft-tauri -- --control
+```
+
+> Scope note: the control socket speaks the **composer-action** protocol on both
+> hosts. App-level workflows (load-to-play, run a record session, import,
+> library, backing) are the separate **M8-A host-command tier**, not actions.
+
 ### Connecting a client
 
 The server speaks plain WebSocket (no TLS). Connect to `ws://127.0.0.1:<PORT>`.
