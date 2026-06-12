@@ -2,7 +2,9 @@
 
 > Milestone: M2 · Issue: #24 · Suggested tier: sonnet
 > Branch: `claude/tauri-record-screen`
-> Depends on: M2-tauri-scaffold (#22 must be merged first)
+> Depends on: M2-tauri-scaffold (#22, **merged**) **and M7-tauri-0-solid-swap
+> (#171 — the frontend is SolidJS; do not start before it lands)**
+> Follow-up: M7-tauri-I-record-live (#169) wires this screen to live MIDI + saving
 
 ## Goal
 
@@ -14,6 +16,30 @@ All data is mocked from the Ember Lantern take fixture; live MIDI hookup is a
 follow-up.
 
 ## Context
+
+### How this relates to the live TUI (updated 2026-06)
+
+This spec predates the TUI record screen's current state. The mock-only scope
+below is **unchanged**, but know what the controls will eventually mean so
+the port stays wirable (#169, `specs/M7-tauri-I-record-live.md`):
+
+- **Real today** in core/TUI (`crates/tui/src/record.rs`, `core::Composer`):
+  recording to an `EventBuffer`, saving bundles to
+  `recordings/take-<timestamp>/` (`song.mid` + `meta.json` + backing copy),
+  recording **with a backing track** (origin anchored to backing start),
+  metronome (`toggle_metronome`), count-in (`start_count_in_record`),
+  undo/redo.
+- **Visual-only stubs with no core action yet**: Trim, Quantize, Punch-in,
+  the CLEF/SPELL pickers, and the note inspector's Nudge/Snap buttons. Build
+  them as the spec says, but keep them clearly separable — #169 disables the
+  unwired ones rather than faking behaviour.
+- The SNAP picker below shows `1/8 · 1/16 · 1/32`; core's
+  `Subdivision` also has `Quarter` and two triplet values
+  (`crates/core/src/grid.rs`). Keep the segmented control's value list in
+  one constant so #169 can extend it without layout surgery.
+- The app shell/router lands separately (#162). If present on `main`, mount
+  this as the `record` route instead of hand-rolling the two-button switcher
+  in `App.tsx`.
 
 Design reference files:
 
@@ -100,23 +126,26 @@ Port `RecordCanvas` from `record.js` as a TypeScript class:
 
 ```tsx
 export function RecordScreen() {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const engRef = useRef<RecordCanvas | null>(null);
-  const [, tick] = useReducer((x) => x + 1, 0);
-  const [metro, setMetro] = useState(true);
-  const [count, setCount] = useState(true);
-  const [snap, setSnap] = useState<"1/8" | "1/16" | "1/32">("1/16");
-  const [clef, setClef] = useState<"Grand" | "Treble">("Grand");
-  const [spelling, setSpelling] = useState<"♯" | "♭">("♯");
-  // mount engine; RAF throttled at ~9 fps for header/toolbar state reads
+  let canvasEl!: HTMLCanvasElement;
+  let eng: RecordCanvas | null = null;
+  const [frame, setFrame] = createSignal(0); // bumped ~9 fps for header/toolbar reads
+  const [metro, setMetro] = createSignal(true);
+  const [count, setCount] = createSignal(true);
+  const [snap, setSnap] = createSignal<"1/8" | "1/16" | "1/32">("1/16");
+  const [clef, setClef] = createSignal<"Grand" | "Treble">("Grand");
+  const [spelling, setSpelling] = createSignal<"♯" | "♭">("♯");
+  // onMount: create engine on canvasEl, eng.start(), ~110 ms interval bumping
+  // frame(); onCleanup: eng.stop(). Pass signal accessors down (metro, not
+  // metro()) so the chrome stays reactive — see tauri-app/CONVENTIONS.md.
   return (
-    <div style={{ height: "100vh", display: "flex", flexDirection: "column",
-                  background: "#101119", fontFamily: "'Space Grotesk', system-ui, sans-serif" }}>
-      <RecordHeader engRef={engRef} song={RSONG} metro={metro} onMetro={setMetro}
+    <div style={{ height: "100vh", display: "flex", "flex-direction": "column",
+                  background: "#101119", "font-family": "'Space Grotesk', system-ui, sans-serif" }}>
+      <RecordHeader eng={() => eng} frame={frame} song={RSONG}
+                    metro={metro} onMetro={setMetro}
                     count={count} onCount={setCount} />
-      <div style={{ flex: "1 1 auto", minHeight: 0, position: "relative" }}>
-        <canvas ref={canvasRef} style={{ width: "100%", height: "100%", display: "block" }} />
-        <NoteInspector note={engRef.current?.sel ?? null} />
+      <div style={{ flex: "1 1 auto", "min-height": 0, position: "relative" }}>
+        <canvas ref={canvasEl} style={{ width: "100%", height: "100%", display: "block" }} />
+        <NoteInspector eng={() => eng} frame={frame} />
       </div>
       <RecordToolbar snap={snap} onSnap={setSnap} clef={clef} onClef={setClef}
                      spelling={spelling} onSpelling={setSpelling} />
@@ -127,10 +156,11 @@ export function RecordScreen() {
 
 ### UI primitives
 
-Port each component from `record-ui.jsx` (`RUI` namespace) to a typed React
-component. Props must be fully typed. All toggle/segmented controls must be
-interactive (local state changes visually; they do not need to affect the canvas
-engine for this issue).
+Port each component from `record-ui.jsx` (`RUI` namespace) to a typed Solid
+component (the source is React JSX — translate per
+`tauri-app/CONVENTIONS.md`; never destructure props). Props must be fully
+typed. All toggle/segmented controls must be interactive (local state changes
+visually; they do not need to affect the canvas engine for this issue).
 
 ### `App.tsx`
 
@@ -152,7 +182,8 @@ below.
 
 ## Scope boundaries (do NOT)
 
-- Do not wire to live Tauri IPC / real MIDI — mock take fixture only.
+- Do not wire to live Tauri IPC / real MIDI — mock take fixture only
+  (live wiring is #169; the IPC bridge itself is #161).
 - Do not implement the note highway (separate issue).
 - Do not modify anything in `crates/`.
 - Do not implement drag-edit of notes on the canvas (inspector Nudge/Snap

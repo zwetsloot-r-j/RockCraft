@@ -10,6 +10,7 @@
 // Re-exported so downstream crates have a single import surface.
 pub use rockcraft_core as core;
 
+pub mod bundle;
 pub mod file;
 pub mod live;
 pub mod mock;

@@ -2,6 +2,10 @@
 
 > Milestone: M2 · Issue: #22 · Suggested tier: opus
 > Branch: `claude/tauri-scaffold`
+> **Status: shipped as specified (React), then superseded** — the frontend
+> framework switches to SolidJS in `specs/M7-tauri-0-solid-swap.md` (#171).
+> This file is the historical record of #22; do not build new screens on the
+> React setup it describes.
 
 ## Goal
 
