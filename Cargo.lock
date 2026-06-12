@@ -3092,6 +3092,7 @@ dependencies = [
 name = "rockcraft-tauri"
 version = "0.1.0"
 dependencies = [
+ "rockcraft-audio",
  "rockcraft-core",
  "rockcraft-midi",
  "serde",

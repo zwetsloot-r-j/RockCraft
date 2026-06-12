@@ -202,3 +202,72 @@ export interface LibraryEntryDto {
   /** Whether the bundle declares a backing audio track. */
   has_backing: boolean;
 }
+
+// ── Play screen (#168) ──────────────────────────────────────────────────────
+
+/**
+ * One projected note span for the highway — mirror of `play::SpanView`.
+ * Bounds are in MILLISECONDS (the webview engine is ms-based), already shifted
+ * by the pre-roll. No hand info exists in a bundle.
+ */
+export interface PlaySpan {
+  note: number;
+  /** Start in milliseconds. */
+  start: number;
+  /** End in milliseconds. */
+  end: number;
+}
+
+/**
+ * Static song info returned by `play_load` — mirror of `play::PlayInfo`.
+ * Source of truth: `tauri-app/src-tauri/src/play.rs`.
+ */
+export interface PlayInfo {
+  title: string;
+  notes: PlaySpan[];
+  /** Whole-song forward shift in microseconds (`song_shift_us`). */
+  shift_us: number;
+  /** Total song length including the lead-in, in microseconds. */
+  duration_us: number;
+  /** Lead window the highway shows top→hit-line, in microseconds. */
+  lead_us: number;
+  has_backing: boolean;
+  hear_song: boolean;
+}
+
+/**
+ * A ~60 Hz live snapshot pushed while a take runs — mirror of
+ * `play::PlayStateEvent`.
+ */
+export interface PlayStateEvent {
+  /** Current song time in microseconds (the authoritative clock). */
+  time_us: number;
+  /** Whether wait mode has frozen the clock. */
+  frozen: boolean;
+  score: number;
+  combo: number;
+  best_combo: number;
+  hits: number;
+  misses: number;
+  /** Notes currently held by the player. */
+  held: number[];
+  /** Notes the player must hold to un-freeze (empty unless `frozen`). */
+  awaiting: number[];
+  /** Set once the song (plus tail) has finished. */
+  finished: boolean;
+}
+
+/** End-of-take summary returned by `play_finish` — mirror of `play::PlaySummary`. */
+export interface PlaySummary {
+  total_expected: number;
+  hits: number;
+  misses: number;
+  extras: number;
+  perfect: number;
+  early: number;
+  late: number;
+  /** Accuracy in basis points (0..=10000); divide by 100 for a percentage. */
+  accuracy_bp: number;
+  best_combo: number;
+  score: number;
+}

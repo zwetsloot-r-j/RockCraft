@@ -17,6 +17,7 @@
 mod audio;
 mod library;
 mod midi;
+mod play;
 mod state;
 
 use std::sync::Mutex;
@@ -27,6 +28,7 @@ use tauri::{Emitter, Manager, State};
 
 use crate::audio::AudioState;
 use crate::midi::{MidiState, MidiStatus};
+use crate::play::PlayState;
 use crate::state::{ActionReply, AppState};
 
 /// Tick cadence for the transport-advance thread (~4 ms ≈ 250 Hz).
@@ -38,6 +40,8 @@ const EVENT_SNAPSHOT: &str = "snapshot";
 const EVENT_EFFECTS: &str = "effects";
 /// Event name carrying a serialised [`NoteEvent`] to the webview.
 const EVENT_MIDI: &str = "midi_event";
+/// Event name carrying a live [`play::PlayStateEvent`] to the highway (#168).
+const EVENT_PLAY_STATE: &str = "play_state";
 
 /// Apply a named action and return its effects plus the new snapshot.
 ///
@@ -164,6 +168,23 @@ fn spawn_tick_thread(app: tauri::AppHandle) {
             let midi_state = app.state::<MidiState>();
             let audio = app.state::<AudioState>();
             let prev_transport = app.state::<PrevTransport>();
+            let play_state = app.state::<PlayState>();
+
+            // When a play session is active (#168), MIDI feeds the highway, not
+            // the composer: drain raw events, drive the session, emit play_state.
+            // Scoring/wait/clock all run off the injected `dt_us`, never the
+            // render loop. The composer path is skipped entirely this tick.
+            let play_active = play_state.0.lock().expect("play state poisoned").is_some();
+            if play_active {
+                let raw = crate::midi::drain(&midi_state);
+                for ev in &raw {
+                    let _ = app.emit(EVENT_MIDI, crate::midi::NoteEventPayload::from(*ev));
+                }
+                if let Some(snapshot) = crate::play::tick_play(&play_state, &audio, &raw, dt_us) {
+                    let _ = app.emit(EVENT_PLAY_STATE, &snapshot);
+                }
+                continue;
+            }
 
             // Drain pending MIDI events, ingest into composer, emit to webview.
             let (midi_events, midi_effects) = {
@@ -226,6 +247,7 @@ pub fn run() {
         .manage(AudioState::new())
         .manage(MidiState::new())
         .manage(PrevTransport::default())
+        .manage(PlayState::default())
         .invoke_handler(tauri::generate_handler![
             run_action,
             query_state,
@@ -236,6 +258,10 @@ pub fn run() {
             audio::attach_backing,
             audio::detach_backing,
             audio::audio_status,
+            play::play_load,
+            play::play_set_wait,
+            play::play_toggle_hear_song,
+            play::play_finish,
         ])
         .setup(|app| {
             spawn_tick_thread(app.handle().clone());

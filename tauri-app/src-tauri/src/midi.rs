@@ -154,6 +154,19 @@ pub fn mock_key(state: &MidiState, key: char, down: bool) -> Result<(), String> 
     }
 }
 
+/// Drain pending events without ingesting them into the composer.
+///
+/// Used by the play screen (#168), which routes raw events to its own
+/// [`crate::play::PlaySession`] (held-tracking + scoring) rather than placing
+/// notes in the composer. The caller projects them to [`NoteEventPayload`] for
+/// `midi_event` emission.
+pub fn drain(midi: &MidiState) -> Vec<NoteEvent> {
+    midi.source
+        .lock()
+        .expect("midi source mutex poisoned")
+        .drain_events()
+}
+
 /// Drain pending events, feed each one into the composer, and return
 /// serialisable payloads (for `midi_event` emission) plus accumulated effects.
 pub fn drain_and_ingest(

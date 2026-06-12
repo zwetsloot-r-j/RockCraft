@@ -33,9 +33,9 @@ export function useRouter(): RouterContext {
 // ── Screens that accept instrument (MIDI note) input ──────────────────────
 
 function screenWantsInstrumentInput(s: Screen): boolean {
-  // StepRecord / LiveRecord input modes are active on the edit screen.
-  // Play/record screens (#168/#169) will add themselves here when they land.
-  return s.kind === "edit";
+  // StepRecord / LiveRecord input modes are active on the edit screen; the
+  // play screen (#168) scores live mock-key strikes against the chart.
+  return s.kind === "edit" || s.kind === "play";
 }
 
 // ── Router component ───────────────────────────────────────────────────────
