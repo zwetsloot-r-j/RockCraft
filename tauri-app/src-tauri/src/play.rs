@@ -113,7 +113,7 @@ pub struct PlayStateEvent {
 }
 
 /// The end-of-take summary returned by `play_finish`.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub struct PlaySummary {
     pub total_expected: usize,
     pub hits: usize,
@@ -306,7 +306,9 @@ impl PlaySession {
     }
 
     /// Start with "hear the song" on (imported charts opt in; play-along leaves
-    /// it off so the song doesn't sound over the player).
+    /// it off so the song doesn't sound over the player). Test-only for now —
+    /// the live path leaves it off and toggles via `play_toggle_hear_song`.
+    #[cfg(test)]
     pub fn with_hear_song(mut self, on: bool) -> Self {
         self.hear_song = on;
         self
@@ -338,7 +340,9 @@ impl PlaySession {
         self.clock.now_us()
     }
 
-    /// Whole-song shift (where the backing begins).
+    /// Whole-song shift (where the backing begins). Test-only assertion helper;
+    /// the live path reads it through `info().shift_us`.
+    #[cfg(test)]
     pub fn shift_us(&self) -> u64 {
         self.shift_us
     }
@@ -346,11 +350,6 @@ impl PlaySession {
     /// Is wait-mode armed?
     pub fn is_wait_mode(&self) -> bool {
         self.wait.is_armed()
-    }
-
-    /// Is "hear the song" active?
-    pub fn is_hear_song(&self) -> bool {
-        self.hear_song
     }
 
     /// The backing track, if any.
@@ -460,7 +459,9 @@ impl PlaySession {
         }
     }
 
-    /// Toggle wait-mode, returning the new armed state.
+    /// Toggle wait-mode, returning the new armed state. Test-only; the live path
+    /// flips it via `play_set_wait(on)` from the UI's current state.
+    #[cfg(test)]
     pub fn toggle_wait_mode(&mut self) -> bool {
         let next = !self.wait.is_armed();
         self.set_wait_mode(next);
@@ -670,18 +671,7 @@ pub fn play_finish(
 ) -> PlaySummary {
     let summary = {
         let mut guard = state.0.lock().expect("play state mutex poisoned");
-        let summary = guard.as_ref().map(|s| s.finish()).unwrap_or(PlaySummary {
-            total_expected: 0,
-            hits: 0,
-            misses: 0,
-            extras: 0,
-            perfect: 0,
-            early: 0,
-            late: 0,
-            accuracy_bp: 0,
-            best_combo: 0,
-            score: 0,
-        });
+        let summary = guard.as_ref().map(|s| s.finish()).unwrap_or_default();
         *guard = None;
         summary
     };
@@ -732,8 +722,7 @@ pub fn tick_play(
     // Sync the backing track to the clock (start at the shift boundary, pause
     // while frozen) using core's shared position formula so audio never drifts.
     let target = session.backing_target_us();
-    let backing = session.backing().cloned();
-    audio.sync_play_backing(backing.as_ref(), target, frozen);
+    audio.sync_play_backing(session.backing(), target, frozen);
 
     Some(session.live_state())
 }
