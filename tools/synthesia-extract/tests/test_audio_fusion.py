@@ -326,3 +326,186 @@ def test_cli_audio_fusion_requires_audio(tmp_path):
     )
     assert result.returncode == 2
     assert "requires --audio" in result.stderr
+
+
+# --------------------------------------------------------------------------- #
+# Iteration 3: clock alignment + merged-note splitting (issue #151 follow-up)
+# --------------------------------------------------------------------------- #
+def _visual_chart(notes, fps=30.0):
+    return ExtractedChart(
+        notes=[
+            ExtractedNote(
+                pitch=n.pitch, start_us=n.start_us, dur_us=n.dur_us,
+                hand=Hand.UNKNOWN, confidence=0.9,
+            )
+            for n in notes
+        ],
+        source=SourceMeta(fps=fps),
+    )
+
+
+def test_global_offset_aligns_visual_clock():
+    """A constant visual lead/lag must be measured and removed for every note,
+    matched or not."""
+    notes, _ = c_major_demo()
+    lead_us = 120_000
+    base_us = 300_000  # keep every shifted onset positive (no clamping)
+    # estimate_global_offset needs >= 30 matches; repeat the demo notes by
+    # tiling them later in time (audio re-rendered to match).
+    tiled = []
+    tiled_shifted = []
+    span = max(n.start_us + n.dur_us for n in notes) + 500_000
+    for k in (0, 1, 2):
+        for n in notes:
+            t = base_us + n.start_us + k * span
+            tiled.append(SynthNote(n.pitch, t, n.dur_us, n.hand, n.velocity))
+            tiled_shifted.append(
+                SynthNote(n.pitch, t - lead_us, n.dur_us, n.hand, n.velocity)
+            )
+    track = render_audio(tiled, sample_rate=DEFAULT_SAMPLE_RATE)
+    chart = _visual_chart(tiled_shifted)
+    fused = audio.fuse_chart(chart, track, DEFAULT_SAMPLE_RATE)
+    assert "offset +1" in fused.source.audio_fusion  # ~ +120 ms
+    for gt in tiled:
+        m = _nearest(fused.notes, gt.pitch, gt.start_us)
+        assert m is not None
+        assert abs(m.start_us - gt.start_us) <= 40_000, (gt.pitch, gt.start_us, m.start_us)
+
+
+def test_split_merged_repeated_notes():
+    """Two same-pitch strikes the roll merged into one long note are split at
+    the audible second onset, each side keeping its own velocity."""
+    truth = [
+        SynthNote(60, 100_000, 350_000, "Right", velocity=96),
+        SynthNote(60, 600_000, 350_000, "Right", velocity=52),
+    ]
+    track = render_audio(truth, sample_rate=DEFAULT_SAMPLE_RATE)
+    merged = [SynthNote(60, 100_000, 850_000, "Right")]  # one held visual note
+    fused = audio.fuse_chart(_visual_chart(merged), track, DEFAULT_SAMPLE_RATE)
+    sixty = [n for n in fused.notes if n.pitch == 60]
+    assert len(sixty) == 2, fused.source.audio_fusion
+    assert "split 1 merged notes" in fused.source.audio_fusion
+    first, second = sixty
+    assert abs(first.start_us - 100_000) <= 40_000
+    assert abs(second.start_us - 600_000) <= 40_000
+    assert abs(first.velocity - 96) <= VEL_TOL
+    assert abs(second.velocity - 52) <= VEL_TOL
+
+
+def test_split_vetoes_harmonic_bleed():
+    """A lower note's harmonic landing in a held note's band is bleed, not a
+    re-strike: the held note must stay whole."""
+    # Audio: C4 strikes briefly at t=0; C3 (one octave below, strong harmonics)
+    # strikes at 600 ms while the *visual* C4 bar is still held.
+    audio_truth = [
+        SynthNote(60, 0, 300_000, "Right", velocity=80),
+        SynthNote(48, 600_000, 300_000, "Left", velocity=100),
+    ]
+    track = render_audio(
+        audio_truth, sample_rate=DEFAULT_SAMPLE_RATE, harmonics=(1.0, 0.5)
+    )
+    held = [SynthNote(60, 0, 1_100_000, "Right")]
+    fused = audio.fuse_chart(_visual_chart(held), track, DEFAULT_SAMPLE_RATE)
+    sixty = [n for n in fused.notes if n.pitch == 60]
+    assert len(sixty) == 1, [(n.start_us, n.dur_us) for n in sixty]
+
+
+def test_decimation_preserves_transcription():
+    """48 kHz input is decimated for speed without losing the notes."""
+    notes, _ = c_major_demo()
+    hi_rate = 48_000
+    track = render_audio(notes, sample_rate=hi_rate)
+    chart = _visual_chart(notes)
+    fused = audio.fuse_chart(chart, track, hi_rate)
+    assert fused.source.audio_fusion.startswith("applied")
+    for gt in notes:
+        m = _nearest(fused.notes, gt.pitch, gt.start_us)
+        assert m is not None
+        assert abs(m.velocity - gt.velocity) <= VEL_TOL + 2
+
+
+# --------------------------------------------------------------------------- #
+# eval.py: the accuracy harness scores known discrepancies correctly
+# --------------------------------------------------------------------------- #
+def test_eval_buckets_known_discrepancies():
+    sys.path.insert(0, ROOT)
+    from eval import evaluate
+
+    ref = [
+        {"pitch": 60, "start_us": 1_000_000, "dur_us": 200_000},
+        {"pitch": 62, "start_us": 1_500_000, "dur_us": 200_000},
+        {"pitch": 64, "start_us": 2_000_000, "dur_us": 200_000},  # chart has 76
+        {"pitch": 65, "start_us": 2_500_000, "dur_us": 200_000},  # chart lacks it
+        {"pitch": 67, "start_us": 3_000_000, "dur_us": 200_000},  # buried repeat
+        {"pitch": 67, "start_us": 3_400_000, "dur_us": 200_000},
+    ]
+    chart = [
+        {"pitch": 60, "start_us": 1_010_000, "dur_us": 200_000},
+        {"pitch": 62, "start_us": 1_490_000, "dur_us": 200_000},
+        {"pitch": 76, "start_us": 2_000_000, "dur_us": 200_000},
+        {"pitch": 67, "start_us": 3_000_000, "dur_us": 620_000},  # merged pair
+        {"pitch": 90, "start_us": 5_000_000, "dur_us": 200_000},  # chart-only
+    ]
+    r = evaluate(chart, ref, tol_us=150_000)
+    assert r["exact"] == 3  # 60, 62, first 67
+    assert r["octave"] == 1  # 64 vs 76
+    assert r["missing"] == 2  # 65, second 67
+    assert r["buried_onsets"] == 1  # second 67 inside the merged note
+    assert r["chart_only"] == 1  # pitch 90
+
+
+def test_split_pedal_sustained_repeats():
+    """Sustain (overlapping same-pitch audio) keeps the envelope from dipping
+    between strikes; the mid-run flux onset must still find the re-strike and
+    split the merged visual note."""
+    truth = [
+        SynthNote(60, 100_000, 700_000, "Right", velocity=90),  # rings past...
+        SynthNote(60, 550_000, 400_000, "Right", velocity=88),  # ...this strike
+    ]
+    track = render_audio(truth, sample_rate=DEFAULT_SAMPLE_RATE)
+    merged = [SynthNote(60, 100_000, 850_000, "Right")]
+    fused = audio.fuse_chart(_visual_chart(merged), track, DEFAULT_SAMPLE_RATE)
+    sixty = [n for n in fused.notes if n.pitch == 60]
+    assert len(sixty) == 2, fused.source.audio_fusion
+    assert abs(sixty[1].start_us - 550_000) <= 40_000
+
+
+def test_learned_transcriber_adapter(monkeypatch, tmp_path):
+    """When basic-pitch is importable, fuse_chart uses it (events mapped onto
+    TranscribedNote); when not, it falls back to the DSP transcriber."""
+    import types
+
+    fake = types.ModuleType("basic_pitch")
+    fake.ICASSP_2022_MODEL_PATH = "fake-model"
+    inference = types.ModuleType("basic_pitch.inference")
+
+    def predict(path, model):
+        assert model == "fake-model"
+        # (start_s, end_s, pitch, amplitude, pitch_bends)
+        return None, None, [(0.10, 0.40, 60, 0.75, None), (0.60, 0.90, 60, 0.4, None)]
+
+    inference.predict = predict
+    monkeypatch.setitem(sys.modules, "basic_pitch", fake)
+    monkeypatch.setitem(sys.modules, "basic_pitch.inference", inference)
+
+    events = audio.transcribe_learned("ignored.wav")
+    assert [(t.pitch, t.start_us, t.velocity) for t in events] == [
+        (60, 100_000, 95),
+        (60, 600_000, 51),
+    ]
+
+    # End-to-end: the learned events split a merged visual note even though the
+    # *samples* are a plain clean tone (suitability still gated on samples).
+    truth = [SynthNote(60, 100_000, 300_000, "Right", velocity=95)]
+    track = render_audio(truth, sample_rate=DEFAULT_SAMPLE_RATE, total_s=1.2)
+    merged = [SynthNote(60, 100_000, 800_000, "Right")]
+    fused = audio.fuse_chart(
+        _visual_chart(merged), track, DEFAULT_SAMPLE_RATE, audio_path="ignored.wav"
+    )
+    assert "applied (learned)" in fused.source.audio_fusion
+    assert len([n for n in fused.notes if n.pitch == 60]) == 2
+
+
+def test_learned_transcriber_absent_falls_back(monkeypatch):
+    monkeypatch.setitem(sys.modules, "basic_pitch", None)  # import -> ImportError
+    assert audio.transcribe_learned("x.wav") is None

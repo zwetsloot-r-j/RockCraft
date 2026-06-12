@@ -211,6 +211,123 @@ def test_overlay_black_pattern_calibration():
 
 
 # --------------------------------------------------------------------------- #
+# Animated-background noise rejection (issue #151)
+# --------------------------------------------------------------------------- #
+def test_animated_background_noise_rejected():
+    """A fully animated music-video backdrop — bright, lane-narrow shapes
+    falling at near-scroll speed — defeats every per-pixel gate and must be
+    rejected by the note-level colour-mode filter instead."""
+    cfg = SynthConfig()
+    notes, _ = c_major_demo(cfg)
+    frames, _ = render_overlay_frames(notes, cfg, animated_blobs=8)
+    chart = extract_chart(frames, cfg.fps, title="animated-overlay")
+
+    tol = _frame_tol_us(cfg, frames=2)
+    got_pitches = sorted(n.pitch for n in chart.notes)
+    want_pitches = sorted(n.pitch for n in notes)
+    assert got_pitches == want_pitches
+
+    for gt in notes:
+        m = _match(chart.notes, gt.pitch, gt.start_us)
+        assert m is not None, f"missing note pitch={gt.pitch}"
+        assert abs(m.start_us - gt.start_us) <= tol, f"onset off for {gt}"
+        assert abs(m.dur_us - gt.dur_us) <= tol, f"dur off for {gt}"
+    # The diagnostic records that the filter actually engaged.
+    assert "dropped" in chart.source.noise_filter
+
+
+def test_bar_glow_ghosts_suppressed():
+    """Bar bloom bleeding into neighbouring lanes must not become ghost notes
+    one or two semitones away from every real note."""
+    cfg = SynthConfig()
+    notes, _ = c_major_demo(cfg)
+    frames, _ = render_overlay_frames(notes, cfg, glow=0.35)
+    chart = extract_chart(frames, cfg.fps)
+    assert sorted(n.pitch for n in chart.notes) == sorted(n.pitch for n in notes)
+
+
+def test_animated_background_with_glow():
+    """Both failure classes at once: the full animated-music-video source."""
+    cfg = SynthConfig()
+    notes, _ = c_major_demo(cfg)
+    frames, _ = render_overlay_frames(notes, cfg, animated_blobs=8, glow=0.35)
+    chart = extract_chart(frames, cfg.fps)
+    assert sorted(n.pitch for n in chart.notes) == sorted(n.pitch for n in notes)
+
+
+# --------------------------------------------------------------------------- #
+# Noise-filter internals: satellite modes and hysteresis gap bridging
+# --------------------------------------------------------------------------- #
+def _raw(pitch, start_us, dur_us, color, coverage=0.9):
+    from synthesia_extract.pipeline import _RawNote
+
+    return _RawNote(
+        pitch=pitch, start_us=start_us, dur_us=dur_us,
+        coverage=coverage, color=np.array(color, dtype=np.float64),
+    )
+
+
+def test_color_modes_keep_satellites_drop_far_modes():
+    """A translucent ink tinted by a rare scene forms a small tight mode *near*
+    the main one — real notes, must survive.  A small tight mode far from any
+    bar ink (e.g. dark shadow shapes) is noise, dropped despite its tightness."""
+    from synthesia_extract.pipeline import filter_color_modes
+
+    rng = np.random.default_rng(0)
+    raws = []
+    # Primary: 30 whitish notes.
+    for i in range(30):
+        raws.append(_raw(60 + i % 12, i * 100_000, 90_000,
+                         np.array([215, 215, 210]) + rng.normal(0, 4, 3)))
+    # Satellite: 4 pink-tinted notes (a rare backdrop), ~0.13 away in colour.
+    for i in range(4):
+        raws.append(_raw(64 + i, (30 + i) * 100_000, 90_000,
+                         np.array([210, 185, 195]) + rng.normal(0, 3, 3)))
+    # Tight-but-far noise: 4 dark notes (shadow shapes).
+    for i in range(4):
+        raws.append(_raw(40 + i, (34 + i) * 100_000, 90_000,
+                         np.array([55, 65, 60]) + rng.normal(0, 3, 3)))
+    # Diffuse noise: 8 saturated random colours.
+    for i in range(8):
+        raws.append(_raw(50 + i, (38 + i) * 100_000, 90_000,
+                         rng.uniform(40, 255, 3)))
+
+    survivors, diag = filter_color_modes(raws)
+    pitches = sorted(r.pitch for r in survivors)
+    assert pitches == sorted(r.pitch for r in raws[:34]), diag
+    assert "satellite" in diag
+
+
+def test_extract_notes_hysteresis_bridges_short_dropout():
+    """A brief sub-threshold dip mid-bar (mask dropout) must not split the note,
+    but a long low-coverage stretch must not weld two separate notes."""
+    from synthesia_extract.pipeline import extract_notes
+
+    n_bins = 120
+    votes = np.zeros((1, n_bins), dtype=np.float32)
+    totals = np.full((1, n_bins), 10.0, dtype=np.float32)
+    color_sum = np.zeros((1, n_bins, 3), dtype=np.float64)
+    # One bar split by a 4-bin dropout at coverage 0.5; core colour white.
+    votes[0, 10:30] = 10.0
+    votes[0, 30:34] = 5.0
+    votes[0, 34:50] = 10.0
+    # A second, separate note after a 20-bin half-coverage stretch.
+    votes[0, 50:70] = 5.0
+    votes[0, 70:90] = 10.0
+    for b in range(n_bins):
+        color_sum[0, b] = votes[0, b] * np.array([250.0, 250.0, 250.0])
+    # Poison the dropout bins' colour: it must not leak into the note colour.
+    color_sum[0, 30:34] = 5.0 * np.array([0.0, 255.0, 0.0])
+
+    notes = extract_notes(
+        votes, totals, color_sum, [60], 1000.0,
+        threshold=0.6, hysteresis_low=0.42, min_run_px=3,
+    )
+    assert [(n.start_us, n.dur_us) for n in notes] == [(10_000, 40_000), (70_000, 20_000)]
+    assert np.allclose(notes[0].color, [250.0, 250.0, 250.0])
+
+
+# --------------------------------------------------------------------------- #
 # JSON wire format (must match crates/import schema)
 # --------------------------------------------------------------------------- #
 def test_json_schema_shape():

@@ -15,8 +15,10 @@ Stages:
 3. :func:`estimate_scroll` — vertical cross-correlation of the falling region
    across frames -> scroll speed (px/s).
 4. :func:`build_roll` — accumulate per-pitch song-time coverage + colour.
-5. :func:`extract_notes` / :func:`assign_hands` — threshold coverage into notes,
-   map dominant colours to Left/Right.
+5. :func:`extract_notes` — threshold coverage into notes; then
+   :func:`suppress_neighbor_ghosts` and :func:`filter_color_modes` reject
+   what isn't a falling bar (halo bleed, animated-artwork noise).
+6. :func:`assign_hands` — map dominant colours to Left/Right.
 """
 
 from __future__ import annotations
@@ -703,27 +705,60 @@ def extract_notes(
     us_per_px: float,
     *,
     threshold: float = 0.5,
+    hysteresis_low: Optional[float] = None,
     min_run_px: int = 3,
 ) -> list[_RawNote]:
     """Threshold per-pitch coverage into note runs.
 
     ``totals`` may be global (1-D, one value per bin) or per-lane (2-D,
     ``[pitch_index, bin]``, from the dead-zone-aware roll).
+
+    ``hysteresis_low`` enables dual-threshold *gap bridging*: two solid seeds
+    above ``threshold`` (each >= ``min_run_px`` long) merge into one run when
+    the gap between them is short (<= ``2 * min_run_px``) and stays above the
+    low threshold throughout.  Brief mask dropouts — washed-out scenes,
+    dead-zone holes — dip a bar's coverage below the high threshold mid-note
+    and would otherwise split one bar into fragments; they rarely dip below
+    the low one, while true gaps between repeated notes carry no votes at
+    all.  Only interior gaps are bridged — runs never extend past their
+    outermost seed bins, so a note's onset/offset always rests on
+    high-coverage evidence.
     """
     raws: list[_RawNote] = []
     for pi, pitch in enumerate(pitches):
         tot = totals[pi] if totals.ndim == 2 else totals
         coverage = votes[pi] / np.maximum(tot, 1e-6)
         on = (coverage > threshold) & (tot > 0)
-        for a, b in _find_runs(on):
+        if hysteresis_low is not None:
+            low_on = (coverage > hysteresis_low) & (tot > 0)
+            max_gap = 2 * min_run_px
+            merged: list[tuple[int, int]] = []
+            for a, b in _find_runs(on):
+                if b - a < min_run_px:
+                    continue
+                if merged and a - merged[-1][1] <= max_gap and low_on[merged[-1][1] : a].all():
+                    merged[-1] = (merged[-1][0], b)
+                else:
+                    merged.append((a, b))
+            runs = merged
+        else:
+            runs = _find_runs(on)
+        for a, b in runs:
             if b - a < min_run_px:
                 continue
-            seg_votes = votes[pi, a:b]
-            total_votes = float(seg_votes.sum())
-            if total_votes <= 0:
+            # Colour comes from the strongest-evidence bins only (near the
+            # run's own coverage peak): bridged-gap and weakly-attested bins
+            # are part background, and unrelated same-lane evidence welded
+            # onto the run (animated artwork) sits at lower coverage than the
+            # bar core — neither may tint the note away from its ink.
+            seg_cov = coverage[a:b]
+            core = seg_cov >= max(threshold, 0.8 * float(seg_cov.max()))
+            core_votes = float(votes[pi, a:b][core].sum())
+            total_votes = float(votes[pi, a:b].sum())
+            if total_votes <= 0 or core_votes <= 0:
                 continue
-            color = color_sum[pi, a:b].sum(axis=0) / total_votes
-            cov = float(np.clip(coverage[a:b].mean(), 0.0, 1.0))
+            color = color_sum[pi, a:b][core].sum(axis=0) / core_votes
+            cov = float(np.clip(seg_cov.mean(), 0.0, 1.0))
             raws.append(
                 _RawNote(
                     pitch=pitch,
@@ -735,6 +770,159 @@ def extract_notes(
             )
     raws.sort(key=lambda r: (r.start_us, r.pitch))
     return raws
+
+
+def suppress_neighbor_ghosts(
+    raws: list[_RawNote],
+    *,
+    brightness_ratio: float = 1.2,
+    chroma_tol: float = 0.10,
+    min_overlap: float = 0.5,
+) -> tuple[list[_RawNote], int]:
+    """Drop *ghost* notes: a bar's glow bleeding into the adjacent lane.
+
+    Rendered bars (and compressed video) bloom a halo past their own lane, so a
+    strong note often drags a faint copy of itself 1–2 semitones away.  A ghost
+    is recognisable by all three of: it overlaps a neighbouring-lane note in
+    time, that neighbour is much *brighter* (the halo is an attenuated fringe),
+    and the two share a chroma direction (a halo has its parent's colour — a
+    genuinely different-coloured neighbouring note, e.g. the other hand in a
+    close interval, is never suppressed).  Returns ``(survivors, n_dropped)``.
+    """
+    n = len(raws)
+    if n < 2:
+        return raws, 0
+    colors = np.array([r.color for r in raws], dtype=np.float64)
+    brightness = colors.mean(axis=1)
+    chroma = colors / np.maximum(np.linalg.norm(colors, axis=1, keepdims=True), 1e-6)
+    by_pitch: dict[int, list[int]] = {}
+    for i, r in enumerate(raws):
+        by_pitch.setdefault(r.pitch, []).append(i)
+
+    keep = np.ones(n, dtype=bool)
+    for i, r in enumerate(raws):
+        s, e = r.start_us, r.start_us + r.dur_us
+        for dp in (-2, -1, 1, 2):
+            for j in by_pitch.get(r.pitch + dp, ()):
+                other = raws[j]
+                overlap = min(e, other.start_us + other.dur_us) - max(s, other.start_us)
+                if (
+                    overlap > min_overlap * r.dur_us
+                    and brightness[j] > brightness_ratio * brightness[i]
+                    and float(np.linalg.norm(chroma[i] - chroma[j])) <= chroma_tol
+                ):
+                    keep[i] = False
+                    break
+            if not keep[i]:
+                break
+    survivors = [r for r, k in zip(raws, keep) if k]
+    return survivors, n - len(survivors)
+
+
+def _is_satellite(
+    center: np.ndarray, accepted: list[np.ndarray], satellite_dist: float
+) -> bool:
+    """A small mode counts as a satellite of its nearest accepted mode only if
+    it is both *near* it in colour space (the same ink under a different scene
+    tint) and *comparably bright* — a same-chroma mode at a fraction of the
+    anchor's brightness is residual halo bleed (ghosts), not a tint: scene
+    tints shift hue, never cost half the ink's brightness."""
+    nearest = min(accepted, key=lambda c: float(np.linalg.norm(center - c)))
+    if float(np.linalg.norm(center - nearest)) > satellite_dist:
+        return False
+    return float(center.mean()) >= 0.7 * float(nearest.mean())
+
+
+def filter_color_modes(
+    raws: list[_RawNote],
+    *,
+    radius: float = 0.12,
+    min_mode_frac: float = 0.10,
+    satellite_frac: float = 0.02,
+    satellite_dist: float = 0.35,
+    max_modes: int = 8,
+    min_notes: int = 24,
+) -> tuple[list[_RawNote], str]:
+    """Keep only notes whose colour belongs to a tight, coverage-strong mode;
+    return ``(survivors, diagnostic)``.
+
+    Real falling bars are rendered in a handful of solid inks (per hand), so
+    their *full* colours — brightness included, since a translucent bar over
+    any backdrop stays bright — pile into modes that are simultaneously *tight*
+    (every note near one colour) and *strong* (a large share of the total vote
+    mass).  Bright animated artwork — characters, sparkles, flashes — is
+    colour-diverse: its false notes scatter across colour space and never form
+    such a mode.  Dropping the diffuse residue removes them while leaving any
+    solid-colour bar population (however styled) untouched.
+
+    A translucent ink additionally spawns *satellite* modes: the same ink over
+    each recurring scene backdrop picks up that scene's tint, so rarer scenes
+    contribute small-but-tight modes *near* the main one in colour space.
+    Those are real notes — a weight floor alone would throw away every note
+    played during a rare backdrop.  A small tight mode is therefore also kept
+    when it sits within ``satellite_dist`` of an already-accepted mode; noise
+    modes (dark shadow shapes, saturated artwork colours) lie far from any bar
+    ink and still die regardless of their tightness.
+
+    Fail-safes: clips with too few notes to support the statistics pass through
+    unfiltered, as does a population with no qualifying mode at all (we cannot
+    tell signal from noise — never destroy the chart on a hunch).
+    """
+    if len(raws) < min_notes:
+        return raws, f"skipped: only {len(raws)} notes"
+    colors = np.array([r.color for r in raws], dtype=np.float64) / 255.0
+    # Vote mass: how much evidence the roll accumulated for this note.
+    weight = np.array([r.coverage * r.dur_us for r in raws], dtype=np.float64)
+    total = float(weight.sum())
+    if total <= 0:
+        return raws, "skipped: zero weight"
+
+    remaining = np.ones(len(raws), dtype=bool)
+    keep = np.zeros(len(raws), dtype=bool)
+    rng = np.random.default_rng(0)
+    accepted_centers: list[np.ndarray] = []
+    primaries = satellites = 0
+    for _ in range(max_modes):
+        idx = np.where(remaining)[0]
+        if idx.size == 0:
+            break
+        # Densest ball: try a bounded sample of the remaining notes as centres
+        # and take the one capturing the most weight (O(sample * n), no O(n^2)).
+        cand = idx if idx.size <= 256 else rng.choice(idx, 256, replace=False)
+        d = np.linalg.norm(colors[idx][None, :] - colors[cand][:, None], axis=2)
+        captured = ((d <= radius) * weight[idx][None, :]).sum(axis=1)
+        center = colors[cand[int(captured.argmax())]]
+        # A few mean-shift steps to settle on the mode's true centre.
+        for _ in range(3):
+            member = np.linalg.norm(colors[idx] - center, axis=1) <= radius
+            if not member.any():
+                break
+            center = np.average(colors[idx][member], axis=0, weights=weight[idx][member])
+        member = np.linalg.norm(colors[idx] - center, axis=1) <= radius
+        frac = float(weight[idx][member].sum()) / total
+        if frac < satellite_frac:
+            break  # strongest remaining mode is a speck -> the rest is residue
+        if frac >= min_mode_frac:
+            primaries += 1
+        elif accepted_centers and _is_satellite(center, accepted_centers, satellite_dist):
+            satellites += 1
+        else:
+            # Tight but weak and far from every bar ink: noise. Carve it out
+            # of `remaining` so the next-densest mode can surface.
+            remaining[idx[member]] = False
+            continue
+        accepted_centers.append(center)
+        keep[idx[member]] = True
+        remaining[idx[member]] = False
+
+    if primaries == 0:
+        return raws, "skipped: no qualifying colour mode"
+    survivors = [r for r, k in zip(raws, keep) if k]
+    dropped = len(raws) - len(survivors)
+    return survivors, (
+        f"kept {primaries} mode(s) + {satellites} satellite(s), "
+        f"dropped {dropped}/{len(raws)} notes"
+    )
 
 
 def assign_hands(raws: list[_RawNote]) -> list[ExtractedNote]:
@@ -869,8 +1057,13 @@ def extract_chart(
     votes, totals, color_sum, pitches, us_per_px = build_roll(
         frames, fps, kb, scroll, plate=bg, max_run_w=max_run_w
     )
-    # 40 ms is shorter than any playable tutorial note; in pixels it scales
-    # with the scroll speed.
+    # 25 ms is shorter than any playable tutorial note; in pixels it scales
+    # with the scroll speed.  The run gate is deliberately permissive — the
+    # eval-harness sweep showed the note-level noise filters downstream absorb
+    # what it admits, while a tighter gate costs real fast notes.  (Lowering
+    # the coverage threshold below 0.6 scores higher still on busy real
+    # sources, but lets bright artwork weld onto a bar's run in its own lane,
+    # corrupting that note's timing — not worth it.)
     raws = extract_notes(
         votes,
         totals,
@@ -878,7 +1071,14 @@ def extract_chart(
         pitches,
         us_per_px,
         threshold=0.6,
-        min_run_px=max(3, int(round(0.04 * scroll))),
+        hysteresis_low=0.42,
+        min_run_px=max(3, int(round(0.025 * scroll))),
+    )
+    n_extracted = len(raws)
+    raws, n_ghosts = suppress_neighbor_ghosts(raws)
+    raws, color_diag = filter_color_modes(raws)
+    source.noise_filter = (
+        f"extracted {n_extracted}; ghosts dropped {n_ghosts}; colour modes: {color_diag}"
     )
     notes = assign_hands(raws)
 

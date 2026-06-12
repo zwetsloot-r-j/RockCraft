@@ -84,9 +84,6 @@ fn run_pipeline(
     ctx: &PipelineCtx,
 ) -> Result<PathBuf, ImportError> {
     let video_path = resolve_input(input, on_progress, ctx)?;
-    let chart_json = run_sidecar(&video_path, on_progress, &ctx.workspace)?;
-    let chart = from_json(&chart_json)?;
-    on_progress(Progress::Writing);
     let out_dir = ctx
         .workspace
         .join("import-out")
@@ -94,7 +91,19 @@ fn run_pipeline(
     std::fs::create_dir_all(&out_dir)?;
     // Best-effort: attach the source video's audio as the default backing track.
     // ffmpeg is optional — a missing or failing binary leaves `backing: null`.
+    // Extracted *before* the sidecar so the same audio can drive its fusion
+    // pass (velocity, clock alignment, merged-note splitting); the sidecar
+    // safely no-ops fusion on unsuitable (full-mix) audio.
     let backing = extract_backing(&video_path, &out_dir, &ctx.ffmpeg_cmd);
+    let audio_path = backing.as_ref().map(|b| out_dir.join(&b.file));
+    let chart_json = run_sidecar(
+        &video_path,
+        audio_path.as_deref(),
+        on_progress,
+        &ctx.workspace,
+    )?;
+    let chart = from_json(&chart_json)?;
+    on_progress(Progress::Writing);
     let bundle = write_chart_bundle_with_backing(&chart, &out_dir, backing)?;
     on_progress(Progress::Done(bundle.clone()));
     Ok(bundle)
@@ -248,24 +257,27 @@ fn run_fetch(
 
 fn run_sidecar(
     video_path: &Path,
+    audio_path: Option<&Path>,
     on_progress: &mut dyn FnMut(Progress),
     workspace: &Path,
 ) -> Result<String, ImportError> {
     on_progress(Progress::Extracting(0.0));
     let sidecar = find_sidecar(workspace)?;
-    let output = Command::new("python3")
-        .arg(&sidecar)
+    let mut cmd = Command::new("python3");
+    cmd.arg(&sidecar)
         .arg("--in")
         .arg(video_path)
         .arg("--out")
-        .arg("-")
-        .output()
-        .map_err(|e| {
-            ImportError::SidecarMissing(format!(
-                "could not launch python3: {e}; install python3 and set up \
+        .arg("-");
+    if let Some(audio) = audio_path {
+        cmd.arg("--audio").arg(audio).arg("--audio-fusion");
+    }
+    let output = cmd.output().map_err(|e| {
+        ImportError::SidecarMissing(format!(
+            "could not launch python3: {e}; install python3 and set up \
                  tools/synthesia-extract/ (see docs/IMPORT.md)"
-            ))
-        })?;
+        ))
+    })?;
     if !output.status.success() {
         return Err(ImportError::SidecarFailed(
             String::from_utf8_lossy(&output.stderr).into_owned(),

@@ -25,10 +25,23 @@ chart with what the picture can't give:
 * **sub-frame onset/offset** — audio is sample-precise where the visual roll is
   quantised to the video frame grid.
 
+Beyond velocity and onset refinement, the pass also:
+
+* **aligns the visual clock to the audio clock** — the hit-line placement and
+  encoder delay give the whole chart a small constant lead/lag; the median
+  onset offset over all same-pitch matches measures it, and every note is
+  shifted by it (so the chart lines up with the backing track), and
+* **splits merged repeated notes** — back-to-back bars touch on screen, so the
+  roll reads two strikes as one long note; an audible re-strike of the same
+  pitch inside a visual note's span marks where to cut. A lower note's
+  harmonic landing in the pitch's band is recognised (much weaker, synchronous
+  with the lower strike) and never causes a split.
+
 It is strictly additive: M6-C alone still produces a full chart, and on
 **full-band** audio (vocals/drums/broadband energy) the pass detects the
 unsuitable input and **no-ops**, leaving the visual notes authoritative rather
-than corrupting them.
+than corrupting them. The M6-D pipeline runs it automatically whenever the
+source video yields a backing track.
 
 ```bash
 # Visual + audio fusion (audio is a 16-bit PCM WAV alongside the video/frames):
@@ -42,18 +55,38 @@ note (same pitch, onset within the visual's frame uncertainty), copies velocity,
 and nudges timing **within** that uncertainty. Unmatched visual notes keep their
 timing and take a default velocity.
 
+## Scoring accuracy (eval.py)
+
+`eval.py` compares a chart against any independent reference transcription of
+the same source (e.g. a learned audio transcriber's output, or a hand-checked
+note list) and prints a bucketized report: exact matches, octave/semitone
+disagreements, missing notes, onsets buried inside longer chart notes (merged
+repeats), and chart-only notes. Reference files of copyrighted media stay
+local, like every other derived artifact (see docs/IMPORT.md).
+
+```bash
+python eval.py --chart chart.json --ref reference.json --tol-ms 150
+```
+
 ### Transcription dependency
 
 The bundled transcriber (`synthesia_extract.audio`) is **self-contained
 classical DSP** (per-pitch FFT band-pass → amplitude envelope → onsets +
-velocity), so it needs no ML weights and stays hermetic in CI. For real-world
-accuracy you can drop in a learned piano-transcription model — e.g.
-[`basic-pitch`](https://github.com/spotify/basic-pitch) or an
-Onsets-and-Frames implementation — behind the same `TranscribedNote` interface
-(`pitch`, `start_us`, `dur_us`, `velocity`); a learned model reports absolute
-MIDI velocity and would set `REFERENCE_PEAK_AMPLITUDE`/`_ENVELOPE_PEAK_CAL` to
-`1.0`. Such a model is an **optional** extra (heavy TF/Torch deps) and is *not*
-in `requirements.txt`; the fusion path works without it.
+velocity), so it needs no ML weights and stays hermetic in CI.
+
+For real-world accuracy, the fusion pass **automatically upgrades** to
+[`basic-pitch`](https://github.com/spotify/basic-pitch) whenever it is
+importable (`transcribe_learned`, same `TranscribedNote` interface): a learned
+model hears through pedal sustain and dense polyphony the DSP band-pass
+cannot, which directly improves merged-note splitting and velocities. It is an
+**optional** extra and *not* in `requirements.txt`; the fusion path works
+without it. On Python ≥3.12 (where basic-pitch's TensorFlow pin has no
+wheels), install it against the ONNX runtime:
+
+```bash
+pip install basic-pitch --no-deps
+pip install onnxruntime librosa pretty-midi scipy scikit-learn mir_eval resampy
+```
 
 ## Setup
 
@@ -103,9 +136,19 @@ pipeline:
 4. **Roll stitching** — every colored pixel of every frame votes into a per-pitch
    song-time occupancy map; overlapping frames reinforce true bars, sub-frame
    interpolation beats the frame grid.
-5. **Notes + hands** — threshold coverage into note runs; cluster the (typically
-   two) dominant bar colors into Left/Right (lower average pitch → Left), else
-   `Unknown`. Coverage and color-purity feed `confidence` for the M6-E review.
+5. **Notes + noise rejection** — threshold coverage into note runs (with
+   dual-threshold gap bridging, so a brief mask dropout doesn't split one bar
+   into fragments), then drop what isn't a bar: *ghost notes* (a bar's bloom
+   bleeding into the adjacent lane — overlapping a much brighter same-chroma
+   neighbour 1–2 semitones away) and *animated-artwork noise* (bright
+   characters/sparkles behind the roll — their colours are diverse, while
+   real bars pile into a few tight, coverage-strong colour modes; small tight
+   modes *near* an accepted one are kept too — the same ink tinted by a rarer
+   scene backdrop — while diffuse or far-away residue is discarded). The
+   `source.noise_filter` diagnostic records what each stage dropped.
+6. **Hands** — cluster the (typically two) dominant bar colors into Left/Right
+   (lower average pitch → Left), else `Unknown`. Coverage and color-purity feed
+   `confidence` for the M6-E review.
 
 ## Output
 

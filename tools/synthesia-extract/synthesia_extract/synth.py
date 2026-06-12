@@ -204,6 +204,8 @@ def render_overlay_frames(
     alpha: float = 0.7,
     seed: int = 7,
     lyrics: bool = True,
+    animated_blobs: int = 0,
+    glow: float = 0.0,
 ) -> tuple[list[np.ndarray], SynthKeyboard]:
     """Render an *overlay-style* clip: translucent white bars over a busy,
     colorful static background, above a filmed-piano-like keyboard.
@@ -217,6 +219,21 @@ def render_overlay_frames(
     * the bottom rows fade to dark like a filmed piano's front edge;
     * optionally a static "lyrics" text overlay sits mid-highway and changes
       halfway through (it must not drag the scroll estimate to zero).
+
+    ``animated_blobs`` adds the issue-#151 failure class: an *animated music
+    video* behind the roll.  Each blob is a tall, bright, lane-narrow shape
+    (a character's highlight) drifting smoothly around the falling region with
+    a slowly cycling hue — it defeats every cheap per-pixel gate (brighter than
+    the plate, narrower than the run cap, taller than the per-frame scroll
+    shift so it self-overlaps through the coherence gate, never still long
+    enough for the dead-zone map) and must be rejected downstream by the
+    note-level colour statistics instead.
+
+    ``glow`` (0..1) adds a lateral halo around every bar, like the bloom real
+    videos exhibit: a weaker white blend extending past the bar's own lane into
+    its neighbours' centre strips.  This is the *ghost note* failure class —
+    the halo rides the hit line in perfect sync with its parent bar, so only
+    the neighbour-brightness relation can reject it.
     """
     import cv2
 
@@ -249,6 +266,37 @@ def render_overlay_frames(
     for f in range(n_frames):
         t = f / cfg.fps
         frame = static.copy()
+        # Animated-background blobs sit *behind* the bars (drawn first).  Each
+        # is a bright, lane-narrow shape falling at *near* (not exactly) the
+        # scroll speed — sparkles/petals in the artwork — the worst case for
+        # the per-pixel gates: the small velocity mismatch stays inside the
+        # coherence gate's tolerance while the steady descent racks up
+        # coverage.  Colour varies per blob and per pass (diverse palette).
+        for b in range(animated_blobs):
+            u = (0.72 + 0.06 * (b % 3)) * v  # fall speed, near scroll
+            blob_h = 90 + 12 * (b % 4)
+            half_w = 7 + (b % 3)
+            travel = hit + 2 * blob_h
+            pos = (u * t + (b * 977) % travel) % travel
+            pass_idx = int((u * t + (b * 977) % travel) // travel)
+            by = pos - blob_h  # blob centre row, entering from above
+            home = 30 + ((b * 131 + pass_idx * 61) % 89) / 89.0 * (width - 60)
+            bx = home + 14.0 * np.sin(2.0 * np.pi * t / (3.0 + 0.5 * b))
+            hue = (b * 53 + pass_idx * 101 + 17) % 180
+            sat = 170 + (b * 29 + pass_idx * 43) % 86
+            color = cv2.cvtColor(
+                np.uint8([[[hue, sat, 255]]]), cv2.COLOR_HSV2BGR
+            )[0, 0]
+            cv2.ellipse(
+                frame,
+                (int(bx), int(by)),
+                (half_w, blob_h // 2),
+                0, 0, 360,
+                tuple(int(c) for c in color),
+                -1,
+            )
+        if animated_blobs:
+            frame[hit:] = static[hit:]  # animation never covers the keyboard
         for note in notes:
             span = kb.lane_x_range(note.pitch)
             if span is None:
@@ -260,6 +308,13 @@ def render_overlay_frames(
             y1 = min(hit, int(round(hit + (t - start) * v)))
             if y1 <= y0:
                 continue
+            if glow > 0.0:
+                # Lateral halo: a weaker blend reaching into neighbouring lanes.
+                gw = cfg.white_w // 2
+                gx0, gx1 = max(0, x0 - gw), min(width, x1 + gw)
+                ga = glow * alpha
+                halo = frame[y0:y1, gx0:gx1].astype(np.float32)
+                frame[y0:y1, gx0:gx1] = (ga * 255.0 + (1.0 - ga) * halo).astype(np.uint8)
             region = frame[y0:y1, x0:x1].astype(np.float32)
             frame[y0:y1, x0:x1] = (alpha * 255.0 + (1.0 - alpha) * region).astype(np.uint8)
         if lyrics:
