@@ -63,6 +63,26 @@ pub struct AudioState {
     pub synth: Option<SynthHandle>,
     /// Channel to the backing-manager thread. `None` when no device.
     backing_tx: Mutex<Option<Sender<BackingMsg>>>,
+    /// Play-mode backing coupling state (#168). Tracks the attached file and
+    /// last seek target so the play tick only sends a message on a change. Kept
+    /// separate from the composer/transport `sync_backing` path so the two
+    /// screens never fight over the backing thread.
+    play_backing: Mutex<PlayBacking>,
+}
+
+/// Play-mode backing coupling state. Mirrors the TUI `PlayScreen`'s lazy
+/// backing-arm: nothing plays until the clock crosses `shift_us` (the play
+/// session returns `Some(target)` only then), and a freeze pauses it.
+#[derive(Default)]
+struct PlayBacking {
+    /// The currently-attached backing file (the play session's bundle track).
+    attached: Option<PathBuf>,
+    /// Whether the backing has been started (PlayAt sent) this take.
+    started: bool,
+    /// Whether playback is currently paused (frozen by wait mode / lead-in).
+    paused: bool,
+    /// The last file-position target we issued, to suppress redundant seeks.
+    last_target_us: u64,
 }
 
 impl AudioState {
@@ -157,12 +177,14 @@ impl AudioState {
             Ok(Some(synth)) => Self {
                 synth: Some(synth),
                 backing_tx: Mutex::new(Some(backing_tx)),
+                play_backing: Mutex::new(PlayBacking::default()),
             },
             _ => {
                 // Audio init failed or thread panicked.
                 Self {
                     synth: None,
                     backing_tx: Mutex::new(None),
+                    play_backing: Mutex::new(PlayBacking::default()),
                 }
             }
         }
@@ -173,6 +195,82 @@ impl AudioState {
         let guard = self.backing_tx.lock().expect("backing_tx mutex poisoned");
         if let Some(tx) = guard.as_ref() {
             let _ = tx.send(msg);
+        }
+    }
+
+    // ── Play-mode backing coupling (#168) ───────────────────────────────────
+
+    /// Stop and clear the play-mode backing track. Called on `play_load`
+    /// (between takes) and `play_finish`. Idempotent.
+    pub fn stop_backing(&self) {
+        let mut pb = self.play_backing.lock().expect("play_backing poisoned");
+        if pb.attached.is_some() || pb.started {
+            self.send_backing(BackingMsg::Detach);
+        }
+        *pb = PlayBacking::default();
+    }
+
+    /// Couple the play session's backing track to its clock for one tick.
+    ///
+    /// `backing` is the bundle's track (or `None`); `target_us` is the file
+    /// position the session expects *now* (`None` while the clock is still in the
+    /// lead-in); `frozen` is whether wait mode has frozen the clock. Mirrors the
+    /// TUI `tick_backing` / `advance` pause logic: start lazily at the shift
+    /// boundary, pause while frozen, resume (re-seeking to the live position) on
+    /// thaw.
+    pub fn sync_play_backing(
+        &self,
+        backing: Option<&super::play::Backing>,
+        target_us: Option<u64>,
+        frozen: bool,
+    ) {
+        let mut pb = self.play_backing.lock().expect("play_backing poisoned");
+
+        let Some(b) = backing else {
+            // No backing track this take — make sure nothing lingers.
+            if pb.started {
+                self.send_backing(BackingMsg::Detach);
+                *pb = PlayBacking::default();
+            }
+            return;
+        };
+
+        // Lazily attach the file the first time we see this backing track.
+        if pb.attached.as_ref() != Some(&b.path) {
+            self.send_backing(BackingMsg::Attach(b.path.clone()));
+            pb.attached = Some(b.path.clone());
+            pb.started = false;
+            pb.paused = false;
+            pb.last_target_us = 0;
+        }
+
+        // Still in the lead-in: nothing to play yet.
+        let Some(pos) = target_us else { return };
+
+        if frozen {
+            // Freeze: pause once and hold position.
+            if pb.started && !pb.paused {
+                self.send_backing(BackingMsg::Pause);
+                pb.paused = true;
+            }
+            return;
+        }
+
+        if !pb.started {
+            // First time the clock reached the shift point: start it.
+            self.send_backing(BackingMsg::PlayAt(pos));
+            pb.started = true;
+            pb.paused = false;
+            pb.last_target_us = pos;
+        } else if pb.paused {
+            // Resuming after a freeze: re-seek to the live position and play.
+            self.send_backing(BackingMsg::PlayAt(pos));
+            pb.paused = false;
+            pb.last_target_us = pos;
+        } else {
+            // Playing normally — the audio thread drives playback; we only track
+            // the latest target so a future jump (rewind) is detectable.
+            pb.last_target_us = pos;
         }
     }
 }
@@ -330,6 +428,7 @@ mod tests {
         let audio = AudioState {
             synth: None,
             backing_tx: Mutex::new(None),
+            play_backing: Mutex::new(PlayBacking::default()),
         };
         apply_effects(
             &audio,

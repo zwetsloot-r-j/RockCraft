@@ -101,6 +101,44 @@ export class HighwayCanvas {
   t0: number;
   private lastNow = 0;
 
+  // ── live wiring (#168) ───────────────────────────────────────────────────
+  // When `live` is set the engine stops using its internal `performance.now()`
+  // clock and `runScoring` sim; instead the song time, freeze flag, and held
+  // notes come from the backend `play_state` event (driven by `core::PlayClock`
+  // off MIDI timestamps). The header reads score/combo from `play_state`, not
+  // these fields. `liveTimeMs` is interpolated between events with the wall
+  // clock so the scroll stays smooth at the render rate without owning timing.
+  private live = false;
+  private liveTimeMs = 0;
+  /** Wall-clock anchor (performance.now) for the last `setLiveState` call. */
+  private liveAnchor = 0;
+  private liveFrozen = false;
+  private liveHeld = new Set<number>();
+  private liveAwaiting = new Set<number>();
+
+  /** Enable live mode: the engine reads time/held from the backend, not its
+   * own clock or scoring sim. */
+  setLive(on: boolean): void {
+    this.live = on;
+  }
+
+  /** Push the latest backend `play_state`. `timeMs` is the authoritative song
+   * time; render interpolates forward from here using the wall clock unless
+   * `frozen`. `held` highlights the player's keys; `awaiting` pulses the notes
+   * the player must hold to un-freeze. */
+  setLiveState(
+    timeMs: number,
+    frozen: boolean,
+    held: number[],
+    awaiting: number[] = [],
+  ): void {
+    this.liveTimeMs = timeMs;
+    this.liveAnchor = performance.now();
+    this.liveFrozen = frozen;
+    this.liveHeld = new Set(held);
+    this.liveAwaiting = new Set(awaiting);
+  }
+
   // scoring sim state (public reads for the header chrome)
   score = 0;
   combo = 0;
@@ -174,8 +212,14 @@ export class HighwayCanvas {
     this.ro.disconnect();
   }
 
-  // The one clock accessor — #168 swaps this for an external time source.
+  // The one clock accessor. In live mode (#168) this is the backend song time
+  // interpolated forward from the last `play_state` with the wall clock (frozen
+  // holds it steady); otherwise the demo-only internal clock.
   private elapsed(): number {
+    if (this.live) {
+      if (this.liveFrozen) return this.liveTimeMs;
+      return this.liveTimeMs + (performance.now() - this.liveAnchor);
+    }
     return performance.now() - this.t0;
   }
 
@@ -213,8 +257,10 @@ export class HighwayCanvas {
 
   private frame(): void {
     const c = this.cfg;
-    const now = this.elapsed() % this.song.LOOP;
-    if (c.scoring) this.runScoring(now);
+    // Live bundles play once (no loop wrap); the demo mock loops on LOOP.
+    const now = this.live ? this.elapsed() : this.elapsed() % this.song.LOOP;
+    // The internal scoring sim is demo-only; live scoring is the backend's.
+    if (c.scoring && !this.live) this.runScoring(now);
 
     this.ctx.clearRect(0, 0, this.w, this.h);
     this.drawBackground();
@@ -406,9 +452,20 @@ export class HighwayCanvas {
         fill = col;
         topF = withAlpha("#ffffff", 0.6);
       }
+      // Live: a held key that is not (yet) a target reads as "you" (blue).
+      if (this.live && !tHand && this.liveHeld.has(k.note)) {
+        fill = "#6fa8ff";
+        topF = "#cfe0ff";
+      }
       if (isMatch) {
         fill = "#7ee08a";
         topF = "#d8ffdd";
+      }
+      // Live wait-mode: pulse the awaited keys so the player knows what to hold.
+      if (this.live && this.liveAwaiting.has(k.note)) {
+        const p = 0.5 + 0.5 * Math.sin(performance.now() / 140);
+        fill = withAlpha("#ffd166", 0.55 + 0.45 * p);
+        topF = "#fff0c4";
       }
       if (style === "realistic") {
         const g = ctx.createLinearGradient(0, top, 0, top + h);
@@ -503,8 +560,17 @@ export class HighwayCanvas {
 
   // ── simulated player + scoring ─────────────────────────────────────────
   private matchedNotes(now: number): Set<number> {
-    // notes whose onset was recently "hit" by the sim, still sounding
     const set = new Set<number>();
+    // Live (#168): a "match" is a target note the player is actually holding.
+    if (this.live) {
+      for (const nt of this.song.notes) {
+        if (nt.start <= now && now < nt.end && this.liveHeld.has(nt.note)) {
+          set.add(nt.note);
+        }
+      }
+      return set;
+    }
+    // Demo: notes whose onset was recently "hit" by the sim, still sounding.
     if (!this.cfg.scoring) return set;
     for (const nt of this.song.notes) {
       if (nt.start <= now && now < nt.end && this.hitNotes.has(nt)) set.add(nt.note);

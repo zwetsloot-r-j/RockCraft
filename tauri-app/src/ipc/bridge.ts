@@ -18,6 +18,9 @@ import type {
   ComposerSnapshot,
   Effect,
   LibraryEntryDto,
+  PlayInfo,
+  PlayStateEvent,
+  PlaySummary,
   SaveBundleResult,
   SaveDest,
 } from "./types";
@@ -26,6 +29,8 @@ import type {
 const EVENT_SNAPSHOT = "snapshot";
 /** Event name the backend emits a batch of {@link Effect}s on. */
 const EVENT_EFFECTS = "effects";
+/** Event name the backend emits a live {@link PlayStateEvent} on (#168). */
+const EVENT_PLAY_STATE = "play_state";
 
 /**
  * Apply a named action, returning its effects and the new snapshot.
@@ -142,6 +147,45 @@ export function detachBacking(): Promise<void> {
 /** Poll current audio status (device availability + backing file name). */
 export function audioStatus(): Promise<AudioStatus> {
   return invoke<AudioStatus>("audio_status");
+}
+
+// ── Play commands (#168) ──────────────────────────────────────────────────
+
+/**
+ * Load a bundle directory into a fresh play session and return its static info
+ * (title, shifted spans, lead-in, backing presence). Rejects if `song.mid` is
+ * missing or unparseable. Mirrors `play_load` on the Rust backend.
+ */
+export function playLoad(dir: string): Promise<PlayInfo> {
+  return invoke<PlayInfo>("play_load", { dir });
+}
+
+/** Arm / disarm wait mode (`w` key). Returns the new armed state. */
+export function playSetWait(on: boolean): Promise<boolean> {
+  return invoke<boolean>("play_set_wait", { on });
+}
+
+/** Toggle "hear the song" audition (`m` key). Returns the new state. */
+export function playToggleHearSong(): Promise<boolean> {
+  return invoke<boolean>("play_toggle_hear_song");
+}
+
+/**
+ * Finish the take: tear the session down (stop backing, silence the synth) and
+ * return the end-of-take summary. Idempotent.
+ */
+export function playFinish(): Promise<PlaySummary> {
+  return invoke<PlaySummary>("play_finish");
+}
+
+/**
+ * Subscribe to `play_state` events (the ~60 Hz live highway snapshot). Returns
+ * the Tauri unlisten function; call it in `onCleanup`.
+ */
+export function onPlayState(
+  cb: (state: PlayStateEvent) => void,
+): Promise<UnlistenFn> {
+  return listen<PlayStateEvent>(EVENT_PLAY_STATE, (e) => cb(e.payload));
 }
 
 // ── Import commands ────────────────────────────────────────────────────────
