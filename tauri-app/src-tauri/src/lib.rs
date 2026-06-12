@@ -15,6 +15,7 @@
 //! the backing track follows the transport via [`audio::sync_backing`].
 
 mod audio;
+mod import;
 mod library;
 mod midi;
 mod state;
@@ -26,6 +27,7 @@ use rockcraft_core::ComposerSnapshot;
 use tauri::{Emitter, Manager, State};
 
 use crate::audio::AudioState;
+use crate::import::ImportRunning;
 use crate::midi::{MidiState, MidiStatus};
 use crate::state::{ActionReply, AppState, SaveDest};
 
@@ -267,10 +269,12 @@ fn spawn_tick_thread(app: tauri::AppHandle) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState::new())
         .manage(AudioState::new())
         .manage(MidiState::new())
         .manage(PrevTransport::default())
+        .manage(ImportRunning::default())
         .invoke_handler(tauri::generate_handler![
             run_action,
             query_state,
@@ -284,6 +288,8 @@ pub fn run() {
             audio::attach_backing,
             audio::detach_backing,
             audio::audio_status,
+            import::import_url_available,
+            import::import_start,
         ])
         .setup(|app| {
             spawn_tick_thread(app.handle().clone());
