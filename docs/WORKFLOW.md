@@ -46,8 +46,12 @@ work"). To make a queue safe, ensure queue issues are well-specced and not
 3. Delegate by issue number or by label queue (see above).
 4. The agent claims the issue (`status:in-progress`), works on its branch
    prefix, opens a PR with `Closes #N`.
-5. Merges only when the gate (`fmt · clippy · test`) is green and `main`'s
-   protection is satisfied. A human reviews; agents do not self-merge.
+5. The agent syncs its branch with `main` (resolving conflicts itself),
+   re-runs the gate, then **squash-merges its own PR** once
+   `fmt · clippy · test` is green and the branch is up to date — both
+   enforced by `main`'s branch protection. Issues labeled `needs-review`
+   are the exception: a human merges those. Human review is post-merge:
+   skim merged PRs, revert the rare bad one.
 
 ## What can be delegated to a sandbox
 
