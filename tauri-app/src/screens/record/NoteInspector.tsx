@@ -1,6 +1,7 @@
 // NoteInspector.tsx — the floating selected-note panel (Design E, from
 // C · Score). Appears top-right of the canvas whenever the engine has a
-// selected note. Nudge / Snap are visual stubs (no core action yet — #169).
+// selected note. Nudge / Snap have no backing core action yet (#188), so they
+// render disabled rather than silently no-op-ing.
 
 import { type Accessor, createMemo, For, type JSX, Show } from "solid-js";
 import type { RecordCanvas } from "./RecordCanvas";
@@ -95,6 +96,8 @@ export function NoteInspector(props: NoteInspectorProps): JSX.Element {
             </For>
             <div style={{ display: "flex", gap: "6px", "margin-top": "10px" }}>
               <button
+                disabled
+                title="Nudge — not yet wired"
                 style={{
                   flex: 1,
                   border: "1px solid rgba(255,255,255,0.12)",
@@ -104,12 +107,15 @@ export function NoteInspector(props: NoteInspectorProps): JSX.Element {
                   padding: "6px 0",
                   "font-size": "11px",
                   "font-family": DISP,
-                  cursor: "pointer",
+                  cursor: "default",
+                  opacity: "0.4",
                 }}
               >
                 Nudge
               </button>
               <button
+                disabled
+                title="Snap — not yet wired"
                 style={{
                   flex: 1,
                   border: `1px solid ${OK}44`,
@@ -119,7 +125,8 @@ export function NoteInspector(props: NoteInspectorProps): JSX.Element {
                   padding: "6px 0",
                   "font-size": "11px",
                   "font-family": DISP,
-                  cursor: "pointer",
+                  cursor: "default",
+                  opacity: "0.4",
                 }}
               >
                 Snap

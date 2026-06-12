@@ -6,6 +6,8 @@ import { MONO } from "./theme";
 
 export interface ToggleProps {
   active?: boolean;
+  /** When true the toggle is rendered dimmed and non-interactive. */
+  disabled?: boolean;
   onClick?: () => void;
   title?: string;
   children?: JSX.Element;
@@ -14,13 +16,14 @@ export interface ToggleProps {
 export function Toggle(props: ToggleProps): JSX.Element {
   return (
     <button
-      onClick={() => props.onClick?.()}
+      onClick={() => !props.disabled && props.onClick?.()}
+      disabled={props.disabled}
       title={props.title}
       style={{
         display: "inline-flex",
         "align-items": "center",
         gap: "6px",
-        cursor: "pointer",
+        cursor: props.disabled ? "default" : "pointer",
         "font-family": MONO,
         "font-size": "10.5px",
         padding: "4px 9px",
@@ -28,6 +31,7 @@ export function Toggle(props: ToggleProps): JSX.Element {
         background: "rgba(0,0,0,0.24)",
         border: `1px solid ${props.active ? "rgba(91,231,196,0.5)" : "rgba(255,255,255,0.09)"}`,
         color: props.active ? "#e7e8ef" : "#6e7282",
+        opacity: props.disabled ? "0.45" : "1",
         transition: "border-color .12s, color .12s",
       }}
     >

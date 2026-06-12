@@ -11,6 +11,8 @@ export interface RoundBtnProps {
   size?: number;
   glow?: boolean;
   active?: boolean;
+  /** When true the button is rendered dimmed and non-interactive. */
+  disabled?: boolean;
   onClick?: () => void;
   title?: string;
 }
@@ -23,7 +25,8 @@ export function RoundBtn(props: RoundBtnProps): JSX.Element {
   return (
     <button
       title={props.title}
-      onClick={() => props.onClick?.()}
+      disabled={props.disabled}
+      onClick={() => !props.disabled && props.onClick?.()}
       style={{
         width: `${size()}px`,
         height: `${size()}px`,
@@ -34,9 +37,10 @@ export function RoundBtn(props: RoundBtnProps): JSX.Element {
         display: "flex",
         "align-items": "center",
         "justify-content": "center",
-        cursor: "pointer",
+        cursor: props.disabled ? "default" : "pointer",
         "box-shadow": props.glow ? `0 2px 14px ${color()}55` : "none",
         flex: "0 0 auto",
+        opacity: props.disabled ? "0.38" : "1",
         transition: "transform .1s",
       }}
     >
