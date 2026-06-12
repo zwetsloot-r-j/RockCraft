@@ -26,7 +26,7 @@ rockcraft-midi = { workspace = true }
 rockcraft-audio = { workspace = true }
 rockcraft-import = { workspace = true }
 rockcraft-control = { workspace = true }
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -15,6 +15,7 @@
 //   - Dirty tracking via the `dirty` field returned in `ActionReply`.
 
 import {
+  createEffect,
   createSignal,
   onCleanup,
   onMount,
@@ -22,21 +23,35 @@ import {
   type JSX,
 } from "solid-js";
 import { createStore } from "solid-js/store";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
   loadBundle,
   onSnapshot,
+  openVideoFilePicker,
   queryDirty,
   queryState,
   runAction,
   saveBundle,
+  transcriptionLoad,
+  transcriptionSave,
 } from "../../ipc/bridge";
 import type { ComposerSnapshot } from "../../ipc/types";
 import { EditCanvas } from "./EditCanvas";
 import { StatusBar } from "./StatusBar";
 import { resolveKey } from "./keymap";
+import { stepUs } from "./viewport";
 import { noteName } from "../highway/utils";
 import { useRouter } from "../../shell/Router";
+
+// ── Video backdrop (M7-tauri-N) ────────────────────────────────────────────
+
+/** Fine backdrop-offset nudge (10 ms), bound to `,` / `.` while attached. */
+const BACKDROP_NUDGE_FINE_US = 10_000;
+/** Coarse backdrop-offset nudge (250 ms), bound to `;` / `'` while attached. */
+const BACKDROP_NUDGE_COARSE_US = 250_000;
+/** Opacity the backdrop `<video>` renders at (dimmed under the grid). */
+const BACKDROP_OPACITY = 0.5;
 
 // ── Overlay state ─────────────────────────────────────────────────────────
 
@@ -66,8 +81,16 @@ interface Props {
 export function EditScreen(props: Props): JSX.Element {
   const { navigate } = useRouter();
   let canvasEl!: HTMLCanvasElement;
+  let videoEl: HTMLVideoElement | undefined;
   let engine: EditCanvas | null = null;
   let raf = 0;
+
+  // ── Video backdrop state (M7-tauri-N) ───────────────────────────────────
+  // The attached backdrop path (null = none) and its alignment offset, applied
+  // as videoTime = songTime + offset. State lives here (frontend-only); it is
+  // persisted via the `transcription.json` sidecar, never the bundle schema.
+  const [videoPath, setVideoPath] = createSignal<string | null>(null);
+  const [offsetUs, setOffsetUs] = createSignal(0);
 
   // The snapshot mirror.
   const [store, setStore] = createStore<{ snap: ComposerSnapshot | null }>({
@@ -98,10 +121,37 @@ export function EditScreen(props: Props): JSX.Element {
     return basePlayheadUs + elapsedUs;
   }
 
+  /**
+   * The song-time line the viewport scrolls around — the playhead while
+   * playing, else the cursor step. Mirrors `EditCanvas`'s own anchor so the
+   * backdrop frame lines up with the on-screen grid.
+   */
+  function anchorUsOf(s: ComposerSnapshot): number {
+    if (s.playing) return interpolatedPlayheadUs(s);
+    return s.cursor.step * stepUs(s.bpm, s.subdivision);
+  }
+
+  /**
+   * Scrub the backdrop `<video>` to the song time at the reference line. We
+   * *seek* rather than `play()` so the frame stays in lockstep with the
+   * playhead (no audio, no drift); clamped to the clip's duration.
+   */
+  function syncVideo(anchorUs: number): void {
+    const v = videoEl;
+    if (!v || videoPath() === null) return;
+    const dur = v.duration;
+    if (!Number.isFinite(dur) || dur <= 0) return; // metadata not ready yet
+    const t = (anchorUs + offsetUs()) / 1e6;
+    v.currentTime = Math.min(Math.max(t, 0), dur);
+  }
+
   function render(): void {
     const s = store.snap;
     if (!engine || !s) return;
-    engine.draw(s, interpolatedPlayheadUs(s));
+    engine.setBackdrop(videoPath() !== null);
+    const playhead = interpolatedPlayheadUs(s);
+    engine.draw(s, playhead);
+    syncVideo(anchorUsOf(s));
   }
 
   function applySnapshot(s: ComposerSnapshot): void {
@@ -124,6 +174,7 @@ export function EditScreen(props: Props): JSX.Element {
     saveBundle({ kind: "quick_save" })
       .then((dir) => {
         setDirty(false);
+        persistBackdrop(dir);
         showFlash(`saved → ${dir}`);
       })
       .catch((e: unknown) => {
@@ -135,12 +186,75 @@ export function EditScreen(props: Props): JSX.Element {
     saveBundle({ kind: "library", name })
       .then((dir) => {
         setDirty(false);
+        persistBackdrop(dir);
         showFlash(`saved to library → ${dir}`);
       })
       .catch((e: unknown) => {
         showFlash(`save failed: ${String(e)}`);
       });
   }
+
+  // ── Video backdrop (M7-tauri-N) ─────────────────────────────────────────
+
+  /** After a save resolves, write the backdrop sidecar if one is attached. */
+  function persistBackdrop(dir: string): void {
+    const v = videoPath();
+    if (v === null) return;
+    void transcriptionSave(dir, { video: v, offset_us: offsetUs() }).catch(
+      () => {
+        /* sidecar is best-effort; the bundle itself already saved */
+      },
+    );
+  }
+
+  /** Open the native picker and attach the chosen video as the backdrop. */
+  function attachBackdrop(): void {
+    void openVideoFilePicker()
+      .then((path) => {
+        if (path === null) return; // cancelled
+        setVideoPath(path);
+        setOffsetUs(0);
+      })
+      .catch(() => {
+        showFlash("could not open video picker");
+      });
+  }
+
+  /** Clear the backdrop and reset its offset. */
+  function detachBackdrop(): void {
+    setVideoPath(null);
+    setOffsetUs(0);
+  }
+
+  /** `V` toggles the backdrop: pick when none, detach when attached. */
+  function toggleBackdrop(): void {
+    if (videoPath() === null) attachBackdrop();
+    else detachBackdrop();
+  }
+
+  /** Nudge the alignment offset and re-sync the frame immediately. */
+  function nudgeOffset(deltaUs: number): void {
+    setOffsetUs((o) => o + deltaUs);
+    const s = store.snap;
+    if (s) syncVideo(anchorUsOf(s));
+  }
+
+  // Bind the `<video>` src to the attached path (via the asset protocol) and
+  // repaint so the grid dim toggles with it.
+  createEffect(() => {
+    const p = videoPath();
+    engine?.setBackdrop(p !== null);
+    if (videoEl) {
+      if (p !== null) {
+        videoEl.src = convertFileSrc(p);
+        videoEl.load();
+      } else {
+        videoEl.removeAttribute("src");
+        videoEl.load();
+      }
+    }
+    render();
+  });
 
   // ── Key routing ─────────────────────────────────────────────────────────
 
@@ -232,6 +346,39 @@ export function EditScreen(props: Props): JSX.Element {
       }
     }
 
+    // ── Video backdrop (M7-tauri-N), non-chord mode only ────────────────
+    if (s.chord_preview === null) {
+      // `V` attaches a video (or detaches the current one).
+      if (e.key === "V") {
+        e.preventDefault();
+        toggleBackdrop();
+        return;
+      }
+      // While a backdrop is attached, the backing-align nudge keys realign the
+      // *video* offset instead (they don't collide with backing-offset because
+      // they only divert here when a video is present).
+      if (videoPath() !== null) {
+        switch (e.key) {
+          case ",":
+            e.preventDefault();
+            nudgeOffset(-BACKDROP_NUDGE_FINE_US);
+            return;
+          case ".":
+            e.preventDefault();
+            nudgeOffset(BACKDROP_NUDGE_FINE_US);
+            return;
+          case ";":
+            e.preventDefault();
+            nudgeOffset(-BACKDROP_NUDGE_COARSE_US);
+            return;
+          case "'":
+            e.preventDefault();
+            nudgeOffset(BACKDROP_NUDGE_COARSE_US);
+            return;
+        }
+      }
+    }
+
     // Esc in non-chord, no-selection mode → dirty exit prompt or menu nav.
     if (e.key === "Escape" && s.chord_preview === null && s.selection === null) {
       if (dirty()) {
@@ -282,6 +429,17 @@ export function EditScreen(props: Props): JSX.Element {
       ? loadBundle(props.dir).then((snap) => {
           applySnapshot(snap);
           setDirty(false);
+          // Re-attach a previously saved video backdrop, if any (M7-tauri-N).
+          void transcriptionLoad(props.dir!)
+            .then((dto) => {
+              if (dto) {
+                setVideoPath(dto.video);
+                setOffsetUs(dto.offset_us);
+              }
+            })
+            .catch(() => {
+              /* no sidecar / backend down — leave the backdrop detached */
+            });
         })
       : queryState().then(applySnapshot);
 
@@ -387,10 +545,43 @@ export function EditScreen(props: Props): JSX.Element {
 
       {/* Canvas area */}
       <div style={{ flex: "1 1 auto", "min-height": 0, position: "relative" }}>
+        {/* Video backdrop (M7-tauri-N) — sits *behind* the canvas (lower
+            z-index). Paused/muted; we scrub `currentTime`, never `play()`.
+            Hidden until a backdrop is attached. */}
+        <video
+          ref={videoEl}
+          muted
+          playsinline
+          preload="auto"
+          style={{
+            position: "absolute",
+            inset: 0,
+            width: "100%",
+            height: "100%",
+            "object-fit": "contain",
+            "z-index": 0,
+            opacity: BACKDROP_OPACITY,
+            "pointer-events": "none",
+            display: videoPath() === null ? "none" : "block",
+            background: "#000",
+          }}
+        />
+
         <canvas
           ref={canvasEl}
-          style={{ width: "100%", height: "100%", display: "block" }}
+          style={{
+            position: "relative",
+            "z-index": 1,
+            width: "100%",
+            height: "100%",
+            display: "block",
+          }}
         />
+
+        {/* Backdrop HUD — current alignment offset + key hints */}
+        <Show when={videoPath() !== null}>
+          <BackdropHud offsetUs={offsetUs()} />
+        </Show>
 
         {/* Chord selector panel — shown while chord_preview is non-null */}
         <Show when={store.snap?.chord_preview !== null && store.snap?.chord_preview !== undefined}>
@@ -412,6 +603,71 @@ export function EditScreen(props: Props): JSX.Element {
       <Show when={overlay() === "save-as"}>
         <SaveAsPrompt name={saveName()} />
       </Show>
+    </div>
+  );
+}
+
+// ── BackdropHud ───────────────────────────────────────────────────────────
+
+/**
+ * Small floating HUD shown while a video backdrop is attached: the current
+ * alignment offset (videoTime = songTime + offset) and the realign/detach keys.
+ */
+function BackdropHud(props: { offsetUs: number }): JSX.Element {
+  const offsetMs = (): string => {
+    const ms = Math.round(props.offsetUs / 1000);
+    return ms >= 0 ? `+${ms}` : String(ms);
+  };
+
+  return (
+    <div
+      style={{
+        position: "absolute",
+        bottom: "12px",
+        left: "16px",
+        background: "rgba(26,27,36,0.85)",
+        border: "1px solid #f5c542",
+        "border-radius": "8px",
+        padding: "8px 12px",
+        "z-index": 100,
+        "backdrop-filter": "blur(3px)",
+        "font-family": "'Space Grotesk', system-ui, sans-serif",
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          "align-items": "center",
+          gap: "8px",
+          "margin-bottom": "4px",
+        }}
+      >
+        <span
+          style={{
+            background: "#f5c542",
+            color: "#0f1016",
+            padding: "2px 8px",
+            "border-radius": "4px",
+            "font-size": "11px",
+            "font-weight": 700,
+            "letter-spacing": "0.5px",
+          }}
+        >
+          VIDEO
+        </span>
+        <span
+          style={{
+            color: "#e7e8ef",
+            "font-size": "12px",
+            "font-family": "'IBM Plex Mono', ui-monospace, monospace",
+          }}
+        >
+          offset {offsetMs()} ms
+        </span>
+      </div>
+      <div style={{ color: "#6a6e7e", "font-size": "11px" }}>
+        ,/. ±10 ms · ;/' ±250 ms · V detach
+      </div>
     </div>
   );
 }
@@ -575,6 +831,14 @@ function HelpOverlay(props: { onClose: () => void }): JSX.Element {
       rows: [
         ", / .         Nudge −/+ 10 ms",
         "; / '         Nudge −/+ 250 ms",
+      ],
+    },
+    {
+      title: "Video backdrop",
+      rows: [
+        "V             Attach / detach a video backdrop",
+        ", / .         Realign −/+ 10 ms (while attached)",
+        "; / '         Realign −/+ 250 ms (while attached)",
       ],
     },
     {
