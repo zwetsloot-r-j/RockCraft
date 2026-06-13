@@ -26,6 +26,8 @@ import {
 import { gridTiming, Viewport } from "./viewport";
 
 const BG = "#0f1016";
+/** Translucent dim used over a video backdrop (lets the frame read through). */
+const BG_BACKDROP = "rgba(15,16,22,0.45)";
 const FONT_MONO = "'IBM Plex Mono', ui-monospace, monospace";
 
 /** µs spanned across the canvas height (~8 bars at 120 4/4): the vertical zoom. */
@@ -40,6 +42,11 @@ export class EditCanvas {
   private w = 1;
   private h = 1;
 
+  // When a video backdrop is attached the grid must show the frame underneath:
+  // the opaque background fill is replaced by a translucent dim so the <video>
+  // behind the canvas reads through while keeping notes/grid legible.
+  private backdrop = false;
+
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
     this.ctx = canvas.getContext("2d")!;
@@ -51,6 +58,15 @@ export class EditCanvas {
   /** Detach the resize observer. Call from `onCleanup`. */
   dispose(): void {
     this.ro.disconnect();
+  }
+
+  /**
+   * Toggle backdrop mode. When `on`, `draw` dims the grid with a translucent
+   * fill instead of the opaque `BG`, so the `<video>` behind the canvas shows
+   * through. The next `draw` call picks it up.
+   */
+  setBackdrop(on: boolean): void {
+    this.backdrop = on;
   }
 
   private resize(): void {
@@ -72,7 +88,10 @@ export class EditCanvas {
   draw(snapshot: ComposerSnapshot, playheadUs: number): void {
     const ctx = this.ctx;
     ctx.clearRect(0, 0, this.w, this.h);
-    ctx.fillStyle = BG;
+    // With a backdrop attached, leave the fill translucent so the <video>
+    // underneath reads through (clearRect already made it transparent); the dim
+    // keeps notes/grid legible on top. Otherwise paint the opaque app bg.
+    ctx.fillStyle = this.backdrop ? BG_BACKDROP : BG;
     ctx.fillRect(0, 0, this.w, this.h);
 
     const g = gridTiming(
