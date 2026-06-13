@@ -22,6 +22,7 @@ mod midi;
 mod play;
 mod record;
 mod state;
+mod transcription;
 
 use std::sync::Mutex;
 use std::time::Instant;
@@ -341,6 +342,8 @@ pub fn run() {
             play::play_finish,
             import::import_url_available,
             import::import_start,
+            transcription::transcription_save,
+            transcription::transcription_load,
         ])
         .setup(|app| {
             spawn_tick_thread(app.handle().clone());

@@ -297,6 +297,39 @@ export function importUrlAvailable(): Promise<boolean> {
   return invoke<boolean>("import_url_available");
 }
 
+// ── Transcription backdrop sidecar (M7-tauri-N) ─────────────────────────────
+
+/**
+ * The persisted video-backdrop reference — mirrors `transcription::TranscriptionDto`
+ * on the Rust side. Stored next to a bundle as `transcription.json`, deliberately
+ * outside the `core` bundle schema.
+ */
+export interface TranscriptionDto {
+  /** Path to the backdrop video file (absolute). */
+  video: string;
+  /** Alignment offset in microseconds (`videoTime = songTime + offset`). */
+  offset_us: number;
+}
+
+/**
+ * Write the backdrop sidecar (`transcription.json`) into the bundle `dir`.
+ * Called after `save_bundle` resolves when a backdrop is attached.
+ */
+export function transcriptionSave(
+  dir: string,
+  dto: TranscriptionDto,
+): Promise<void> {
+  return invoke<void>("transcription_save", { dir, dto });
+}
+
+/**
+ * Read the backdrop sidecar for the bundle at `dir`, or `null` when none
+ * exists. Called on `load_bundle` to re-attach the backdrop.
+ */
+export function transcriptionLoad(dir: string): Promise<TranscriptionDto | null> {
+  return invoke<TranscriptionDto | null>("transcription_load", { dir });
+}
+
 /**
  * Start an import. Returns `Err("import already running")` if a concurrent
  * import is in progress; otherwise spawns the pipeline thread and resolves
