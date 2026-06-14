@@ -909,8 +909,9 @@ function HelpOverlay(props: { onClose: () => void }): JSX.Element {
     {
       title: "Transport",
       rows: [
-        "Space         Play / stop from cursor",
+        "Space         Play / stop from cursor (toggles — press again to stop)",
         "P             Play from start",
+        "              While playing, a PLAYING badge shows in the status bar",
       ],
     },
     {
@@ -931,7 +932,9 @@ function HelpOverlay(props: { onClose: () => void }): JSX.Element {
     {
       title: "Loop / Metronome / Count-in",
       rows: [
-        "o             Toggle loop",
+        "o             Toggle loop (defaults to the bar under the cursor)",
+        "{             Set loop start (loop-in) at the cursor",
+        "}             Set loop end (loop-out) at the cursor",
         "M             Toggle metronome",
         "C             Count-in record",
       ],

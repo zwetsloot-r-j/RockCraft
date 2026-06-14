@@ -83,6 +83,16 @@ export function StatusBar(props: Props): JSX.Element {
     return `${bar + 1}:${beat + 1}`;
   };
 
+  // Loop badge text shows the region's bar span so the loop bounds are legible
+  // even when scrolled off the grid (mirrors the TUI's "LOOP a-b" badge).
+  const loopLabel = (): string => {
+    const s = props.snapshot;
+    const inBar = barBeatOf(s.loop_start_us, s.bpm, s.time_sig).bar + 1;
+    const outBar =
+      barBeatOf(Math.max(0, s.loop_end_us - 1), s.bpm, s.time_sig).bar + 1;
+    return `LOOP ${inBar}-${outBar}`;
+  };
+
   return (
     <div
       style={{
@@ -99,8 +109,11 @@ export function StatusBar(props: Props): JSX.Element {
     >
       <Badge {...mode()} />
 
+      <Show when={props.snapshot.playing}>
+        <Badge text="▶ PLAYING" bg="#5be7c4" />
+      </Show>
       <Show when={props.snapshot.looping}>
-        <Badge text="LOOP" bg="#5be7c4" />
+        <Badge text={loopLabel()} bg="#5be7c4" />
       </Show>
       <Show when={props.snapshot.metronome}>
         <Badge text="METRO" bg="#7aa2ff" />
@@ -146,7 +159,8 @@ export function StatusBar(props: Props): JSX.Element {
         }}
       >
         a/x add·del · [/] size · +/- vel · m grab · c chord · v·y·p·D select ·
-        u/U undo · Space play · o loop · V video · s save · ? help
+        u/U undo · Space play/stop · P play-start · o loop · {"{"}/{"}"} loop
+        in/out · V video · s save · ? help
       </span>
     </div>
   );

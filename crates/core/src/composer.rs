@@ -384,6 +384,14 @@ impl Composer {
                 self.loop_end_us = end_us;
                 Vec::new()
             }
+            Action::SetLoopStart => {
+                self.set_loop_start_at_cursor();
+                Vec::new()
+            }
+            Action::SetLoopEnd => {
+                self.set_loop_end_at_cursor();
+                Vec::new()
+            }
 
             // ── selection / clipboard ───────────────────────────────────
             Action::StartSelection => {
@@ -1142,6 +1150,29 @@ impl Composer {
                 self.loop_end_us = end;
             }
             self.loop_enabled = true;
+        }
+    }
+
+    /// Set the loop **start** to the cursor position. The end is pushed out to
+    /// keep the region non-empty (at least one grid step) if start would meet or
+    /// cross it.
+    fn set_loop_start_at_cursor(&mut self) {
+        let start = self.cursor_us();
+        self.loop_start_us = start;
+        if self.loop_end_us <= start {
+            self.loop_end_us = start + self.grid.step_us();
+        }
+    }
+
+    /// Set the loop **end** to just past the step under the cursor (so a single
+    /// cell yields a non-empty region). The start is pulled back to keep the
+    /// region non-empty if end would meet or cross it.
+    fn set_loop_end_at_cursor(&mut self) {
+        let step = self.grid.step_us();
+        let end = self.cursor_us() + step;
+        self.loop_end_us = end;
+        if self.loop_start_us >= end {
+            self.loop_start_us = end.saturating_sub(step);
         }
     }
 
@@ -2091,6 +2122,59 @@ mod tests {
         assert_eq!(c.loop_bounds(), (0, bar_us));
         apply(&mut c, Action::ToggleLoop);
         assert!(!c.is_looping());
+    }
+
+    #[test]
+    fn set_loop_start_uses_cursor_position() {
+        let mut c = Composer::new();
+        let step = c.grid().step_us();
+        // Move cursor two steps right, then set the loop start there.
+        apply(&mut c, Action::CursorRight);
+        apply(&mut c, Action::CursorRight);
+        apply(&mut c, Action::SetLoopStart);
+        let (start, end) = c.loop_bounds();
+        assert_eq!(start, 2 * step, "loop start follows the cursor");
+        assert!(end > start, "region kept non-empty");
+        assert_eq!(end, 3 * step, "end pushed one step past start");
+    }
+
+    #[test]
+    fn set_loop_end_uses_cursor_position() {
+        let mut c = Composer::new();
+        let step = c.grid().step_us();
+        // Set start at step 0 first.
+        apply(&mut c, Action::SetLoopStart);
+        // Move cursor to step 3 and mark the loop end there.
+        for _ in 0..3 {
+            apply(&mut c, Action::CursorRight);
+        }
+        apply(&mut c, Action::SetLoopEnd);
+        let (start, end) = c.loop_bounds();
+        assert_eq!(start, 0, "start unchanged");
+        assert_eq!(end, 4 * step, "end includes the step under the cursor");
+    }
+
+    #[test]
+    fn set_loop_start_past_end_keeps_region_non_empty() {
+        let mut c = Composer::new();
+        let step = c.grid().step_us();
+        // Establish a small region [0, step).
+        apply(
+            &mut c,
+            Action::SetLoopBounds {
+                start_us: 0,
+                end_us: step,
+            },
+        );
+        // Move the cursor well past the end, then set the start there.
+        for _ in 0..5 {
+            apply(&mut c, Action::CursorRight);
+        }
+        apply(&mut c, Action::SetLoopStart);
+        let (start, end) = c.loop_bounds();
+        assert_eq!(start, 5 * step);
+        assert_eq!(end, 6 * step, "end pushed past the new start");
+        assert!(end > start);
     }
 
     #[test]

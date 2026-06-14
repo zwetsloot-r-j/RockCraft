@@ -186,6 +186,8 @@ export type ActionName =
   | "toggle_metronome"
   | "start_count_in_record"
   | "set_loop_bounds"
+  | "set_loop_start"
+  | "set_loop_end"
   // ── selection / clipboard ───────────────────────────────────────────
   | "start_selection"
   | "clear_selection"
