@@ -642,7 +642,7 @@ impl rockcraft_control::HostServices for Shell {
                 let midi = std::path::Path::new(&dir).join("song.mid");
                 match load_play_screen(&midi, self.synth.clone()) {
                     Ok(play) => {
-                        self.screen = Screen::Play(play);
+                        self.screen = Screen::Play(Box::new(play));
                         Ok(json!({ "loaded": dir }))
                     }
                     Err(detail) => Err(HostError::Failed {
