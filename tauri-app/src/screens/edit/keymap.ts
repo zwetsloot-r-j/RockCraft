@@ -19,6 +19,8 @@ const VEL_STEP = 8;
 const BACKING_NUDGE_FINE_US = 10_000;
 /** Coarse backing-alignment nudge (250 ms), bound to `;` / `'`. */
 const BACKING_NUDGE_COARSE_US = 250_000;
+/** Tempo nudge in BPM, bound to `(` / `)` (mirrors `edit.rs::BPM_NUDGE`). */
+const BPM_NUDGE = 5;
 
 /** A resolved action dispatch: an `ActionName` and its (optional) params. */
 export interface ActionDispatch {
@@ -84,6 +86,12 @@ export const NORMAL_BINDINGS: Binding[] = [
   },
   { keys: ["m"], action: { name: "toggle_grab" } },
   { keys: ["c"], action: { name: "enter_chord_mode" } },
+
+  // ── tempo (BPM) ─────────────────────────────────────────────────────────
+  // `(` / `)` nudge tempo down/up. `T` opens an absolute set-BPM prompt, handled
+  // in EditScreen (text entry), not as a binding here — mirrors `edit.rs`.
+  { keys: ["("], action: { name: "adjust_bpm", params: { delta: -BPM_NUDGE } } },
+  { keys: [")"], action: { name: "adjust_bpm", params: { delta: BPM_NUDGE } } },
 
   // ── input mode ────────────────────────────────────────────────────────
   { keys: ["R"], action: { name: "toggle_record_arm" } },

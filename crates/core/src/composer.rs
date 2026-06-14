@@ -319,6 +319,23 @@ impl Composer {
             Action::AdjustVelocity { delta } => self.adjust_velocity(delta),
             Action::ToggleGrab => self.toggle_grab(),
 
+            // ── tempo ────────────────────────────────────────────────────
+            // Tempo lives in the grid (single source of truth, persisted in
+            // RecordingMeta.grid). Changing it re-snaps the cursor so its
+            // position holds steady across the new step spacing.
+            Action::AdjustBpm { delta } => {
+                let cursor_us = self.cursor_us();
+                self.grid.adjust_bpm(delta);
+                self.resnap_cursor_from_us(cursor_us);
+                Vec::new()
+            }
+            Action::SetBpm { bpm } => {
+                let cursor_us = self.cursor_us();
+                self.grid.set_bpm(bpm);
+                self.resnap_cursor_from_us(cursor_us);
+                Vec::new()
+            }
+
             // ── chord selector ──────────────────────────────────────────
             Action::EnterChordMode => self.enter_chord_mode(),
             Action::CommitChord => self.commit_chord(),
@@ -1674,6 +1691,41 @@ mod tests {
         apply(&mut c, Action::AdjustVelocity { delta: -1000 });
         let id = c.note_under_cursor().unwrap();
         assert_eq!(c.get_note(id).unwrap().velocity.value(), 1);
+    }
+
+    // ── tempo ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn set_bpm_changes_grid_and_snapshot_and_clamps() {
+        let mut c = Composer::new();
+        assert_eq!(c.grid().bpm, 120);
+
+        apply(&mut c, Action::SetBpm { bpm: 90 });
+        assert_eq!(c.grid().bpm, 90);
+        assert_eq!(c.snapshot().bpm, 90.0);
+
+        // Clamp below the floor and above the ceiling.
+        apply(&mut c, Action::SetBpm { bpm: 1 });
+        assert_eq!(c.grid().bpm, Grid::MIN_BPM);
+        apply(&mut c, Action::SetBpm { bpm: 100_000 });
+        assert_eq!(c.grid().bpm, Grid::MAX_BPM);
+    }
+
+    #[test]
+    fn adjust_bpm_nudges_and_clamps_and_updates_snapshot() {
+        let mut c = Composer::new();
+        apply(&mut c, Action::AdjustBpm { delta: 10 });
+        assert_eq!(c.grid().bpm, 130);
+        assert_eq!(c.snapshot().bpm, 130.0);
+
+        apply(&mut c, Action::AdjustBpm { delta: -20 });
+        assert_eq!(c.grid().bpm, 110);
+
+        // Extreme deltas clamp to the bounds.
+        apply(&mut c, Action::AdjustBpm { delta: -100_000 });
+        assert_eq!(c.grid().bpm, Grid::MIN_BPM);
+        apply(&mut c, Action::AdjustBpm { delta: 100_000 });
+        assert_eq!(c.grid().bpm, Grid::MAX_BPM);
     }
 
     // ── grab ────────────────────────────────────────────────────────────

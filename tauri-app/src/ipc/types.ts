@@ -160,6 +160,9 @@ export type ActionName =
   | "resize_note"
   | "adjust_velocity"
   | "toggle_grab"
+  // ── tempo ─────────────────────────────────────────────────────────────
+  | "adjust_bpm"
+  | "set_bpm"
   // ── chord selector ──────────────────────────────────────────────────
   | "enter_chord_mode"
   | "commit_chord"

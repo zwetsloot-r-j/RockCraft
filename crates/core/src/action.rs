@@ -61,6 +61,16 @@ pub enum Action {
     },
     ToggleGrab,
 
+    // ── tempo (piece-wide; lives in the composer Grid) ──────────────────
+    /// Nudge the piece tempo by `delta` BPM (clamped to a sane range).
+    AdjustBpm {
+        delta: i32,
+    },
+    /// Set the piece tempo to `bpm` BPM (clamped to a sane range).
+    SetBpm {
+        bpm: u32,
+    },
+
     // ── chord selector ──────────────────────────────────────────────────
     EnterChordMode,
     CommitChord,
@@ -157,6 +167,8 @@ impl Action {
             Action::ResizeNote { .. } => "resize_note",
             Action::AdjustVelocity { .. } => "adjust_velocity",
             Action::ToggleGrab => "toggle_grab",
+            Action::AdjustBpm { .. } => "adjust_bpm",
+            Action::SetBpm { .. } => "set_bpm",
             Action::EnterChordMode => "enter_chord_mode",
             Action::CommitChord => "commit_chord",
             Action::CancelChord => "cancel_chord",
@@ -295,6 +307,8 @@ pub fn action_names() -> &'static [&'static str] {
         "resize_note",
         "adjust_velocity",
         "toggle_grab",
+        "adjust_bpm",
+        "set_bpm",
         "enter_chord_mode",
         "commit_chord",
         "cancel_chord",
@@ -389,6 +403,9 @@ static ACTION_HELP: &[ActionInfo] = {
         ActionInfo { name: "resize_note", params: &[p("delta_steps", "i64")], description: "Lengthen (positive) or shorten (negative) the note under the cursor by delta_steps grid steps." },
         ActionInfo { name: "adjust_velocity", params: &[p("delta", "i16")], description: "Adjust the velocity of the note under the cursor by delta (clamped 1..=127)." },
         ActionInfo { name: "toggle_grab", params: &[], description: "Grab/drop the note under the cursor so cursor moves drag it." },
+        // ── tempo ─────────────────────────────────────────────────────────
+        ActionInfo { name: "adjust_bpm", params: &[p("delta", "i32")], description: "Nudge the piece tempo by delta BPM (clamped to 20..=300)." },
+        ActionInfo { name: "set_bpm", params: &[p("bpm", "u32")], description: "Set the piece tempo to bpm BPM (clamped to 20..=300)." },
         // ── chord selector ──────────────────────────────────────────────
         ActionInfo { name: "enter_chord_mode", params: &[], description: "Open the chord selector at the cursor and start previewing a chord." },
         ActionInfo { name: "commit_chord", params: &[], description: "Write the previewed chord into the timeline and close the selector." },
@@ -460,6 +477,8 @@ mod tests {
             Action::ResizeNote { delta_steps: 2 },
             Action::AdjustVelocity { delta: -8 },
             Action::ToggleGrab,
+            Action::AdjustBpm { delta: -5 },
+            Action::SetBpm { bpm: 90 },
             Action::EnterChordMode,
             Action::CommitChord,
             Action::CancelChord,
@@ -700,6 +719,31 @@ mod tests {
         // Missing param is rejected.
         assert!(matches!(
             action_from_name("nudge_backing_offset", &json!({})).unwrap_err(),
+            ActionError::BadParams { .. }
+        ));
+    }
+
+    #[test]
+    fn bpm_actions_round_trip_via_name() {
+        assert_eq!(
+            action_from_name("adjust_bpm", &json!({ "delta": 5 })).unwrap(),
+            Action::AdjustBpm { delta: 5 }
+        );
+        assert_eq!(
+            action_from_name("adjust_bpm", &json!({ "delta": -10 })).unwrap(),
+            Action::AdjustBpm { delta: -10 }
+        );
+        assert_eq!(
+            action_from_name("set_bpm", &json!({ "bpm": 90 })).unwrap(),
+            Action::SetBpm { bpm: 90 }
+        );
+        // Missing params are rejected.
+        assert!(matches!(
+            action_from_name("adjust_bpm", &json!({})).unwrap_err(),
+            ActionError::BadParams { .. }
+        ));
+        assert!(matches!(
+            action_from_name("set_bpm", &json!({})).unwrap_err(),
             ActionError::BadParams { .. }
         ));
     }

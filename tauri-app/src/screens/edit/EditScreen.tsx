@@ -67,7 +67,9 @@ type Overlay =
   /** "Save / Discard / Cancel" shown on dirty Esc. */
   | "exit-prompt"
   /** Text input for the save-to-library name. */
-  | "save-as";
+  | "save-as"
+  /** Numeric input for the absolute set-BPM (tempo) value. */
+  | "set-bpm";
 
 // ── Chord selector helpers ────────────────────────────────────────────────
 
@@ -123,6 +125,9 @@ export function EditScreen(props: Props): JSX.Element {
 
   // Save-as prompt: name typed so far.
   const [saveName, setSaveName] = createSignal("");
+
+  // Set-BPM prompt: digits typed so far (seeded with the current tempo on open).
+  const [bpmText, setBpmText] = createSignal("");
 
   // One-shot save-confirmation toast, cleared after 2.5 s.
   const [saveFlash, setSaveFlash] = createSignal<string | null>(null);
@@ -327,6 +332,32 @@ export function EditScreen(props: Props): JSX.Element {
       return;
     }
 
+    // ── Set-BPM overlay ─────────────────────────────────────────────────
+    if (ov === "set-bpm") {
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.key === "Escape") {
+        setOverlay("none");
+        setBpmText("");
+      } else if (e.key === "Enter") {
+        const bpm = parseInt(bpmText().trim(), 10);
+        setOverlay("none");
+        setBpmText("");
+        if (Number.isFinite(bpm)) {
+          // core clamps to 20..=300; we just forward the typed value.
+          void runAction("set_bpm", { bpm }).then((reply) => {
+            setDirty(reply.dirty);
+          });
+        }
+      } else if (e.key === "Backspace") {
+        setBpmText((n) => n.slice(0, -1));
+      } else if (/^[0-9]$/.test(e.key)) {
+        // Cap at 3 digits (max BPM is 300).
+        setBpmText((n) => (n.length < 3 ? n + e.key : n));
+      }
+      return;
+    }
+
     // ── Exit-prompt overlay ─────────────────────────────────────────────
     if (ov === "exit-prompt") {
       e.preventDefault();
@@ -382,6 +413,13 @@ export function EditScreen(props: Props): JSX.Element {
         e.preventDefault();
         setSaveName("");
         setOverlay("save-as");
+        return;
+      }
+      // `T` opens the absolute set-BPM prompt, seeded with the current tempo.
+      if (e.key === "T") {
+        e.preventDefault();
+        setBpmText(String(Math.round(s.bpm)));
+        setOverlay("set-bpm");
         return;
       }
     }
@@ -690,6 +728,11 @@ export function EditScreen(props: Props): JSX.Element {
       <Show when={overlay() === "save-as"}>
         <SaveAsPrompt name={saveName()} />
       </Show>
+
+      {/* Set-BPM overlay */}
+      <Show when={overlay() === "set-bpm"}>
+        <SetBpmPrompt text={bpmText()} />
+      </Show>
     </div>
   );
 }
@@ -882,6 +925,8 @@ function HelpOverlay(props: { onClose: () => void }): JSX.Element {
         "[             Shorten note (−1 step)",
         "+ / =         Velocity +8",
         "-             Velocity −8",
+        "( / )         Tempo −/+ 5 BPM",
+        "T             Set BPM (type a value, Enter to apply)",
         "m             Toggle grab (move note with h/j/k/l)",
       ],
     },
@@ -1172,6 +1217,64 @@ function SaveAsPrompt(props: { name: string }): JSX.Element {
         </div>
         <div style={{ color: "#4a4d5a", "font-size": "11px" }}>
           Enter to save · Esc to cancel · empty name is rejected
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── SetBpmPrompt ──────────────────────────────────────────────────────────
+
+/**
+ * Single-line numeric input overlay for the absolute tempo (BPM). Mirrors the
+ * TUI's `draw_bpm_prompt`; key routing is in the parent `onKeydown`. The typed
+ * value is forwarded to `set_bpm`, which clamps to 20..=300 in `core`.
+ */
+function SetBpmPrompt(props: { text: string }): JSX.Element {
+  return (
+    <div
+      style={{
+        position: "absolute",
+        inset: 0,
+        background: "rgba(0,0,0,0.6)",
+        display: "flex",
+        "align-items": "center",
+        "justify-content": "center",
+        "z-index": 200,
+      }}
+    >
+      <div
+        style={{
+          background: "#1a1b24",
+          border: "1px solid #f5c542",
+          "border-radius": "8px",
+          padding: "16px 24px",
+          "min-width": "320px",
+          "font-family": "'Space Grotesk', system-ui, sans-serif",
+          "box-shadow": "0 4px 24px rgba(0,0,0,0.5)",
+        }}
+      >
+        <div style={{ color: "#f5c542", "font-size": "13px", "margin-bottom": "10px" }}>
+          Set tempo (BPM)
+        </div>
+        <div
+          style={{
+            background: "#0f1016",
+            border: "1px solid rgba(255,255,255,0.12)",
+            "border-radius": "4px",
+            padding: "6px 10px",
+            "font-family": "'IBM Plex Mono', ui-monospace, monospace",
+            "font-size": "14px",
+            color: "#e7e8ef",
+            "margin-bottom": "8px",
+            "min-height": "28px",
+          }}
+        >
+          {props.text}
+          <span style={{ color: "#f5c542" }}>█</span>
+        </div>
+        <div style={{ color: "#4a4d5a", "font-size": "11px" }}>
+          Enter to apply · Esc to cancel · range 20–300
         </div>
       </div>
     </div>

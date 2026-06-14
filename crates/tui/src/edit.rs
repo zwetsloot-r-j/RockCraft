@@ -81,6 +81,9 @@ const BACKING_NUDGE_FINE_US: i64 = 10_000;
 /// Coarse backing-alignment nudge step (250 ms), bound to `;` / `'`.
 const BACKING_NUDGE_COARSE_US: i64 = 250_000;
 
+/// Tempo nudge step in BPM, bound to `(` / `)`.
+const BPM_NUDGE: i32 = 5;
+
 /// Cursor highlight (status badge, cursor key, cursor cell).
 const CURSOR_COLOR: Color = Color::Magenta;
 /// Faint crosshair-guide tint marking the cursor's pitch column and step row.
@@ -170,6 +173,12 @@ fn key_to_action(code: KeyCode) -> Option<Action> {
         },
         KeyCode::Char('m') => Action::ToggleGrab,
         KeyCode::Char('c') => Action::EnterChordMode,
+
+        // ── tempo (BPM) ──────────────────────────────────────────────────
+        // `(` / `)` nudge tempo down/up; `T` opens an absolute set-BPM prompt
+        // (handled in `on_key`, not here, since it needs text entry).
+        KeyCode::Char('(') => Action::AdjustBpm { delta: -BPM_NUDGE },
+        KeyCode::Char(')') => Action::AdjustBpm { delta: BPM_NUDGE },
 
         // ── input mode ──────────────────────────────────────────────────
         KeyCode::Char('R') => Action::ToggleRecordArm,
@@ -299,6 +308,9 @@ pub struct EditScreen {
     /// When `Some`, the "save to library" name overlay is active and holds the
     /// name typed so far. Keys route to `on_name_key` instead of the keymap.
     name_prompt: Option<String>,
+    /// When `Some`, the absolute set-BPM overlay is active and holds the digits
+    /// typed so far. Keys route to the bpm prompt instead of the keymap.
+    bpm_prompt: Option<String>,
     /// Backing audio track to play in lock-step with the transport, if attached
     /// (via `with_backing`). `None` makes all backing wiring a no-op.
     backing: Option<Backing>,
@@ -350,6 +362,7 @@ impl EditScreen {
             exit_prompt: false,
             origin: TrackOrigin::Composed,
             name_prompt: None,
+            bpm_prompt: None,
             backing: None,
             backing_handle: None,
             prev_playing: false,
@@ -472,6 +485,18 @@ impl EditScreen {
     pub fn on_key(&mut self, code: KeyCode) {
         // Any key clears the save flash.
         self.save_flash = None;
+
+        // Set-BPM overlay owns the keymap while active: digits build the value,
+        // Enter commits via SetBpm, Esc/empty-Enter cancels, Backspace edits.
+        if self.bpm_prompt.is_some() {
+            self.on_bpm_key(code);
+            return;
+        }
+        // `T` opens the absolute set-BPM prompt (seeded with the current tempo).
+        if let KeyCode::Char('T') = code {
+            self.bpm_prompt = Some(self.composer.grid().bpm.to_string());
+            return;
+        }
 
         // Help overlay: `?` toggles visibility; Esc closes it. Takes precedence
         // over every other mode so help is always reachable.
@@ -943,6 +968,47 @@ impl EditScreen {
         }
     }
 
+    // ── set-BPM prompt ────────────────────────────────────────────────────────
+
+    /// Whether the absolute set-BPM overlay is active.
+    pub fn is_setting_bpm(&self) -> bool {
+        self.bpm_prompt.is_some()
+    }
+
+    /// The digits typed so far in the set-BPM overlay (empty until shown / typed).
+    pub fn bpm_prompt_text(&self) -> &str {
+        self.bpm_prompt.as_deref().unwrap_or("")
+    }
+
+    /// Handle a key while the set-BPM overlay is active. Enter commits the typed
+    /// value via [`Action::SetBpm`] (clamped in `core`); Esc or empty Enter
+    /// cancels; Backspace edits; only ASCII digits are accepted.
+    fn on_bpm_key(&mut self, code: KeyCode) {
+        let Some(buf) = self.bpm_prompt.as_mut() else {
+            return;
+        };
+        match code {
+            KeyCode::Esc => {
+                self.bpm_prompt = None;
+            }
+            KeyCode::Enter => {
+                let parsed = buf.trim().parse::<u32>().ok();
+                self.bpm_prompt = None;
+                if let Some(bpm) = parsed {
+                    self.dispatch(Action::SetBpm { bpm });
+                }
+            }
+            KeyCode::Backspace => {
+                buf.pop();
+            }
+            // Cap at 3 digits (max BPM is 300); ignore extra input.
+            KeyCode::Char(c) if c.is_ascii_digit() && buf.len() < 3 => {
+                buf.push(c);
+            }
+            _ => {}
+        }
+    }
+
     /// Whether the transport is currently playing.
     pub fn is_playing(&self) -> bool {
         self.composer.is_playing()
@@ -1092,6 +1158,11 @@ impl EditScreen {
         // The save-to-library name overlay, when active, sits on top too.
         if self.name_prompt.is_some() {
             self.draw_name_prompt(f, area);
+        }
+
+        // The set-BPM overlay, when active, sits on top too.
+        if self.bpm_prompt.is_some() {
+            self.draw_bpm_prompt(f, area);
         }
     }
 
@@ -1259,6 +1330,10 @@ impl EditScreen {
             count_in_span,
             note_keys_span,
             pos_span,
+            Span::styled(
+                format!("{} BPM  ", self.grid.bpm),
+                Style::default().fg(Color::Yellow),
+            ),
             Span::raw(format!("snap {}  ", self.grid.subdivision.label())),
             backing_span,
             Span::styled(
@@ -1267,7 +1342,7 @@ impl EditScreen {
             ),
             vel_span,
             Span::styled(
-                "[a/x] add/del  []/[] size  [+/-] vel  [m] grab  [c] chord  [v] select  [y/p/D] yank/paste/del  [u/U] undo/redo  [R] rec  [t] step/live  [C] count-in  [Space] play/stop  [P] play-start  [o] loop  [{/}] loop in/out  [M] metro  [>/<] subdiv  [hjkl] pitch/time  [H/L] bar  [w/b] oct  [g/G] timeline ends  [0/$] pitch ends  [s] save  [S] save to library  [Tab] menu",
+                "[a/x] add/del  []/[] size  [+/-] vel  [(/)] tempo  [T] set BPM  [m] grab  [c] chord  [v] select  [y/p/D] yank/paste/del  [u/U] undo/redo  [R] rec  [t] step/live  [C] count-in  [Space] play/stop  [P] play-start  [o] loop  [{/}] loop in/out  [M] metro  [>/<] subdiv  [hjkl] pitch/time  [H/L] bar  [w/b] oct  [g/G] timeline ends  [0/$] pitch ends  [s] save  [S] save to library  [Tab] menu",
                 Style::default().fg(Color::DarkGray),
             ),
         ]);
@@ -1593,6 +1668,8 @@ impl EditScreen {
             Line::from(Span::raw("  a/i : Add note          x/d : Delete note")),
             Line::from(Span::raw("  ] : Lengthen note       [ : Shorten note")),
             Line::from(Span::raw("  +/= : Velocity +8       - : Velocity -8")),
+            Line::from(Span::raw("  ( : Tempo -5 BPM        ) : Tempo +5 BPM")),
+            Line::from(Span::raw("  T : Set BPM (type a value, Enter to apply)")),
             Line::from(Span::raw("  m : Grab mode (move note with h/j/k/l)")),
             Line::from(Span::raw("")), // Empty line
             Line::from(Span::styled(
@@ -1739,6 +1816,28 @@ impl EditScreen {
             inner,
         );
     }
+
+    fn draw_bpm_prompt(&self, f: &mut Frame, area: Rect) {
+        let typed = self.bpm_prompt_text();
+        let label = format!(" Set tempo (BPM): {typed}█  [Enter] apply  [Esc] cancel  (20-300) ");
+        let w = (label.len() as u16 + 4).min(area.width).max(20);
+        let h = 3u16;
+        let x = area.x + area.width.saturating_sub(w) / 2;
+        let y = area.y + area.height.saturating_sub(h) / 2;
+        let prompt_area = Rect::new(x, y, w, h.min(area.height));
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow));
+        let inner = block.inner(prompt_area);
+        f.render_widget(block, prompt_area);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                label,
+                Style::default().fg(Color::Yellow),
+            ))),
+            inner,
+        );
+    }
 }
 
 impl Default for EditScreen {
@@ -1796,6 +1895,61 @@ mod tests {
             1,
             "key `a` placed a note through the composer"
         );
+    }
+
+    #[test]
+    fn bpm_nudge_keys_map_to_adjust_bpm() {
+        assert_eq!(
+            key_to_action(KeyCode::Char(')')),
+            Some(Action::AdjustBpm { delta: BPM_NUDGE })
+        );
+        assert_eq!(
+            key_to_action(KeyCode::Char('(')),
+            Some(Action::AdjustBpm { delta: -BPM_NUDGE })
+        );
+
+        let mut e = EditScreen::new();
+        assert_eq!(e.composer.grid().bpm, 120);
+        e.on_key(KeyCode::Char(')'));
+        assert_eq!(e.composer.grid().bpm, 125);
+        assert_eq!(
+            e.grid.bpm, 125,
+            "mirrored grid re-synced for the status bar"
+        );
+        e.on_key(KeyCode::Char('('));
+        assert_eq!(e.composer.grid().bpm, 120);
+    }
+
+    #[test]
+    fn set_bpm_prompt_types_and_applies() {
+        let mut e = EditScreen::new();
+        assert!(!e.is_setting_bpm());
+        // `T` opens the prompt seeded with the current tempo.
+        e.on_key(KeyCode::Char('T'));
+        assert!(e.is_setting_bpm());
+        assert_eq!(e.bpm_prompt_text(), "120");
+        // Clear it and type a new value.
+        e.on_key(KeyCode::Backspace);
+        e.on_key(KeyCode::Backspace);
+        e.on_key(KeyCode::Backspace);
+        e.on_key(KeyCode::Char('9'));
+        e.on_key(KeyCode::Char('0'));
+        assert_eq!(e.bpm_prompt_text(), "90");
+        e.on_key(KeyCode::Enter);
+        assert!(!e.is_setting_bpm());
+        assert_eq!(e.composer.grid().bpm, 90);
+        assert_eq!(e.grid.bpm, 90);
+    }
+
+    #[test]
+    fn set_bpm_prompt_esc_cancels_without_change() {
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('T'));
+        e.on_key(KeyCode::Backspace);
+        e.on_key(KeyCode::Char('6'));
+        e.on_key(KeyCode::Esc);
+        assert!(!e.is_setting_bpm());
+        assert_eq!(e.composer.grid().bpm, 120, "Esc left tempo unchanged");
     }
 
     fn note(pitch: u8, start_us: u64, dur_us: u64) -> Note {
