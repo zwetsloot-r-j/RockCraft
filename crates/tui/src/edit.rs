@@ -83,6 +83,11 @@ const BACKING_NUDGE_COARSE_US: i64 = 250_000;
 
 /// Cursor highlight (status badge, cursor key, cursor cell).
 const CURSOR_COLOR: Color = Color::Magenta;
+/// Faint crosshair-guide tint marking the cursor's pitch column and step row.
+const CROSSHAIR_COLOR: Color = Color::Indexed(53); // dim magenta/purple
+/// Bright cursor-cell background so the selected cell is unmistakable on the
+/// crosshair guides.
+const CURSOR_CELL_BG: Color = Color::Indexed(127); // vivid magenta
 /// Chord-mode badge colour.
 const CHORD_COLOR: Color = Color::Cyan;
 /// Record-armed badge colour (step / live record).
@@ -1257,6 +1262,47 @@ impl EditScreen {
         self.draw_gridlines(f, area, now, lead);
         self.draw_playhead(f, area, now, lead);
 
+        // Crosshair guides through the cursor (its step row, full width, and its
+        // pitch column, full height), tinted so the selected timeslot reads at a
+        // glance even on a sparse grid. Drawn under the notes and the bright
+        // cursor cell, which are painted on top below.
+        let cursor_row = project(
+            &NoteSpan {
+                note: cursor.pitch,
+                start_us: self.cursor_us(),
+                end_us: self.cursor_us() + 1,
+            },
+            now,
+            lead,
+            area.height,
+        )
+        .map(|rs| rs.bottom_row);
+        let cursor_col = note_col(cursor.pitch);
+        // Step-row guide: a full-width tinted band on the cursor's row.
+        if let Some(row) = cursor_row {
+            let y = area.y + row;
+            if y < area.y + area.height {
+                let rect = Rect::new(area.x, y, area.width, 1);
+                f.render_widget(
+                    Paragraph::new(" ".repeat(area.width as usize))
+                        .style(Style::default().bg(CROSSHAIR_COLOR)),
+                    rect,
+                );
+            }
+        }
+        // Pitch-column guide: a full-height tinted band on the cursor's column.
+        if let Some(col) = cursor_col {
+            let cell_w = if is_black_key(cursor.pitch) { 1 } else { w };
+            for row in 0..area.height {
+                let rect = Rect::new(col, area.y + row, cell_w, 1);
+                f.render_widget(
+                    Paragraph::new(" ".repeat(cell_w as usize))
+                        .style(Style::default().bg(CROSSHAIR_COLOR)),
+                    rect,
+                );
+            }
+        }
+
         // Pre-compute selection bounds so we can highlight selected notes.
         let sel = self
             .composer
@@ -1315,6 +1361,7 @@ impl EditScreen {
                     Paragraph::new("█".repeat(cell_w as usize)).style(
                         Style::default()
                             .fg(CURSOR_COLOR)
+                            .bg(CURSOR_CELL_BG)
                             .add_modifier(Modifier::BOLD),
                     ),
                     rect,
@@ -3265,6 +3312,72 @@ mod tests {
             content_before, content_after,
             "a single 1/16-step move must change the rendered output \
              (sub-beat indicator advances from .1 to .2)"
+        );
+    }
+
+    // ── cursor cell / crosshair feedback (M9-B) ──────────────────────────────
+
+    /// Find the single cursor cell in the buffer: the `█` glyph styled with the
+    /// distinct cursor foreground + background. Returns its `(x, y)`.
+    fn find_cursor_cell(buf: &ratatui::buffer::Buffer) -> Option<(u16, u16)> {
+        let area = *buf.area();
+        for y in area.y..area.y + area.height {
+            for x in area.x..area.x + area.width {
+                let cell = &buf[(x, y)];
+                if cell.symbol() == "█" && cell.fg == CURSOR_COLOR && cell.bg == CURSOR_CELL_BG {
+                    return Some((x, y));
+                }
+            }
+        }
+        None
+    }
+
+    /// The cursor cell renders with its distinct fg+bg styling, and at least one
+    /// crosshair-guide cell (the cursor's tinted step row / pitch column) shows.
+    #[test]
+    fn cursor_cell_and_crosshair_render_distinctly() {
+        let e = EditScreen::new();
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal
+            .draw(|f| e.draw(f, f.area()))
+            .expect("draw panicked");
+        let buf = terminal.backend().buffer();
+
+        assert!(
+            find_cursor_cell(buf).is_some(),
+            "the cursor cell must render with its distinct fg+bg styling"
+        );
+        let has_crosshair = buf.content().iter().any(|c| c.bg == CROSSHAIR_COLOR);
+        assert!(
+            has_crosshair,
+            "the crosshair guides (cursor row / column) must tint the grid"
+        );
+    }
+
+    /// Moving the cursor one pitch right moves the cursor cell to a different
+    /// column in the rendered buffer.
+    #[test]
+    fn cursor_cell_moves_with_the_cursor() {
+        let mut e = EditScreen::new();
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+
+        terminal
+            .draw(|f| e.draw(f, f.area()))
+            .expect("initial draw panicked");
+        let before = find_cursor_cell(terminal.backend().buffer())
+            .expect("cursor cell renders before the move");
+
+        // One pitch right (l → CursorUp): the cell must shift columns.
+        e.on_key(KeyCode::Char('l'));
+        terminal
+            .draw(|f| e.draw(f, f.area()))
+            .expect("post-move draw panicked");
+        let after = find_cursor_cell(terminal.backend().buffer())
+            .expect("cursor cell renders after the move");
+
+        assert_ne!(
+            before.0, after.0,
+            "moving the cursor one pitch right must move the cursor cell's column"
         );
     }
 
