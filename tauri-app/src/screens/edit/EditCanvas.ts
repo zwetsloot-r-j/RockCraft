@@ -112,6 +112,10 @@ export class EditCanvas {
     this.drawLanes(vp);
     this.drawLoopRegion(snapshot, vp);
     this.drawGridlines(g, vp);
+    // Crosshair guides sit under the notes so a note on the cursor's column /
+    // row stays fully legible, but over the gridlines so the selected timeslot
+    // reads at a glance even on a sparse grid.
+    this.drawCrosshair(snapshot, vp, cursorUs, g.stepUs);
     this.drawNotes(snapshot, vp);
     this.drawSelection(snapshot, vp);
     this.drawChordPreview(snapshot, vp, cursorUs, g.stepUs);
@@ -274,7 +278,40 @@ export class EditCanvas {
     ctx.restore();
   }
 
-  // ── cursor cell ─────────────────────────────────────────────────────────
+  // ── cursor crosshair + cell ─────────────────────────────────────────────
+
+  /**
+   * Light crosshair guides through the cursor: the cursor's pitch column
+   * (full canvas height) and step row (full canvas width) are tinted magenta so
+   * the selected timeslot is locatable at a glance even on a sparse grid. Drawn
+   * faintly *under* the notes; the bright cursor cell ({@link drawCursor}) sits
+   * on top.
+   */
+  private drawCrosshair(
+    snapshot: ComposerSnapshot,
+    vp: Viewport,
+    cursorUs: number,
+    stepUs: number,
+  ): void {
+    const { pitch } = snapshot.cursor;
+    const ctx = this.ctx;
+    ctx.save();
+    // Pitch column guide (full height), only when the lane is on-screen.
+    if (vp.pitchVisible(pitch)) {
+      const x = vp.xOf(pitch);
+      ctx.fillStyle = "rgba(217,107,255,0.08)";
+      ctx.fillRect(x, 0, vp.laneW, this.h);
+    }
+    // Step row guide (full width). The cursor is kept in view by the viewport,
+    // so the row is normally on-screen; clamp-skip if it ever isn't.
+    const yTop = vp.yOf(cursorUs + stepUs);
+    const h = Math.max(3, vp.hOf(stepUs));
+    if (yTop + h >= 0 && yTop <= this.h) {
+      ctx.fillStyle = "rgba(217,107,255,0.08)";
+      ctx.fillRect(0, yTop, this.w, h);
+    }
+    ctx.restore();
+  }
 
   private drawCursor(
     snapshot: ComposerSnapshot,
@@ -289,11 +326,15 @@ export class EditCanvas {
     const y = vp.yOf(cursorUs + stepUs);
     const h = Math.max(3, vp.hOf(stepUs));
     ctx.save();
+    // Unmistakable filled cell with a bright outline, distinct from notes
+    // (rounded, hue-tinted) and the playhead (a thin green line).
+    ctx.fillStyle = "rgba(217,107,255,0.28)";
+    ctx.fillRect(x + 1, y + 1, vp.laneW - 2, h - 2);
     ctx.strokeStyle = "#d96bff"; // magenta, matching the TUI cursor
     ctx.lineWidth = 2;
+    ctx.shadowColor = "#d96bff";
+    ctx.shadowBlur = 6;
     ctx.strokeRect(x + 1, y + 1, vp.laneW - 2, h - 2);
-    ctx.fillStyle = "rgba(217,107,255,0.12)";
-    ctx.fillRect(x + 1, y + 1, vp.laneW - 2, h - 2);
     ctx.restore();
   }
 
