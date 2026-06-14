@@ -131,6 +131,7 @@ impl RecordSession {
             grid: None,
             key: None,
             origin: Some(TrackOrigin::Recorded),
+            video: None,
             version: 1,
         };
         std::fs::write(bundle_dir.join("meta.json"), meta.to_json())?;
@@ -508,6 +509,7 @@ mod tests {
             grid: None,
             key: None,
             origin: Some(TrackOrigin::Recorded),
+            video: None,
             version: 1,
         };
         std::fs::write(bundle_dir.join("meta.json"), meta.to_json()).unwrap();

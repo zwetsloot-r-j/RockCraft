@@ -19,6 +19,22 @@ pub struct BackingTrack {
     pub audio_start_us: u64,
 }
 
+/// Describes a background video attached to a recording bundle.
+///
+/// `file` is the bundle-relative filename only (e.g. `"source.mp4"`) — never an
+/// absolute path, so the bundle stays movable. `offset_us` is the signed
+/// alignment offset applied as `videoTime = songTime + offset_us` (a positive
+/// offset means the video runs ahead of the song); it mirrors the edit-grid
+/// backdrop offset from M7-tauri-N.
+///
+/// `core` only carries this reference — it never decodes or renders video; the
+/// webview's HTML5 `<video>` element does that.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundVideo {
+    pub file: String,
+    pub offset_us: i64,
+}
+
 /// Where a chart bundle came from, used by the library browser to label entries.
 ///
 /// Optional in `meta.json` (`#[serde(default)]` → `None`) so older bundles
@@ -66,6 +82,11 @@ pub struct RecordingMeta {
     /// field existed; the library browser then shows it as unknown.
     #[serde(default)]
     pub origin: Option<TrackOrigin>,
+    /// Optional background video played behind the highway during play/practice
+    /// (and the edit grid). `None` for pieces without one, including all legacy
+    /// bundles written before this field existed.
+    #[serde(default)]
+    pub video: Option<BackgroundVideo>,
     /// Schema version; always written as `1`. Kept for forward-compat.
     #[serde(default = "default_version")]
     pub version: u32,
@@ -96,6 +117,7 @@ impl RecordingMeta {
             grid: None,
             key: None,
             origin: None,
+            video: None,
             version: 1,
         }
     }
@@ -156,6 +178,7 @@ mod tests {
             grid: None,
             key: None,
             origin: None,
+            video: None,
             version: 1,
         };
         let json = meta.to_json();
@@ -175,10 +198,41 @@ mod tests {
                 scale: Scale::NaturalMinor,
             }),
             origin: None,
+            video: None,
             version: 1,
         };
         let json = meta.to_json();
         let back = RecordingMeta::from_json(&json).unwrap();
+        assert_eq!(meta, back);
+    }
+
+    #[test]
+    fn with_video_roundtrip() {
+        let meta = RecordingMeta {
+            midi_file: "song.mid".into(),
+            backing: None,
+            grid: None,
+            key: None,
+            origin: Some(TrackOrigin::Imported),
+            video: Some(BackgroundVideo {
+                file: "source.mp4".into(),
+                offset_us: -250_000,
+            }),
+            version: 1,
+        };
+        let json = meta.to_json();
+        let back = RecordingMeta::from_json(&json).unwrap();
+        assert_eq!(meta, back);
+        assert_eq!(back.video.as_ref().unwrap().file, "source.mp4");
+        assert_eq!(back.video.as_ref().unwrap().offset_us, -250_000);
+    }
+
+    #[test]
+    fn without_video_roundtrip() {
+        let meta = RecordingMeta::new_midi_only("song.mid");
+        assert!(meta.video.is_none());
+        let back = RecordingMeta::from_json(&meta.to_json()).unwrap();
+        assert!(back.video.is_none());
         assert_eq!(meta, back);
     }
 
@@ -198,14 +252,23 @@ mod tests {
         assert!(meta.backing.is_none());
         assert!(meta.grid.is_none());
         assert!(meta.key.is_none());
+        assert!(meta.video.is_none());
 
-        // Legacy with backing but no grid/key.
+        // Legacy with backing but no grid/key/video.
         let with_backing =
             r#"{"midi_file":"song.mid","backing":{"file":"b.mp3","audio_start_us":0}}"#;
         let meta2 = RecordingMeta::from_json(with_backing).unwrap();
         assert!(meta2.backing.is_some());
         assert!(meta2.grid.is_none());
         assert!(meta2.key.is_none());
+        assert!(meta2.video.is_none());
+
+        // A pre-video bundle that already carried grid/key/origin (post-M3-H but
+        // pre-M9-G) still parses with video == None.
+        let pre_video = r#"{"midi_file":"song.mid","origin":"imported","version":1}"#;
+        let meta3 = RecordingMeta::from_json(pre_video).unwrap();
+        assert_eq!(meta3.origin, Some(TrackOrigin::Imported));
+        assert!(meta3.video.is_none());
     }
 
     // ── song_shift_us ────────────────────────────────────────────────────────

@@ -55,6 +55,25 @@ pub struct NoteSpan {
     pub end_us: u64,
 }
 
+/// A background video attached to a bundle, surfaced to the play screen so the
+/// webview can render it behind the highway (M9-G). `path` is absolute (resolved
+/// against the bundle dir); `offset_us` is the signed alignment offset applied as
+/// `videoTime = songTime + offset_us`. `core` carries only the reference — the
+/// HTML5 `<video>` element decodes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackgroundVideoSession {
+    pub path: PathBuf,
+    pub offset_us: i64,
+}
+
+/// Serializable background-video reference for [`PlayInfo`]. `path` is the
+/// absolute file path (the webview wraps it with `convertFileSrc`).
+#[derive(Debug, Clone, Serialize)]
+pub struct BackgroundVideoView {
+    pub path: String,
+    pub offset_us: i64,
+}
+
 /// A backing audio track attached to a bundle, plus the file position that lines
 /// up with song time 0 (`audio_start_us`).
 #[derive(Debug, Clone)]
@@ -78,6 +97,9 @@ pub struct PlayInfo {
     pub lead_us: u64,
     /// Whether a backing track is attached.
     pub has_backing: bool,
+    /// Background video to render behind the highway, or `None` when the piece
+    /// has no backdrop (M9-G).
+    pub video: Option<BackgroundVideoView>,
     /// Whether "hear the song" starts on.
     pub hear_song: bool,
 }
@@ -223,6 +245,8 @@ pub struct PlaySession {
     /// backing track begins.
     shift_us: u64,
     backing: Option<Backing>,
+    /// Background video reference resolved from the bundle's `meta.json` (M9-G).
+    video: Option<BackgroundVideoSession>,
     hear_song: bool,
     cfg: ScoreConfig,
 
@@ -281,6 +305,7 @@ impl PlaySession {
             wait,
             shift_us,
             backing: None,
+            video: None,
             hear_song: false,
             cfg: ScoreConfig::default(),
             held: BTreeSet::new(),
@@ -303,6 +328,17 @@ impl PlaySession {
             audio_start_us,
         });
         self
+    }
+
+    /// Attach a background video resolved from the bundle's `meta.json` (M9-G).
+    pub fn with_video(mut self, path: PathBuf, offset_us: i64) -> Self {
+        self.video = Some(BackgroundVideoSession { path, offset_us });
+        self
+    }
+
+    /// The attached background video, if any.
+    pub fn video(&self) -> Option<&BackgroundVideoSession> {
+        self.video.as_ref()
     }
 
     /// Start with "hear the song" on (imported charts opt in; play-along leaves
@@ -331,6 +367,10 @@ impl PlaySession {
             duration_us: self.duration_us,
             lead_us: LEAD_US,
             has_backing: self.backing.is_some(),
+            video: self.video.as_ref().map(|v| BackgroundVideoView {
+                path: v.path.to_string_lossy().into_owned(),
+                offset_us: v.offset_us,
+            }),
             hear_song: self.hear_song,
         }
     }
@@ -599,6 +639,9 @@ fn load_session_from_dir(dir: &Path) -> Result<PlaySession, String> {
         if let Ok(meta) = RecordingMeta::from_json(&json) {
             if let Some(backing) = meta.backing {
                 session = session.with_backing(dir.join(&backing.file), backing.audio_start_us);
+            }
+            if let Some(video) = meta.video {
+                session = session.with_video(dir.join(&video.file), video.offset_us);
             }
         }
     }

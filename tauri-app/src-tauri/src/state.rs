@@ -13,8 +13,8 @@
 use std::sync::Mutex;
 
 use rockcraft_core::{
-    action_from_name, action_help, ActionError, BackingTrack, Composer, ComposerSnapshot, Effect,
-    Grid, Key, NoteView, RecordingMeta, Scale, Timeline, TrackOrigin,
+    action_from_name, action_help, ActionError, BackgroundVideo, BackingTrack, Composer,
+    ComposerSnapshot, Effect, Grid, Key, NoteView, RecordingMeta, Scale, Timeline, TrackOrigin,
 };
 use rockcraft_midi::{events_to_smf_bytes, smf_bytes_to_events};
 use serde::{Deserialize, Serialize};
@@ -46,6 +46,23 @@ pub struct AppState {
     pub dirty: Mutex<bool>,
     /// Path to an attached backing file (bundle-relative when loaded from one).
     pub backing_path: Mutex<Option<std::path::PathBuf>>,
+    /// Absolute path to an attached background video, plus its alignment offset
+    /// (`videoTime = songTime + offset_us`). `None` when the piece has no
+    /// backdrop. Persisted into `meta.json` on save (M9-G); the file is copied
+    /// into the bundle next to `song.mid`.
+    pub video: Mutex<Option<AttachedVideo>>,
+}
+
+/// A background video attached to the live editor, mirrored frontend-side so
+/// `save_bundle` can copy it into the bundle and write `RecordingMeta.video`.
+///
+/// `path` is the absolute source path the webview picked (or the resolved
+/// in-bundle path after a load). `offset_us` mirrors
+/// [`rockcraft_core::BackgroundVideo::offset_us`].
+#[derive(Debug, Clone)]
+pub struct AttachedVideo {
+    pub path: std::path::PathBuf,
+    pub offset_us: i64,
 }
 
 impl AppState {
@@ -61,6 +78,7 @@ impl AppState {
             origin: Mutex::new(TrackOrigin::Composed),
             dirty: Mutex::new(false),
             backing_path: Mutex::new(None),
+            video: Mutex::new(None),
         }
     }
 }
@@ -177,6 +195,7 @@ pub fn save_bundle(state: &AppState, dest: SaveDest) -> Result<String, String> {
         .lock()
         .expect("backing_path mutex poisoned")
         .clone();
+    let video = state.video.lock().expect("video mutex poisoned").clone();
 
     let bundle_dir = match &dest {
         SaveDest::QuickSave => {
@@ -203,6 +222,7 @@ pub fn save_bundle(state: &AppState, dest: SaveDest) -> Result<String, String> {
         origin,
         backing_path.as_deref(),
         backing_offset_us,
+        video.as_ref(),
     )
     .map_err(|e| e.to_string())?;
 
@@ -213,7 +233,9 @@ pub fn save_bundle(state: &AppState, dest: SaveDest) -> Result<String, String> {
     Ok(bundle_dir.to_string_lossy().into_owned())
 }
 
-/// Write `song.mid` + `meta.json` (+ optional backing copy) into `bundle_dir`.
+/// Write `song.mid` + `meta.json` (+ optional backing/video copies) into
+/// `bundle_dir`.
+#[allow(clippy::too_many_arguments)]
 fn write_bundle(
     bundle_dir: &std::path::Path,
     timeline: &Timeline,
@@ -222,6 +244,7 @@ fn write_bundle(
     origin: TrackOrigin,
     backing_path: Option<&std::path::Path>,
     backing_offset_us: u64,
+    video: Option<&AttachedVideo>,
 ) -> std::io::Result<()> {
     std::fs::create_dir_all(bundle_dir)?;
     let bytes = events_to_smf_bytes(&timeline.to_events());
@@ -238,16 +261,59 @@ fn write_bundle(
         None
     };
 
+    let video = video
+        .map(|v| video_meta_for_bundle(bundle_dir, v))
+        .transpose()?;
+
     let meta = RecordingMeta {
         midi_file: "song.mid".into(),
         backing,
         grid: Some(grid),
         key: Some(key),
         origin: Some(origin),
+        video,
         version: 1,
     };
     std::fs::write(bundle_dir.join("meta.json"), meta.to_json())?;
     Ok(())
+}
+
+/// Bundle-relative filename for a retained background video, derived from the
+/// source extension (defaulting to `source.mp4`).
+fn video_bundle_filename(src: &std::path::Path) -> String {
+    match src
+        .extension()
+        .and_then(|e| e.to_str())
+        .filter(|e| !e.is_empty())
+    {
+        Some(ext) => format!("background.{ext}"),
+        None => "background.mp4".to_string(),
+    }
+}
+
+/// Copy the attached video into the bundle (idempotent: if `src` already lives
+/// inside `bundle_dir`, no copy is made) and return the [`BackgroundVideo`]
+/// reference to persist in `meta.json`.
+fn video_meta_for_bundle(
+    bundle_dir: &std::path::Path,
+    v: &AttachedVideo,
+) -> std::io::Result<BackgroundVideo> {
+    let already_in_bundle = v.path.parent() == Some(bundle_dir);
+    let filename = if already_in_bundle {
+        v.path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| video_bundle_filename(&v.path))
+    } else {
+        let name = video_bundle_filename(&v.path);
+        std::fs::copy(&v.path, bundle_dir.join(&name))?;
+        name
+    };
+    Ok(BackgroundVideo {
+        file: filename,
+        offset_us: v.offset_us,
+    })
 }
 
 /// Load a bundle directory into the composer, replacing its current timeline.
@@ -265,7 +331,28 @@ pub fn load_bundle(state: &AppState, dir: &str) -> Result<ComposerSnapshot, Stri
     let timeline = Timeline::from_events(&events);
 
     // Load the meta (optional — legacy bundles have no meta.json).
-    let (grid, key, origin, backing_path, backing_offset_us) =
+    type MetaTuple = (
+        Grid,
+        Key,
+        TrackOrigin,
+        Option<std::path::PathBuf>,
+        u64,
+        Option<AttachedVideo>,
+    );
+    let default_meta = || -> MetaTuple {
+        (
+            Grid::default_120(),
+            Key {
+                root_pc: 0,
+                scale: Scale::Major,
+            },
+            TrackOrigin::Edited,
+            None,
+            0,
+            None,
+        )
+    };
+    let (grid, key, origin, backing_path, backing_offset_us, video) =
         match std::fs::read_to_string(bundle_dir.join("meta.json")) {
             Ok(json) => match RecordingMeta::from_json(&json) {
                 Ok(meta) => {
@@ -283,29 +370,17 @@ pub fn load_bundle(state: &AppState, dir: &str) -> Result<ComposerSnapshot, Stri
                             (Some(abs), b.audio_start_us)
                         })
                         .unwrap_or((None, 0));
-                    (grid, key, origin, bpath, boffset)
+                    // Resolve the bundle-relative video to an absolute path so the
+                    // webview's asset protocol can load it (M9-G).
+                    let video = meta.video.map(|v| AttachedVideo {
+                        path: bundle_dir.join(&v.file),
+                        offset_us: v.offset_us,
+                    });
+                    (grid, key, origin, bpath, boffset, video)
                 }
-                Err(_) => (
-                    Grid::default_120(),
-                    Key {
-                        root_pc: 0,
-                        scale: Scale::Major,
-                    },
-                    TrackOrigin::Edited,
-                    None,
-                    0,
-                ),
+                Err(_) => default_meta(),
             },
-            Err(_) => (
-                Grid::default_120(),
-                Key {
-                    root_pc: 0,
-                    scale: Scale::Major,
-                },
-                TrackOrigin::Edited,
-                None,
-                0,
-            ),
+            Err(_) => default_meta(),
         };
 
     // Replace the composer.
@@ -324,10 +399,60 @@ pub fn load_bundle(state: &AppState, dir: &str) -> Result<ComposerSnapshot, Stri
         .backing_path
         .lock()
         .expect("backing_path mutex poisoned") = backing_path;
+    *state.video.lock().expect("video mutex poisoned") = video;
 
     // Return the fresh snapshot.
     let composer = state.composer.lock().expect("composer mutex poisoned");
     Ok(composer.snapshot())
+}
+
+/// Serializable background-video reference for the edit screen — the absolute
+/// `path` the webview wraps with `convertFileSrc`, plus the alignment offset.
+#[derive(Debug, Clone, Serialize)]
+pub struct VideoRef {
+    pub path: String,
+    pub offset_us: i64,
+}
+
+/// Attach (or replace) the background video, marking the timeline dirty so a
+/// later save persists it into the bundle (M9-G). `path` is the absolute source
+/// path the webview picked; `offset_us` is the alignment offset.
+pub fn set_video(state: &AppState, path: String, offset_us: i64) {
+    *state.video.lock().expect("video mutex poisoned") = Some(AttachedVideo {
+        path: std::path::PathBuf::from(path),
+        offset_us,
+    });
+    *state.dirty.lock().expect("dirty mutex poisoned") = true;
+}
+
+/// Update only the alignment offset of an already-attached video. No-op when no
+/// video is attached. Marks the timeline dirty.
+pub fn set_video_offset(state: &AppState, offset_us: i64) {
+    let mut guard = state.video.lock().expect("video mutex poisoned");
+    if let Some(v) = guard.as_mut() {
+        v.offset_us = offset_us;
+        drop(guard);
+        *state.dirty.lock().expect("dirty mutex poisoned") = true;
+    }
+}
+
+/// Detach the background video. Marks the timeline dirty.
+pub fn clear_video(state: &AppState) {
+    *state.video.lock().expect("video mutex poisoned") = None;
+    *state.dirty.lock().expect("dirty mutex poisoned") = true;
+}
+
+/// The currently attached background video, or `None`.
+pub fn query_video(state: &AppState) -> Option<VideoRef> {
+    state
+        .video
+        .lock()
+        .expect("video mutex poisoned")
+        .as_ref()
+        .map(|v| VideoRef {
+            path: v.path.to_string_lossy().into_owned(),
+            offset_us: v.offset_us,
+        })
 }
 
 /// Current composer snapshot — mirrors `query state`.

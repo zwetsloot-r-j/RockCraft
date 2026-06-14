@@ -250,7 +250,23 @@ export interface PlayInfo {
   /** Lead window the highway shows top→hit-line, in microseconds. */
   lead_us: number;
   has_backing: boolean;
+  /**
+   * Background video to render behind the highway, or `null` when the piece has
+   * no backdrop (M9-G). Mirror of `play::BackgroundVideoView`.
+   */
+  video: BackgroundVideoView | null;
   hear_song: boolean;
+}
+
+/**
+ * A background video reference returned with {@link PlayInfo} — mirror of
+ * `play::BackgroundVideoView` (and `state::VideoRef`).
+ */
+export interface BackgroundVideoView {
+  /** Absolute file path (wrap with `convertFileSrc` before assigning to a `<video>`). */
+  path: string;
+  /** Alignment offset in microseconds (`videoTime = songTime + offset_us`). */
+  offset_us: number;
 }
 
 /**

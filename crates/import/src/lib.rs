@@ -19,6 +19,8 @@ pub mod writer;
 pub use error::ImportError;
 pub use parser::{chart_to_timeline, from_json, to_json};
 pub use pipeline::{fetch_command_configured, import_video, ImportInput, Progress};
-pub use rockcraft_core::{BackingTrack, RecordingMeta, Timeline};
+pub use rockcraft_core::{BackgroundVideo, BackingTrack, RecordingMeta, Timeline};
 pub use schema::{ExtractedChart, ExtractedNote, Hand, SourceMeta};
-pub use writer::{import_output_dir, write_chart_bundle, write_chart_bundle_with_backing};
+pub use writer::{
+    import_output_dir, write_chart_bundle, write_chart_bundle_full, write_chart_bundle_with_backing,
+};
