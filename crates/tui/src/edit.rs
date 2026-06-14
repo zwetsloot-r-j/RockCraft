@@ -820,6 +820,16 @@ impl EditScreen {
         self.composer.input_mode() != InputMode::DirectEdit
     }
 
+    /// Arm step-record if currently in direct-edit, reusing the same
+    /// `ToggleRecordArm` action the `R` key dispatches. Used by the shell to
+    /// open a "New piece" already in recording mode (M9-A). A no-op if a record
+    /// mode is already armed, so it never disarms.
+    pub fn arm_record(&mut self) {
+        if self.composer.input_mode() == InputMode::DirectEdit {
+            self.dispatch(Action::ToggleRecordArm);
+        }
+    }
+
     // ── dirty / save-feedback / exit-prompt ──────────────────────────────────
 
     /// Whether the timeline has unsaved changes.

@@ -1,6 +1,10 @@
 //! The app shell: owns the live MIDI connection and switches between screens
-//! (Menu / Record / Play). Each screen handles its own rendering; the shell
+//! (Menu / Edit / Play). Each screen handles its own rendering; the shell
 //! drains MIDI once per frame and routes events to the active screen.
+//!
+//! Capture and editing are a single screen (`Screen::Edit`): the editor both
+//! records (StepRecord / LiveRecord input modes, toggled by `R` / `t`) and
+//! hand-edits the same timeline (M9-A). There is no separate record screen.
 
 use std::io;
 use std::path::PathBuf;
@@ -30,7 +34,6 @@ use crate::key_source::{CrosstermKeys, KeySource};
 use crate::library::{default_scan_roots, library_root};
 use crate::library_screen::{LibraryOutcome, LibraryScreen};
 use crate::play::PlayScreen;
-use crate::record::RecordScreen;
 
 // ---------------------------------------------------------------------------
 // Shell
@@ -39,8 +42,10 @@ use crate::record::RecordScreen;
 /// Which screen is active.
 pub(crate) enum Screen {
     Menu,
-    Record(RecordScreen),
-    Play(PlayScreen),
+    Play(Box<PlayScreen>),
+    /// The unified capture + edit surface (M9-A): records (StepRecord /
+    /// LiveRecord) and hand-edits the same timeline. There is no separate
+    /// record screen — "New piece" arms this screen in record mode.
     Edit(Box<EditScreen>),
     BackingPicker(BackingPicker),
     /// Browse for a local video file to import.
@@ -54,11 +59,14 @@ pub(crate) enum Screen {
 }
 
 /// Fixed menu entries always shown.
+///
+/// M9-A collapsed Record / Compose (new) / Edit last recording into the single
+/// capture+edit screen. "New piece" opens it empty and armed for recording;
+/// "Continue last" reopens the most recent bundle in the same screen.
 const MENU_ITEMS_BASE: &[&str] = &[
-    "Record",
+    "New piece",
+    "Continue last",
     "Play last recording",
-    "Compose (new)",
-    "Edit last recording",
     "Choose backing track",
     "Import from video file…",
     "Library…",
@@ -79,7 +87,7 @@ pub struct Shell {
     menu_state: ListState,
     status: String,
     should_quit: bool,
-    /// Optional backing track path forwarded to each new `RecordScreen`.
+    /// Optional backing track path forwarded into a new capture+edit session.
     backing_path: Option<PathBuf>,
     /// Inbound remote commands from the control server, if one is running.
     /// Drained once per run-loop iteration with non-blocking `try_recv`; `None`
@@ -248,21 +256,25 @@ impl Shell {
         let idx = self.menu_state.selected().unwrap_or(0);
         let item = items.get(idx).copied().unwrap_or("");
         match item {
-            "Record" => {
-                self.screen = Screen::Record(RecordScreen::with_backing(self.backing_path.clone()));
+            // New piece: the unified capture+edit screen, empty and armed for
+            // recording (StepRecord) so a played note lands immediately (M9-A).
+            "New piece" => {
+                self.activate_edit();
+                if let Screen::Edit(edit) = &mut self.screen {
+                    edit.arm_record();
+                }
             }
-            "Play last recording" => match latest_recording() {
-                Some(path) => match load_play_screen(&path, self.synth.clone()) {
-                    Ok(p) => self.screen = Screen::Play(p),
-                    Err(e) => self.status = e,
-                },
+            // Continue last: reopen the most recent bundle in the same unified
+            // screen (in edit mode); `R` toggles back into recording.
+            "Continue last" => match latest_recording() {
+                Some(path) => self.open_edit_from_midi(&path),
                 None => self.status = "no recordings yet — record one first".into(),
             },
-            "Compose (new)" => {
-                self.activate_edit();
-            }
-            "Edit last recording" => match latest_recording() {
-                Some(path) => self.open_edit_from_midi(&path),
+            "Play last recording" => match latest_recording() {
+                Some(path) => match load_play_screen(&path, self.synth.clone()) {
+                    Ok(p) => self.screen = Screen::Play(Box::new(p)),
+                    Err(e) => self.status = e,
+                },
                 None => self.status = "no recordings yet — record one first".into(),
             },
             "Library…" => {
@@ -294,29 +306,14 @@ impl Shell {
                 _ => {}
             },
             // Note-key precedence inside a screen: navigation keys (Tab/Esc/
-            // Enter/arrows) and the screen's own letter controls (`s` save here)
-            // are handled first; any other key is forwarded to the source as a
-            // note key — the mock maps the number row 1-0 to a C-major scale and
-            // ignores the rest; a real piano ignores the keyboard entirely.
-            Screen::Record(rec) => match code {
-                KeyCode::Tab | KeyCode::Esc => {
-                    // Release anything still sounding before leaving the screen.
-                    if let Some(s) = &self.synth {
-                        s.all_off();
-                    }
-                    rec.stop_backing();
-                    self.screen = Screen::Menu;
-                }
-                KeyCode::Char('s') => match rec.save() {
-                    Ok(p) => self.status = format!("saved {}", p.display()),
-                    Err(e) => self.status = format!("save failed: {e}"),
-                },
-                KeyCode::Char(c) => {
-                    self.input.forward_key(c);
-                }
-                _ => {}
-            },
-            // Same precedence as Record: `r`/`m` are reserved controls; the mock
+            // Enter/arrows) and the screen's own letter controls are handled
+            // first; while record is armed, any unhandled key is forwarded to
+            // the source as a note key — the mock maps the number row 1-0 to a
+            // C-major scale and ignores the rest; a real piano ignores the
+            // keyboard entirely. This routing now lives on the unified Edit
+            // screen (M9-A); recording is its `R`-armed input mode.
+            //
+            // `r`/`m` precedence on Play: reserved controls; the mock
             // turns the number row into note presses (other keys are no-ops).
             Screen::Play(play) => match code {
                 KeyCode::Tab | KeyCode::Esc => {
@@ -479,7 +476,7 @@ impl Shell {
                     LibraryOutcome::OpenPlay(dir) => {
                         let midi = dir.join("song.mid");
                         match load_play_screen(&midi, self.synth.clone()) {
-                            Ok(p) => self.screen = Screen::Play(p),
+                            Ok(p) => self.screen = Screen::Play(Box::new(p)),
                             Err(e) => {
                                 self.status = e;
                                 self.screen = Screen::Menu;
@@ -579,7 +576,6 @@ impl Shell {
     pub fn screen_name(&self) -> &'static str {
         match &self.screen {
             Screen::Menu => "menu",
-            Screen::Record(_) => "record",
             Screen::Play(_) => "play",
             Screen::Edit(_) => "edit",
             Screen::BackingPicker(_) => "backing_picker",
@@ -646,7 +642,7 @@ impl rockcraft_control::HostServices for Shell {
                 let midi = std::path::Path::new(&dir).join("song.mid");
                 match load_play_screen(&midi, self.synth.clone()) {
                     Ok(play) => {
-                        self.screen = Screen::Play(play);
+                        self.screen = Screen::Play(Box::new(play));
                         Ok(json!({ "loaded": dir }))
                     }
                     Err(detail) => Err(HostError::Failed {
@@ -727,17 +723,11 @@ pub fn run_loop<B: ratatui::backend::Backend>(
         let events = shell.input.events();
         for ev in events {
             match &mut shell.screen {
-                Screen::Record(rec) => {
-                    rec.ingest(ev);
-                    // Sound the keys you play while recording.
-                    if let Some(s) = &synth {
-                        s.apply(&ev);
-                    }
-                }
                 Screen::Play(play) => play.ingest(ev),
-                // In a record mode the editor consumes played notes (step / live
-                // record); in direct-edit `ingest` ignores them. Either way we
-                // sound the keys you play, as Record does.
+                // The unified capture+edit screen (M9-A): in a record input mode
+                // the editor consumes played notes (step / live record); in
+                // direct-edit `ingest` ignores them for placement. Either way we
+                // sound the keys you play.
                 Screen::Edit(edit) => {
                     edit.ingest(ev);
                     if let Some(s) = &synth {
@@ -798,7 +788,7 @@ pub fn run_loop<B: ratatui::backend::Backend>(
                         shell.status = format!("imported: {}", bundle.display());
                         // Audition the imported chart immediately: without a live
                         // piano part, an import would otherwise be silent (#152).
-                        shell.screen = Screen::Play(play.with_hear_song(true));
+                        shell.screen = Screen::Play(Box::new(play.with_hear_song(true)));
                     }
                     Err(e) => {
                         shell.status = format!("import succeeded but load failed: {e}");
@@ -832,7 +822,6 @@ pub fn run_loop<B: ratatui::backend::Backend>(
 fn draw(f: &mut Frame, shell: &Shell) {
     match &shell.screen {
         Screen::Menu => draw_menu(f, f.area(), shell),
-        Screen::Record(rec) => rec.draw(f, f.area()),
         Screen::Play(play) => play.draw(f, f.area()),
         Screen::Edit(edit) => edit.draw(f, f.area()),
         Screen::BackingPicker(picker) => picker.draw(f, f.area()),
@@ -1058,22 +1047,99 @@ mod tests {
         Shell::new(Box::new(ScriptedSource::new(vec![])), None, None)
     }
 
-    /// "Compose (new)" (index 2) enters the editor with an empty timeline,
-    /// driven by the same key routing used in the live shell.
+    /// "New piece" (index 0) enters the unified capture+edit screen with an
+    /// empty timeline, already armed for recording (M9-A), driven by the same
+    /// key routing used in the live shell.
     #[test]
-    fn compose_new_enters_empty_edit_screen() {
+    fn new_piece_enters_empty_armed_edit_screen() {
         let mut shell = make_shell();
 
-        shell.on_key(KeyCode::Down); // → index 1 (Play last recording)
-        shell.on_key(KeyCode::Down); // → index 2 (Compose new)
-        shell.on_key(KeyCode::Enter); // enter the editor
+        shell.on_key(KeyCode::Enter); // index 0 = New piece
 
         assert_eq!(shell.screen_name(), "edit");
         assert_eq!(
             shell.edit_note_count(),
             Some(0),
-            "new composition starts with an empty timeline"
+            "new piece starts with an empty timeline"
         );
+        if let Screen::Edit(e) = &shell.screen {
+            assert!(
+                e.is_recording(),
+                "New piece opens the unified screen already armed for recording"
+            );
+            assert_eq!(
+                e.input_mode(),
+                rockcraft_core::InputMode::StepRecord,
+                "New piece arms step-record by default"
+            );
+        } else {
+            panic!("expected the unified edit screen");
+        }
+    }
+
+    /// The retired `record` route no longer exists: there is no menu item that
+    /// lands on a `"record"` screen — "New piece" lands on the unified editor.
+    #[test]
+    fn no_standalone_record_route() {
+        let mut shell = make_shell();
+        // None of the menu items name the old Record / Compose / Edit entries.
+        let items = shell.menu_items();
+        for retired in ["Record", "Compose (new)", "Edit last recording"] {
+            assert!(
+                !items.contains(&retired),
+                "retired menu item still present: {retired}"
+            );
+        }
+        // The unified entries are present.
+        assert!(items.contains(&"New piece"));
+        assert!(items.contains(&"Continue last"));
+
+        // Activating every menu item never yields a "record" screen.
+        for idx in 0..items.len() {
+            shell.menu_state.select(Some(idx));
+            shell.menu_activate();
+            assert_ne!(
+                shell.screen_name(),
+                "record",
+                "menu item {idx} routed to a retired record screen"
+            );
+            // Reset to the menu for the next activation.
+            shell.screen = Screen::Menu;
+        }
+    }
+
+    /// "Continue last" reopens the most recent bundle in the same unified edit
+    /// screen (mirrors the former "Edit last recording"), pre-populated.
+    #[test]
+    fn continue_last_opens_latest_bundle_in_edit() {
+        let mut tl = Timeline::new();
+        tl.insert(make_note(60, 0, 500_000));
+        tl.insert(make_note(64, 500_000, 500_000));
+        let expected = tl.len();
+
+        let base = std::env::temp_dir().join(format!(
+            "rockcraft_continue_last_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let edit_src = EditScreen::from_timeline(tl, Grid::default_120());
+        edit_src.save_bundle(&base).expect("seed save failed");
+
+        // Drive the same shell path "Continue last" uses.
+        let midi_path = latest_recording_from(&base).expect("recording not found");
+        let mut shell = make_shell();
+        shell.open_edit_from_midi(&midi_path);
+
+        assert_eq!(shell.screen_name(), "edit");
+        assert_eq!(
+            shell.edit_note_count(),
+            Some(expected),
+            "Continue last lands on the unified editor with the saved notes"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     /// Drain whatever the input source has queued into the active edit screen,
@@ -1627,8 +1693,13 @@ mod tests {
         let mut shell = make_shell();
         shell.set_has_fetch_cmd(false);
 
-        // Navigate to "Import from video file…" (index 5 in base items).
-        for _ in 0..5 {
+        // Navigate to "Import from video file…" by name (order is M9-A's menu).
+        let idx = shell
+            .menu_items()
+            .iter()
+            .position(|s| *s == "Import from video file…")
+            .expect("video import item present");
+        for _ in 0..idx {
             shell.on_key(KeyCode::Down);
         }
         shell.on_key(KeyCode::Enter);
@@ -1642,7 +1713,12 @@ mod tests {
         let mut shell = make_shell();
         shell.set_has_fetch_cmd(false);
 
-        for _ in 0..5 {
+        let idx = shell
+            .menu_items()
+            .iter()
+            .position(|s| *s == "Import from video file…")
+            .expect("video import item present");
+        for _ in 0..idx {
             shell.on_key(KeyCode::Down);
         }
         shell.on_key(KeyCode::Enter);

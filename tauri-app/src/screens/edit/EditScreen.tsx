@@ -40,8 +40,10 @@ import {
   transcriptionLoad,
 } from "../../ipc/bridge";
 import type { ComposerSnapshot } from "../../ipc/types";
+import { onMidiEvent } from "../../ipc/midi";
 import { EditCanvas } from "./EditCanvas";
 import { StatusBar } from "./StatusBar";
+import { RecordControls } from "./RecordControls";
 import { resolveKey } from "./keymap";
 import { stepUs } from "./viewport";
 import { noteName } from "../highway/utils";
@@ -79,6 +81,12 @@ function pitchToName(p: number): string {
 interface Props {
   /** Bundle directory to load on mount (from the router payload). */
   dir?: string;
+  /**
+   * Open already armed for recording (StepRecord) — the "New piece" entry
+   * point (M9-A). Arms once on mount via the same `toggle_record_arm` action
+   * the `R` key dispatches.
+   */
+  armed?: boolean;
 }
 
 export function EditScreen(props: Props): JSX.Element {
@@ -103,6 +111,12 @@ export function EditScreen(props: Props): JSX.Element {
 
   // Dirty flag — mirrors the backend's AppState::dirty.
   const [dirty, setDirty] = createSignal(false);
+
+  // ── Live-capture feedback (M9-A) ─────────────────────────────────────────
+  // Input activity level (0..1), driven by played note-on velocity and decayed
+  // each animation frame — the record-mode level meter folded in from the
+  // standalone RecordScreen so the recording mode keeps its activity feedback.
+  const [inputLevel, setInputLevel] = createSignal(0);
 
   // Overlay state.
   const [overlay, setOverlay] = createSignal<Overlay>("none");
@@ -196,6 +210,24 @@ export function EditScreen(props: Props): JSX.Element {
       .catch((e: unknown) => {
         showFlash(`save failed: ${String(e)}`);
       });
+  }
+
+  // ── Record arm / flavour (M9-A) ──────────────────────────────────────────
+  // The unified screen toggles between editing (DirectEdit) and recording
+  // (StepRecord / LiveRecord) via the existing core actions — no new action.
+  // These wrap `run_action` so the on-screen Record⇄Edit control and the `R` /
+  // `t` keys drive the exact same path.
+
+  /** Dispatch `toggle_record_arm` (arm ⇄ disarm), then refresh dirty state. */
+  function toggleRecordArm(): void {
+    void runAction("toggle_record_arm").then((reply) => setDirty(reply.dirty));
+  }
+
+  /** Dispatch `toggle_record_flavour` (step ⇄ live; no-op while disarmed). */
+  function toggleRecordFlavour(): void {
+    void runAction("toggle_record_flavour").then((reply) =>
+      setDirty(reply.dirty),
+    );
   }
 
   // ── Video backdrop (M7-tauri-N) ─────────────────────────────────────────
@@ -464,8 +496,25 @@ export function EditScreen(props: Props): JSX.Element {
         })
       : queryState().then(applySnapshot);
 
-    init.catch(() => {
-      /* backend not up (plain vite without tauri) — render stays blank */
+    init
+      .then(() => {
+        // "New piece" opens armed for recording (M9-A): arm step-record once,
+        // only if the loaded state is still in DirectEdit (never disarm).
+        if (props.armed && store.snap?.input_mode === "DirectEdit") {
+          toggleRecordArm();
+        }
+      })
+      .catch(() => {
+        /* backend not up (plain vite without tauri) — render stays blank */
+      });
+
+    // Drive the live input-level meter from played note-ons (M9-A). The level
+    // decays in the render loop; a strike snaps it up to the note velocity.
+    let unlistenMidi: UnlistenFn | undefined;
+    onMidiEvent((ev) => {
+      if (ev.on) setInputLevel(Math.min(1, ev.velocity / 127));
+    }).then((fn) => {
+      unlistenMidi = fn;
     });
 
     // Fetch initial dirty state (covers the case where a bundle was pre-loaded
@@ -479,6 +528,10 @@ export function EditScreen(props: Props): JSX.Element {
     const loop = (): void => {
       const s = store.snap;
       if (s?.playing) render();
+      // Decay the input-level meter toward zero between strikes (M9-A).
+      const lvl = inputLevel();
+      if (lvl > 0.001) setInputLevel(lvl * 0.9);
+      else if (lvl !== 0) setInputLevel(0);
       raf = requestAnimationFrame(loop);
     };
     raf = requestAnimationFrame(loop);
@@ -489,6 +542,7 @@ export function EditScreen(props: Props): JSX.Element {
       cancelAnimationFrame(raf);
       clearTimeout(flashTimeout);
       unlisten?.();
+      unlistenMidi?.();
       engine?.dispose();
       engine = null;
     });
@@ -607,6 +661,18 @@ export function EditScreen(props: Props): JSX.Element {
         {/* Chord selector panel — shown while chord_preview is non-null */}
         <Show when={store.snap?.chord_preview !== null && store.snap?.chord_preview !== undefined}>
           <ChordSelectorPanel snap={store.snap!} />
+        </Show>
+
+        {/* Record ⇄ Edit controls (M9-A): a discoverable on-screen toggle, a
+            record indicator, and the live input-level meter folded in from the
+            standalone record screen. Reuses the existing toggle actions. */}
+        <Show when={store.snap}>
+          <RecordControls
+            inputMode={store.snap!.input_mode}
+            level={inputLevel()}
+            onToggleArm={toggleRecordArm}
+            onToggleFlavour={toggleRecordFlavour}
+          />
         </Show>
       </div>
 

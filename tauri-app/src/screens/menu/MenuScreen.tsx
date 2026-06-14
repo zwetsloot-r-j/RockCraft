@@ -28,11 +28,14 @@ interface MenuItem {
 }
 
 // The static part of the menu (order preserved; dynamic items managed below).
+//
+// M9-A collapsed Record / Compose (new) / Edit last recording into the single
+// capture+edit screen: "New piece" opens it empty and armed for recording;
+// "Continue last" reopens the most recent bundle in the same screen.
 const STATIC_ITEMS: MenuItem[] = [
-  { label: "Record", key: "record" },
+  { label: "New piece", key: "new-piece" },
+  { label: "Continue last", key: "continue-last" },
   { label: "Play last recording", key: "play" },
-  { label: "Compose (new)", key: "compose" },
-  { label: "Edit last recording", key: "edit" },
   { label: "Library…", key: "library" },
   { label: "Choose backing track", key: "backing-picker" },
   { label: "Import from video file…", key: "video-import" },
@@ -62,8 +65,8 @@ export function MenuScreen(): JSX.Element {
 
   /**
    * Open the newest bundle on `screen`, or show the no-recordings notice when
-   * the library is empty. Shared by "Play last recording" / "Edit last
-   * recording" so both route real bundles (never the retired demo fixture).
+   * the library is empty. Shared by "Play last recording" / "Continue last"
+   * so both route real bundles (never the retired demo fixture).
    */
   async function openLatest(screen: "play" | "edit"): Promise<void> {
     try {
@@ -94,17 +97,17 @@ export function MenuScreen(): JSX.Element {
 
   async function activate(key: string): Promise<void> {
     switch (key) {
-      case "record":
-        navigate({ kind: "record" });
+      // New piece: the unified capture+edit screen, empty and armed for
+      // recording so a played note lands immediately (M9-A).
+      case "new-piece":
+        navigate({ kind: "edit", armed: true });
+        break;
+      // Continue last: reopen the most recent bundle in the same screen.
+      case "continue-last":
+        await openLatest("edit");
         break;
       case "play":
         await openLatest("play");
-        break;
-      case "compose":
-        navigate({ kind: "edit" });
-        break;
-      case "edit":
-        await openLatest("edit");
         break;
       case "library":
         navigate({ kind: "library" });

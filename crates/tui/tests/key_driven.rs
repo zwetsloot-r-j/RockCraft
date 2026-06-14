@@ -54,16 +54,18 @@ fn make_terminal() -> Terminal<TestBackend> {
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Pressing Enter opens Record (index 0 is pre-selected); Tab returns to Menu.
+/// Pressing Enter opens the unified capture+edit screen ("New piece", index 0
+/// is pre-selected); Tab returns to Menu (M9-A retired the separate record
+/// route — index 0 now lands on the editor, armed).
 #[test]
-fn menu_navigation_down_enter_opens_record_tab_returns_to_menu() {
+fn menu_navigation_enter_opens_new_piece_tab_returns_to_menu() {
     let mut shell = make_shell(ScriptedNotes::empty());
     let mut terminal = make_terminal();
 
-    // Menu starts at index 0 ("Record"). Enter activates it.
+    // Menu starts at index 0 ("New piece"). Enter activates it.
     let mut keys = ScriptedKeys::new([
-        KeyCode::Enter,     // activate "Record" (already selected)
-        KeyCode::Tab,       // return to Menu from Record
+        KeyCode::Enter,     // activate "New piece" (already selected)
+        KeyCode::Tab,       // return to Menu from the editor (clean → no prompt)
         KeyCode::Char('q'), // quit
     ]);
 
@@ -73,19 +75,19 @@ fn menu_navigation_down_enter_opens_record_tab_returns_to_menu() {
     assert_eq!(shell.screen_name(), "menu");
 }
 
-/// Down arrow moves the menu cursor, Enter on "Record" opens it, Esc returns.
+/// Down arrow moves the menu cursor, Enter on "New piece" opens it, Esc returns.
 #[test]
 fn down_arrow_then_enter_then_esc_back_to_menu() {
     let mut shell = make_shell(ScriptedNotes::empty());
     let mut terminal = make_terminal();
 
-    // Start at index 0 (Record). Move down to index 1 (Play last recording),
-    // then back up to 0, then Enter → Record screen.
+    // Start at index 0 (New piece). Move down to index 1 (Continue last), then
+    // back up to 0, then Enter → unified edit screen.
     let mut keys = ScriptedKeys::new([
         KeyCode::Down,  // → index 1
         KeyCode::Up,    // → index 0 again
-        KeyCode::Enter, // activate "Record"
-        KeyCode::Esc,   // return to Menu
+        KeyCode::Enter, // activate "New piece"
+        KeyCode::Esc,   // return to Menu (clean editor → no prompt)
         KeyCode::Esc,   // quit (Esc from Menu == quit)
     ]);
 
@@ -116,15 +118,15 @@ fn esc_from_menu_quits() {
     assert!(shell.is_quit());
 }
 
-/// Navigation keys (Tab/Esc) inside Record return to Menu — not forwarded as
-/// notes — the shell ends up back at Menu.
+/// Navigation keys (Tab/Esc) inside the unified editor return to Menu — not
+/// forwarded as notes — the shell ends up back at Menu.
 #[test]
-fn tab_in_record_is_navigation_not_note() {
+fn tab_in_editor_is_navigation_not_note() {
     let mut shell = make_shell(ScriptedNotes::empty());
     let mut terminal = make_terminal();
 
     let mut keys = ScriptedKeys::new([
-        KeyCode::Enter,     // → Record screen
+        KeyCode::Enter,     // → unified edit screen (New piece)
         KeyCode::Tab,       // ← back to Menu (navigation, not a note)
         KeyCode::Char('q'), // quit
     ]);
@@ -134,39 +136,39 @@ fn tab_in_record_is_navigation_not_note() {
     assert_eq!(shell.screen_name(), "menu");
 }
 
-/// Unrecognised keys inside Record do not crash or change the screen.
+/// Unrecognised keys inside the unified editor do not crash or change the
+/// screen. ("New piece" arms step-record, so non-note keys still resolve as
+/// editor commands or no-ops; the screen stays put until Tab.)
 #[test]
-fn unknown_keys_in_record_are_ignored() {
+fn unknown_keys_in_editor_are_ignored() {
     let mut shell = make_shell(ScriptedNotes::empty());
     let mut terminal = make_terminal();
 
     let mut keys = ScriptedKeys::new([
-        KeyCode::Enter,     // → Record
-        KeyCode::Char('z'), // forwarded to source (no-op on ScriptedNotes)
-        KeyCode::Char('x'), // forwarded to source (no-op on ScriptedNotes)
+        KeyCode::Enter,     // → unified edit screen (armed)
+        KeyCode::Char('z'), // unmapped editor key (no-op)
+        KeyCode::Char('q'), // 'q' is unmapped in the editor (only quits in Menu)
         KeyCode::Tab,       // ← Menu
-        KeyCode::Char('q'), // quit
+        KeyCode::Char('q'), // quit from Menu
     ]);
 
     run_loop(&mut terminal, &mut shell, &mut keys).unwrap();
     assert_eq!(shell.screen_name(), "menu");
 }
 
-/// "Compose" (menu index 2) opens the editor; Tab returns to the Menu. Inside
-/// the editor, letter keys are navigation (not forwarded as notes) and don't
-/// escape the screen.
+/// "New piece" (menu index 0) opens the unified editor; Tab returns to the
+/// Menu. Inside the editor, letter keys are navigation/commands (not forwarded
+/// as notes) and don't escape the screen.
 #[test]
-fn compose_opens_editor_and_tab_returns_to_menu() {
+fn new_piece_opens_editor_and_tab_returns_to_menu() {
     let mut shell = make_shell(ScriptedNotes::empty());
     let mut terminal = make_terminal();
 
     let mut keys = ScriptedKeys::new([
-        KeyCode::Down,      // → index 1 (Play)
-        KeyCode::Down,      // → index 2 (Compose)
-        KeyCode::Enter,     // open the editor
+        KeyCode::Enter,     // index 0 = New piece → open the editor
         KeyCode::Char('l'), // navigate (cursor right) — stays in editor
         KeyCode::Char('k'), // navigate (cursor up) — stays in editor
-        KeyCode::Tab,       // ← back to Menu
+        KeyCode::Tab,       // ← back to Menu (clean editor → no prompt)
         KeyCode::Char('q'), // quit
     ]);
 
