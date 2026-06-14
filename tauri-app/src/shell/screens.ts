@@ -15,7 +15,6 @@ export type Screen =
    * `record` screen was retired into this one.
    */
   | { kind: "edit"; dir?: string; armed?: boolean }
-  | { kind: "backing-picker" }
   | { kind: "video-picker" }
   | { kind: "url-input" }
   | { kind: "importing" }

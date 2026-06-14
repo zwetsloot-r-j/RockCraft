@@ -37,7 +37,9 @@ const STATIC_ITEMS: MenuItem[] = [
   { label: "Continue last", key: "continue-last" },
   { label: "Play last recording", key: "play" },
   { label: "Library…", key: "library" },
-  { label: "Choose backing track", key: "backing-picker" },
+  // "Choose backing track" relocated into the unified capture/edit screen (M9-E):
+  // backing now attaches to the loaded piece (B key there) and persists into its
+  // bundle, instead of being a piece-less top-level action.
   { label: "Import from video file…", key: "video-import" },
   { label: "Import from URL…", key: "url-import" },
   { label: "Quit", key: "quit" },
@@ -111,9 +113,6 @@ export function MenuScreen(): JSX.Element {
         break;
       case "library":
         navigate({ kind: "library" });
-        break;
-      case "backing-picker":
-        navigate({ kind: "backing-picker" });
         break;
       case "video-import": {
         const path = await openVideoFilePicker();

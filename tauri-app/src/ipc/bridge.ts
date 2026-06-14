@@ -158,6 +158,59 @@ export function audioStatus(): Promise<AudioStatus> {
   return invoke<AudioStatus>("audio_status");
 }
 
+// ── Edit-screen backing track, persisted in the bundle (M9-E) ───────────────
+
+/**
+ * A backing-track reference held on the live editor — mirror of
+ * `state::BackingRef`. `path` is absolute; `name` is the bare file name for
+ * display.
+ */
+export interface BackingRef {
+  path: string;
+  name: string;
+}
+
+/**
+ * Open a native file-picker dialog filtered to audio files.
+ * Returns the selected path, or `null` if the user cancelled.
+ *
+ * Audio extensions mirror the backing-track formats the playback path supports
+ * (mp3 wav ogg flac m4a aac).
+ */
+export async function openBackingFilePicker(): Promise<string | null> {
+  const selected = await dialogOpen({
+    multiple: false,
+    filters: [
+      {
+        name: "Audio files",
+        extensions: ["mp3", "wav", "ogg", "flac", "m4a", "aac"],
+      },
+    ],
+  });
+  if (selected === null || selected === undefined) return null;
+  return typeof selected === "string" ? selected : null;
+}
+
+/**
+ * Attach (or replace) the edit-screen backing track (M9-E). Stored on the live
+ * editor so the next `save_bundle` persists it into the bundle's
+ * `meta.backing`, and handed to the playback thread so it plays under the
+ * transport. Rejects if the file is missing.
+ */
+export function editSetBacking(path: string): Promise<void> {
+  return invoke<void>("edit_set_backing", { path });
+}
+
+/** Detach the edit-screen backing track (M9-E). */
+export function editClearBacking(): Promise<void> {
+  return invoke<void>("edit_clear_backing");
+}
+
+/** Return the currently attached backing track, or `null` (M9-E). */
+export function editQueryBacking(): Promise<BackingRef | null> {
+  return invoke<BackingRef | null>("edit_query_backing");
+}
+
 // ── Record commands ───────────────────────────────────────────────────────────
 
 /** Status of the live-recording session. */

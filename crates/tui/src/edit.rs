@@ -394,6 +394,41 @@ impl EditScreen {
         self
     }
 
+    /// Attach (or replace) the backing track while editing the loaded piece
+    /// (M9-E — the relocation of the former menu picker). Marks the timeline
+    /// dirty so saving persists the choice into `meta.backing`, and drops any
+    /// live handle so the next tick re-arms playback from the playhead. The
+    /// alignment offset is left untouched (a fresh attach keeps the current
+    /// nudge; callers seed it via [`with_backing`] when loading a bundle).
+    pub fn set_backing(&mut self, path: PathBuf) {
+        self.backing = Some(Backing { path });
+        if let Some(h) = self.backing_handle.take() {
+            h.stop();
+        }
+        self.mark_dirty();
+    }
+
+    /// Detach the backing track while editing (M9-E). Stops playback and marks
+    /// the timeline dirty so the next save drops `meta.backing`.
+    pub fn clear_backing(&mut self) {
+        self.backing = None;
+        if let Some(h) = self.backing_handle.take() {
+            h.stop();
+        }
+        self.mark_dirty();
+    }
+
+    /// The attached backing file's bare name, or `None` when none is attached.
+    /// Drives the on-screen backing indicator.
+    pub fn backing_name(&self) -> Option<String> {
+        self.backing.as_ref().map(|b| {
+            b.path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| b.path.to_string_lossy().into_owned())
+        })
+    }
+
     /// Stop any in-progress audition and editor state and return to a clean rest.
     /// An uncommitted chord preview is cancelled (its notes removed) so leaving
     /// never strands a ghost chord. Call before navigating away from the screen.
@@ -878,6 +913,13 @@ impl EditScreen {
         self.dirty = false;
     }
 
+    /// Mark the timeline as having unsaved changes. Used when a non-timeline
+    /// edit (e.g. attaching/detaching a backing track, M9-E) needs to be
+    /// persisted on the next save.
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
     /// Set the one-shot save-confirmation message shown after a successful save.
     /// Cleared automatically when the user next presses any key.
     pub fn set_save_flash(&mut self, msg: String) {
@@ -1308,18 +1350,20 @@ impl EditScreen {
             })
             .unwrap_or_else(|| Span::raw(""));
 
-        // Surface the backing alignment offset (and its nudge keys) only when a
-        // track is attached, so MIDI-only editing keeps a clean status line.
-        let backing_span = if self.backing.is_some() {
+        // Surface the backing track: when attached, name it with its alignment
+        // offset + nudge keys; when not, show the `B` affordance so the relocated
+        // entry point (M9-E) is discoverable on the edit screen itself.
+        let backing_span = if let Some(name) = self.backing_name() {
             Span::styled(
                 format!(
-                    "backing {:+}ms [,/.·;/']  ",
+                    "backing {} {:+}ms [,/.·;/'·B]  ",
+                    name,
                     self.composer.backing_offset_us() as i64 / 1000
                 ),
                 Style::default().fg(Color::Cyan),
             )
         } else {
-            Span::raw("")
+            Span::styled("[B] backing  ", Style::default().fg(Color::DarkGray))
         };
 
         let line = Line::from(vec![
@@ -1711,11 +1755,12 @@ impl EditScreen {
             )),
             Line::from(Span::raw("")), // Empty line
             Line::from(Span::styled(
-                " Backing alignment (slide audio under the highway):",
+                " Backing track:",
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             )),
+            Line::from(Span::raw("  B : Choose / detach a backing audio track")),
             Line::from(Span::raw(
                 "  , / . : Nudge -/+10ms      ; / ' : Nudge -/+250ms",
             )),
@@ -3953,5 +3998,62 @@ mod tests {
         let (start, end) = e.loop_bounds();
         assert_eq!(start, 0);
         assert_eq!(end, 4 * step, "loop-out includes the step under the cursor");
+    }
+
+    /// M9-E: attaching a backing track while editing (`set_backing`) marks the
+    /// timeline dirty, names the file for the indicator, and is written into the
+    /// saved bundle's `meta.backing` — the relocated picker now persists into
+    /// the piece. Detaching drops it from the next save.
+    #[test]
+    fn set_backing_persists_into_bundle_and_round_trips() {
+        let dir = std::env::temp_dir().join(format!(
+            "rockcraft_tui_backing_rt_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src_backing = dir.join("groove.ogg");
+        std::fs::write(&src_backing, b"audio bytes").unwrap();
+
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('a')); // a note so the bundle is non-trivial
+        e.mark_clean();
+        assert!(e.backing_name().is_none(), "starts with no backing");
+
+        // Attach the chosen file (what the picker's Selected outcome does).
+        e.set_backing(src_backing.clone());
+        assert!(e.is_dirty(), "attaching a backing marks the piece dirty");
+        assert_eq!(e.backing_name().as_deref(), Some("groove.ogg"));
+
+        // Save → meta.backing carries the bundle-relative backing file.
+        let bundle = e.save_bundle(&dir).expect("save with backing");
+        let meta_json =
+            std::fs::read_to_string(bundle.join("meta.json")).expect("meta.json exists");
+        let meta = RecordingMeta::from_json(&meta_json).expect("meta parses");
+        let backing = meta
+            .backing
+            .expect("meta.backing present after attach+save");
+        assert_eq!(backing.file, bundle_backing_filename(&src_backing));
+        assert!(
+            bundle.join(&backing.file).exists(),
+            "backing audio copied into the bundle"
+        );
+
+        // Detach → next save drops meta.backing.
+        e.clear_backing();
+        assert!(e.backing_name().is_none(), "detach clears the backing");
+        let bundle2 = e.save_bundle(&dir).expect("save after detach");
+        let meta2 = RecordingMeta::from_json(
+            &std::fs::read_to_string(bundle2.join("meta.json")).expect("meta.json"),
+        )
+        .expect("meta parses");
+        assert!(
+            meta2.backing.is_none(),
+            "detached piece saves without a backing"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

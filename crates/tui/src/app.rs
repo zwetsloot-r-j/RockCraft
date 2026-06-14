@@ -47,7 +47,14 @@ pub(crate) enum Screen {
     /// LiveRecord) and hand-edits the same timeline. There is no separate
     /// record screen — "New piece" arms this screen in record mode.
     Edit(Box<EditScreen>),
-    BackingPicker(BackingPicker),
+    /// Browse for a backing audio file. `return_to` carries the editor to
+    /// resume after picking (M9-E): backing is now chosen *for the loaded piece*
+    /// from inside the edit screen, not as a piece-less top-level action. The
+    /// chosen file persists into the piece's `meta.backing` on the next save.
+    BackingPicker {
+        picker: BackingPicker,
+        return_to: Box<EditScreen>,
+    },
     /// Browse for a local video file to import.
     VideoPicker(VideoPicker),
     /// Text input for a video URL to import.
@@ -63,11 +70,13 @@ pub(crate) enum Screen {
 /// M9-A collapsed Record / Compose (new) / Edit last recording into the single
 /// capture+edit screen. "New piece" opens it empty and armed for recording;
 /// "Continue last" reopens the most recent bundle in the same screen.
+// "Choose backing track" was relocated into the unified capture/edit screen
+// (M9-E): backing now attaches to the loaded piece (the `B` key there) and
+// persists into its bundle, instead of being a piece-less top-level action.
 const MENU_ITEMS_BASE: &[&str] = &[
     "New piece",
     "Continue last",
     "Play last recording",
-    "Choose backing track",
     "Import from video file…",
     "Library…",
 ];
@@ -280,10 +289,6 @@ impl Shell {
             "Library…" => {
                 self.screen = Screen::Library(LibraryScreen::new(&default_scan_roots()));
             }
-            "Choose backing track" => {
-                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                self.screen = Screen::BackingPicker(BackingPicker::new(cwd));
-            }
             "Import from video file…" => {
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 self.screen = Screen::VideoPicker(VideoPicker::new(cwd));
@@ -414,21 +419,51 @@ impl Shell {
                         },
                         // Shift-S opens the "save to library" name overlay.
                         KeyCode::Char('S') => edit.start_save_prompt(),
+                        // `B` opens the backing-track picker *for the loaded
+                        // piece* (M9-E). Stop the editor's audition/backing,
+                        // then stash the editor in the picker so the choice
+                        // returns to it (and persists into the bundle on save).
+                        KeyCode::Char('B') => {
+                            edit.leave();
+                            let cwd =
+                                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                            if let Screen::Edit(e) =
+                                std::mem::replace(&mut self.screen, Screen::Menu)
+                            {
+                                self.screen = Screen::BackingPicker {
+                                    picker: BackingPicker::new(cwd),
+                                    return_to: e,
+                                };
+                            }
+                        }
                         KeyCode::Char(c) if edit.is_recording() && self.input.forward_key(c) => {}
                         other => edit.on_key(other),
                     }
                 }
             }
-            Screen::BackingPicker(picker) => {
+            Screen::BackingPicker { picker, .. } => {
                 let outcome = picker.on_key(code).clone();
                 match outcome {
+                    // Attach the chosen file to the piece being edited and resume
+                    // editing — saving the piece persists it into meta.backing
+                    // (M9-E). The editor is taken back out of the picker variant.
                     PickerOutcome::Selected(path) => {
                         self.status = format!("backing: {}", path.display());
-                        self.backing_path = Some(path);
-                        self.screen = Screen::Menu;
+                        if let Screen::BackingPicker { return_to, .. } =
+                            std::mem::replace(&mut self.screen, Screen::Menu)
+                        {
+                            let mut edit = return_to;
+                            edit.set_backing(path);
+                            self.screen = Screen::Edit(edit);
+                        }
                     }
+                    // Cancel: resume editing unchanged.
                     PickerOutcome::Cancelled => {
-                        self.screen = Screen::Menu;
+                        if let Screen::BackingPicker { return_to, .. } =
+                            std::mem::replace(&mut self.screen, Screen::Menu)
+                        {
+                            self.screen = Screen::Edit(return_to);
+                        }
                     }
                     PickerOutcome::Pending => {}
                 }
@@ -578,7 +613,7 @@ impl Shell {
             Screen::Menu => "menu",
             Screen::Play(_) => "play",
             Screen::Edit(_) => "edit",
-            Screen::BackingPicker(_) => "backing_picker",
+            Screen::BackingPicker { .. } => "backing_picker",
             Screen::VideoPicker(_) => "video_picker",
             Screen::UrlInput(_) => "url_input",
             Screen::Importing(_) => "importing",
@@ -736,7 +771,7 @@ pub fn run_loop<B: ratatui::backend::Backend>(
                 }
                 // These screens ignore live MIDI input.
                 Screen::Menu
-                | Screen::BackingPicker(_)
+                | Screen::BackingPicker { .. }
                 | Screen::VideoPicker(_)
                 | Screen::UrlInput(_)
                 | Screen::Importing(_)
@@ -824,7 +859,7 @@ fn draw(f: &mut Frame, shell: &Shell) {
         Screen::Menu => draw_menu(f, f.area(), shell),
         Screen::Play(play) => play.draw(f, f.area()),
         Screen::Edit(edit) => edit.draw(f, f.area()),
-        Screen::BackingPicker(picker) => picker.draw(f, f.area()),
+        Screen::BackingPicker { picker, .. } => picker.draw(f, f.area()),
         Screen::VideoPicker(picker) => picker.draw(f, f.area()),
         Screen::UrlInput(ui) => ui.draw(f, f.area()),
         Screen::Importing(imp) => imp.draw(f, f.area()),
@@ -1106,6 +1141,56 @@ mod tests {
             // Reset to the menu for the next activation.
             shell.screen = Screen::Menu;
         }
+    }
+
+    /// M9-E: the standalone "Choose backing track" menu item is gone — backing
+    /// is now chosen from inside the edit screen. No menu item lands on the
+    /// backing picker.
+    #[test]
+    fn no_standalone_backing_menu_item() {
+        let mut shell = make_shell();
+        let items = shell.menu_items();
+        assert!(
+            !items.contains(&"Choose backing track"),
+            "backing-track menu item should be relocated into the edit screen"
+        );
+        for idx in 0..items.len() {
+            shell.menu_state.select(Some(idx));
+            shell.menu_activate();
+            assert_ne!(
+                shell.screen_name(),
+                "backing_picker",
+                "menu item {idx} still routes to the standalone backing picker"
+            );
+            shell.screen = Screen::Menu;
+        }
+    }
+
+    /// M9-E: `B` in the editor opens the backing picker *for the loaded piece*;
+    /// cancelling (Esc) returns to the same editor with its notes intact, and
+    /// the editor exposes the picker entry point (not the menu).
+    #[test]
+    fn edit_b_opens_backing_picker_and_returns() {
+        let mut shell = make_shell();
+        shell.activate_edit();
+        shell.on_key(KeyCode::Char('a')); // one note
+        assert_eq!(shell.edit_note_count(), Some(1));
+
+        shell.on_key(KeyCode::Char('B'));
+        assert_eq!(
+            shell.screen_name(),
+            "backing_picker",
+            "B opens the backing picker from the editor"
+        );
+
+        // Esc cancels the picker → back to the editor, notes preserved.
+        shell.on_key(KeyCode::Esc);
+        assert_eq!(shell.screen_name(), "edit", "cancel returns to the editor");
+        assert_eq!(
+            shell.edit_note_count(),
+            Some(1),
+            "the edited piece survives the picker round-trip"
+        );
     }
 
     /// "Continue last" reopens the most recent bundle in the same unified edit
