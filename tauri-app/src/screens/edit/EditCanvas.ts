@@ -363,21 +363,38 @@ export class EditCanvas {
 
   private drawLoopRegion(snapshot: ComposerSnapshot, vp: Viewport): void {
     if (!snapshot.looping) return;
+    if (snapshot.loop_end_us <= snapshot.loop_start_us) return;
     const ctx = this.ctx;
-    // y0 is the earlier (lower) bound, y1 the later (higher) bound.
+    // y0 is the earlier (lower / loop-in) bound, y1 the later (higher /
+    // loop-out) bound. The band is bright enough to read as a deliberate region
+    // (not just a tint) so the `{`/`}` loop-in/out keys have a visible target.
     const y0 = vp.yOf(snapshot.loop_start_us);
     const y1 = vp.yOf(snapshot.loop_end_us);
     ctx.save();
-    ctx.fillStyle = "rgba(91,231,196,0.06)";
+    ctx.fillStyle = "rgba(91,231,196,0.10)";
     ctx.fillRect(0, y1, this.w, y0 - y1);
-    ctx.strokeStyle = "rgba(91,231,196,0.3)";
-    ctx.lineWidth = 1;
+    // Solid bracket lines at both bounds.
+    ctx.strokeStyle = "rgba(91,231,196,0.6)";
+    ctx.lineWidth = 1.5;
     ctx.beginPath();
     ctx.moveTo(0, y0 + 0.5);
     ctx.lineTo(this.w, y0 + 0.5);
     ctx.moveTo(0, y1 + 0.5);
     ctx.lineTo(this.w, y1 + 0.5);
     ctx.stroke();
+    // Edge labels so the region is unmistakably the loop, and which edge is
+    // which (the in is the lower line, the out the higher one).
+    ctx.font = `600 10px ${FONT_MONO}`;
+    ctx.textAlign = "left";
+    ctx.fillStyle = "rgba(91,231,196,0.85)";
+    if (y0 >= 0 && y0 <= this.h) {
+      ctx.textBaseline = "bottom";
+      ctx.fillText("LOOP IN", 6, y0 - 2);
+    }
+    if (y1 >= 0 && y1 <= this.h) {
+      ctx.textBaseline = "top";
+      ctx.fillText("LOOP OUT", 6, y1 + 2);
+    }
     ctx.restore();
   }
 }

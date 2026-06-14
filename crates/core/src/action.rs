@@ -110,6 +110,12 @@ pub enum Action {
         start_us: u64,
         end_us: u64,
     },
+    /// Set the loop region's **start** to the cursor position. Cursor-relative
+    /// so a frontend keypress need not compute microseconds itself.
+    SetLoopStart,
+    /// Set the loop region's **end** to the cursor position. Cursor-relative
+    /// so a frontend keypress need not compute microseconds itself.
+    SetLoopEnd,
 
     // ── selection / clipboard ───────────────────────────────────────────
     StartSelection,
@@ -171,6 +177,8 @@ impl Action {
             Action::ToggleMetronome => "toggle_metronome",
             Action::StartCountInRecord => "start_count_in_record",
             Action::SetLoopBounds { .. } => "set_loop_bounds",
+            Action::SetLoopStart => "set_loop_start",
+            Action::SetLoopEnd => "set_loop_end",
             Action::StartSelection => "start_selection",
             Action::ClearSelection => "clear_selection",
             Action::YankSelection => "yank_selection",
@@ -307,6 +315,8 @@ pub fn action_names() -> &'static [&'static str] {
         "toggle_metronome",
         "start_count_in_record",
         "set_loop_bounds",
+        "set_loop_start",
+        "set_loop_end",
         "start_selection",
         "clear_selection",
         "yank_selection",
@@ -405,6 +415,8 @@ static ACTION_HELP: &[ActionInfo] = {
         ActionInfo { name: "toggle_metronome", params: &[], description: "Toggle the metronome click." },
         ActionInfo { name: "start_count_in_record", params: &[], description: "Begin a metronome count-in, then start recording." },
         ActionInfo { name: "set_loop_bounds", params: &[p("start_us", "u64"), p("end_us", "u64")], description: "Set the loop region to [start_us, end_us) microseconds." },
+        ActionInfo { name: "set_loop_start", params: &[], description: "Set the loop region's start to the cursor position." },
+        ActionInfo { name: "set_loop_end", params: &[], description: "Set the loop region's end to the cursor position." },
         // ── selection / clipboard ───────────────────────────────────────
         ActionInfo { name: "start_selection", params: &[], description: "Begin a selection rectangle anchored at the cursor." },
         ActionInfo { name: "clear_selection", params: &[], description: "Clear the active selection." },
@@ -471,6 +483,8 @@ mod tests {
                 start_us: 0,
                 end_us: 1_000,
             },
+            Action::SetLoopStart,
+            Action::SetLoopEnd,
             Action::StartSelection,
             Action::ClearSelection,
             Action::YankSelection,

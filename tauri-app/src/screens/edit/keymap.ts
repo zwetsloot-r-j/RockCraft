@@ -125,6 +125,8 @@ export const NORMAL_BINDINGS: Binding[] = [
 
   // ── loop / metronome / count-in ───────────────────────────────────────
   { keys: ["o"], action: { name: "toggle_loop" } },
+  { keys: ["{"], action: { name: "set_loop_start" } }, // loop-in at cursor
+  { keys: ["}"], action: { name: "set_loop_end" } }, // loop-out at cursor
   { keys: ["M"], action: { name: "toggle_metronome" } },
   { keys: ["C"], action: { name: "start_count_in_record" } },
 

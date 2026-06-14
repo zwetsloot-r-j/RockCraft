@@ -100,6 +100,10 @@ const GRID_COLOR: Color = Color::DarkGray;
 const PLAYHEAD_COLOR: Color = Color::Green;
 /// Selected-note highlight on the highway.
 const SELECT_COLOR: Color = Color::LightGreen;
+/// Loop-region band tint and bracket lines on the highway.
+const LOOP_COLOR: Color = Color::Indexed(22); // dark green band
+/// Loop-region bracket / label colour (brighter than the band).
+const LOOP_EDGE_COLOR: Color = Color::Green;
 
 /// Outcome of a key press while the dirty-exit prompt is displayed.
 #[derive(Debug, PartialEq, Eq)]
@@ -191,6 +195,8 @@ fn key_to_action(code: KeyCode) -> Option<Action> {
 
         // ── loop / metronome / count-in ─────────────────────────────────
         KeyCode::Char('o') => Action::ToggleLoop,
+        KeyCode::Char('{') => Action::SetLoopStart, // loop-in at cursor
+        KeyCode::Char('}') => Action::SetLoopEnd,   // loop-out at cursor
         KeyCode::Char('M') => Action::ToggleMetronome,
         KeyCode::Char('C') => Action::StartCountInRecord,
 
@@ -981,6 +987,16 @@ impl EditScreen {
         self.dispatch(Action::ToggleLoop);
     }
 
+    /// Set the loop region's start (loop-in) to the cursor position.
+    pub fn set_loop_start(&mut self) {
+        self.dispatch(Action::SetLoopStart);
+    }
+
+    /// Set the loop region's end (loop-out) to the cursor position.
+    pub fn set_loop_end(&mut self) {
+        self.dispatch(Action::SetLoopEnd);
+    }
+
     /// Whether the metronome click is armed.
     pub fn is_metronome_on(&self) -> bool {
         self.composer.is_metronome_on()
@@ -1147,8 +1163,27 @@ impl EditScreen {
             }
         };
 
+        // Make playback state unmistakable: a bright PLAYING badge while the
+        // transport runs, so users know Space (a toggle) will stop it.
+        let playing_span = if self.composer.is_playing() {
+            Span::styled(
+                " ▶ PLAYING ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(PLAYHEAD_COLOR)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::raw("")
+        };
         let loop_span = if self.composer.is_looping() {
-            Span::styled(" LOOP ", Style::default().fg(Color::Black).bg(Color::Green))
+            let (ls, le) = self.composer.loop_bounds();
+            let (lb, _) = self.grid.bar_beat_of(ls);
+            let (le_bar, _) = self.grid.bar_beat_of(le.saturating_sub(1));
+            Span::styled(
+                format!(" LOOP {}-{} ", lb + 1, le_bar + 1),
+                Style::default().fg(Color::Black).bg(Color::Green),
+            )
         } else {
             Span::raw("")
         };
@@ -1218,6 +1253,7 @@ impl EditScreen {
 
         let line = Line::from(vec![
             Span::styled(badge_text, badge_style),
+            playing_span,
             loop_span,
             metro_span,
             count_in_span,
@@ -1231,7 +1267,7 @@ impl EditScreen {
             ),
             vel_span,
             Span::styled(
-                "[a/x] add/del  []/[] size  [+/-] vel  [m] grab  [c] chord  [v] select  [y/p/D] yank/paste/del  [u/U] undo/redo  [R] rec  [t] step/live  [C] count-in  [o] loop  [M] metro  [P] play-start  [>/<] subdiv  [hjkl] pitch/time  [H/L] bar  [w/b] oct  [g/G] timeline ends  [0/$] pitch ends  [s] save  [S] save to library  [Tab] menu",
+                "[a/x] add/del  []/[] size  [+/-] vel  [m] grab  [c] chord  [v] select  [y/p/D] yank/paste/del  [u/U] undo/redo  [R] rec  [t] step/live  [C] count-in  [Space] play/stop  [P] play-start  [o] loop  [{/}] loop in/out  [M] metro  [>/<] subdiv  [hjkl] pitch/time  [H/L] bar  [w/b] oct  [g/G] timeline ends  [0/$] pitch ends  [s] save  [S] save to library  [Tab] menu",
                 Style::default().fg(Color::DarkGray),
             ),
         ]);
@@ -1260,6 +1296,8 @@ impl EditScreen {
 
         // Beat/bar gridlines first, so notes and the cursor paint over them.
         self.draw_gridlines(f, area, now, lead);
+        // Loop region band under the playhead/notes so it reads as a backdrop.
+        self.draw_loop_region(f, area, now, lead);
         self.draw_playhead(f, area, now, lead);
 
         // Crosshair guides through the cursor (its step row, full width, and its
@@ -1392,6 +1430,81 @@ impl EditScreen {
         );
     }
 
+    /// Draw the loop region as a tinted band spanning its rows, with bracket
+    /// lines at the loop-in / loop-out edges and a "LOOP" label, so the region
+    /// `o` plays and `{`/`}` move is visible and locatable. A no-op when not
+    /// looping or the region has no positive width.
+    fn draw_loop_region(&self, f: &mut Frame, area: Rect, now: u64, lead: u64) {
+        if !self.composer.is_looping() || area.width == 0 {
+            return;
+        }
+        let (start_us, end_us) = self.composer.loop_bounds();
+        if end_us <= start_us {
+            return;
+        }
+        // Project the loop edges onto highway rows. `end_us - 1` keeps the band
+        // inside the region (the end is exclusive).
+        let row_of = |us: u64| -> Option<u16> {
+            project(
+                &NoteSpan {
+                    note: LOWEST_MIDI,
+                    start_us: us,
+                    end_us: us + 1,
+                },
+                now,
+                lead,
+                area.height,
+            )
+            .map(|rs| rs.bottom_row)
+        };
+        // Later song time projects to a *higher* (smaller) row, so the start row
+        // is the band's bottom and the end row its top.
+        let start_row = row_of(start_us);
+        let end_row = row_of(end_us.saturating_sub(1));
+        // Tint every visible row inside [end_row, start_row].
+        let (lo, hi) = match (end_row, start_row) {
+            (Some(a), Some(b)) => (a.min(b), a.max(b)),
+            // One edge off-screen: tint from the visible edge to the window edge
+            // so a partially-scrolled loop still reads as a band.
+            (Some(a), None) => (a, area.height.saturating_sub(1)),
+            (None, Some(b)) => (0, b),
+            (None, None) => return,
+        };
+        let band = " ".repeat(area.width as usize);
+        for row in lo..=hi {
+            if row >= area.height {
+                break;
+            }
+            let rect = Rect::new(area.x, area.y + row, area.width, 1);
+            f.render_widget(
+                Paragraph::new(band.clone()).style(Style::default().bg(LOOP_COLOR)),
+                rect,
+            );
+        }
+        // Bracket lines at the in/out edges, plus a label on the loop-in line.
+        let edge = "═".repeat(area.width as usize);
+        if let Some(row) = start_row {
+            if row < area.height {
+                let rect = Rect::new(area.x, area.y + row, area.width, 1);
+                f.render_widget(
+                    Paragraph::new(format!("╞═ LOOP IN {edge}"))
+                        .style(Style::default().fg(LOOP_EDGE_COLOR).bg(LOOP_COLOR)),
+                    rect,
+                );
+            }
+        }
+        if let Some(row) = end_row {
+            if row < area.height {
+                let rect = Rect::new(area.x, area.y + row, area.width, 1);
+                f.render_widget(
+                    Paragraph::new(format!("╞═ LOOP OUT {edge}"))
+                        .style(Style::default().fg(LOOP_EDGE_COLOR).bg(LOOP_COLOR)),
+                    rect,
+                );
+            }
+        }
+    }
+
     /// Faint horizontal lines at bar boundaries within the visible window.
     fn draw_gridlines(&self, f: &mut Frame, area: Rect, now: u64, lead: u64) {
         let bar = self.grid.bar_us();
@@ -1516,6 +1629,9 @@ impl EditScreen {
             Line::from(Span::raw(
                 "  Space : Play/stop from cursor  P : Play from start",
             )),
+            Line::from(Span::raw(
+                "  (Space toggles — press again to stop; PLAYING shows in status)",
+            )),
             Line::from(Span::raw("")), // Empty line
             Line::from(Span::styled(
                 " Backing alignment (slide audio under the highway):",
@@ -1534,6 +1650,9 @@ impl EditScreen {
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::raw("  o : Toggle loop         M : Toggle metronome")),
+            Line::from(Span::raw(
+                "  { : Set loop start (in)  } : Set loop end (out) at cursor",
+            )),
             Line::from(Span::raw("  C : Count-in record")),
             Line::from(Span::raw("")), // Empty line
             Line::from(Span::styled(
@@ -3589,5 +3708,96 @@ mod tests {
         let meta = RecordingMeta::from_json(&json).unwrap();
         assert!(meta.backing.is_none());
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    // ── M9-C: transport visibility + loop-region controls ────────────────────
+
+    /// `Space`/`o` plus the new `{`/`}` keys map to the expected transport /
+    /// loop-bounds actions (the rebinding seam).
+    #[test]
+    fn transport_and_loop_keymap() {
+        assert_eq!(
+            key_to_action(KeyCode::Char(' ')),
+            Some(Action::TogglePlayCursor)
+        );
+        assert_eq!(
+            key_to_action(KeyCode::Char('P')),
+            Some(Action::PlayFromStart)
+        );
+        assert_eq!(key_to_action(KeyCode::Char('o')), Some(Action::ToggleLoop));
+        assert_eq!(
+            key_to_action(KeyCode::Char('{')),
+            Some(Action::SetLoopStart)
+        );
+        assert_eq!(key_to_action(KeyCode::Char('}')), Some(Action::SetLoopEnd));
+    }
+
+    /// The PLAYING badge appears in the status line while playing and clears on
+    /// stop (Space toggles).
+    #[test]
+    fn playing_badge_shows_while_playing_and_clears_on_stop() {
+        let mut e = EditScreen::new();
+        let mut terminal = Terminal::new(TestBackend::new(160, 30)).unwrap();
+
+        let rendered = |t: &mut Terminal<TestBackend>, e: &EditScreen| -> String {
+            t.draw(|f| e.draw(f, f.area())).expect("draw");
+            t.backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect()
+        };
+
+        assert!(!rendered(&mut terminal, &e).contains("PLAYING"));
+        e.on_key(KeyCode::Char(' ')); // start
+        assert!(e.is_playing());
+        assert!(rendered(&mut terminal, &e).contains("PLAYING"));
+        e.on_key(KeyCode::Char(' ')); // stop (toggle)
+        assert!(!e.is_playing());
+        assert!(!rendered(&mut terminal, &e).contains("PLAYING"));
+    }
+
+    /// With looping on, the loop band renders (LOOP IN / OUT brackets appear).
+    #[test]
+    fn loop_band_renders_when_looping() {
+        let mut e = EditScreen::new();
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+
+        let rendered = |t: &mut Terminal<TestBackend>, e: &EditScreen| -> String {
+            t.draw(|f| e.draw(f, f.area())).expect("draw");
+            t.backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect()
+        };
+
+        assert!(!rendered(&mut terminal, &e).contains("LOOP IN"));
+        e.on_key(KeyCode::Char('o')); // toggle loop on (defaults to current bar)
+        assert!(e.is_looping());
+        let frame = rendered(&mut terminal, &e);
+        assert!(
+            frame.contains("LOOP IN") || frame.contains("LOOP OUT"),
+            "loop region band should render an edge bracket when looping"
+        );
+    }
+
+    /// `{` / `}` move the loop bounds to the cursor (loop-in / loop-out).
+    #[test]
+    fn loop_in_out_keys_move_bounds_to_cursor() {
+        let mut e = EditScreen::new();
+        let step = e.grid.step_us();
+        // Loop-in at step 0.
+        e.on_key(KeyCode::Char('{'));
+        // Move three steps later, loop-out there.
+        for _ in 0..3 {
+            e.on_key(KeyCode::Char('k')); // step +1 (later)
+        }
+        e.on_key(KeyCode::Char('}'));
+        let (start, end) = e.loop_bounds();
+        assert_eq!(start, 0);
+        assert_eq!(end, 4 * step, "loop-out includes the step under the cursor");
     }
 }
