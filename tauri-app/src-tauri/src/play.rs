@@ -367,7 +367,7 @@ impl PlaySession {
             duration_us: self.duration_us,
             lead_us: LEAD_US,
             has_backing: self.backing.is_some(),
-            video: self.video.as_ref().map(|v| BackgroundVideoView {
+            video: self.video().map(|v| BackgroundVideoView {
                 path: v.path.to_string_lossy().into_owned(),
                 offset_us: v.offset_us,
             }),

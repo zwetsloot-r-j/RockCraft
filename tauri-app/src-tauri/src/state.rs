@@ -620,6 +620,7 @@ mod tests {
                 *state.origin.lock().unwrap(),
                 None,
                 0,
+                None,
             )
             .expect("write_bundle should succeed");
         }
