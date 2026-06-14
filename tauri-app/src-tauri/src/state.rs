@@ -406,6 +406,60 @@ pub fn load_bundle(state: &AppState, dir: &str) -> Result<ComposerSnapshot, Stri
     Ok(composer.snapshot())
 }
 
+/// Serializable backing-track reference for the edit screen — the absolute
+/// `path` of the attached audio file and its display file name (no directory).
+/// Mirrors the video-ref shape (M9-E). The alignment offset itself lives on the
+/// composer (`backing_offset_us`) and surfaces in the snapshot, so it is not
+/// duplicated here.
+#[derive(Debug, Clone, Serialize)]
+pub struct BackingRef {
+    pub path: String,
+    pub name: String,
+}
+
+/// Attach (or replace) the backing audio track on the live editor, marking the
+/// timeline dirty so a later save persists it into the bundle's
+/// `RecordingMeta.backing` (M9-E). `path` is the absolute file the webview
+/// picked; the audio plumbing (attach to the playback thread) is driven by the
+/// command wrapper in `lib.rs`, reusing the existing `attach_backing` path.
+///
+/// This is the sibling of [`set_video`]: it only owns the frontend-mirrored
+/// state that `save_bundle` reads (`backing_path`); it does not touch the audio
+/// device or the composer's `backing_offset_us`.
+pub fn set_backing(state: &AppState, path: String) {
+    *state
+        .backing_path
+        .lock()
+        .expect("backing_path mutex poisoned") = Some(std::path::PathBuf::from(path));
+    *state.dirty.lock().expect("dirty mutex poisoned") = true;
+}
+
+/// Detach the backing audio track. Marks the timeline dirty (M9-E). The audio
+/// stop is driven by the command wrapper, reusing the existing `detach_backing`.
+pub fn clear_backing(state: &AppState) {
+    *state
+        .backing_path
+        .lock()
+        .expect("backing_path mutex poisoned") = None;
+    *state.dirty.lock().expect("dirty mutex poisoned") = true;
+}
+
+/// The currently attached backing track, or `None` (M9-E).
+pub fn query_backing(state: &AppState) -> Option<BackingRef> {
+    state
+        .backing_path
+        .lock()
+        .expect("backing_path mutex poisoned")
+        .as_ref()
+        .map(|p| BackingRef {
+            path: p.to_string_lossy().into_owned(),
+            name: p
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| p.to_string_lossy().into_owned()),
+        })
+}
+
 /// Serializable background-video reference for the edit screen — the absolute
 /// `path` the webview wraps with `convertFileSrc`, plus the alignment offset.
 #[derive(Debug, Clone, Serialize)]
@@ -682,5 +736,95 @@ mod tests {
         assert_eq!(snap.notes.len(), 1, "legacy bundle note count");
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// M9-E: a backing track attached while editing (`set_backing`) is written
+    /// into the bundle's `meta.json` on save and restored into `backing_path`
+    /// (and the composer's offset) on load — the relocation's persistence
+    /// round-trip. Mirrors the video round-trip but for audio backing.
+    #[test]
+    fn set_backing_persists_and_round_trips() {
+        let dir = std::env::temp_dir().join(format!(
+            "rockcraft-backing-rt-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A stand-in backing file the picker would have chosen.
+        let src_backing = dir.join("my-song.ogg");
+        std::fs::write(&src_backing, b"not really audio, just bytes").unwrap();
+
+        let state = AppState::new();
+        run_action(&state, "add_note", &json!({})).expect("add_note");
+
+        // Attach the backing while editing, then give it a non-zero alignment
+        // offset (the existing nudge path the spec must not break).
+        set_backing(&state, src_backing.to_string_lossy().into_owned());
+        assert!(query_dirty(&state), "attaching backing marks dirty");
+        let backing_ref = query_backing(&state).expect("backing attached");
+        assert_eq!(backing_ref.name, "my-song.ogg");
+        run_action(
+            &state,
+            "nudge_backing_offset",
+            &json!({ "delta_us": 250_000 }),
+        )
+        .expect("nudge_backing_offset");
+
+        // Save into a bundle directory (write_bundle reads backing_path + offset).
+        let bundle_dir = dir.join("bundle");
+        {
+            let composer = state.composer.lock().unwrap();
+            write_bundle(
+                &bundle_dir,
+                composer.timeline(),
+                composer.grid(),
+                *state.key.lock().unwrap(),
+                *state.origin.lock().unwrap(),
+                state.backing_path.lock().unwrap().as_deref(),
+                composer.backing_offset_us(),
+                None,
+            )
+            .expect("write_bundle with backing should succeed");
+        }
+
+        // meta.json carries the backing entry (bundle-relative filename + offset).
+        let meta_json =
+            std::fs::read_to_string(bundle_dir.join("meta.json")).expect("meta.json exists");
+        let meta = RecordingMeta::from_json(&meta_json).expect("meta parses");
+        let backing = meta.backing.expect("meta.backing is present after save");
+        assert_eq!(backing.file, "backing.ogg", "backing filename in meta");
+        assert_eq!(
+            backing.audio_start_us, 250_000,
+            "backing alignment offset round-trips into meta"
+        );
+        assert!(
+            bundle_dir.join("backing.ogg").exists(),
+            "backing audio copied into the bundle"
+        );
+
+        // Load the bundle back: backing_path and the composer offset are restored.
+        let snap = load_bundle(&state, &bundle_dir.to_string_lossy())
+            .expect("load_bundle with backing succeeds");
+        assert_eq!(
+            snap.backing_offset_us, 250_000,
+            "composer backing offset restored on load"
+        );
+        let reloaded = query_backing(&state).expect("backing restored after load");
+        assert_eq!(reloaded.name, "backing.ogg");
+        assert!(
+            reloaded.path.ends_with("backing.ogg"),
+            "restored backing path points into the bundle, got {}",
+            reloaded.path
+        );
+
+        // Detach clears it and marks dirty again.
+        clear_backing(&state);
+        assert!(query_backing(&state).is_none(), "detach clears backing");
+        assert!(query_dirty(&state), "detach marks dirty");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

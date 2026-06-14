@@ -35,7 +35,7 @@ use crate::import::ImportRunning;
 use crate::midi::{MidiState, MidiStatus};
 use crate::play::PlayState;
 use crate::record::RecordState;
-use crate::state::{ActionReply, AppState, SaveDest, VideoRef};
+use crate::state::{ActionReply, AppState, BackingRef, SaveDest, VideoRef};
 
 /// Tick cadence for the transport-advance thread (~4 ms ≈ 250 Hz).
 const TICK_PERIOD: std::time::Duration = std::time::Duration::from_millis(4);
@@ -147,9 +147,19 @@ fn save_bundle(state: State<'_, AppState>, dest: SaveDest) -> Result<String, Str
 #[tauri::command]
 fn load_bundle(
     state: State<'_, AppState>,
+    audio: State<'_, AudioState>,
     dir: String,
 ) -> Result<rockcraft_core::ComposerSnapshot, String> {
-    state::load_bundle(&state, &dir)
+    let snapshot = state::load_bundle(&state, &dir)?;
+    // Re-attach the bundle's backing track (if any) to the audio thread so the
+    // transport coupling (`sync_backing`) plays it under the editor — mirrors
+    // the play screen's lazy attach (M9-E). When the bundle declares no backing,
+    // detach so a previously-loaded one does not linger.
+    match state::query_backing(&state) {
+        Some(b) => audio::attach_backing_inner(&audio, std::path::PathBuf::from(b.path)),
+        None => audio::detach_backing_inner(&audio),
+    }
+    Ok(snapshot)
 }
 
 /// Return whether the current timeline has unsaved changes.
@@ -182,6 +192,41 @@ fn edit_clear_video(state: State<'_, AppState>) {
 #[tauri::command]
 fn edit_query_video(state: State<'_, AppState>) -> Option<VideoRef> {
     state::query_video(&state)
+}
+
+/// Attach (or replace) the edit-screen backing audio track (M9-E). `path` is the
+/// absolute file the webview picked; it is stored on the live editor so
+/// `save_bundle` persists it into the bundle's `RecordingMeta.backing`, and is
+/// handed to the existing playback thread (`attach_backing_inner`) so it plays
+/// under the transport without duplicating the audio plumbing. The file must
+/// exist; returns an error string otherwise.
+#[tauri::command]
+fn edit_set_backing(
+    state: State<'_, AppState>,
+    audio: State<'_, AudioState>,
+    path: String,
+) -> Result<(), String> {
+    let p = std::path::PathBuf::from(&path);
+    if !p.exists() {
+        return Err(format!("backing file not found: {path}"));
+    }
+    state::set_backing(&state, path);
+    audio::attach_backing_inner(&audio, p);
+    Ok(())
+}
+
+/// Detach the edit-screen backing audio track (M9-E). Clears it from the live
+/// editor (so the next save drops `meta.backing`) and stops playback.
+#[tauri::command]
+fn edit_clear_backing(state: State<'_, AppState>, audio: State<'_, AudioState>) {
+    state::clear_backing(&state);
+    audio::detach_backing_inner(&audio);
+}
+
+/// Return the currently attached backing track, or `null` (M9-E).
+#[tauri::command]
+fn edit_query_backing(state: State<'_, AppState>) -> Option<BackingRef> {
+    state::query_backing(&state)
 }
 
 /// Return the current MIDI input status (`kind` + optional `port` name).
@@ -357,6 +402,9 @@ pub fn run() {
             edit_set_video_offset,
             edit_clear_video,
             edit_query_video,
+            edit_set_backing,
+            edit_clear_backing,
+            edit_query_backing,
             midi_status,
             mock_key,
             audio::attach_backing,

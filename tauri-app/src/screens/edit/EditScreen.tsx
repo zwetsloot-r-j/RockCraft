@@ -26,12 +26,16 @@ import { createStore } from "solid-js/store";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
+  editClearBacking,
   editClearVideo,
+  editQueryBacking,
   editQueryVideo,
+  editSetBacking,
   editSetVideo,
   editSetVideoOffset,
   loadBundle,
   onSnapshot,
+  openBackingFilePicker,
   openVideoFilePicker,
   queryDirty,
   queryState,
@@ -104,6 +108,13 @@ export function EditScreen(props: Props): JSX.Element {
   // persisted via the `transcription.json` sidecar, never the bundle schema.
   const [videoPath, setVideoPath] = createSignal<string | null>(null);
   const [offsetUs, setOffsetUs] = createSignal(0);
+
+  // ── Backing audio track (M9-E) ───────────────────────────────────────────
+  // The attached backing file name (null = none). The relocation of the former
+  // top-level "Choose backing track" menu item into this screen: `B` opens the
+  // native audio picker (or detaches), and the choice is persisted into the
+  // loaded piece's meta.backing by `save_bundle` (the backend holds the path).
+  const [backingName, setBackingName] = createSignal<string | null>(null);
 
   // The snapshot mirror.
   const [store, setStore] = createStore<{ snap: ComposerSnapshot | null }>({
@@ -270,6 +281,47 @@ export function EditScreen(props: Props): JSX.Element {
     else detachBackdrop();
   }
 
+  // ── Backing audio track (M9-E) ──────────────────────────────────────────
+
+  /** Open the native audio picker and attach the chosen file as the backing
+   * track for the loaded piece. The path is pushed to the backend so
+   * `save_bundle` persists it into the bundle's meta.backing and the playback
+   * thread plays it under the transport (reusing attach_backing). Marks dirty. */
+  function attachBacking(): void {
+    void openBackingFilePicker()
+      .then((path) => {
+        if (path === null) return; // cancelled
+        editSetBacking(path)
+          .then(() => {
+            const name = path.split(/[\\/]/).pop() ?? path;
+            setBackingName(name);
+            setDirty(true);
+            showFlash(`backing → ${name}`);
+          })
+          .catch((e: unknown) => {
+            showFlash(`backing failed: ${String(e)}`);
+          });
+      })
+      .catch(() => {
+        showFlash("could not open audio picker");
+      });
+  }
+
+  /** Detach the backing track (stops playback, drops it from the next save). */
+  function detachBacking(): void {
+    setBackingName(null);
+    setDirty(true);
+    void editClearBacking().catch(() => {
+      /* backend down — UI state already cleared */
+    });
+  }
+
+  /** `B` toggles the backing track: pick when none, detach when attached. */
+  function toggleBacking(): void {
+    if (backingName() === null) attachBacking();
+    else detachBacking();
+  }
+
   /** Nudge the alignment offset and re-sync the frame immediately. The new
    * offset is pushed to the backend so a later save persists it (M9-G). */
   function nudgeOffset(deltaUs: number): void {
@@ -424,6 +476,17 @@ export function EditScreen(props: Props): JSX.Element {
       }
     }
 
+    // ── Backing audio track (M9-E), non-chord mode only ─────────────────
+    if (s.chord_preview === null) {
+      // `B` attaches a backing track (or detaches the current one). Relocated
+      // here from the former top-level "Choose backing track" menu item.
+      if (e.key === "B") {
+        e.preventDefault();
+        toggleBacking();
+        return;
+      }
+    }
+
     // ── Video backdrop (M7-tauri-N), non-chord mode only ────────────────
     if (s.chord_preview === null) {
       // `V` attaches a video (or detaches the current one).
@@ -507,6 +570,14 @@ export function EditScreen(props: Props): JSX.Element {
       ? loadBundle(props.dir).then((snap) => {
           applySnapshot(snap);
           setDirty(false);
+          // Reflect the bundle's backing track, if any (M9-E). The backend's
+          // load_bundle already restored meta.backing into backing_path and
+          // re-attached it to the playback thread; mirror its name on screen.
+          void editQueryBacking()
+            .then((ref) => setBackingName(ref ? ref.name : null))
+            .catch(() => {
+              /* backend down — leave the indicator hidden */
+            });
           // Re-attach the persisted background video, if any. The backend's
           // load_bundle already populated it from meta.video (M9-G); fall back
           // to the legacy transcription.json sidecar (M7-tauri-N) so older
@@ -696,6 +767,10 @@ export function EditScreen(props: Props): JSX.Element {
           <BackdropHud offsetUs={offsetUs()} />
         </Show>
 
+        {/* Backing-track indicator (M9-E) — shows the attached audio file and
+            the attach/detach key. Sits above the backdrop HUD when both show. */}
+        <BackingHud name={backingName()} />
+
         {/* Chord selector panel — shown while chord_preview is non-null */}
         <Show when={store.snap?.chord_preview !== null && store.snap?.chord_preview !== undefined}>
           <ChordSelectorPanel snap={store.snap!} />
@@ -797,6 +872,62 @@ function BackdropHud(props: { offsetUs: number }): JSX.Element {
       </div>
       <div style={{ color: "#6a6e7e", "font-size": "11px" }}>
         ,/. ±10 ms · ;/' ±250 ms · V detach
+      </div>
+    </div>
+  );
+}
+
+// ── BackingHud ──────────────────────────────────────────────────────────────
+
+/**
+ * Small floating indicator for the backing audio track (M9-E). When a track is
+ * attached it names the file and offers `B` to detach; when none is attached it
+ * shows the `B`-to-attach affordance so the relocated entry point is
+ * discoverable on the edit screen itself. Aligns audio with `,/. ;/'`.
+ */
+function BackingHud(props: { name: string | null }): JSX.Element {
+  return (
+    <div
+      style={{
+        position: "absolute",
+        top: "12px",
+        left: "16px",
+        background: "rgba(26,27,36,0.85)",
+        border: `1px solid ${props.name ? "#3fd0d6" : "rgba(255,255,255,0.12)"}`,
+        "border-radius": "8px",
+        padding: "8px 12px",
+        "z-index": 100,
+        "backdrop-filter": "blur(3px)",
+        "font-family": "'Space Grotesk', system-ui, sans-serif",
+      }}
+    >
+      <div style={{ display: "flex", "align-items": "center", gap: "8px" }}>
+        <span
+          style={{
+            background: props.name ? "#3fd0d6" : "transparent",
+            color: props.name ? "#0f1016" : "#6a6e7e",
+            border: props.name ? "none" : "1px solid #3a3d4a",
+            padding: "2px 8px",
+            "border-radius": "4px",
+            "font-size": "11px",
+            "font-weight": 700,
+            "letter-spacing": "0.5px",
+          }}
+        >
+          BACKING
+        </span>
+        <span
+          style={{
+            color: props.name ? "#e7e8ef" : "#6a6e7e",
+            "font-size": "12px",
+            "font-family": "'IBM Plex Mono', ui-monospace, monospace",
+          }}
+        >
+          {props.name ?? "none"}
+        </span>
+        <span style={{ color: "#6a6e7e", "font-size": "11px" }}>
+          {props.name ? "· B detach" : "· B choose"}
+        </span>
       </div>
     </div>
   );
@@ -960,8 +1091,9 @@ function HelpOverlay(props: { onClose: () => void }): JSX.Element {
       ],
     },
     {
-      title: "Backing alignment",
+      title: "Backing track",
       rows: [
+        "B             Choose / detach a backing audio track",
         ", / .         Nudge −/+ 10 ms",
         "; / '         Nudge −/+ 250 ms",
       ],

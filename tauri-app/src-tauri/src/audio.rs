@@ -381,6 +381,15 @@ pub fn play_backing_now(state: &AudioState) {
     state.send_backing(BackingMsg::PlayAt(0));
 }
 
+/// Detach the backing track (stops playback) without a Tauri `State` wrapper.
+///
+/// The sibling of [`attach_backing_inner`]: used by the edit-screen
+/// attach/detach path (M9-E) and on `load_bundle` when the loaded bundle
+/// declares no backing, so a previously-loaded track does not linger.
+pub fn detach_backing_inner(state: &AudioState) {
+    state.send_backing(BackingMsg::Detach);
+}
+
 // ── Tauri commands ───────────────────────────────────────────────────────────
 
 /// Audio status reported to the webview.
