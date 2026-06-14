@@ -26,6 +26,10 @@ import { createStore } from "solid-js/store";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
+  editClearVideo,
+  editQueryVideo,
+  editSetVideo,
+  editSetVideoOffset,
   loadBundle,
   onSnapshot,
   openVideoFilePicker,
@@ -34,7 +38,6 @@ import {
   runAction,
   saveBundle,
   transcriptionLoad,
-  transcriptionSave,
 } from "../../ipc/bridge";
 import type { ComposerSnapshot } from "../../ipc/types";
 import { EditCanvas } from "./EditCanvas";
@@ -171,10 +174,12 @@ export function EditScreen(props: Props): JSX.Element {
   }
 
   function doQuickSave(): void {
+    // The background video (if any) is persisted into the bundle's meta.json by
+    // `save_bundle` itself now (M9-G) — the backend holds the reference, set via
+    // editSetVideo/editSetVideoOffset/editClearVideo.
     saveBundle({ kind: "quick_save" })
       .then((dir) => {
         setDirty(false);
-        persistBackdrop(dir);
         showFlash(`saved → ${dir}`);
       })
       .catch((e: unknown) => {
@@ -186,7 +191,6 @@ export function EditScreen(props: Props): JSX.Element {
     saveBundle({ kind: "library", name })
       .then((dir) => {
         setDirty(false);
-        persistBackdrop(dir);
         showFlash(`saved to library → ${dir}`);
       })
       .catch((e: unknown) => {
@@ -196,34 +200,31 @@ export function EditScreen(props: Props): JSX.Element {
 
   // ── Video backdrop (M7-tauri-N) ─────────────────────────────────────────
 
-  /** After a save resolves, write the backdrop sidecar if one is attached. */
-  function persistBackdrop(dir: string): void {
-    const v = videoPath();
-    if (v === null) return;
-    void transcriptionSave(dir, { video: v, offset_us: offsetUs() }).catch(
-      () => {
-        /* sidecar is best-effort; the bundle itself already saved */
-      },
-    );
-  }
-
-  /** Open the native picker and attach the chosen video as the backdrop. */
+  /** Open the native picker and attach the chosen video as the backdrop.
+   * The reference is pushed to the backend so `save_bundle` persists it into the
+   * bundle's `meta.json` (M9-G — promotes N's sidecar to a first-class field). */
   function attachBackdrop(): void {
     void openVideoFilePicker()
       .then((path) => {
         if (path === null) return; // cancelled
         setVideoPath(path);
         setOffsetUs(0);
+        void editSetVideo(path, 0).catch(() => {
+          /* backend down (plain vite) — UI state still reflects the pick */
+        });
       })
       .catch(() => {
         showFlash("could not open video picker");
       });
   }
 
-  /** Clear the backdrop and reset its offset. */
+  /** Clear the backdrop and reset its offset (both locally and on the backend). */
   function detachBackdrop(): void {
     setVideoPath(null);
     setOffsetUs(0);
+    void editClearVideo().catch(() => {
+      /* backend down — UI state already cleared */
+    });
   }
 
   /** `V` toggles the backdrop: pick when none, detach when attached. */
@@ -232,11 +233,18 @@ export function EditScreen(props: Props): JSX.Element {
     else detachBackdrop();
   }
 
-  /** Nudge the alignment offset and re-sync the frame immediately. */
+  /** Nudge the alignment offset and re-sync the frame immediately. The new
+   * offset is pushed to the backend so a later save persists it (M9-G). */
   function nudgeOffset(deltaUs: number): void {
-    setOffsetUs((o) => o + deltaUs);
+    const next = offsetUs() + deltaUs;
+    setOffsetUs(next);
     const s = store.snap;
     if (s) syncVideo(anchorUsOf(s));
+    if (videoPath() !== null) {
+      void editSetVideoOffset(next).catch(() => {
+        /* backend down — UI state still reflects the offset */
+      });
+    }
   }
 
   // Bind the `<video>` src to the attached path (via the asset protocol) and
@@ -429,16 +437,29 @@ export function EditScreen(props: Props): JSX.Element {
       ? loadBundle(props.dir).then((snap) => {
           applySnapshot(snap);
           setDirty(false);
-          // Re-attach a previously saved video backdrop, if any (M7-tauri-N).
-          void transcriptionLoad(props.dir!)
-            .then((dto) => {
-              if (dto) {
-                setVideoPath(dto.video);
-                setOffsetUs(dto.offset_us);
+          // Re-attach the persisted background video, if any. The backend's
+          // load_bundle already populated it from meta.video (M9-G); fall back
+          // to the legacy transcription.json sidecar (M7-tauri-N) so older
+          // bundles still re-attach their backdrop.
+          void editQueryVideo()
+            .then((ref) => {
+              if (ref) {
+                setVideoPath(ref.path);
+                setOffsetUs(ref.offset_us);
+                return;
               }
+              return transcriptionLoad(props.dir!).then((dto) => {
+                if (dto) {
+                  setVideoPath(dto.video);
+                  setOffsetUs(dto.offset_us);
+                  // Promote the legacy sidecar onto the bundle field so the next
+                  // save persists it in meta.json.
+                  void editSetVideo(dto.video, dto.offset_us).catch(() => {});
+                }
+              });
             })
             .catch(() => {
-              /* no sidecar / backend down — leave the backdrop detached */
+              /* backend down — leave the backdrop detached */
             });
         })
       : queryState().then(applySnapshot);

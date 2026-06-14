@@ -5,12 +5,15 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 
-use rockcraft_core::BackingTrack;
+use rockcraft_core::{BackgroundVideo, BackingTrack};
 
-use crate::{error::ImportError, parser::from_json, writer::write_chart_bundle_with_backing};
+use crate::{error::ImportError, parser::from_json, writer::write_chart_bundle_full};
 
 /// Bundle-relative filename of the audio extracted from the source video.
 const BACKING_FILENAME: &str = "backing.wav";
+
+/// Bundle-relative base name (without extension) for the retained source video.
+const VIDEO_BASENAME: &str = "source";
 
 /// How many trailing fetch-hook output lines to retain for failure messages.
 const FETCH_TAIL_LINES: usize = 20;
@@ -95,7 +98,11 @@ fn run_pipeline(
     // Best-effort: attach the source video's audio as the default backing track.
     // ffmpeg is optional — a missing or failing binary leaves `backing: null`.
     let backing = extract_backing(&video_path, &out_dir, &ctx.ffmpeg_cmd);
-    let bundle = write_chart_bundle_with_backing(&chart, &out_dir, backing)?;
+    // Retain the original source video inside the bundle so the imported piece
+    // comes with its background backdrop already attached (M9-G). Best-effort:
+    // a copy failure leaves `video: null` and the import still succeeds.
+    let video = retain_source_video(&video_path, &out_dir);
+    let bundle = write_chart_bundle_full(&chart, &out_dir, backing, video)?;
     on_progress(Progress::Done(bundle.clone()));
     Ok(bundle)
 }
@@ -135,6 +142,37 @@ fn extract_backing(video_path: &Path, out_dir: &Path, ffmpeg_cmd: &Path) -> Opti
         // Remove any empty/partial file so the bundle stays clean.
         let _ = std::fs::remove_file(&out_file);
         None
+    }
+}
+
+/// Copy the source video into `out_dir/source.<ext>` and return the
+/// [`BackgroundVideo`] reference to record in `meta.json` (offset 0 — 1:1
+/// real-time alignment, like M7-tauri-N).
+///
+/// Best-effort: returns `None` (leaving the bundle without a backdrop) when the
+/// source has no usable extension or the copy fails, so import degrades
+/// gracefully. The bundle-relative filename preserves the source extension so
+/// the webview's `<video>` can pick the right decoder.
+fn retain_source_video(video_path: &Path, out_dir: &Path) -> Option<BackgroundVideo> {
+    let ext = video_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .filter(|e| !e.is_empty());
+    let filename = match ext {
+        Some(e) => format!("{VIDEO_BASENAME}.{e}"),
+        None => VIDEO_BASENAME.to_string(),
+    };
+    let dest = out_dir.join(&filename);
+    match std::fs::copy(video_path, &dest) {
+        Ok(len) if len > 0 => Some(BackgroundVideo {
+            file: filename,
+            offset_us: 0,
+        }),
+        _ => {
+            // Clean up any empty/partial file so the bundle stays tidy.
+            let _ = std::fs::remove_file(&dest);
+            None
+        }
     }
 }
 
@@ -571,6 +609,87 @@ mod tests {
         let json = std::fs::read_to_string(bundle.join("meta.json")).unwrap();
         let meta = RecordingMeta::from_json(&json).unwrap();
         meta.backing.map(|b| b.file)
+    }
+
+    /// Parse the `video` reference from a bundle's `meta.json`, if any.
+    fn meta_video(bundle: &Path) -> Option<rockcraft_core::BackgroundVideo> {
+        let json = std::fs::read_to_string(bundle.join("meta.json")).unwrap();
+        RecordingMeta::from_json(&json).unwrap().video
+    }
+
+    /// Build a stub-sidecar workspace and run a File import end to end, returning
+    /// the resulting bundle path. ffmpeg is stubbed out (missing binary) so the
+    /// backing path degrades; the source video is `clip.<ext>`.
+    fn import_file_with_stub_sidecar(tmp: &TempDir, ext: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let video = tmp.path().join(format!("clip.{ext}"));
+        std::fs::write(&video, b"stub-video-bytes").unwrap();
+
+        let fixture_path = tmp.path().join("fixture.json");
+        std::fs::write(&fixture_path, FIXTURE_JSON).unwrap();
+        let sidecar_dir = tmp.path().join("tools/synthesia-extract");
+        std::fs::create_dir_all(&sidecar_dir).unwrap();
+        std::fs::write(
+            sidecar_dir.join("extract.py"),
+            format!(
+                "import sys\nwith open('{}') as f:\n    sys.stdout.write(f.read())\n",
+                fixture_path.display()
+            ),
+        )
+        .unwrap();
+        let _ = std::fs::set_permissions(
+            sidecar_dir.join("extract.py"),
+            std::fs::Permissions::from_mode(0o644),
+        );
+
+        let ctx = ctx_no_fetch(tmp);
+        run_pipeline(ImportInput::File(video), &mut |_| {}, &ctx)
+            .expect("import succeeds with stub sidecar")
+    }
+
+    /// A File import retains the original source video in the bundle and records
+    /// it as the background video (offset 0), preserving the source extension.
+    #[cfg(unix)]
+    #[test]
+    fn import_retains_source_video() {
+        let tmp = TempDir::new().unwrap();
+        let bundle = import_file_with_stub_sidecar(&tmp, "mp4");
+
+        let video = meta_video(&bundle).expect("imported bundle must carry a background video");
+        assert_eq!(video.file, "source.mp4", "source extension preserved");
+        assert_eq!(video.offset_us, 0, "imported video aligns 1:1");
+        assert!(
+            bundle.join("source.mp4").exists(),
+            "source video file must be copied into the bundle"
+        );
+        assert!(
+            std::fs::metadata(bundle.join("source.mp4")).unwrap().len() > 0,
+            "retained source video must be non-empty"
+        );
+    }
+
+    /// The retained source video keeps a `.webm` source extension (the webview
+    /// `<video>` decoder relies on it).
+    #[cfg(unix)]
+    #[test]
+    fn import_retains_source_video_extension() {
+        let tmp = TempDir::new().unwrap();
+        let bundle = import_file_with_stub_sidecar(&tmp, "webm");
+        assert_eq!(meta_video(&bundle).unwrap().file, "source.webm");
+        assert!(bundle.join("source.webm").exists());
+    }
+
+    /// `retain_source_video` returns `None` and leaves no file when the source
+    /// path does not exist (graceful degradation: audio-only / no source video).
+    #[test]
+    fn retain_source_video_missing_is_none() {
+        let tmp = TempDir::new().unwrap();
+        let out_dir = tmp.path().join("out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let missing = tmp.path().join("does-not-exist.mp4");
+        assert!(retain_source_video(&missing, &out_dir).is_none());
+        assert!(!out_dir.join("source.mp4").exists());
     }
 
     /// With no usable ffmpeg, a File import still produces a valid bundle whose

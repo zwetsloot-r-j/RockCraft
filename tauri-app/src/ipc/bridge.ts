@@ -330,6 +330,41 @@ export function transcriptionLoad(dir: string): Promise<TranscriptionDto | null>
   return invoke<TranscriptionDto | null>("transcription_load", { dir });
 }
 
+// ── Background video, persisted in the bundle (M9-G) ─────────────────────────
+
+/**
+ * A background-video reference held on the live editor — mirror of
+ * `state::VideoRef`. `path` is absolute; wrap it with `convertFileSrc` before
+ * assigning to a `<video>` element.
+ */
+export interface VideoRef {
+  path: string;
+  offset_us: number;
+}
+
+/**
+ * Attach (or replace) the edit-screen background video. Persisted into the
+ * bundle's `meta.json` on the next `save_bundle` (M9-G).
+ */
+export function editSetVideo(path: string, offsetUs: number): Promise<void> {
+  return invoke<void>("edit_set_video", { path, offsetUs });
+}
+
+/** Update only the alignment offset of the attached background video (M9-G). */
+export function editSetVideoOffset(offsetUs: number): Promise<void> {
+  return invoke<void>("edit_set_video_offset", { offsetUs });
+}
+
+/** Detach the edit-screen background video (M9-G). */
+export function editClearVideo(): Promise<void> {
+  return invoke<void>("edit_clear_video");
+}
+
+/** Return the currently attached background video, or `null` (M9-G). */
+export function editQueryVideo(): Promise<VideoRef | null> {
+  return invoke<VideoRef | null>("edit_query_video");
+}
+
 /**
  * Start an import. Returns `Err("import already running")` if a concurrent
  * import is in progress; otherwise spawns the pipeline thread and resolves
