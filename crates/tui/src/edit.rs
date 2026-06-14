@@ -442,6 +442,7 @@ impl EditScreen {
             grid: Some(self.grid),
             key: Some(self.key),
             origin: Some(self.origin),
+            video: None,
             version: 1,
         };
         std::fs::write(bundle_dir.join("meta.json"), meta.to_json())?;

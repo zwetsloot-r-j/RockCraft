@@ -536,6 +536,33 @@ impl Shell {
                 text: self.render_to_string(w, h),
             };
         }
+        // Host commands (the app-level I/O tier) are shell-wide, not editor-only:
+        // they drive play/library/etc. across screens. Dispatch them through the
+        // shell's `HostServices` regardless of the active screen.
+        if let Request::RunHostCommand {
+            id,
+            command,
+            params,
+        } = &req
+        {
+            return rockcraft_control::handle_run_host_command(self, *id, command, params);
+        }
+        // `query help` returns the full catalog (actions + host commands) from
+        // anywhere — agents discover the surface without first opening the editor.
+        if let Request::Query {
+            id,
+            what: QueryKind::Help,
+        } = &req
+        {
+            let mut composer = rockcraft_core::Composer::new();
+            return rockcraft_control::handle(
+                &mut composer,
+                Request::Query {
+                    id: *id,
+                    what: QueryKind::Help,
+                },
+            );
+        }
         match &mut self.screen {
             Screen::Edit(edit) => edit.apply_remote(req),
             _ => Response::Err {
@@ -562,6 +589,89 @@ impl Shell {
     /// Whether the shell has been asked to quit.
     pub fn is_quit(&self) -> bool {
         self.should_quit
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Host-command tier (app-level workflows over the control protocol)
+// ---------------------------------------------------------------------------
+
+/// The TUI's app-level command surface (M8-A).
+///
+/// `core::Action`s are handled by the editor's composer; these are the I/O
+/// workflows (library/play/...) the keyboard drives through the menu and library
+/// screens. The single exhaustive `match` is the compiler-enforced seam: a new
+/// [`HostCommand`](rockcraft_control::HostCommand) variant won't compile until
+/// this arm exists.
+///
+/// The TUI's record / import / backing flows are interactive screen state
+/// machines (text prompts, file pickers) with no headless entry point, so they
+/// return [`HostError::Unsupported`] here — an explicit, still-exhaustive arm.
+/// The library / play workflows, which *do* have direct entry points, are wired.
+impl rockcraft_control::HostServices for Shell {
+    fn dispatch(
+        &mut self,
+        cmd: rockcraft_control::HostCommand,
+    ) -> Result<serde_json::Value, rockcraft_control::HostError> {
+        use rockcraft_control::{HostCommand, HostError};
+        use serde_json::json;
+
+        match cmd {
+            HostCommand::ScanLibrary => {
+                let entries: Vec<serde_json::Value> =
+                    rockcraft_midi::bundle::list_library(&default_scan_roots())
+                        .into_iter()
+                        .map(|e| {
+                            json!({
+                                "name": e.name,
+                                "dir": e.dir.to_string_lossy(),
+                                "note_count": e.note_count,
+                                "duration_us": e.duration_us,
+                                "has_backing": e.has_backing,
+                            })
+                        })
+                        .collect();
+                Ok(json!(entries))
+            }
+            HostCommand::QueryDirty => {
+                // Only the editor tracks unsaved edits; other screens are clean.
+                let dirty = matches!(&self.screen, Screen::Edit(edit) if edit.is_dirty());
+                Ok(json!(dirty))
+            }
+            HostCommand::PlayLoad { dir } => {
+                let midi = std::path::Path::new(&dir).join("song.mid");
+                match load_play_screen(&midi, self.synth.clone()) {
+                    Ok(play) => {
+                        self.screen = Screen::Play(play);
+                        Ok(json!({ "loaded": dir }))
+                    }
+                    Err(detail) => Err(HostError::Failed {
+                        command: "play_load".into(),
+                        detail,
+                    }),
+                }
+            }
+            // Interactive, screen-state-machine workflows with no headless entry
+            // point in the TUI. Explicit, compiler-checked Unsupported arms.
+            HostCommand::SaveBundle { .. } => Err(HostError::Unsupported("save_bundle".into())),
+            HostCommand::LoadBundle { .. } => Err(HostError::Unsupported("load_bundle".into())),
+            HostCommand::PlaySetWait { .. } => Err(HostError::Unsupported("play_set_wait".into())),
+            HostCommand::PlayToggleHearSong => {
+                Err(HostError::Unsupported("play_toggle_hear_song".into()))
+            }
+            HostCommand::PlayFinish => Err(HostError::Unsupported("play_finish".into())),
+            HostCommand::RecordStart { .. } => Err(HostError::Unsupported("record_start".into())),
+            HostCommand::RecordStop => Err(HostError::Unsupported("record_stop".into())),
+            HostCommand::RecordSave => Err(HostError::Unsupported("record_save".into())),
+            HostCommand::AttachBacking { .. } => {
+                Err(HostError::Unsupported("attach_backing".into()))
+            }
+            HostCommand::DetachBacking => Err(HostError::Unsupported("detach_backing".into())),
+            HostCommand::ImportStart { .. } => Err(HostError::Unsupported("import_start".into())),
+            HostCommand::AudioStatus => Err(HostError::Unsupported("audio_status".into())),
+            HostCommand::MidiStatus => Err(HostError::Unsupported("midi_status".into())),
+            HostCommand::RecordStatus => Err(HostError::Unsupported("record_status".into())),
+        }
     }
 }
 
@@ -864,9 +974,65 @@ fn load_play_screen(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rockcraft_control::{HostCommand, HostServices, SaveDest};
     use rockcraft_core::{Grid, Key, MidiNote, Note, Scale, Timeline, Velocity};
     use rockcraft_midi::ScriptedSource;
     use tokio::sync::oneshot;
+
+    /// A sample of every [`HostCommand`] variant, for the no-panic dispatch test.
+    fn every_host_command() -> Vec<HostCommand> {
+        vec![
+            HostCommand::ScanLibrary,
+            HostCommand::SaveBundle {
+                dest: SaveDest::QuickSave,
+            },
+            HostCommand::LoadBundle { dir: "x".into() },
+            HostCommand::QueryDirty,
+            HostCommand::PlayLoad {
+                dir: "does/not/exist".into(),
+            },
+            HostCommand::PlaySetWait { on: true },
+            HostCommand::PlayToggleHearSong,
+            HostCommand::PlayFinish,
+            HostCommand::RecordStart { backing: None },
+            HostCommand::RecordStop,
+            HostCommand::RecordSave,
+            HostCommand::AttachBacking {
+                path: "b.ogg".into(),
+            },
+            HostCommand::DetachBacking,
+            HostCommand::ImportStart { url: "u".into() },
+            HostCommand::AudioStatus,
+            HostCommand::MidiStatus,
+            HostCommand::RecordStatus,
+        ]
+    }
+
+    /// Every host command dispatches without panicking. ScanLibrary and
+    /// QueryDirty succeed; PlayLoad on a missing dir fails cleanly; the
+    /// interactive workflows return Unsupported. None of them panic.
+    #[test]
+    fn shell_host_dispatch_handles_every_command() {
+        for cmd in every_host_command() {
+            let mut shell = make_shell();
+            let name = cmd.name();
+            // The result is allowed to be Ok or Err — what matters is no panic.
+            let _ = shell.dispatch(cmd);
+            // ScanLibrary and QueryDirty must always succeed.
+            if name == "scan_library" {
+                let mut shell = make_shell();
+                assert!(shell.dispatch(HostCommand::ScanLibrary).is_ok());
+            }
+            if name == "query_dirty" {
+                let mut shell = make_shell();
+                assert_eq!(
+                    shell.dispatch(HostCommand::QueryDirty).unwrap(),
+                    serde_json::json!(false),
+                    "a fresh shell (menu screen) is not dirty"
+                );
+            }
+        }
+    }
 
     fn make_note(pitch: u8, start: u64, dur: u64) -> Note {
         Note {

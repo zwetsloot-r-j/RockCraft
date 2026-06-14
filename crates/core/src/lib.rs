@@ -35,7 +35,8 @@ pub use history::History;
 pub use play_clock::PlayClock;
 pub use scoring::{score, ExpectedNote, NoteJudgment, ScoreConfig, ScoreReport, Timing};
 pub use song::{
-    backing_position_us, song_shift_us, BackingTrack, MetaError, RecordingMeta, TrackOrigin,
+    backing_position_us, song_shift_us, BackgroundVideo, BackingTrack, MetaError, RecordingMeta,
+    TrackOrigin,
 };
 pub use stats::Summary;
 pub use timeline::{Note, NoteId, Timeline};

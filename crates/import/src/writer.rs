@@ -4,7 +4,7 @@ use midly::{
     num::{u15, u28, u4, u7},
     Header, MidiMessage, Smf, Timing, Track, TrackEvent, TrackEventKind,
 };
-use rockcraft_core::{BackingTrack, NoteEvent, NoteEventKind, RecordingMeta};
+use rockcraft_core::{BackgroundVideo, BackingTrack, NoteEvent, NoteEventKind, RecordingMeta};
 
 use crate::{error::ImportError, parser::chart_to_timeline, schema::ExtractedChart};
 
@@ -48,6 +48,23 @@ pub fn write_chart_bundle_with_backing(
     dir: &Path,
     backing: Option<BackingTrack>,
 ) -> Result<PathBuf, ImportError> {
+    write_chart_bundle_full(chart, dir, backing, None)
+}
+
+/// Like [`write_chart_bundle_with_backing`], but also records an optional
+/// background `video` reference in the bundle's `meta.json` (M9-G).
+///
+/// As with `backing`, `BackgroundVideo::file` is a bundle-relative filename — the
+/// video file itself must already live next to `song.mid` in `dir`. The import
+/// pipeline uses this to retain the original source video so imported pieces come
+/// with their backdrop already attached. `None` is equivalent to
+/// [`write_chart_bundle_with_backing`].
+pub fn write_chart_bundle_full(
+    chart: &ExtractedChart,
+    dir: &Path,
+    backing: Option<BackingTrack>,
+    video: Option<BackgroundVideo>,
+) -> Result<PathBuf, ImportError> {
     guard_path(dir)?;
 
     let timeline = chart_to_timeline(chart)?;
@@ -60,6 +77,7 @@ pub fn write_chart_bundle_with_backing(
 
     let mut meta = RecordingMeta::new_midi_only("song.mid");
     meta.backing = backing;
+    meta.video = video;
     meta.origin = Some(rockcraft_core::TrackOrigin::Imported);
     std::fs::write(dir.join("meta.json"), meta.to_json())?;
 

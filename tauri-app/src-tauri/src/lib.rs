@@ -35,7 +35,7 @@ use crate::import::ImportRunning;
 use crate::midi::{MidiState, MidiStatus};
 use crate::play::PlayState;
 use crate::record::RecordState;
-use crate::state::{ActionReply, AppState, SaveDest};
+use crate::state::{ActionReply, AppState, SaveDest, VideoRef};
 
 /// Tick cadence for the transport-advance thread (~4 ms ≈ 250 Hz).
 const TICK_PERIOD: std::time::Duration = std::time::Duration::from_millis(4);
@@ -156,6 +156,32 @@ fn load_bundle(
 #[tauri::command]
 fn query_dirty(state: State<'_, AppState>) -> bool {
     state::query_dirty(&state)
+}
+
+/// Attach (or replace) the edit-screen background video (M9-G). `path` is the
+/// absolute file the webview picked; `offset_us` is the alignment offset
+/// (`videoTime = songTime + offset_us`). Persisted into the bundle on save.
+#[tauri::command]
+fn edit_set_video(state: State<'_, AppState>, path: String, offset_us: i64) {
+    state::set_video(&state, path, offset_us)
+}
+
+/// Update only the alignment offset of the attached background video (M9-G).
+#[tauri::command]
+fn edit_set_video_offset(state: State<'_, AppState>, offset_us: i64) {
+    state::set_video_offset(&state, offset_us)
+}
+
+/// Detach the edit-screen background video (M9-G).
+#[tauri::command]
+fn edit_clear_video(state: State<'_, AppState>) {
+    state::clear_video(&state)
+}
+
+/// Return the currently attached background video, or `null` (M9-G).
+#[tauri::command]
+fn edit_query_video(state: State<'_, AppState>) -> Option<VideoRef> {
+    state::query_video(&state)
 }
 
 /// Return the current MIDI input status (`kind` + optional `port` name).
@@ -327,6 +353,10 @@ pub fn run() {
             save_bundle,
             load_bundle,
             query_dirty,
+            edit_set_video,
+            edit_set_video_offset,
+            edit_clear_video,
+            edit_query_video,
             midi_status,
             mock_key,
             audio::attach_backing,

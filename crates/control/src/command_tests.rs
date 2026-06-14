@@ -162,4 +162,104 @@ mod tests {
 
         server_handle.abort();
     }
+
+    /// A stand-in application that owns a `Composer` **and** a fake
+    /// `HostServices`, dispatching every request via `handle_with_host` —
+    /// exactly the seam a frontend's applier fills for the host-command tier.
+    async fn spawn_server_with_host() -> (
+        String,
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use crate::host::{HostCommand, HostError, HostServices};
+        use crate::protocol::handle_with_host;
+
+        /// A fake host with a single bit of "library state": its dirty flag,
+        /// flipped clean by `LoadBundle`, reported by `QueryDirty`.
+        struct FakeHost {
+            dirty: bool,
+        }
+        impl HostServices for FakeHost {
+            fn dispatch(&mut self, cmd: HostCommand) -> Result<Value, HostError> {
+                match cmd {
+                    HostCommand::QueryDirty => Ok(serde_json::json!(self.dirty)),
+                    HostCommand::LoadBundle { dir } => {
+                        self.dirty = false;
+                        Ok(serde_json::json!({ "loaded": dir }))
+                    }
+                    other => Err(HostError::Unsupported(other.name().to_string())),
+                }
+            }
+        }
+
+        let (tx, mut rx) = mpsc::channel::<RemoteCommand>(32);
+        let server = CommandServer::bind("127.0.0.1:0", tx)
+            .await
+            .expect("bind loopback");
+        let url = format!("ws://{}", server.local_addr());
+
+        let server_handle = tokio::spawn(async move {
+            let _ = server.serve().await;
+        });
+
+        let app_handle = tokio::spawn(async move {
+            let mut composer = Composer::new();
+            let mut host = FakeHost { dirty: true };
+            while let Some(cmd) = rx.recv().await {
+                let response = handle_with_host(&mut composer, Some(&mut host), cmd.req);
+                let _ = cmd.reply.send(response);
+            }
+        });
+
+        (url, server_handle, app_handle)
+    }
+
+    #[tokio::test]
+    async fn run_host_command_routed_through_channel_reaches_host_services() {
+        let (url, server_handle, app_handle) = spawn_server_with_host().await;
+        let mut ws = connect(&url).await;
+
+        // QueryDirty starts true.
+        let reply = round_trip(
+            &mut ws,
+            r#"{"type":"run_host_command","id":1,"command":"query_dirty"}"#,
+        )
+        .await;
+        assert_eq!(reply["type"], "host_result");
+        assert_eq!(reply["id"], 1);
+        assert_eq!(reply["value"], true);
+
+        // LoadBundle flips it clean and echoes the dir.
+        let reply = round_trip(
+            &mut ws,
+            r#"{"type":"run_host_command","command":"load_bundle","params":{"dir":"takes/a"}}"#,
+        )
+        .await;
+        assert_eq!(reply["type"], "host_result");
+        assert_eq!(reply["value"]["loaded"], "takes/a");
+
+        // QueryDirty now reads false — the host carried state across requests.
+        let reply = round_trip(
+            &mut ws,
+            r#"{"type":"run_host_command","command":"query_dirty"}"#,
+        )
+        .await;
+        assert_eq!(reply["value"], false);
+
+        // An unsupported command surfaces as an error, not a panic.
+        let reply = round_trip(
+            &mut ws,
+            r#"{"type":"run_host_command","command":"import_start","params":{"url":"u"}}"#,
+        )
+        .await;
+        assert_eq!(reply["type"], "err");
+        assert!(reply["error"].as_str().unwrap().starts_with("unsupported:"));
+
+        // The two tiers coexist: a composer action still works on the same socket.
+        let reply = round_trip(&mut ws, r#"{"type":"run_action","action":"add_note"}"#).await;
+        assert_eq!(reply["type"], "ok");
+
+        server_handle.abort();
+        app_handle.abort();
+    }
 }

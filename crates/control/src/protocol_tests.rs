@@ -2,7 +2,7 @@
 mod tests {
     use crate::protocol::{handle, handle_run_action, QueryKind, Request, Response, Topic};
     use rockcraft_core::{action_names, Composer};
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     fn new_composer() -> Composer {
         Composer::new()
@@ -164,7 +164,11 @@ mod tests {
             what: QueryKind::Help,
         };
         match handle(&mut c, req) {
-            Response::Help { id, actions } => {
+            Response::Help {
+                id,
+                actions,
+                host_commands,
+            } => {
                 assert_eq!(id, Some(9));
                 // Same coverage as the name list, but now with params + prose.
                 assert_eq!(actions.len(), action_names().len());
@@ -177,8 +181,92 @@ mod tests {
                     .expect("set_cursor described");
                 let param_names: Vec<&str> = set_cursor.params.iter().map(|p| p.name).collect();
                 assert_eq!(param_names, vec!["pitch", "step"]);
+                // The host-command catalog ships alongside the action catalog.
+                assert!(
+                    host_commands.iter().any(|c| c.name == "load_bundle"),
+                    "help includes the host-command tier"
+                );
             }
             other => panic!("expected Help, got {other:?}"),
+        }
+    }
+
+    // --- handle_with_host: host-command tier ---
+
+    #[test]
+    fn run_host_command_without_host_is_unavailable() {
+        // The composer-only `handle` has no HostServices, so host commands are
+        // rejected rather than silently dropped.
+        let mut c = new_composer();
+        let req = Request::RunHostCommand {
+            id: Some(3),
+            command: "query_dirty".into(),
+            params: json!({}),
+        };
+        match handle(&mut c, req) {
+            Response::Err { id, error } => {
+                assert_eq!(id, Some(3));
+                assert!(error.starts_with("unavailable:"), "got: {error}");
+            }
+            other => panic!("expected Err, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_host_command_with_host_round_trips_value() {
+        use crate::host::{HostCommand, HostError, HostServices};
+        use crate::protocol::handle_with_host;
+
+        struct Host;
+        impl HostServices for Host {
+            fn dispatch(&mut self, cmd: HostCommand) -> Result<Value, HostError> {
+                match cmd {
+                    HostCommand::QueryDirty => Ok(json!(true)),
+                    other => Err(HostError::Unsupported(other.name().to_string())),
+                }
+            }
+        }
+
+        let mut c = new_composer();
+        let mut host = Host;
+        let req = Request::RunHostCommand {
+            id: Some(4),
+            command: "query_dirty".into(),
+            params: json!({}),
+        };
+        match handle_with_host(&mut c, Some(&mut host), req) {
+            Response::HostResult { id, value } => {
+                assert_eq!(id, Some(4));
+                assert_eq!(value, json!(true));
+            }
+            other => panic!("expected HostResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_unknown_host_command_returns_err_prefix() {
+        use crate::host::{HostCommand, HostError, HostServices};
+        use crate::protocol::handle_with_host;
+
+        struct Host;
+        impl HostServices for Host {
+            fn dispatch(&mut self, _cmd: HostCommand) -> Result<Value, HostError> {
+                Ok(Value::Null)
+            }
+        }
+
+        let mut c = new_composer();
+        let mut host = Host;
+        let req = Request::RunHostCommand {
+            id: None,
+            command: "totally_unknown".into(),
+            params: json!({}),
+        };
+        match handle_with_host(&mut c, Some(&mut host), req) {
+            Response::Err { error, .. } => {
+                assert!(error.starts_with("unknown_action:"), "got: {error}");
+            }
+            other => panic!("expected Err, got {other:?}"),
         }
     }
 

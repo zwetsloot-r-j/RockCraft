@@ -122,6 +122,18 @@ export class HighwayCanvas {
     this.live = on;
   }
 
+  // ── Background video backdrop (M9-G) ──────────────────────────────────────
+  // When a piece carries a background video, the highway draws over it: the
+  // opaque background fill is swapped for a translucent dim so the <video>
+  // element behind the canvas reads through. Mirrors EditCanvas.setBackdrop.
+  private backdrop = false;
+
+  /** Toggle backdrop mode. When `on`, the background fill is translucent so the
+   * `<video>` behind the canvas shows through. */
+  setBackdrop(on: boolean): void {
+    this.backdrop = on;
+  }
+
   /** Push the latest backend `play_state`. `timeMs` is the authoritative song
    * time; render interpolates forward from here using the wall clock unless
    * `frozen`. `held` highlights the player's keys; `awaiting` pulses the notes
@@ -273,10 +285,16 @@ export class HighwayCanvas {
     this.lastNow = now;
   }
 
+  /** Translucent dim used over a video backdrop (lets the frame read through),
+   * mirroring EditCanvas. */
+  private static readonly BG_BACKDROP = "rgba(15,16,22,0.45)";
+
   private drawBackground(): void {
     const ctx = this.ctx,
       c = this.cfg;
-    ctx.fillStyle = c.bg;
+    // With a backdrop attached, leave the fill translucent so the <video> behind
+    // the canvas shows through; otherwise paint the opaque highway background.
+    ctx.fillStyle = this.backdrop ? HighwayCanvas.BG_BACKDROP : c.bg;
     ctx.fillRect(0, 0, this.w, this.h);
     // faint lane tint columns (white keys) on the highway
     if (c.laneTint) {

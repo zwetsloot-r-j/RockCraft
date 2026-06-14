@@ -148,3 +148,27 @@ keyboard triggers. To drive it:
 Full protocol reference: [`docs/AGENT-CONTROL.md`](docs/AGENT-CONTROL.md). A
 guided session exercising every action, with the equivalent TUI keystroke per
 beat, is in [`docs/DEMO-SCENARIO.md`](docs/DEMO-SCENARIO.md).
+
+### Agent-control API: single source of truth
+
+The control surface has **two tiers**, and `query help` returns both
+(`actions` + `host_commands`):
+
+- **Composer ops are `core::Action`s** (`crates/core/src/action.rs`). They are
+  pure (no I/O) and **auto-wired to every frontend** through
+  `action_from_name` / `action_help` — a new variant is callable over every
+  socket and Tauri IPC for free. The `action.rs` parity tests enforce that the
+  catalog (`action_names`/`action_help`) and the enum stay in lockstep.
+- **App-level ops are `control::HostCommand`s** (`crates/control/src/host.rs`).
+  They do I/O (disk, MIDI device, audio, subprocess) — load/save/scan a bundle,
+  run play/record, attach a backing track, import from a URL — so they can
+  **never** be `core::Action`s (`core` stays pure) and cannot ride
+  `action_from_name`. They dispatch through the `HostServices` trait, whose
+  single **exhaustive `match`** in each frontend (`crates/tui`, `tauri-app/
+  src-tauri`) makes the compiler force every frontend to handle a new variant;
+  the `host.rs` parity tests enforce its catalog the same way `action.rs` does.
+
+**The rule:** a new user-facing capability gets an `Action` (if pure) or a
+`HostCommand` (if it does I/O) — **never** a one-off IPC command with no
+protocol counterpart. That is what keeps the agent surface drift-proof and the
+two frontends in sync.

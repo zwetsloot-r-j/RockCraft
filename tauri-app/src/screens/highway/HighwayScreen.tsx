@@ -11,6 +11,7 @@
 // it shows a centered empty state instead of any canned fixture.
 
 import { createSignal, onCleanup, onMount, Show } from "solid-js";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import {
   onPlayState,
   playFinish,
@@ -18,7 +19,11 @@ import {
   playSetWait,
   playToggleHearSong,
 } from "../../ipc/bridge";
-import type { PlayStateEvent, PlaySummary } from "../../ipc/types";
+import type {
+  BackgroundVideoView,
+  PlayStateEvent,
+  PlaySummary,
+} from "../../ipc/types";
 import { useRouter } from "../../shell/Router";
 import { HighwayCanvas } from "./HighwayCanvas";
 import { HighwayHeader } from "./HighwayHeader";
@@ -65,6 +70,16 @@ export function HighwayScreen() {
   const live = dir !== undefined;
 
   let canvasEl!: HTMLCanvasElement;
+  // ── Background video backdrop (M9-G) ───────────────────────────────────────
+  // The piece's persisted background video (from `meta.video`), rendered behind
+  // the highway canvas and scrubbed to song time with `offset_us`. `null` when
+  // the piece has no video. `videoEl` is paused/muted; we set `currentTime`
+  // rather than calling `play()`, exactly like the edit-grid backdrop (N).
+  let videoEl: HTMLVideoElement | undefined;
+  const [video, setVideo] = createSignal<BackgroundVideoView | null>(null);
+  // Whole-song shift in µs; the video aligns to song *content*, which begins
+  // after the pre-roll shift. videoTime = (songTime - shift) + offset.
+  let shiftUs = 0;
   const [eng, setEng] = createSignal<HighwayCanvas | null>(null);
   // ~9 fps throttle so the header re-reads without a per-frame render.
   const [frame, setFrame] = createSignal(0);
@@ -105,11 +120,26 @@ export function HighwayScreen() {
     }
   }
 
+  /** Scrub the backdrop `<video>` to the current song time. videoTime =
+   * (songTime - shift) + offset, clamped at 0, in seconds. We set `currentTime`
+   * and never `play()` so the frame tracks the (pausable) song clock exactly. */
+  function syncVideo(timeUs: number): void {
+    const v = videoEl;
+    const meta = video();
+    if (!v || meta === null) return;
+    const tUs = timeUs - shiftUs + meta.offset_us;
+    const t = Math.max(0, tUs) / 1e6;
+    if (Number.isFinite(t) && Math.abs(v.currentTime - t) > 0.05) {
+      v.currentTime = t;
+    }
+  }
+
   function applyState(s: PlayStateEvent): void {
     setPlayState(s);
     const e = eng();
     // Engine time is ms; backend time is µs.
     if (e) e.setLiveState(s.time_us / 1000, s.frozen, s.held, s.awaiting);
+    syncVideo(s.time_us);
     if (s.finished && !finished) {
       finished = true;
       void playFinish().then(setSummary);
@@ -120,6 +150,7 @@ export function HighwayScreen() {
     playLoad(bundleDir)
       .then((info) => {
         setHearSong(info.hear_song);
+        shiftUs = info.shift_us;
         const sd = songFromInfo(info);
         setSong(sd);
         const engine = new HighwayCanvas(
@@ -128,6 +159,20 @@ export function HighwayScreen() {
           sd,
         );
         engine.setLive(true);
+        // Background video backdrop (M9-G): when the piece carries one, draw the
+        // highway over a translucent fill so the <video> behind shows through.
+        setVideo(info.video ?? null);
+        engine.setBackdrop(info.video != null);
+        if (videoEl) {
+          if (info.video) {
+            videoEl.src = convertFileSrc(info.video.path);
+            videoEl.load();
+            videoEl.currentTime = 0;
+          } else {
+            videoEl.removeAttribute("src");
+            videoEl.load();
+          }
+        }
         engine.start();
         setEng(engine);
       })
@@ -203,7 +248,36 @@ export function HighwayScreen() {
           waitMode={waitMode}
         />
         <div style={{ flex: "1 1 auto", "min-height": 0, position: "relative" }}>
-          <canvas ref={canvasEl} style={{ width: "100%", height: "100%", display: "block" }} />
+          {/* Background video backdrop (M9-G) — sits *behind* the canvas (lower
+              z-index). Paused/muted; we scrub `currentTime`, never `play()`.
+              Hidden until the piece carries a video. */}
+          <video
+            ref={videoEl}
+            muted
+            playsinline
+            preload="auto"
+            style={{
+              position: "absolute",
+              inset: 0,
+              width: "100%",
+              height: "100%",
+              "object-fit": "contain",
+              "z-index": 0,
+              "pointer-events": "none",
+              display: video() === null ? "none" : "block",
+              background: "#000",
+            }}
+          />
+          <canvas
+            ref={canvasEl}
+            style={{
+              position: "relative",
+              "z-index": 1,
+              width: "100%",
+              height: "100%",
+              display: "block",
+            }}
+          />
           <Show when={loadErr()}>
             <div
               style={{
