@@ -158,9 +158,9 @@ export function StatusBar(props: Props): JSX.Element {
           "white-space": "nowrap",
         }}
       >
-        a/x add·del · [/] size · +/- vel · m grab · c chord · v·y·p·D select ·
-        u/U undo · Space play/stop · P play-start · o loop · {"{"}/{"}"} loop
-        in/out · V video · s save · ? help
+        a/x add·del · [/] size · +/- vel · (/) tempo · T set BPM · m grab · c
+        chord · v·y·p·D select · u/U undo · Space play/stop · P play-start · o
+        loop · {"{"}/{"}"} loop in/out · V video · s save · ? help
       </span>
     </div>
   );

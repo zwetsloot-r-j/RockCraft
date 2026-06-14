@@ -207,6 +207,25 @@ mod tests {
     }
 
     #[test]
+    fn edited_bpm_survives_grid_roundtrip() {
+        use crate::Grid;
+        // Simulate an edit-mode BPM change, then persist+reload the meta.
+        let mut grid = Grid::default_120();
+        grid.set_bpm(96);
+        let meta = RecordingMeta {
+            midi_file: "song.mid".into(),
+            backing: None,
+            grid: Some(grid),
+            key: None,
+            origin: None,
+            video: None,
+            version: 1,
+        };
+        let back = RecordingMeta::from_json(&meta.to_json()).unwrap();
+        assert_eq!(back.grid.unwrap().bpm, 96);
+    }
+
+    #[test]
     fn with_video_roundtrip() {
         let meta = RecordingMeta {
             midi_file: "song.mid".into(),

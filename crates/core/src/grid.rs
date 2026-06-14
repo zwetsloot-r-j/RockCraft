@@ -56,6 +56,24 @@ pub struct Grid {
 }
 
 impl Grid {
+    /// Lowest editable tempo, in BPM.
+    pub const MIN_BPM: u32 = 20;
+    /// Highest editable tempo, in BPM.
+    pub const MAX_BPM: u32 = 300;
+
+    /// Set the tempo to `bpm`, clamped to [`MIN_BPM`](Grid::MIN_BPM)..=[`MAX_BPM`](Grid::MAX_BPM).
+    pub fn set_bpm(&mut self, bpm: u32) {
+        self.bpm = bpm.clamp(Self::MIN_BPM, Self::MAX_BPM);
+    }
+
+    /// Nudge the tempo by `delta` BPM, clamped to the editable range. Saturating
+    /// so extreme deltas land cleanly on a bound rather than wrapping.
+    pub fn adjust_bpm(&mut self, delta: i32) {
+        let next =
+            (self.bpm as i64 + delta as i64).clamp(Self::MIN_BPM as i64, Self::MAX_BPM as i64);
+        self.bpm = next as u32;
+    }
+
     pub fn default_120() -> Self {
         Grid {
             bpm: 120,
@@ -140,6 +158,32 @@ mod tests {
     #[test]
     fn quarter_us_120() {
         assert_eq!(grid_120_4_4(Subdivision::Quarter).quarter_us(), 500_000);
+    }
+
+    #[test]
+    fn set_bpm_clamps_to_range() {
+        let mut g = grid_120_4_4(Subdivision::Quarter);
+        g.set_bpm(140);
+        assert_eq!(g.bpm, 140);
+        g.set_bpm(5); // below MIN
+        assert_eq!(g.bpm, Grid::MIN_BPM);
+        g.set_bpm(10_000); // above MAX
+        assert_eq!(g.bpm, Grid::MAX_BPM);
+    }
+
+    #[test]
+    fn adjust_bpm_nudges_and_clamps() {
+        let mut g = grid_120_4_4(Subdivision::Quarter);
+        g.adjust_bpm(5);
+        assert_eq!(g.bpm, 125);
+        g.adjust_bpm(-10);
+        assert_eq!(g.bpm, 115);
+        // Clamp at the floor with an extreme negative delta.
+        g.adjust_bpm(-100_000);
+        assert_eq!(g.bpm, Grid::MIN_BPM);
+        // Clamp at the ceiling with an extreme positive delta.
+        g.adjust_bpm(100_000);
+        assert_eq!(g.bpm, Grid::MAX_BPM);
     }
 
     #[test]
