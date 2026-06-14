@@ -1,14 +1,14 @@
 // UrlInput.tsx — centered modal URL input for "Import from URL…"
 //
+// Uses a real focusable <input> so the OS/webview handle paste (Ctrl/Cmd+V),
+// caret, selection, and mid-string editing natively.
+//
 // TUI parity (`crates/tui/src/import_screen.rs` UrlInput):
-//   - Type characters to build the URL string
-//   - Backspace to delete last character
 //   - Enter submits (non-empty URL only)
 //   - Esc cancels back to menu
 
 import {
   createSignal,
-  onCleanup,
   onMount,
   type JSX,
 } from "solid-js";
@@ -29,7 +29,18 @@ export function UrlInput(props: UrlInputProps): JSX.Element {
   const [url, setUrl] = createSignal("");
   const [error, setError] = createSignal("");
 
+  let inputRef: HTMLInputElement | undefined;
+
+  function onInput(e: InputEvent & { currentTarget: HTMLInputElement }): void {
+    setUrl(e.currentTarget.value);
+    setError("");
+  }
+
   function onKeydown(e: KeyboardEvent): void {
+    // Keep typing/paste inside the field; never let it reach the shell's
+    // global mock-MIDI / router keydown handler.
+    e.stopPropagation();
+
     if (e.key === "Enter") {
       e.preventDefault();
       const val = url().trim();
@@ -43,24 +54,12 @@ export function UrlInput(props: UrlInputProps): JSX.Element {
     if (e.key === "Escape") {
       e.preventDefault();
       navigate({ kind: "menu" });
-      return;
-    }
-    if (e.key === "Backspace") {
-      e.preventDefault();
-      setUrl((s) => s.slice(0, -1));
-      setError("");
-      return;
-    }
-    // Accept printable characters (single char, no modifier except Shift).
-    if (e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey) {
-      e.preventDefault();
-      setUrl((s) => s + e.key);
-      setError("");
     }
   }
 
-  onMount(() => window.addEventListener("keydown", onKeydown));
-  onCleanup(() => window.removeEventListener("keydown", onKeydown));
+  onMount(() => {
+    inputRef?.focus();
+  });
 
   return (
     <div
@@ -92,34 +91,33 @@ export function UrlInput(props: UrlInputProps): JSX.Element {
           Import from URL
         </div>
 
-        {/* URL display */}
-        <div
+        {/* URL input */}
+        <input
+          ref={inputRef}
+          type="text"
+          value={url()}
+          onInput={onInput}
+          onKeyDown={onKeydown}
+          placeholder="paste or type a URL…"
+          spellcheck={false}
+          autocapitalize="off"
+          autocomplete="off"
+          autocorrect="off"
           style={{
             background: "rgba(0,0,0,0.35)",
             border: `1px solid ${error() ? "#e06c75" : "rgba(255,255,255,0.15)"}`,
             "border-radius": "6px",
             padding: "10px 14px",
             "font-size": "14px",
-            color: url() ? FG : DIM,
+            color: FG,
             "min-height": "40px",
-            "word-break": "break-all",
             "font-family": "monospace",
+            outline: "none",
+            "caret-color": ACCENT,
+            width: "100%",
+            "box-sizing": "border-box",
           }}
-        >
-          {url() || "paste or type a URL…"}
-          {/* blinking cursor */}
-          <span
-            style={{
-              display: "inline-block",
-              width: "1px",
-              height: "1em",
-              background: ACCENT,
-              "margin-left": "2px",
-              "vertical-align": "text-bottom",
-              animation: "blink 1s step-end infinite",
-            }}
-          />
-        </div>
+        />
 
         {/* Error message */}
         <div
@@ -137,11 +135,6 @@ export function UrlInput(props: UrlInputProps): JSX.Element {
           Enter — submit · Esc — cancel
         </div>
       </div>
-
-      {/* CSS for blinking cursor */}
-      <style>
-        {`@keyframes blink { 0%,100% { opacity:1 } 50% { opacity:0 } }`}
-      </style>
     </div>
   );
 }
