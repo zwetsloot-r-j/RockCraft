@@ -36,7 +36,11 @@ pub enum SaveDest {
 /// The state-side mirror of `rockcraft_control::SegmentSpec`, kept here so this
 /// module stays free of the control crate (like [`SaveDest`]); `control.rs`
 /// maps between the two.
-#[derive(Debug, Clone)]
+///
+/// Derives `Serialize`/`Deserialize` so the webview can pass kept parts straight
+/// to the `split_bundle` invoke command (the same shape the M10-C split editor
+/// gathers), mirroring how [`SaveDest`] crosses the IPC boundary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SplitSegment {
     pub start_us: u64,
     pub end_us: u64,

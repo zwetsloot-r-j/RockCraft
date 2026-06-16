@@ -23,6 +23,7 @@ import type {
   PlaySummary,
   SaveBundleResult,
   SaveDest,
+  SegmentSpec,
 } from "./types";
 
 /** Event name the backend emits a fresh {@link ComposerSnapshot} on. */
@@ -126,6 +127,20 @@ export function loadBundle(dir: string): Promise<ComposerSnapshot> {
  */
 export function queryDirty(): Promise<boolean> {
   return invoke<boolean>("query_dirty");
+}
+
+/**
+ * Slice the loaded piece into the given kept parts (M10-C), writing each as a
+ * new standalone library bundle via the shared `SplitBundle` write path (M10-B).
+ * Each {@link SegmentSpec} is the half-open range `[start_us, end_us)` plus a
+ * name; discarded parts are simply omitted by the caller (= trimming).
+ *
+ * Resolves to the created bundle directory paths, or rejects with a string
+ * error. The source piece is left untouched (non-destructive — does not clear
+ * the dirty flag).
+ */
+export function splitBundle(segments: SegmentSpec[]): Promise<string[]> {
+  return invoke<string[]>("split_bundle", { segments });
 }
 
 // ── Audio commands ────────────────────────────────────────────────────────
