@@ -247,6 +247,55 @@ mod tests {
     }
 
     #[test]
+    fn backing_swap_preserves_video() {
+        // M10-E: backing audio and the background video are independent piece
+        // attributes. Mutating `meta.backing` — whether replacing the file or
+        // detaching it entirely — must never disturb `meta.video`.
+        let video = BackgroundVideo {
+            file: "source.mp4".into(),
+            offset_us: -250_000,
+        };
+        let mut meta = RecordingMeta {
+            midi_file: "song.mid".into(),
+            backing: Some(BackingTrack {
+                file: "original.mp3".into(),
+                audio_start_us: 100_000,
+            }),
+            grid: None,
+            key: None,
+            origin: Some(TrackOrigin::Imported),
+            video: Some(video.clone()),
+            version: 1,
+        };
+
+        // Replace the backing with a different file/offset.
+        meta.backing = Some(BackingTrack {
+            file: "studio.flac".into(),
+            audio_start_us: 0,
+        });
+        assert_eq!(
+            meta.video.as_ref(),
+            Some(&video),
+            "replacing backing leaves video untouched"
+        );
+        // The swapped backing survives a JSON round-trip alongside the video.
+        let back = RecordingMeta::from_json(&meta.to_json()).unwrap();
+        assert_eq!(back.backing.as_ref().unwrap().file, "studio.flac");
+        assert_eq!(back.video.as_ref(), Some(&video));
+
+        // Detaching the backing also leaves the video intact, byte-for-byte.
+        meta.backing = None;
+        assert_eq!(
+            meta.video.as_ref(),
+            Some(&video),
+            "detaching backing leaves video untouched"
+        );
+        let back = RecordingMeta::from_json(&meta.to_json()).unwrap();
+        assert!(back.backing.is_none());
+        assert_eq!(back.video.as_ref(), Some(&video));
+    }
+
+    #[test]
     fn without_video_roundtrip() {
         let meta = RecordingMeta::new_midi_only("song.mid");
         assert!(meta.video.is_none());
