@@ -14,4 +14,5 @@ serde_json.workspace = true
 midly = "0.5"
 
 [dev-dependencies]
+rockcraft-core.workspace = true
 tempfile = "3"

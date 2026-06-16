@@ -690,6 +690,7 @@ impl rockcraft_control::HostServices for Shell {
             // point in the TUI. Explicit, compiler-checked Unsupported arms.
             HostCommand::SaveBundle { .. } => Err(HostError::Unsupported("save_bundle".into())),
             HostCommand::LoadBundle { .. } => Err(HostError::Unsupported("load_bundle".into())),
+            HostCommand::SplitBundle { .. } => Err(HostError::Unsupported("split_bundle".into())),
             HostCommand::PlaySetWait { .. } => Err(HostError::Unsupported("play_set_wait".into())),
             HostCommand::PlayToggleHearSong => {
                 Err(HostError::Unsupported("play_toggle_hear_song".into()))
@@ -1023,6 +1024,7 @@ mod tests {
             },
             HostCommand::LoadBundle { dir: "x".into() },
             HostCommand::QueryDirty,
+            HostCommand::SplitBundle { segments: vec![] },
             HostCommand::PlayLoad {
                 dir: "does/not/exist".into(),
             },

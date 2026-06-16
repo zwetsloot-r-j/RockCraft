@@ -4,7 +4,10 @@ use midly::{
     num::{u15, u28, u4, u7},
     Header, MidiMessage, Smf, Timing, Track, TrackEvent, TrackEventKind,
 };
-use rockcraft_core::{BackgroundVideo, BackingTrack, NoteEvent, NoteEventKind, RecordingMeta};
+use rockcraft_core::{
+    BackgroundVideo, BackingTrack, Grid, Key, NoteEvent, NoteEventKind, RecordingMeta, SliceResult,
+    TrackOrigin,
+};
 
 use crate::{error::ImportError, parser::chart_to_timeline, schema::ExtractedChart};
 
@@ -79,6 +82,64 @@ pub fn write_chart_bundle_full(
     meta.backing = backing;
     meta.video = video;
     meta.origin = Some(rockcraft_core::TrackOrigin::Imported);
+    std::fs::write(dir.join("meta.json"), meta.to_json())?;
+
+    Ok(dir.to_path_buf())
+}
+
+/// Write one kept part of a split piece as its own standalone bundle (M10-B).
+///
+/// `sliced` is the [`SliceResult`] from `core::segment::slice_segment` for this
+/// part: a sub-timeline already shifted to t=0, plus the **derived**
+/// `backing`/`video` references whose offsets have been shifted by the segment
+/// start (file names unchanged). `backing_src` / `video_src` are the absolute
+/// source paths of the media in the loaded bundle; each is copied **unchanged**
+/// (no re-encode, no trim) into the new bundle under the bundle-relative name
+/// carried by `sliced.backing.file` / `sliced.video.file`. `grid`/`key` are
+/// copied from the source piece; the new bundle's `origin` is recorded as
+/// [`TrackOrigin::Edited`].
+///
+/// Writes `<dir>/song.mid`, the copied media file(s) (when present), and
+/// `<dir>/meta.json`; returns the bundle directory path. `dir` is created if it
+/// does not yet exist. The source bundle is never touched.
+///
+/// This is the shared write half of `HostCommand::SplitBundle`: each frontend
+/// builds the per-segment [`SliceResult`] from its own live editor state and
+/// calls this helper, rather than duplicating the meta-writing logic. It is
+/// kept distinct from [`write_chart_bundle_full`] because the loaded editor
+/// timeline is not an [`ExtractedChart`], it carries `grid`/`key`, and its
+/// `origin` is `Edited` rather than `Imported`.
+pub fn write_part_bundle(
+    dir: &Path,
+    sliced: &SliceResult,
+    grid: Grid,
+    key: Key,
+    backing_src: Option<&Path>,
+    video_src: Option<&Path>,
+) -> Result<PathBuf, ImportError> {
+    std::fs::create_dir_all(dir)?;
+
+    let midi_bytes = events_to_smf_bytes(&sliced.timeline.to_events());
+    std::fs::write(dir.join("song.mid"), &midi_bytes)?;
+
+    // Copy the media as-is into the new bundle, under the derived (unchanged)
+    // filename. A source path with no matching derived reference is a no-op.
+    if let (Some(src), Some(backing)) = (backing_src, sliced.backing.as_ref()) {
+        std::fs::copy(src, dir.join(&backing.file))?;
+    }
+    if let (Some(src), Some(video)) = (video_src, sliced.video.as_ref()) {
+        std::fs::copy(src, dir.join(&video.file))?;
+    }
+
+    let meta = RecordingMeta {
+        midi_file: "song.mid".into(),
+        backing: sliced.backing.clone(),
+        grid: Some(grid),
+        key: Some(key),
+        origin: Some(TrackOrigin::Edited),
+        video: sliced.video.clone(),
+        version: 1,
+    };
     std::fs::write(dir.join("meta.json"), meta.to_json())?;
 
     Ok(dir.to_path_buf())

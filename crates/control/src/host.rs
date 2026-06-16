@@ -40,6 +40,22 @@ pub enum SaveDest {
     Library { name: String },
 }
 
+/// One kept part to write as its own standalone bundle by
+/// [`HostCommand::SplitBundle`].
+///
+/// The half-open song-time range `[start_us, end_us)` is sliced out of the
+/// loaded piece (notes shifted to t=0, media offsets shifted — see
+/// `core::segment::slice_segment`) and written as a new library bundle whose
+/// slug/name is `name`. Discarded parts are simply omitted from the
+/// `segments` list, which doubles as trimming.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SegmentSpec {
+    pub start_us: u64,
+    pub end_us: u64,
+    /// Becomes the new bundle's library slug/name.
+    pub name: String,
+}
+
 /// Every app-level workflow command, transport-agnostic.
 ///
 /// Each variant serialises with an internal `"command"` tag holding its stable
@@ -63,6 +79,11 @@ pub enum HostCommand {
     LoadBundle { dir: String },
     /// Whether the timeline has unsaved changes; returns a bool.
     QueryDirty,
+    /// Slice the loaded piece into the given kept parts, writing each as a new
+    /// library bundle (subset MIDI + copied media + derived offsets,
+    /// `origin = Edited`); returns the created bundle dir paths. Discarded
+    /// parts are omitted (= trimming); the source piece is left untouched.
+    SplitBundle { segments: Vec<SegmentSpec> },
 
     // ── play ────────────────────────────────────────────────────────────
     /// Load a bundle dir as a play session; returns play info.
@@ -112,6 +133,7 @@ impl HostCommand {
             HostCommand::SaveBundle { .. } => "save_bundle",
             HostCommand::LoadBundle { .. } => "load_bundle",
             HostCommand::QueryDirty => "query_dirty",
+            HostCommand::SplitBundle { .. } => "split_bundle",
             HostCommand::PlayLoad { .. } => "play_load",
             HostCommand::PlaySetWait { .. } => "play_set_wait",
             HostCommand::PlayToggleHearSong => "play_toggle_hear_song",
@@ -228,6 +250,7 @@ pub fn host_command_names() -> &'static [&'static str] {
         "save_bundle",
         "load_bundle",
         "query_dirty",
+        "split_bundle",
         "play_load",
         "play_set_wait",
         "play_toggle_hear_song",
@@ -275,6 +298,7 @@ static HOST_HELP: &[HostCommandInfo] = {
         HostCommandInfo { name: "save_bundle", params: &[p("dest", "SaveDest")], description: "Save the current timeline to a bundle; dest is {kind:\"quick_save\"} or {kind:\"library\",name:\"…\"}. Returns the bundle directory path." },
         HostCommandInfo { name: "load_bundle", params: &[p("dir", "String")], description: "Load a bundle directory into the composer, replacing its timeline. Returns the new snapshot." },
         HostCommandInfo { name: "query_dirty", params: &[], description: "Return whether the timeline has unsaved changes." },
+        HostCommandInfo { name: "split_bundle", params: &[p("segments", "Vec<SegmentSpec>")], description: "Slice the loaded piece into the given kept parts, writing each as a new library bundle (subset MIDI + copied media + derived offsets, origin=Edited). Each segment is {start_us,end_us,name}; discarded parts are omitted (= trimming). Returns the created bundle directory paths; the source piece is left untouched." },
         // ── play ──────────────────────────────────────────────────────────
         HostCommandInfo { name: "play_load", params: &[p("dir", "String")], description: "Load a bundle directory as a play session. Returns play info." },
         HostCommandInfo { name: "play_set_wait", params: &[p("on", "bool")], description: "Arm (true) or disarm (false) note-by-note wait mode for the play session." },
@@ -314,6 +338,20 @@ mod tests {
                 dir: "some/dir".into(),
             },
             HostCommand::QueryDirty,
+            HostCommand::SplitBundle {
+                segments: vec![
+                    SegmentSpec {
+                        start_us: 0,
+                        end_us: 1_000_000,
+                        name: "Verse".into(),
+                    },
+                    SegmentSpec {
+                        start_us: 2_000_000,
+                        end_us: 3_000_000,
+                        name: "Chorus".into(),
+                    },
+                ],
+            },
             HostCommand::PlayLoad {
                 dir: "some/dir".into(),
             },
@@ -391,6 +429,9 @@ mod tests {
                 let sample = match p.ty {
                     "bool" => json!(true),
                     "SaveDest" => json!({ "kind": "quick_save" }),
+                    "Vec<SegmentSpec>" => {
+                        json!([{ "start_us": 0, "end_us": 1, "name": "x" }])
+                    }
                     // String, String?, and any other scalar accept a string.
                     _ => json!("x"),
                 };
@@ -459,6 +500,30 @@ mod tests {
                 dest: SaveDest::Library {
                     name: "Tune".into()
                 }
+            }
+        );
+        assert_eq!(
+            host_command_from_name(
+                "split_bundle",
+                &json!({ "segments": [
+                    { "start_us": 0, "end_us": 1_000_000, "name": "Intro" },
+                    { "start_us": 1_000_000, "end_us": 2_000_000, "name": "Verse" }
+                ] })
+            )
+            .unwrap(),
+            HostCommand::SplitBundle {
+                segments: vec![
+                    SegmentSpec {
+                        start_us: 0,
+                        end_us: 1_000_000,
+                        name: "Intro".into()
+                    },
+                    SegmentSpec {
+                        start_us: 1_000_000,
+                        end_us: 2_000_000,
+                        name: "Verse".into()
+                    },
+                ]
             }
         );
     }

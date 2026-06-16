@@ -13,8 +13,9 @@
 use std::sync::Mutex;
 
 use rockcraft_core::{
-    action_from_name, action_help, ActionError, BackgroundVideo, BackingTrack, Composer,
-    ComposerSnapshot, Effect, Grid, Key, NoteView, RecordingMeta, Scale, Timeline, TrackOrigin,
+    action_from_name, action_help, slice_segment, ActionError, BackgroundVideo, BackingTrack,
+    Composer, ComposerSnapshot, Effect, Grid, Key, NoteView, RecordingMeta, Scale, Segment,
+    Timeline, TrackOrigin,
 };
 use rockcraft_midi::{events_to_smf_bytes, smf_bytes_to_events};
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,19 @@ pub enum SaveDest {
     QuickSave,
     /// Named save — writes to `<library_root>/<slug>/`.
     Library { name: String },
+}
+
+/// One kept part for [`split_bundle`] (M10-B): the half-open song-time range
+/// `[start_us, end_us)` becomes a new library bundle named `name`.
+///
+/// The state-side mirror of `rockcraft_control::SegmentSpec`, kept here so this
+/// module stays free of the control crate (like [`SaveDest`]); `control.rs`
+/// maps between the two.
+#[derive(Debug, Clone)]
+pub struct SplitSegment {
+    pub start_us: u64,
+    pub end_us: u64,
+    pub name: String,
 }
 
 /// Tauri-managed state: the live composer behind a `Mutex`, plus the extra
@@ -276,6 +290,91 @@ fn write_bundle(
     };
     std::fs::write(bundle_dir.join("meta.json"), meta.to_json())?;
     Ok(())
+}
+
+/// Slice the loaded piece into the given kept parts, writing each as its own
+/// standalone library bundle (M10-B).
+///
+/// Each [`SplitSegment`] becomes `<library_root>/<slug>/` containing the subset
+/// MIDI (notes shifted to t=0), a **copied** backing/video file when the piece
+/// has media (offsets shifted by the segment start), and a `meta.json` carrying
+/// the derived offsets, the source piece's `grid`/`key`, and
+/// `origin = Edited`. Discarded parts are simply omitted from `segments`
+/// (= trimming). The **source** piece, its bundle, and the dirty flag are left
+/// untouched — splitting is non-destructive.
+///
+/// Returns the created bundle directory paths as strings.
+pub fn split_bundle(state: &AppState, segments: Vec<SplitSegment>) -> Result<Vec<String>, String> {
+    split_bundle_into(state, &rockcraft_midi::bundle::library_root(), segments)
+}
+
+/// [`split_bundle`] with an explicit library root, so tests can target a temp
+/// directory without touching `$ROCKCRAFT_LIBRARY_DIR`.
+fn split_bundle_into(
+    state: &AppState,
+    library_root: &std::path::Path,
+    segments: Vec<SplitSegment>,
+) -> Result<Vec<String>, String> {
+    if segments.is_empty() {
+        return Err("no segments to write".to_string());
+    }
+
+    let composer = state.composer.lock().expect("composer mutex poisoned");
+    let timeline = composer.timeline().clone();
+    let grid = composer.grid();
+    let backing_offset_us = composer.backing_offset_us();
+    drop(composer);
+
+    let key = *state.key.lock().expect("key mutex poisoned");
+    let backing_path = state
+        .backing_path
+        .lock()
+        .expect("backing_path mutex poisoned")
+        .clone();
+    let video = state.video.lock().expect("video mutex poisoned").clone();
+
+    // The loaded media references the slicer shifts per segment. The file names
+    // match what `write_bundle` would write, so the copied files line up.
+    let backing_meta = backing_path.as_ref().map(|p| BackingTrack {
+        file: crate::record_bundle_backing_filename(p),
+        audio_start_us: backing_offset_us,
+    });
+    let video_meta = video.as_ref().map(|v| BackgroundVideo {
+        file: video_bundle_filename(&v.path),
+        offset_us: v.offset_us,
+    });
+
+    let mut dirs = Vec::with_capacity(segments.len());
+    for seg in segments {
+        let slug = rockcraft_midi::bundle::slug(&seg.name);
+        if slug.is_empty() {
+            return Err(format!(
+                "empty name for segment `{}` — cannot save",
+                seg.name
+            ));
+        }
+        let sliced = slice_segment(
+            &timeline,
+            Segment {
+                start_us: seg.start_us,
+                end_us: seg.end_us,
+            },
+            backing_meta.as_ref(),
+            video_meta.as_ref(),
+        );
+        let dir = library_root.join(&slug);
+        rockcraft_import::write_part_bundle(
+            &dir,
+            &sliced,
+            grid,
+            key,
+            backing_path.as_deref(),
+            video.as_ref().map(|v| v.path.as_path()),
+        )
+        .map_err(|e| e.to_string())?;
+        dirs.push(dir.to_string_lossy().into_owned());
+    }
+    Ok(dirs)
 }
 
 /// Bundle-relative filename for a retained background video, derived from the
@@ -826,5 +925,85 @@ mod tests {
         assert!(query_dirty(&state), "detach marks dirty");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M10-B: `split_bundle` writes each kept segment as its own library bundle
+    /// with copied media + derived offsets and `origin = Edited`, leaving the
+    /// source piece and its media untouched.
+    #[test]
+    fn split_bundle_writes_kept_parts_with_copied_media() {
+        let dir = std::env::temp_dir().join(format!(
+            "rockcraft-split-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Stand-in source media the editor has attached.
+        let src_backing = dir.join("my-song.ogg");
+        let src_video = dir.join("clip.mp4");
+        std::fs::write(&src_backing, b"AUDIO").unwrap();
+        std::fs::write(&src_video, b"VIDEO").unwrap();
+
+        let state = AppState::new();
+        run_action(&state, "add_note", &json!({})).expect("add_note");
+        set_backing(&state, src_backing.to_string_lossy().into_owned());
+        run_action(
+            &state,
+            "nudge_backing_offset",
+            &json!({ "delta_us": 250_000 }),
+        )
+        .expect("nudge_backing_offset");
+        set_video(&state, src_video.to_string_lossy().into_owned(), -100_000);
+
+        let lib = dir.join("library");
+        let segs = vec![
+            SplitSegment {
+                start_us: 0,
+                end_us: 1_000_000,
+                name: "Part One".into(),
+            },
+            SplitSegment {
+                start_us: 2_000_000,
+                end_us: 3_000_000,
+                name: "Part Two".into(),
+            },
+        ];
+        let dirs = split_bundle_into(&state, &lib, segs).expect("split_bundle succeeds");
+        assert_eq!(dirs.len(), 2, "one bundle per kept segment");
+
+        for (path, seg_start) in dirs.iter().zip([0u64, 2_000_000]) {
+            let bundle = std::path::Path::new(path);
+            assert!(bundle.join("song.mid").exists(), "song.mid written");
+            assert_eq!(std::fs::read(bundle.join("backing.ogg")).unwrap(), b"AUDIO");
+            assert_eq!(
+                std::fs::read(bundle.join("background.mp4")).unwrap(),
+                b"VIDEO"
+            );
+
+            let meta = RecordingMeta::from_json(
+                &std::fs::read_to_string(bundle.join("meta.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(meta.origin, Some(TrackOrigin::Edited));
+            assert!(meta.grid.is_some() && meta.key.is_some());
+            assert_eq!(meta.backing.unwrap().audio_start_us, 250_000 + seg_start);
+            assert_eq!(meta.video.unwrap().offset_us, -100_000 + seg_start as i64);
+        }
+
+        // The source media is left untouched (non-destructive).
+        assert_eq!(std::fs::read(&src_backing).unwrap(), b"AUDIO");
+        assert_eq!(std::fs::read(&src_video).unwrap(), b"VIDEO");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn split_bundle_rejects_empty_segments() {
+        let state = AppState::new();
+        let err = split_bundle_into(&state, std::path::Path::new("/tmp/x"), vec![]).unwrap_err();
+        assert!(err.contains("no segments"), "got: {err}");
     }
 }

@@ -6,7 +6,7 @@ pub mod server;
 pub use command::{CommandServer, RemoteCommand};
 pub use host::{
     host_command_from_name, host_command_names, host_help, HostCommand, HostCommandInfo, HostError,
-    HostServices, SaveDest,
+    HostServices, SaveDest, SegmentSpec,
 };
 pub use protocol::{
     handle, handle_run_host_command, handle_with_host, QueryKind, Request, Response,
