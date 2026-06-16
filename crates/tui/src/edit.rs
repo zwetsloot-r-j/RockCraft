@@ -40,11 +40,14 @@ use ratatui::{
     Frame,
 };
 use rockcraft_audio::{play_file_at, BackingHandle, SynthHandle};
+use rockcraft_control::SegmentSpec;
 use rockcraft_core::{
-    backing_position_us, Action, BackingTrack, Composer, Cursor, Effect, Grid, InputMode, Key,
-    MidiNote, Note, NoteEvent, NoteId, RecordingMeta, Scale as MusicScale, Subdivision, Timeline,
-    TrackOrigin, Velocity,
+    backing_position_us, segments_from_splits, slice_segment, Action, BackgroundVideo,
+    BackingTrack, Composer, Cursor, Effect, Grid, InputMode, Key, MidiNote, Note, NoteEvent,
+    NoteId, RecordingMeta, Scale as MusicScale, Segment, Subdivision, Timeline, TrackOrigin,
+    Velocity,
 };
+use rockcraft_import::write_part_bundle;
 use rockcraft_midi::{events_to_smf_bytes, key_map as mock_key_map};
 
 use crate::highway::{build_spans, project, NoteSpan};
@@ -107,6 +110,8 @@ const SELECT_COLOR: Color = Color::LightGreen;
 const LOOP_COLOR: Color = Color::Indexed(22); // dark green band
 /// Loop-region bracket / label colour (brighter than the band).
 const LOOP_EDGE_COLOR: Color = Color::Green;
+/// Split-marker tick colour on the highway (M10-D).
+const SPLIT_COLOR: Color = Color::Magenta;
 
 /// Outcome of a key press while the dirty-exit prompt is displayed.
 #[derive(Debug, PartialEq, Eq)]
@@ -128,6 +133,22 @@ pub enum NameOutcome {
     Cancelled,
     /// Still editing (a character typed, backspace, or empty Enter).
     Pending,
+}
+
+/// Outcome of a key press while the split panel (M10-D) owns the keymap.
+///
+/// Marker / segment edits are handled inside [`EditScreen`] itself and reported
+/// as [`SplitOutcome::Handled`]; only the actual write to the library needs the
+/// shell (it owns the library root + status line), surfaced as
+/// [`SplitOutcome::SaveParts`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum SplitOutcome {
+    /// The key was consumed by the split panel; nothing for the shell to do.
+    Handled,
+    /// `w` — the shell should write the kept segments to the library.
+    SaveParts,
+    /// The split panel was closed (Esc / `X`); back to normal editing.
+    Left,
 }
 
 /// Map a `KeyCode` to the composer [`Action`] it triggers in normal (non-chord)
@@ -252,6 +273,30 @@ struct Backing {
     path: PathBuf,
 }
 
+/// A background video reference carried by the editor (M10-D).
+///
+/// The TUI never decodes or renders the video; it holds the reference purely so
+/// split / save can round-trip `meta.video` into the part bundles (the file is
+/// copied unchanged, the `offset_us` shifted per segment by `slice_segment`).
+struct Video {
+    /// Absolute source path of the video file in the loaded bundle (copied into
+    /// each new bundle).
+    src: PathBuf,
+    /// Bundle-relative filename to record in `meta.video.file` (kept unchanged).
+    file: String,
+    /// Real-time alignment offset carried from the source `meta.video.offset_us`.
+    offset_us: i64,
+}
+
+/// One derived segment's editable metadata in the split panel: whether it is
+/// kept (vs. trimmed) and the name its bundle is saved under. Indexed by segment
+/// position; defaults are keep + `part-N`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SegmentEntry {
+    keep: bool,
+    name: String,
+}
+
 /// What the backing track should do on a given tick, derived purely from the
 /// transport state (no device touched). [`EditScreen::poll_backing`] computes
 /// it; [`EditScreen::tick_backing`] applies it to the live [`BackingHandle`].
@@ -326,6 +371,22 @@ pub struct EditScreen {
     /// Backing offset at the previous `poll_backing`; a change while playing
     /// (an alignment nudge) triggers a re-seek so the shift is audible at once.
     prev_offset_us: u64,
+    /// Background video reference carried for split round-trip (M10-D). `None`
+    /// when the loaded piece has no backdrop; never rendered by the TUI.
+    video: Option<Video>,
+    /// Whether the split panel (M10-D) is active and owns the keymap.
+    split_mode: bool,
+    /// Split marker song-times (µs), kept sorted + deduped. Divide the piece
+    /// into the consecutive segments shown in the split panel.
+    splits: Vec<u64>,
+    /// Per-segment keep/discard + name metadata, indexed by segment position and
+    /// re-synced to the derived segment count after every marker edit.
+    segments: Vec<SegmentEntry>,
+    /// Selected row in the split panel's segment list.
+    seg_selected: usize,
+    /// When `Some`, the split-panel rename overlay is active and holds the name
+    /// typed so far for the selected segment.
+    rename_prompt: Option<String>,
 }
 
 impl EditScreen {
@@ -368,6 +429,12 @@ impl EditScreen {
             prev_playing: false,
             prev_playhead_us: 0,
             prev_offset_us: 0,
+            video: None,
+            split_mode: false,
+            splits: Vec::new(),
+            segments: Vec::new(),
+            seg_selected: 0,
+            rename_prompt: None,
         }
     }
 
@@ -391,6 +458,20 @@ impl EditScreen {
         // The offset is composer state (editable + snapshot-visible); seed it
         // from the loaded value so a reopened bundle restores its alignment.
         self.composer.set_backing_offset_us(audio_start_us);
+        self
+    }
+
+    /// Carry the loaded piece's background video reference for split round-trip
+    /// (M10-D). `src` is the absolute source path (copied into each part bundle),
+    /// `file` the bundle-relative filename, `offset_us` the real-time offset from
+    /// `meta.video`. Builder form, mirroring [`with_backing`]. The TUI never
+    /// renders it — it exists only so saved parts keep their backdrop reference.
+    pub fn with_video(mut self, src: PathBuf, file: String, offset_us: i64) -> Self {
+        self.video = Some(Video {
+            src,
+            file,
+            offset_us,
+        });
         self
     }
 
@@ -495,17 +576,335 @@ impl EditScreen {
         } else {
             None
         };
+        // Carry an attached background video through unchanged (M10-D): copy the
+        // file in and record its reference so a loaded backdrop survives a re-save.
+        // The TUI never decodes it.
+        let video = if let Some(v) = &self.video {
+            std::fs::copy(&v.src, bundle_dir.join(&v.file))?;
+            Some(BackgroundVideo {
+                file: v.file.clone(),
+                offset_us: v.offset_us,
+            })
+        } else {
+            None
+        };
         let meta = RecordingMeta {
             midi_file: "song.mid".into(),
             backing,
             grid: Some(self.grid),
             key: Some(self.key),
             origin: Some(self.origin),
-            video: None,
+            video,
             version: 1,
         };
         std::fs::write(bundle_dir.join("meta.json"), meta.to_json())?;
         Ok(bundle_dir.to_path_buf())
+    }
+
+    // ── split points + parts (M10-D) ────────────────────────────────────────
+
+    /// Whether the split panel is active and owns the keymap.
+    pub fn in_split_mode(&self) -> bool {
+        self.split_mode
+    }
+
+    /// Open the split panel: derive the current segments and show the marker
+    /// ruler + segment list. A no-op when already open.
+    pub fn enter_split_mode(&mut self) {
+        self.split_mode = true;
+        self.rename_prompt = None;
+        self.sync_segments();
+    }
+
+    /// Close the split panel, returning to normal editing. Markers and segment
+    /// metadata are retained so reopening resumes where it left off.
+    pub fn exit_split_mode(&mut self) {
+        self.split_mode = false;
+        self.rename_prompt = None;
+    }
+
+    /// The song length used as the right edge of `[0, total_us)` for segment
+    /// derivation: the end of the last note (0 for an empty timeline).
+    fn total_us(&self) -> u64 {
+        self.timeline()
+            .notes()
+            .map(|(_, n)| n.start_us + n.dur_us)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The song-time a marker is dropped / measured against: the playhead while
+    /// playing, otherwise the cursor's step time.
+    fn split_anchor_us(&self) -> u64 {
+        if self.is_playing() {
+            self.playhead_us()
+        } else {
+            self.cursor_us()
+        }
+    }
+
+    /// The split markers, sorted (read-only; for rendering and tests).
+    pub fn split_markers(&self) -> &[u64] {
+        &self.splits
+    }
+
+    /// Drop a split marker at the current anchor (cursor / playhead), clamped to
+    /// the song range. Duplicate / out-of-range points are ignored.
+    pub fn add_split_marker(&mut self) {
+        let total = self.total_us();
+        let at = self.split_anchor_us().min(total);
+        // A marker at 0 or the song end creates no new boundary — skip it.
+        if at == 0 || at >= total || self.splits.contains(&at) {
+            return;
+        }
+        self.splits.push(at);
+        self.splits.sort_unstable();
+        self.splits.dedup();
+        self.sync_segments();
+    }
+
+    /// Remove the marker nearest the anchor (cursor / playhead). A no-op when
+    /// there are no markers.
+    pub fn remove_nearest_marker(&mut self) {
+        let at = self.split_anchor_us();
+        let Some((idx, _)) = self
+            .splits
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, &m)| m.abs_diff(at))
+        else {
+            return;
+        };
+        self.splits.remove(idx);
+        self.sync_segments();
+    }
+
+    /// Clear every split marker (the whole piece becomes one segment).
+    pub fn clear_split_markers(&mut self) {
+        self.splits.clear();
+        self.sync_segments();
+    }
+
+    /// Re-derive the segment count from the current markers and resize the
+    /// keep/discard + name metadata to match, preserving existing rows by index
+    /// and defaulting new rows to keep + `part-N`. Clamps the selection.
+    fn sync_segments(&mut self) {
+        let count = segments_from_splits(&self.splits, self.total_us()).len();
+        if self.segments.len() > count {
+            self.segments.truncate(count);
+        } else {
+            for i in self.segments.len()..count {
+                self.segments.push(SegmentEntry {
+                    keep: true,
+                    name: format!("part-{}", i + 1),
+                });
+            }
+        }
+        if self.seg_selected >= count {
+            self.seg_selected = count.saturating_sub(1);
+        }
+    }
+
+    /// The derived segments paired with their keep/name metadata, for rendering
+    /// the split panel and for tests. Always re-derived from the live markers so
+    /// it can never drift from `core::segment`.
+    pub fn split_segments(&self) -> Vec<(Segment, bool, String)> {
+        segments_from_splits(&self.splits, self.total_us())
+            .into_iter()
+            .enumerate()
+            .map(|(i, seg)| {
+                let (keep, name) = match self.segments.get(i) {
+                    Some(e) => (e.keep, e.name.clone()),
+                    None => (true, format!("part-{}", i + 1)),
+                };
+                (seg, keep, name)
+            })
+            .collect()
+    }
+
+    /// Selected segment row in the split panel.
+    pub fn selected_segment(&self) -> usize {
+        self.seg_selected
+    }
+
+    /// Move the segment-list selection by `delta`, clamped to the list.
+    fn move_segment_selection(&mut self, delta: i64) {
+        let count = segments_from_splits(&self.splits, self.total_us()).len();
+        if count == 0 {
+            self.seg_selected = 0;
+            return;
+        }
+        let next = (self.seg_selected as i64 + delta).clamp(0, count as i64 - 1);
+        self.seg_selected = next as usize;
+    }
+
+    /// Toggle keep/discard on the selected segment.
+    fn toggle_selected_keep(&mut self) {
+        self.sync_segments();
+        if let Some(e) = self.segments.get_mut(self.seg_selected) {
+            e.keep = !e.keep;
+        }
+    }
+
+    /// Whether the split-panel rename overlay is active.
+    pub fn is_renaming_segment(&self) -> bool {
+        self.rename_prompt.is_some()
+    }
+
+    /// The rename text typed so far (empty until shown / typed).
+    pub fn rename_prompt_text(&self) -> &str {
+        self.rename_prompt.as_deref().unwrap_or("")
+    }
+
+    /// Open the rename overlay for the selected segment, seeded with its name.
+    fn start_segment_rename(&mut self) {
+        self.sync_segments();
+        if let Some(e) = self.segments.get(self.seg_selected) {
+            self.rename_prompt = Some(e.name.clone());
+        }
+    }
+
+    /// The kept segments as [`SegmentSpec`]s, in song order. Discarded segments
+    /// are omitted (= trimming). The same `[start_us, end_us)` boundaries
+    /// `core::segments_from_splits` derives, so the write path matches `core`.
+    pub fn kept_segment_specs(&self) -> Vec<SegmentSpec> {
+        self.split_segments()
+            .into_iter()
+            .filter(|(_, keep, _)| *keep)
+            .map(|(seg, _, name)| SegmentSpec {
+                start_us: seg.start_us,
+                end_us: seg.end_us,
+                name,
+            })
+            .collect()
+    }
+
+    /// Slice the kept segments and write each as its own standalone library
+    /// bundle under `root`, returning the created directories. The shared M10-B
+    /// write path (`core::slice_segment` + `rockcraft_import::write_part_bundle`):
+    /// the subset MIDI is shifted to t=0 and the backing / video references carry
+    /// over with offsets shifted per segment (files copied unchanged). The source
+    /// piece is never touched.
+    pub fn split_into_library(&self, root: &std::path::Path) -> Result<Vec<PathBuf>, String> {
+        let kept = self.kept_segment_specs();
+        if kept.is_empty() {
+            return Err("no kept segments to save".to_string());
+        }
+
+        let timeline = self.timeline().clone();
+        let backing_meta = self.backing.as_ref().map(|b| BackingTrack {
+            file: bundle_backing_filename(&b.path),
+            audio_start_us: self.composer.backing_offset_us(),
+        });
+        let video_meta = self.video.as_ref().map(|v| BackgroundVideo {
+            file: v.file.clone(),
+            offset_us: v.offset_us,
+        });
+        let backing_src = self.backing.as_ref().map(|b| b.path.as_path());
+        let video_src = self.video.as_ref().map(|v| v.src.as_path());
+
+        let mut dirs = Vec::with_capacity(kept.len());
+        for spec in &kept {
+            let slug = crate::library::slug(&spec.name);
+            if slug.is_empty() {
+                return Err(format!(
+                    "empty name for segment `{}` — cannot save",
+                    spec.name
+                ));
+            }
+            let sliced = slice_segment(
+                &timeline,
+                Segment {
+                    start_us: spec.start_us,
+                    end_us: spec.end_us,
+                },
+                backing_meta.as_ref(),
+                video_meta.as_ref(),
+            );
+            let dir = root.join(&slug);
+            write_part_bundle(&dir, &sliced, self.grid, self.key, backing_src, video_src)
+                .map_err(|e| e.to_string())?;
+            dirs.push(dir);
+        }
+        Ok(dirs)
+    }
+
+    /// Handle a key while the split panel owns the keymap. Marker / segment edits
+    /// are applied here; only `w` (write parts) is bubbled to the shell, which
+    /// owns the library root and status line. Unrecognised keys (cursor nav,
+    /// transport, …) fall through to the normal keymap so the user can move the
+    /// playhead to position a marker.
+    pub fn on_split_key(&mut self, code: KeyCode) -> SplitOutcome {
+        self.save_flash = None;
+
+        // The rename overlay owns every key while it is up.
+        if let Some(buf) = self.rename_prompt.as_mut() {
+            match code {
+                KeyCode::Esc => self.rename_prompt = None,
+                KeyCode::Enter => {
+                    let name = buf.trim().to_string();
+                    self.rename_prompt = None;
+                    if !name.is_empty() {
+                        self.sync_segments();
+                        if let Some(e) = self.segments.get_mut(self.seg_selected) {
+                            e.name = name;
+                        }
+                    }
+                }
+                KeyCode::Backspace => {
+                    buf.pop();
+                }
+                KeyCode::Char(c) => buf.push(c),
+                _ => {}
+            }
+            return SplitOutcome::Handled;
+        }
+
+        match code {
+            // Close the panel.
+            KeyCode::Esc | KeyCode::Char('X') => {
+                self.exit_split_mode();
+                SplitOutcome::Left
+            }
+            // Markers.
+            KeyCode::Char('s') => {
+                self.add_split_marker();
+                SplitOutcome::Handled
+            }
+            KeyCode::Char('r') => {
+                self.remove_nearest_marker();
+                SplitOutcome::Handled
+            }
+            KeyCode::Char('c') => {
+                self.clear_split_markers();
+                SplitOutcome::Handled
+            }
+            // Segment-list selection.
+            KeyCode::Char('n') => {
+                self.move_segment_selection(1);
+                SplitOutcome::Handled
+            }
+            KeyCode::Char('N') => {
+                self.move_segment_selection(-1);
+                SplitOutcome::Handled
+            }
+            // Keep/discard + rename.
+            KeyCode::Char('t') => {
+                self.toggle_selected_keep();
+                SplitOutcome::Handled
+            }
+            KeyCode::Char('e') => {
+                self.start_segment_rename();
+                SplitOutcome::Handled
+            }
+            // Write the kept parts — the shell performs the I/O.
+            KeyCode::Char('w') => SplitOutcome::SaveParts,
+            // Everything else edits the piece / moves the playhead as usual.
+            other => {
+                self.on_key(other);
+                SplitOutcome::Handled
+            }
+        }
     }
 
     // ── key routing ───────────────────────────────────────────────────────
@@ -1206,6 +1605,15 @@ impl EditScreen {
         if self.bpm_prompt.is_some() {
             self.draw_bpm_prompt(f, area);
         }
+
+        // The split panel (segment list) docks on the right while active, with
+        // the rename overlay on top of it.
+        if self.split_mode {
+            self.draw_split_panel(f, area);
+            if self.rename_prompt.is_some() {
+                self.draw_rename_prompt(f, area);
+            }
+        }
     }
 
     fn draw_status(&self, f: &mut Frame, area: Rect) {
@@ -1386,7 +1794,7 @@ impl EditScreen {
             ),
             vel_span,
             Span::styled(
-                "[a/x] add/del  []/[] size  [+/-] vel  [(/)] tempo  [T] set BPM  [m] grab  [c] chord  [v] select  [y/p/D] yank/paste/del  [u/U] undo/redo  [R] rec  [t] step/live  [C] count-in  [Space] play/stop  [P] play-start  [o] loop  [{/}] loop in/out  [M] metro  [>/<] subdiv  [hjkl] pitch/time  [H/L] bar  [w/b] oct  [g/G] timeline ends  [0/$] pitch ends  [s] save  [S] save to library  [Tab] menu",
+                "[a/x] add/del  []/[] size  [+/-] vel  [(/)] tempo  [T] set BPM  [m] grab  [c] chord  [v] select  [y/p/D] yank/paste/del  [u/U] undo/redo  [R] rec  [t] step/live  [C] count-in  [Space] play/stop  [P] play-start  [o] loop  [{/}] loop in/out  [M] metro  [>/<] subdiv  [hjkl] pitch/time  [H/L] bar  [w/b] oct  [g/G] timeline ends  [0/$] pitch ends  [s] save  [S] save to library  [X] split  [Tab] menu",
                 Style::default().fg(Color::DarkGray),
             ),
         ]);
@@ -1417,6 +1825,8 @@ impl EditScreen {
         self.draw_gridlines(f, area, now, lead);
         // Loop region band under the playhead/notes so it reads as a backdrop.
         self.draw_loop_region(f, area, now, lead);
+        // Split markers sit above the gridlines so they read as boundaries.
+        self.draw_split_markers(f, area, now, lead);
         self.draw_playhead(f, area, now, lead);
 
         // Crosshair guides through the cursor (its step row, full width, and its
@@ -1651,6 +2061,38 @@ impl EditScreen {
         }
     }
 
+    /// Draw each split marker as a bright full-width tick line across the highway
+    /// (M10-D) so the split boundaries are visible without rendering video. The
+    /// kept/discarded state is shown in the segment panel, not here.
+    fn draw_split_markers(&self, f: &mut Frame, area: Rect, now: u64, lead: u64) {
+        if self.splits.is_empty() || area.width == 0 {
+            return;
+        }
+        let window_end = now + lead;
+        let tick = "╪".repeat(area.width as usize);
+        for &m in &self.splits {
+            if m < now || m > window_end {
+                continue;
+            }
+            let marker = NoteSpan {
+                note: LOWEST_MIDI,
+                start_us: m,
+                end_us: m + 1,
+            };
+            if let Some(rs) = project(&marker, now, lead, area.height) {
+                let rect = Rect::new(area.x, area.y + rs.bottom_row, area.width, 1);
+                f.render_widget(
+                    Paragraph::new(tick.clone()).style(
+                        Style::default()
+                            .fg(SPLIT_COLOR)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    rect,
+                );
+            }
+        }
+    }
+
     /// Draw the help overlay as a centered modal popup listing the keymap.
     fn draw_help_overlay(&self, f: &mut Frame, area: Rect) {
         // Create a centered block for the help overlay
@@ -1799,6 +2241,21 @@ impl EditScreen {
             Line::from(Span::raw("  u : Undo                U : Redo")),
             Line::from(Span::raw("")), // Empty line
             Line::from(Span::styled(
+                " Split into parts:",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::raw("  X : Open/close the split panel")),
+            Line::from(Span::raw(
+                "  s : Mark at cursor     r : Unmark nearest   c : Clear",
+            )),
+            Line::from(Span::raw(
+                "  n/N : Select segment   t : Keep/discard     e : Name",
+            )),
+            Line::from(Span::raw("  w : Save kept parts to the library")),
+            Line::from(Span::raw("")), // Empty line
+            Line::from(Span::styled(
                 " Other:",
                 Style::default()
                     .fg(Color::Yellow)
@@ -1883,6 +2340,104 @@ impl EditScreen {
             inner,
         );
     }
+
+    /// The split panel (M10-D): a right-docked list of the derived segments with
+    /// index, time range, keep/discard flag and name, the selected row
+    /// highlighted, plus the marker count and key hints.
+    fn draw_split_panel(&self, f: &mut Frame, area: Rect) {
+        let segs = self.split_segments();
+
+        // Dock on the right third (min 28 cols), full height.
+        let w = (area.width / 3).clamp(28.min(area.width), area.width);
+        let x = area.x + area.width.saturating_sub(w);
+        let panel = Rect::new(x, area.y, w, area.height);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" SPLIT ")
+            .border_style(Style::default().fg(SPLIT_COLOR));
+        let inner = block.inner(panel);
+        f.render_widget(block, panel);
+
+        let mut lines: Vec<Line> = Vec::new();
+        lines.push(Line::from(Span::styled(
+            format!("{} marker(s)", self.splits.len()),
+            Style::default().fg(Color::DarkGray),
+        )));
+        if segs.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "(no notes to split)",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        for (i, (seg, keep, name)) in segs.iter().enumerate() {
+            let selected = i == self.seg_selected;
+            let marker = if selected { "▸" } else { " " };
+            let flag = if *keep { "keep" } else { "drop" };
+            let flag_color = if *keep { Color::Green } else { Color::Red };
+            let text = format!(
+                "{marker} {}. {}–{}s  {name}",
+                i + 1,
+                fmt_us(seg.start_us),
+                fmt_us(seg.end_us),
+            );
+            let style = if selected {
+                Style::default().fg(Color::Black).bg(SPLIT_COLOR)
+            } else if *keep {
+                Style::default().fg(Color::White)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(text, style),
+                Span::raw(" "),
+                Span::styled(format!("[{flag}]"), Style::default().fg(flag_color)),
+            ]));
+        }
+        lines.push(Line::from(Span::raw("")));
+        lines.push(Line::from(Span::styled(
+            "[s] mark  [r] unmark  [c] clear",
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::from(Span::styled(
+            "[n/N] sel  [t] keep  [e] name",
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::from(Span::styled(
+            "[w] save parts  [Esc/X] close",
+            Style::default().fg(Color::DarkGray),
+        )));
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+
+    /// The split-panel rename overlay: a single-line text field for the selected
+    /// segment's name, mirroring the save-to-library overlay.
+    fn draw_rename_prompt(&self, f: &mut Frame, area: Rect) {
+        let typed = self.rename_prompt_text();
+        let label = format!(" Name segment: {typed}█  [Enter] set  [Esc] cancel ");
+        let w = (label.len() as u16 + 4).min(area.width).max(20);
+        let h = 3u16;
+        let x = area.x + area.width.saturating_sub(w) / 2;
+        let y = area.y + area.height.saturating_sub(h) / 2;
+        let prompt_area = Rect::new(x, y, w, h.min(area.height));
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(SPLIT_COLOR));
+        let inner = block.inner(prompt_area);
+        f.render_widget(block, prompt_area);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                label,
+                Style::default().fg(SPLIT_COLOR),
+            ))),
+            inner,
+        );
+    }
+}
+
+/// Format a song-time in microseconds as seconds with millisecond precision
+/// (e.g. `1.500`), for the split panel's compact time ranges.
+fn fmt_us(us: u64) -> String {
+    format!("{}.{:03}", us / 1_000_000, (us % 1_000_000) / 1_000)
 }
 
 impl Default for EditScreen {
@@ -4055,5 +4610,219 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── split points + parts (M10-D) ─────────────────────────────────────────
+
+    /// A unique temp dir for a split test, named with the caller's tag.
+    fn split_tmp(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "rockcraft_split_{tag}_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ))
+    }
+
+    /// Move the cursor to `target_us` (multiple of the 1/16 step at 120 BPM) by
+    /// stepping right, then drop a split marker there.
+    fn mark_at(e: &mut EditScreen, target_us: u64) {
+        let step = e.grid.step_us();
+        e.composer.apply(Action::CursorToStart).ok();
+        for _ in 0..(target_us / step) {
+            e.on_key(KeyCode::Char('k'));
+        }
+        e.add_split_marker();
+    }
+
+    /// The TUI derives the same segment boundaries as `core::segments_from_splits`
+    /// (and omits discarded parts) — the marker-set → `SegmentSpec` mapping.
+    #[test]
+    fn kept_segment_specs_match_core_segments() {
+        let mut tl = Timeline::new();
+        tl.insert(note(60, 0, 3_000_000));
+        let mut e = EditScreen::from_timeline(tl, Grid::default_120());
+
+        mark_at(&mut e, 1_000_000);
+        mark_at(&mut e, 2_000_000);
+        assert_eq!(e.split_markers(), &[1_000_000, 2_000_000]);
+
+        // All kept: identical boundaries to core, default `part-N` names.
+        let core = segments_from_splits(e.split_markers(), 3_000_000);
+        let specs = e.kept_segment_specs();
+        let core_bounds: Vec<(u64, u64)> = core.iter().map(|s| (s.start_us, s.end_us)).collect();
+        let spec_bounds: Vec<(u64, u64)> = specs.iter().map(|s| (s.start_us, s.end_us)).collect();
+        assert_eq!(spec_bounds, core_bounds);
+        assert_eq!(
+            specs.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
+            vec!["part-1", "part-2", "part-3"],
+        );
+
+        // Discard the middle segment → it is omitted (= trimming).
+        e.enter_split_mode();
+        assert_eq!(e.on_split_key(KeyCode::Char('n')), SplitOutcome::Handled);
+        assert_eq!(e.on_split_key(KeyCode::Char('t')), SplitOutcome::Handled);
+        let kept = e.kept_segment_specs();
+        assert_eq!(
+            kept.iter()
+                .map(|s| (s.start_us, s.end_us))
+                .collect::<Vec<_>>(),
+            vec![(0, 1_000_000), (2_000_000, 3_000_000)],
+        );
+    }
+
+    /// Removing the nearest marker and clearing both behave as expected.
+    #[test]
+    fn marker_add_remove_clear() {
+        let mut tl = Timeline::new();
+        tl.insert(note(60, 0, 3_000_000));
+        let mut e = EditScreen::from_timeline(tl, Grid::default_120());
+
+        mark_at(&mut e, 1_000_000);
+        mark_at(&mut e, 2_000_000);
+        assert_eq!(e.split_markers(), &[1_000_000, 2_000_000]);
+
+        // Cursor near 2 s removes the 2 s marker, leaving the 1 s one.
+        let step = e.grid.step_us();
+        e.composer.apply(Action::CursorToStart).ok();
+        for _ in 0..(2_000_000 / step) {
+            e.on_key(KeyCode::Char('k'));
+        }
+        e.remove_nearest_marker();
+        assert_eq!(e.split_markers(), &[1_000_000]);
+
+        e.clear_split_markers();
+        assert!(e.split_markers().is_empty());
+        // With no markers, the whole piece is one kept segment.
+        assert_eq!(e.kept_segment_specs().len(), 1);
+    }
+
+    /// Round-trip: a split driven through the TUI write path produces part
+    /// bundles whose `meta.json` carries the **derived** backing `audio_start_us`
+    /// and video `offset_us`, with both media files copied in — no loss of the
+    /// backing/video reference even though the TUI never renders the video. The
+    /// source media is left untouched.
+    #[test]
+    fn split_round_trips_backing_and_video() {
+        let tmp = split_tmp("rt");
+        let src = tmp.join("src");
+        std::fs::create_dir_all(&src).expect("mk src");
+        let backing_src = src.join("backing.mp3");
+        std::fs::write(&backing_src, b"FAKE-AUDIO").expect("write backing");
+        let video_src = src.join("source.mp4");
+        std::fs::write(&video_src, b"FAKE-VIDEO").expect("write video");
+
+        let mut tl = Timeline::new();
+        tl.insert(note(60, 0, 3_000_000));
+        let mut e = EditScreen::from_timeline(tl, Grid::default_120())
+            .with_backing(backing_src.clone(), 250_000)
+            .with_video(video_src.clone(), "source.mp4".into(), -200_000);
+
+        mark_at(&mut e, 1_000_000);
+        mark_at(&mut e, 2_000_000);
+
+        let lib = tmp.join("lib");
+        let dirs = e.split_into_library(&lib).expect("split writes parts");
+        assert_eq!(dirs.len(), 3, "three kept parts");
+
+        // The middle part [1 s, 2 s): offsets shift by the 1 s segment start.
+        let part2 = &dirs[1];
+        let meta = RecordingMeta::from_json(
+            &std::fs::read_to_string(part2.join("meta.json")).expect("meta.json"),
+        )
+        .expect("meta parses");
+        let backing = meta.backing.expect("part keeps backing");
+        assert_eq!(backing.file, "backing.mp3");
+        assert_eq!(backing.audio_start_us, 1_250_000);
+        let video = meta.video.expect("part keeps video");
+        assert_eq!(video.file, "source.mp4");
+        assert_eq!(video.offset_us, 800_000);
+
+        // Media files are present in the part bundle (copied, not just referenced).
+        assert!(part2.join("backing.mp3").exists(), "backing copied in");
+        assert!(part2.join("source.mp4").exists(), "video copied in");
+
+        // The source media is untouched.
+        assert!(backing_src.exists() && video_src.exists());
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A normal library save carries a loaded background-video reference through
+    /// to `meta.json` (and copies the file), so opening a backdropped piece for
+    /// edit and re-saving does not silently drop the video.
+    #[test]
+    fn normal_save_preserves_loaded_video() {
+        let tmp = split_tmp("vid");
+        let src = tmp.join("src");
+        std::fs::create_dir_all(&src).expect("mk src");
+        let video_src = src.join("source.mp4");
+        std::fs::write(&video_src, b"FAKE-VIDEO").expect("write video");
+
+        let mut tl = Timeline::new();
+        tl.insert(note(60, 0, 1_000_000));
+        let e = EditScreen::from_timeline(tl, Grid::default_120()).with_video(
+            video_src.clone(),
+            "source.mp4".into(),
+            -200_000,
+        );
+
+        let bundle = e.save_bundle(&tmp).expect("save");
+        let meta = RecordingMeta::from_json(
+            &std::fs::read_to_string(bundle.join("meta.json")).expect("meta.json"),
+        )
+        .expect("meta parses");
+        let video = meta.video.expect("video preserved");
+        assert_eq!(video.file, "source.mp4");
+        assert_eq!(video.offset_us, -200_000);
+        assert!(bundle.join("source.mp4").exists(), "video copied in");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Saving with no kept segments is an error, not an empty write.
+    #[test]
+    fn split_with_no_kept_segments_errors() {
+        let mut tl = Timeline::new();
+        tl.insert(note(60, 0, 1_000_000));
+        let mut e = EditScreen::from_timeline(tl, Grid::default_120());
+        e.enter_split_mode();
+        // One segment, discard it.
+        assert_eq!(e.on_split_key(KeyCode::Char('t')), SplitOutcome::Handled);
+        let tmp = split_tmp("empty");
+        assert!(e.split_into_library(&tmp).is_err());
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// `X`/Esc toggle the split panel and `e` opens the rename overlay, which
+    /// renames the selected segment on Enter.
+    #[test]
+    fn split_panel_toggle_and_rename() {
+        let mut tl = Timeline::new();
+        tl.insert(note(60, 0, 2_000_000));
+        let mut e = EditScreen::from_timeline(tl, Grid::default_120());
+
+        e.enter_split_mode();
+        assert!(e.in_split_mode());
+
+        // Rename segment 0 to "intro". The overlay is seeded with the current
+        // name ("part-1") for editing, so clear it first.
+        assert_eq!(e.on_split_key(KeyCode::Char('e')), SplitOutcome::Handled);
+        assert!(e.is_renaming_segment());
+        assert_eq!(e.rename_prompt_text(), "part-1");
+        for _ in 0.."part-1".len() {
+            e.on_split_key(KeyCode::Backspace);
+        }
+        for c in "intro".chars() {
+            e.on_split_key(KeyCode::Char(c));
+        }
+        assert_eq!(e.on_split_key(KeyCode::Enter), SplitOutcome::Handled);
+        assert!(!e.is_renaming_segment());
+        assert_eq!(e.kept_segment_specs()[0].name, "intro");
+
+        // Esc closes the panel.
+        assert_eq!(e.on_split_key(KeyCode::Esc), SplitOutcome::Left);
+        assert!(!e.in_split_mode());
     }
 }
