@@ -47,6 +47,13 @@ export class EditCanvas {
   // behind the canvas reads through while keeping notes/grid legible.
   private backdrop = false;
 
+  // M10-C split editor: the derived segments (with keep/discard flags). When set,
+  // `draw` paints a marker line at each interior boundary and dims discarded
+  // segments, so the user can see where they are cutting over the video backdrop.
+  // `null` (the default) means the split editor is closed — nothing is drawn.
+  private splits: { start_us: number; end_us: number; keep: boolean }[] | null =
+    null;
+
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
     this.ctx = canvas.getContext("2d")!;
@@ -67,6 +74,18 @@ export class EditCanvas {
    */
   setBackdrop(on: boolean): void {
     this.backdrop = on;
+  }
+
+  /**
+   * Set (or clear) the split-editor segments to overlay (M10-C). Pass the
+   * derived segments with their keep/discard flags to draw marker lines at the
+   * interior boundaries and dim the discarded ranges; pass `null` to draw
+   * nothing (editor closed). The next `draw` call picks it up.
+   */
+  setSplits(
+    segs: { start_us: number; end_us: number; keep: boolean }[] | null,
+  ): void {
+    this.splits = segs;
   }
 
   private resize(): void {
@@ -118,6 +137,7 @@ export class EditCanvas {
     this.drawCrosshair(snapshot, vp, cursorUs, g.stepUs);
     this.drawNotes(snapshot, vp);
     this.drawSelection(snapshot, vp);
+    this.drawSplits(vp);
     this.drawChordPreview(snapshot, vp, cursorUs, g.stepUs);
     this.drawCursor(snapshot, vp, cursorUs, g.stepUs);
     this.drawPlayhead(snapshot, vp, playheadUs);
@@ -395,6 +415,63 @@ export class EditCanvas {
       ctx.textBaseline = "top";
       ctx.fillText("LOOP OUT", 6, y1 + 2);
     }
+    ctx.restore();
+  }
+
+  // ── split markers + discarded shading (M10-C) ────────────────────────────
+
+  /**
+   * Overlay the split editor: a translucent red wash over every discarded
+   * segment (so trimmed-away ranges read as "gone") and a bright amber marker
+   * line at each interior boundary, labelled with the part number. Time runs
+   * bottom→top here, so a "split along the timeline" is a horizontal line across
+   * the width. Drawn over the notes but under the cursor/playhead.
+   */
+  private drawSplits(vp: Viewport): void {
+    if (!this.splits) return;
+    const ctx = this.ctx;
+    ctx.save();
+
+    // Dim discarded segments.
+    for (const seg of this.splits) {
+      if (seg.keep) continue;
+      const yTop = vp.yOf(seg.end_us);
+      const yBot = vp.yOf(seg.start_us);
+      const y = Math.max(0, Math.min(yTop, yBot));
+      const hh = Math.min(this.h, Math.max(yTop, yBot)) - y;
+      if (hh <= 0) continue;
+      ctx.fillStyle = "rgba(255,90,90,0.16)";
+      ctx.fillRect(0, y, this.w, hh);
+    }
+
+    // Marker line + part label at every interior boundary (segment starts > 0).
+    ctx.font = `700 10px ${FONT_MONO}`;
+    ctx.textAlign = "left";
+    this.splits.forEach((seg, i) => {
+      if (i > 0) {
+        const y = vp.yOf(seg.start_us);
+        if (y >= 0 && y <= this.h) {
+          ctx.strokeStyle = "#f5a742";
+          ctx.lineWidth = 2;
+          ctx.setLineDash([6, 4]);
+          ctx.beginPath();
+          ctx.moveTo(0, y + 0.5);
+          ctx.lineTo(this.w, y + 0.5);
+          ctx.stroke();
+          ctx.setLineDash([]);
+        }
+      }
+      // Part-number tag sat just inside the lower edge of the segment.
+      const yLabel = vp.yOf(seg.start_us);
+      if (yLabel >= 8 && yLabel <= this.h) {
+        ctx.fillStyle = seg.keep
+          ? "rgba(245,167,66,0.9)"
+          : "rgba(255,120,120,0.85)";
+        ctx.textBaseline = "bottom";
+        ctx.fillText(`part ${i + 1}${seg.keep ? "" : " (cut)"}`, 6, yLabel - 3);
+      }
+    });
+
     ctx.restore();
   }
 }

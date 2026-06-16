@@ -116,6 +116,17 @@ export type SaveDest =
  */
 export type SaveBundleResult = string;
 
+/**
+ * One kept part for `split_bundle` — mirror of `state::SplitSegment` (itself the
+ * mirror of `rockcraft_control::SegmentSpec`). The half-open song-time range
+ * `[start_us, end_us)` is written as a new library bundle named `name`.
+ */
+export interface SegmentSpec {
+  start_us: number;
+  end_us: number;
+  name: string;
+}
+
 /** One action parameter — mirror of `action::ParamInfo`. */
 export interface ParamInfo {
   name: string;

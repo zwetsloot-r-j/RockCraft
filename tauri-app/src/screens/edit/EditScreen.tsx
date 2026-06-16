@@ -16,7 +16,9 @@
 
 import {
   createEffect,
+  createMemo,
   createSignal,
+  For,
   onCleanup,
   onMount,
   Show,
@@ -41,6 +43,7 @@ import {
   queryState,
   runAction,
   saveBundle,
+  splitBundle,
   transcriptionLoad,
 } from "../../ipc/bridge";
 import type { ComposerSnapshot } from "../../ipc/types";
@@ -50,6 +53,14 @@ import { StatusBar } from "./StatusBar";
 import { RecordControls } from "./RecordControls";
 import { resolveKey } from "./keymap";
 import { stepUs } from "./viewport";
+import {
+  keptSegmentSpecs,
+  pieceLengthUs,
+  reconcileMeta,
+  segmentsFromSplits,
+  type Segment,
+  type SegmentMeta,
+} from "./split";
 import { noteName } from "../highway/utils";
 import { useRouter } from "../../shell/Router";
 
@@ -125,6 +136,31 @@ export function EditScreen(props: Props): JSX.Element {
   // Dirty flag — mirrors the backend's AppState::dirty.
   const [dirty, setDirty] = createSignal(false);
 
+  // ── Split / trim editor (M10-C) ──────────────────────────────────────────
+  // When open, the user drops split markers along the timeline (at the playhead/
+  // cursor), dividing the piece into consecutive segments; each is kept (named)
+  // or discarded, and "Save parts" writes the kept ones as standalone bundles
+  // via the `SplitBundle` host command. All ephemeral UI state — no persistence.
+  const [splitMode, setSplitMode] = createSignal(false);
+  // Interior split points in song-time µs (0 < m < total), kept sorted + unique.
+  const [markers, setMarkers] = createSignal<number[]>([]);
+  // Per-segment keep/name, parallel to `segments()` and reconciled by index.
+  const [meta, setMeta] = createStore<{ list: SegmentMeta[] }>({ list: [] });
+
+  /** Total piece length in µs — the span the segments cover. */
+  const totalUs = createMemo(() => pieceLengthUs(store.snap?.notes ?? []));
+  /** Consecutive segments the markers imply — mirrors `segments_from_splits`. */
+  const segments = createMemo(() => segmentsFromSplits(markers(), totalUs()));
+
+  // Keep `meta.list` the same length as the derived segments, preserving each
+  // keep/name choice by index when a marker is added or removed. The same-length
+  // case returns the existing array unchanged so editing notes mid-playback does
+  // not churn the keep/name state.
+  createEffect(() => {
+    const n = segments().length;
+    setMeta("list", (prev) => (prev.length === n ? prev : reconcileMeta(prev, n)));
+  });
+
   // ── Live-capture feedback (M9-A) ─────────────────────────────────────────
   // Input activity level (0..1), driven by played note-on velocity and decayed
   // each animation frame — the record-mode level meter folded in from the
@@ -182,6 +218,16 @@ export function EditScreen(props: Props): JSX.Element {
     const s = store.snap;
     if (!engine || !s) return;
     engine.setBackdrop(videoPath() !== null);
+    // Overlay the split markers + discarded shading while the editor is open so
+    // the cuts are readable over the grid and video backdrop.
+    engine.setSplits(
+      splitMode()
+        ? segments().map((seg, i) => ({
+            ...seg,
+            keep: meta.list[i]?.keep ?? true,
+          }))
+        : null,
+    );
     const playhead = interpolatedPlayheadUs(s);
     engine.draw(s, playhead);
     syncVideo(anchorUsOf(s));
@@ -353,11 +399,127 @@ export function EditScreen(props: Props): JSX.Element {
     render();
   });
 
+  // Repaint the split overlay whenever its state changes (markers added/removed,
+  // a segment kept/discarded, or the editor opened/closed). Reads the reactive
+  // sources explicitly so the dependency tracking is obvious.
+  createEffect(() => {
+    splitMode();
+    segments();
+    meta.list.forEach((m) => m.keep);
+    render();
+  });
+
+  // ── Split / trim editor (M10-C) ─────────────────────────────────────────
+
+  /** Open/close the split editor. Closing discards the ephemeral marker state. */
+  function toggleSplitMode(): void {
+    if (splitMode()) exitSplitMode();
+    else setSplitMode(true);
+  }
+
+  /** Close the editor and clear the markers/segment meta. */
+  function exitSplitMode(): void {
+    setSplitMode(false);
+    setMarkers([]);
+    setMeta("list", []);
+  }
+
+  /** Drop a split marker at the current playhead/cursor song-time. */
+  function dropMarker(): void {
+    const s = store.snap;
+    if (!s) return;
+    const total = totalUs();
+    const a = Math.round(anchorUsOf(s));
+    if (total <= 0) {
+      showFlash("add some notes before splitting");
+      return;
+    }
+    if (a <= 0 || a >= total) {
+      showFlash("marker must sit inside the piece");
+      return;
+    }
+    setMarkers((ms) => {
+      if (ms.some((m) => Math.abs(m - a) < 1)) return ms; // already a marker here
+      return [...ms, a].sort((x, y) => x - y);
+    });
+  }
+
+  /** Remove the marker nearest the playhead/cursor song-time. */
+  function removeNearestMarker(): void {
+    const s = store.snap;
+    if (!s) return;
+    const a = anchorUsOf(s);
+    setMarkers((ms) => {
+      if (ms.length === 0) return ms;
+      let best = 0;
+      let bestDist = Infinity;
+      ms.forEach((m, i) => {
+        const d = Math.abs(m - a);
+        if (d < bestDist) {
+          bestDist = d;
+          best = i;
+        }
+      });
+      return ms.filter((_, i) => i !== best);
+    });
+  }
+
+  /** Clear every split marker (back to one whole-piece segment). */
+  function clearMarkers(): void {
+    setMarkers([]);
+  }
+
+  /** Toggle keep/discard for the segment at `i`. */
+  function toggleKeep(i: number): void {
+    setMeta("list", i, "keep", (k) => !k);
+  }
+
+  /** Rename the segment at `i`. */
+  function renameSegment(i: number, name: string): void {
+    setMeta("list", i, "name", name);
+  }
+
+  /** Gather the kept segments and write them via `SplitBundle` (M10-B). */
+  function doSaveParts(): void {
+    const specs = keptSegmentSpecs(segments(), meta.list);
+    if (specs.length === 0) {
+      showFlash("keep at least one part to save");
+      return;
+    }
+    if (specs.some((sp) => sp.name.length === 0)) {
+      showFlash("every kept part needs a name");
+      return;
+    }
+    splitBundle(specs)
+      .then((dirs) => {
+        showFlash(
+          `saved ${dirs.length} part${dirs.length === 1 ? "" : "s"} → library`,
+        );
+        exitSplitMode();
+      })
+      .catch((e: unknown) => {
+        showFlash(`split failed: ${String(e)}`);
+      });
+  }
+
   // ── Key routing ─────────────────────────────────────────────────────────
 
   function onKeydown(e: KeyboardEvent): void {
     const s = store.snap;
     if (e.ctrlKey || e.metaKey || e.altKey) return;
+
+    // Let native text editing own the keyboard while a real text field is
+    // focused (the split editor's segment-name inputs). Without this the editor
+    // keymap would steal letters like `n`/`x`/`c` mid-type.
+    const target = e.target as HTMLElement | null;
+    if (
+      target &&
+      (target.tagName === "INPUT" ||
+        target.tagName === "TEXTAREA" ||
+        target.isContentEditable)
+    ) {
+      return;
+    }
 
     const ov = overlay();
 
@@ -447,6 +609,36 @@ export function EditScreen(props: Props): JSX.Element {
     // ── Normal / chord mode ─────────────────────────────────────────────
     if (!s) return;
 
+    // ── Split editor (M10-C) — owns a few keys while open ────────────────
+    // Only the split-specific keys are intercepted; navigation/transport keys
+    // fall through to the normal keymap so the user can move the cursor/playhead
+    // to position the next marker.
+    if (splitMode() && s.chord_preview === null) {
+      switch (e.key) {
+        case "Escape":
+          e.preventDefault();
+          e.stopPropagation();
+          exitSplitMode();
+          return;
+        case "n":
+          e.preventDefault();
+          dropMarker();
+          return;
+        case "x":
+          e.preventDefault();
+          removeNearestMarker();
+          return;
+        case "c":
+          e.preventDefault();
+          clearMarkers();
+          return;
+        case "Enter":
+          e.preventDefault();
+          doSaveParts();
+          return;
+      }
+    }
+
     // `?` toggles help regardless of mode.
     if (e.key === "?" && s.chord_preview === null) {
       e.preventDefault();
@@ -472,6 +664,12 @@ export function EditScreen(props: Props): JSX.Element {
         e.preventDefault();
         setBpmText(String(Math.round(s.bpm)));
         setOverlay("set-bpm");
+        return;
+      }
+      // `F` opens / closes the split & trim editor (M10-C).
+      if (e.key === "F") {
+        e.preventDefault();
+        toggleSplitMode();
         return;
       }
     }
@@ -787,6 +985,23 @@ export function EditScreen(props: Props): JSX.Element {
             onToggleFlavour={toggleRecordFlavour}
           />
         </Show>
+
+        {/* Split & trim strip (M10-C) — markers + per-segment keep/discard/name,
+            docked at the bottom so the grid and video backdrop stay visible. */}
+        <Show when={splitMode()}>
+          <SplitStrip
+            segments={segments()}
+            meta={meta.list}
+            total={totalUs()}
+            onDrop={dropMarker}
+            onRemove={removeNearestMarker}
+            onClear={clearMarkers}
+            onToggleKeep={toggleKeep}
+            onRename={renameSegment}
+            onSave={doSaveParts}
+            onExit={exitSplitMode}
+          />
+        </Show>
       </div>
 
       {/* Help overlay */}
@@ -807,6 +1022,230 @@ export function EditScreen(props: Props): JSX.Element {
       {/* Set-BPM overlay */}
       <Show when={overlay() === "set-bpm"}>
         <SetBpmPrompt text={bpmText()} />
+      </Show>
+    </div>
+  );
+}
+
+// ── SplitStrip (M10-C) ──────────────────────────────────────────────────────
+
+interface SplitStripProps {
+  /** Derived consecutive segments (mirrors `segments_from_splits`). */
+  segments: Segment[];
+  /** Per-segment keep/name, parallel to `segments`. */
+  meta: SegmentMeta[];
+  /** Total piece length in µs (0 ⇒ no notes yet). */
+  total: number;
+  onDrop: () => void;
+  onRemove: () => void;
+  onClear: () => void;
+  onToggleKeep: (i: number) => void;
+  onRename: (i: number, name: string) => void;
+  onSave: () => void;
+  onExit: () => void;
+}
+
+/** µs → "1.2s" for the segment range labels. */
+function fmtSec(us: number): string {
+  return `${(us / 1e6).toFixed(1)}s`;
+}
+
+/**
+ * The split & trim control strip docked at the bottom of the edit screen
+ * (M10-C). Lists the segments the markers imply, each with a keep/discard toggle
+ * and an editable name, plus the marker + save actions. Kept deliberately above
+ * the grid but leaving the video backdrop visible (the point — trim by watching).
+ */
+function SplitStrip(props: SplitStripProps): JSX.Element {
+  const keptCount = (): number =>
+    props.segments.reduce(
+      (n, _seg, i) => n + ((props.meta[i]?.keep ?? true) ? 1 : 0),
+      0,
+    );
+  const hasPiece = (): boolean => props.total > 0;
+
+  // Buttons stay enabled; the handlers validate (and flash) and the strip shows
+  // an explicit empty/all-discarded message, so there is no stale `disabled`
+  // state to keep reactive (components run once in Solid).
+  const btn = (
+    label: string,
+    onClick: () => void,
+    primary?: boolean,
+  ): JSX.Element => (
+    <button
+      onClick={onClick}
+      style={{
+        background: primary ? "#f5a742" : "rgba(255,255,255,0.06)",
+        color: primary ? "#0f1016" : "#e7e8ef",
+        border: "1px solid rgba(255,255,255,0.12)",
+        "border-radius": "5px",
+        padding: "4px 10px",
+        "font-size": "11px",
+        "font-weight": primary ? 700 : 500,
+        cursor: "pointer",
+        "font-family": "'Space Grotesk', system-ui, sans-serif",
+      }}
+    >
+      {label}
+    </button>
+  );
+
+  return (
+    <div
+      style={{
+        position: "absolute",
+        left: 0,
+        right: 0,
+        bottom: 0,
+        background: "rgba(15,16,22,0.94)",
+        "border-top": "1px solid #f5a742",
+        padding: "10px 14px",
+        "z-index": 120,
+        "backdrop-filter": "blur(3px)",
+        "font-family": "'Space Grotesk', system-ui, sans-serif",
+        "max-height": "42%",
+        display: "flex",
+        "flex-direction": "column",
+        gap: "8px",
+      }}
+    >
+      {/* Header: badge + counts + actions */}
+      <div style={{ display: "flex", "align-items": "center", gap: "10px" }}>
+        <span
+          style={{
+            background: "#f5a742",
+            color: "#0f1016",
+            padding: "2px 8px",
+            "border-radius": "4px",
+            "font-size": "11px",
+            "font-weight": 700,
+            "letter-spacing": "0.5px",
+          }}
+        >
+          SPLIT / TRIM
+        </span>
+        <span style={{ color: "#aeb2c4", "font-size": "11px" }}>
+          {props.segments.length} segment
+          {props.segments.length === 1 ? "" : "s"} · {keptCount()} kept
+        </span>
+        <span style={{ flex: 1 }} />
+        {btn("＋ marker (n)", props.onDrop)}
+        {btn("− nearest (x)", props.onRemove)}
+        {btn("clear (c)", props.onClear)}
+        {btn("save parts", props.onSave, true)}
+        {btn("exit (Esc)", props.onExit)}
+      </div>
+
+      {/* Segment chips, or guidance when there is nothing to split */}
+      <Show
+        when={hasPiece()}
+        fallback={
+          <div style={{ color: "#6a6e7e", "font-size": "12px" }}>
+            Add some notes before splitting.
+          </div>
+        }
+      >
+        <div
+          style={{
+            display: "flex",
+            gap: "8px",
+            "overflow-x": "auto",
+            "padding-bottom": "2px",
+          }}
+        >
+          <For each={props.segments}>
+            {(seg, i) => {
+              const m = (): SegmentMeta | undefined => props.meta[i()];
+              const keep = (): boolean => m()?.keep ?? true;
+              return (
+                <div
+                  style={{
+                    "min-width": "150px",
+                    background: keep()
+                      ? "rgba(245,167,66,0.12)"
+                      : "rgba(255,90,90,0.08)",
+                    border: `1px solid ${keep() ? "rgba(245,167,66,0.5)" : "rgba(255,90,90,0.35)"}`,
+                    "border-radius": "6px",
+                    padding: "6px 8px",
+                    opacity: keep() ? 1 : 0.55,
+                    display: "flex",
+                    "flex-direction": "column",
+                    gap: "5px",
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      "align-items": "center",
+                      "justify-content": "space-between",
+                      gap: "6px",
+                    }}
+                  >
+                    <span
+                      style={{
+                        color: "#e7e8ef",
+                        "font-size": "11px",
+                        "font-weight": 600,
+                      }}
+                    >
+                      part {i() + 1}
+                    </span>
+                    <button
+                      onClick={() => props.onToggleKeep(i())}
+                      style={{
+                        background: keep() ? "#f5a742" : "rgba(255,90,90,0.25)",
+                        color: keep() ? "#0f1016" : "#ff9a9a",
+                        border: "none",
+                        "border-radius": "4px",
+                        padding: "2px 8px",
+                        "font-size": "10px",
+                        "font-weight": 700,
+                        cursor: "pointer",
+                        "font-family": "'Space Grotesk', system-ui, sans-serif",
+                      }}
+                    >
+                      {keep() ? "KEEP" : "CUT"}
+                    </button>
+                  </div>
+                  <span
+                    style={{
+                      color: "#6a6e7e",
+                      "font-size": "10px",
+                      "font-family": "'IBM Plex Mono', ui-monospace, monospace",
+                    }}
+                  >
+                    {fmtSec(seg.start_us)}–{fmtSec(seg.end_us)}
+                  </span>
+                  <input
+                    value={m()?.name ?? ""}
+                    disabled={!keep()}
+                    placeholder="name"
+                    onInput={(e) =>
+                      props.onRename(i(), e.currentTarget.value)
+                    }
+                    style={{
+                      background: "#0f1016",
+                      border: "1px solid rgba(255,255,255,0.12)",
+                      "border-radius": "4px",
+                      padding: "3px 6px",
+                      color: "#e7e8ef",
+                      "font-size": "11px",
+                      "font-family": "'IBM Plex Mono', ui-monospace, monospace",
+                      width: "100%",
+                      "box-sizing": "border-box",
+                    }}
+                  />
+                </div>
+              );
+            }}
+          </For>
+        </div>
+      </Show>
+
+      <Show when={hasPiece() && keptCount() === 0}>
+        <div style={{ color: "#ff9a9a", "font-size": "11px" }}>
+          All parts discarded — keep at least one to save.
+        </div>
       </Show>
     </div>
   );
@@ -1104,6 +1543,18 @@ function HelpOverlay(props: { onClose: () => void }): JSX.Element {
         "V             Attach / detach a video backdrop",
         ", / .         Realign −/+ 10 ms (while attached)",
         "; / '         Realign −/+ 250 ms (while attached)",
+      ],
+    },
+    {
+      title: "Split & trim into pieces",
+      rows: [
+        "F             Open / close the split editor",
+        "n             Drop a split marker at the cursor / playhead",
+        "x             Remove the nearest split marker",
+        "c             Clear all split markers",
+        "              Toggle keep/discard and name each part in the strip",
+        "Enter         Save the kept parts as new library pieces",
+        "Esc           Close the split editor",
       ],
     },
     {

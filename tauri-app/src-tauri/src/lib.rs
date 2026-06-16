@@ -35,7 +35,7 @@ use crate::import::ImportRunning;
 use crate::midi::{MidiState, MidiStatus};
 use crate::play::PlayState;
 use crate::record::RecordState;
-use crate::state::{ActionReply, AppState, BackingRef, SaveDest, VideoRef};
+use crate::state::{ActionReply, AppState, BackingRef, SaveDest, SplitSegment, VideoRef};
 
 /// Tick cadence for the transport-advance thread (~4 ms ≈ 250 Hz).
 const TICK_PERIOD: std::time::Duration = std::time::Duration::from_millis(4);
@@ -166,6 +166,24 @@ fn load_bundle(
 #[tauri::command]
 fn query_dirty(state: State<'_, AppState>) -> bool {
     state::query_dirty(&state)
+}
+
+/// Slice the loaded piece into the given kept parts, writing each as its own
+/// standalone library bundle (M10-C split editor). Each `segment` is the
+/// half-open range `[start_us, end_us)` plus a `name`; discarded parts are simply
+/// omitted by the caller (= trimming). Returns the created bundle directory
+/// paths. The source piece is left untouched (non-destructive).
+///
+/// This is the webview-facing mirror of `HostCommand::SplitBundle`: both route
+/// through the one [`state::split_bundle`] write path (M10-B), exactly as
+/// `save_bundle` mirrors `HostCommand::SaveBundle`. No slicing/bundle-writing
+/// logic lives in the frontend.
+#[tauri::command]
+fn split_bundle(
+    state: State<'_, AppState>,
+    segments: Vec<SplitSegment>,
+) -> Result<Vec<String>, String> {
+    state::split_bundle(&state, segments)
 }
 
 /// Attach (or replace) the edit-screen background video (M9-G). `path` is the
@@ -398,6 +416,7 @@ pub fn run() {
             save_bundle,
             load_bundle,
             query_dirty,
+            split_bundle,
             edit_set_video,
             edit_set_video_offset,
             edit_clear_video,
