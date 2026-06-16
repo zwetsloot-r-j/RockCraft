@@ -46,7 +46,7 @@ pub struct Note {
 /// Notes are stored keyed by their [`NoteId`]; iteration order (see
 /// [`Timeline::notes`]) is stable id order, which equals insertion order because
 /// ids are handed out monotonically.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Timeline {
     notes: BTreeMap<u32, Note>,
     next_id: u32,
