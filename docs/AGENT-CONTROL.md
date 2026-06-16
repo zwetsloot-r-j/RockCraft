@@ -420,8 +420,13 @@ below is an at-a-glance convenience only.
 | `record_save` | none | Save the session as a bundle. Returns the dir |
 | `attach_backing` | `{ path: String }` | Attach a backing audio file |
 | `detach_backing` | none | Detach the backing audio file |
+| `attach_video` | `{ path: String, offset_us: i64 }` | Attach a background video ("the movie"); persisted into the bundle on save. Returns the `VideoRef` |
+| `set_video_offset` | `{ offset_us: i64 }` | Re-align the attached video. Returns the `VideoRef` |
+| `detach_video` | none | Detach the background video |
+| `query_video` | none | The attached background video, or `null` |
 | `import_start` | `{ url: String }` | Start importing from a URL |
 | `audio_status` / `midi_status` / `record_status` | none | Read-only status snapshots |
+| `app_quit` | none | Shut the app down gracefully (exit 0); the socket closes as the process exits |
 
 Not every frontend supports every command: the TUI's record/import/backing
 flows are interactive screen state machines, so it returns `unsupported:` for
@@ -487,6 +492,9 @@ All errors return a response of type `err` with an `error` string. Common errors
 - [Demo scenario](DEMO-SCENARIO.md) — a guided session exercising every action,
   with the equivalent TUI keystroke per beat (agent ⇄ human parity) and an
   executable integration test
+- [Backing-movie scenario](BACKING-MOVIE-SCENARIO.md) — an end-to-end host-command
+  session against the Tauri app: start it, author a song with a movie backing,
+  save, play back, then quit — with an executable driver that does it all
 - [Development workflow](../WORKFLOW.md) — how work is tracked and delegated
 - [CLAUDE.md](../CLAUDE.md) — architecture invariants and agent guide
 - [`rockcraft-control` crate](../../crates/control/) — implementation of the server and protocol

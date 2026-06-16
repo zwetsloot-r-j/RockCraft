@@ -303,6 +303,26 @@ impl HostServices for TauriHost<'_> {
                 Ok(serde_json::Value::Null)
             }
 
+            // ── backing video ("the movie") ─────────────────────────────
+            HostCommand::AttachVideo { path, offset_us } => {
+                let state = app.state::<AppState>();
+                crate::state::set_video(&state, path, offset_us);
+                json_payload("attach_video", crate::state::query_video(&state))
+            }
+            HostCommand::SetVideoOffset { offset_us } => {
+                let state = app.state::<AppState>();
+                crate::state::set_video_offset(&state, offset_us);
+                json_payload("set_video_offset", crate::state::query_video(&state))
+            }
+            HostCommand::DetachVideo => {
+                crate::state::clear_video(&app.state::<AppState>());
+                Ok(serde_json::Value::Null)
+            }
+            HostCommand::QueryVideo => json_payload(
+                "query_video",
+                crate::state::query_video(&app.state::<AppState>()),
+            ),
+
             // ── import ──────────────────────────────────────────────────
             HostCommand::ImportStart { url } => {
                 match crate::import::import_start(
@@ -328,6 +348,15 @@ impl HostServices for TauriHost<'_> {
                 "record_status",
                 crate::record::record_status(app.state::<RecordState>()),
             ),
+
+            // ── app lifecycle ───────────────────────────────────────────
+            HostCommand::AppQuit => {
+                // Exit gracefully. The reply may not flush before the process
+                // tears down; the client treats a post-`app_quit` connection
+                // close as success (see the backing-movie scenario driver).
+                app.exit(0);
+                Ok(serde_json::Value::Null)
+            }
         }
     }
 }
