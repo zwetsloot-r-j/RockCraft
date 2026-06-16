@@ -37,7 +37,7 @@ use std::net::SocketAddr;
 
 use rockcraft_control::{
     handle_with_host, CommandServer, HostCommand, HostError, HostServices, RemoteCommand, Request,
-    Response, SaveDest,
+    Response, SaveDest, SegmentSpec,
 };
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::mpsc;
@@ -233,6 +233,13 @@ impl HostServices for TauriHost<'_> {
             HostCommand::QueryDirty => Ok(serde_json::json!(crate::state::query_dirty(
                 &app.state::<AppState>()
             ))),
+            HostCommand::SplitBundle { segments } => {
+                let segs = segments.into_iter().map(map_segment_spec).collect();
+                match crate::state::split_bundle(&app.state::<AppState>(), segs) {
+                    Ok(dirs) => Ok(serde_json::json!({ "dirs": dirs })),
+                    Err(e) => failed("split_bundle", e),
+                }
+            }
 
             // ── play ────────────────────────────────────────────────────
             HostCommand::PlayLoad { dir } => {
@@ -327,6 +334,14 @@ impl HostServices for TauriHost<'_> {
 
 /// Map the protocol's transport-agnostic [`SaveDest`] onto the Tauri
 /// `state::SaveDest`. Kept tiny and total so the two stay in lockstep.
+fn map_segment_spec(seg: SegmentSpec) -> crate::state::SplitSegment {
+    crate::state::SplitSegment {
+        start_us: seg.start_us,
+        end_us: seg.end_us,
+        name: seg.name,
+    }
+}
+
 fn map_save_dest(dest: SaveDest) -> crate::state::SaveDest {
     match dest {
         SaveDest::QuickSave => crate::state::SaveDest::QuickSave,

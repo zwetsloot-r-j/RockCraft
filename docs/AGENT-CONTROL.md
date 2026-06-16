@@ -410,6 +410,7 @@ below is an at-a-glance convenience only.
 | `save_bundle` | `{ dest: SaveDest }` | Save the timeline; `dest` is `{kind:"quick_save"}` or `{kind:"library",name:"…"}`. Returns the bundle dir |
 | `load_bundle` | `{ dir: String }` | Load a bundle into the composer. Returns the new snapshot |
 | `query_dirty` | none | Whether the timeline has unsaved changes |
+| `split_bundle` | `{ segments: [{ start_us, end_us, name }] }` | Slice the loaded piece into the kept parts, each a new library bundle (subset MIDI + copied media + derived offsets, `origin=Edited`). Discarded parts are omitted (= trimming). Returns the created bundle dirs; the source is untouched |
 | `play_load` | `{ dir: String }` | Load a bundle as a play session. Returns play info |
 | `play_set_wait` | `{ on: bool }` | Arm/disarm note-by-note wait mode |
 | `play_toggle_hear_song` | none | Toggle the audible song synth |
