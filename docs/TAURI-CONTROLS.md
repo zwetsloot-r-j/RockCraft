@@ -51,7 +51,20 @@ Every item routes to a real action (`navigate` / `latestRecording` /
 hidden unless a fetch command is configured (`import_url_available`). No no-op
 controls.
 
+## Edit / compose media (`screens/edit/`)
+
+Backing audio and the background video are **independent** piece attributes;
+swapping or detaching one never disturbs the other (M10-E).
+
+| Control | Keybinding | Status | Notes |
+|---|---|---|---|
+| Choose / **replace** backing | `B` | **real** | native audio picker → `edit_set_backing`; swaps the file in place, leaving the video backdrop visible/playing |
+| Detach backing | `Backspace` / `Delete` | **real** | `edit_clear_backing`; clears only the audio — the video remains |
+| Backing align nudge | `,` `.` `;` `'` | **real** | `nudge_backing_offset` (±10 ms / ±250 ms) |
+| Attach / detach video backdrop | `V` | **real** | native video picker → `edit_set_video` / `edit_clear_video` |
+| Video align nudge | `,` `.` `;` `'` (while attached) | **real** | `edit_set_video_offset` (diverts the nudge keys while a backdrop is present) |
+
 ## Out of scope
 
-The edit/compose grid (`screens/edit/`) is audited under M7-tauri-M / M7-tauri-N,
-not here.
+The rest of the edit/compose grid (`screens/edit/`) is audited under
+M7-tauri-M / M7-tauri-N, not here.

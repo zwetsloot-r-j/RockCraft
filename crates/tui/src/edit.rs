@@ -2202,7 +2202,7 @@ impl EditScreen {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             )),
-            Line::from(Span::raw("  B : Choose / detach a backing audio track")),
+            Line::from(Span::raw("  B : Choose / replace the backing audio track")),
             Line::from(Span::raw(
                 "  , / . : Nudge -/+10ms      ; / ' : Nudge -/+250ms",
             )),
@@ -4608,6 +4608,71 @@ mod tests {
             meta2.backing.is_none(),
             "detached piece saves without a backing"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// M10-E: swapping or detaching the backing audio of a loaded piece must
+    /// leave the background-video reference (`meta.video`) intact through a
+    /// save → reload round-trip. The TUI never renders the video, but it carries
+    /// the reference so the backdrop survives an audio swap.
+    #[test]
+    fn backing_swap_preserves_video_round_trip() {
+        let dir = std::env::temp_dir().join(format!(
+            "rockcraft_tui_swap_video_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src_video = dir.join("clip.mp4");
+        let backing_a = dir.join("source-audio.ogg");
+        let backing_b = dir.join("studio.flac");
+        std::fs::write(&src_video, b"VIDEO").unwrap();
+        std::fs::write(&backing_a, b"AUDIO A").unwrap();
+        std::fs::write(&backing_b, b"AUDIO B").unwrap();
+
+        // A loaded piece carrying both a backdrop video and the original backing.
+        let mut e = EditScreen::new()
+            .with_video(src_video.clone(), "background.mp4".into(), -100_000)
+            .with_backing(backing_a.clone(), 0);
+        e.on_key(KeyCode::Char('a')); // a note so the bundle is non-trivial
+
+        // Swap the backing for a different file (what the picker's Selected
+        // outcome does); the video reference must be untouched.
+        e.set_backing(backing_b.clone());
+        assert_eq!(e.backing_name().as_deref(), Some("studio.flac"));
+
+        let bundle = e.save_bundle(&dir).expect("save after swap");
+        let meta = RecordingMeta::from_json(
+            &std::fs::read_to_string(bundle.join("meta.json")).expect("meta.json"),
+        )
+        .expect("meta parses");
+        let video = meta.video.expect("video preserved through backing swap");
+        assert_eq!(video.file, "background.mp4");
+        assert_eq!(video.offset_us, -100_000);
+        assert_eq!(
+            meta.backing.expect("swapped backing present").file,
+            bundle_backing_filename(&backing_b),
+            "the new backing is the one saved"
+        );
+        assert!(
+            bundle.join("background.mp4").exists(),
+            "video copied into the bundle alongside the new backing"
+        );
+
+        // Detaching the backing also keeps the video reference.
+        e.clear_backing();
+        let bundle2 = e.save_bundle(&dir).expect("save after detach");
+        let meta2 = RecordingMeta::from_json(
+            &std::fs::read_to_string(bundle2.join("meta.json")).expect("meta.json"),
+        )
+        .expect("meta parses");
+        assert!(meta2.backing.is_none(), "detach drops the backing");
+        let video2 = meta2.video.expect("video preserved through detach");
+        assert_eq!(video2.file, "background.mp4");
+        assert_eq!(video2.offset_us, -100_000);
 
         std::fs::remove_dir_all(&dir).ok();
     }

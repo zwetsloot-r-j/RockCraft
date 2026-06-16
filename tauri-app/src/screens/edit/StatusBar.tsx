@@ -160,7 +160,7 @@ export function StatusBar(props: Props): JSX.Element {
       >
         a/x add·del · [/] size · +/- vel · (/) tempo · T set BPM · m grab · c
         chord · v·y·p·D select · u/U undo · Space play/stop · P play-start · o
-        loop · {"{"}/{"}"} loop in/out · V video · s save · ? help
+        loop · {"{"}/{"}"} loop in/out · B backing · V video · s save · ? help
       </span>
     </div>
   );

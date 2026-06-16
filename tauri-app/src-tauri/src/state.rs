@@ -931,6 +931,107 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// M10-E: swapping or detaching the backing audio of a piece that carries a
+    /// background video must preserve `meta.video` across a save → load
+    /// round-trip. Backing and video live in independent state, so mutating one
+    /// must never clear the other.
+    #[test]
+    fn backing_swap_preserves_video() {
+        let dir = std::env::temp_dir().join(format!(
+            "rockcraft-swap-video-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src_video = dir.join("clip.mp4");
+        let backing_a = dir.join("source-audio.ogg");
+        let backing_b = dir.join("studio.flac");
+        std::fs::write(&src_video, b"VIDEO").unwrap();
+        std::fs::write(&backing_a, b"AUDIO A").unwrap();
+        std::fs::write(&backing_b, b"AUDIO B").unwrap();
+
+        // Save the current state into `bundle`, mirroring `save_bundle`'s reads.
+        let do_save = |state: &AppState, bundle: &std::path::Path| {
+            let composer = state.composer.lock().unwrap();
+            let timeline = composer.timeline().clone();
+            let grid = composer.grid();
+            let offset = composer.backing_offset_us();
+            drop(composer);
+            let key = *state.key.lock().unwrap();
+            let origin = *state.origin.lock().unwrap();
+            let backing_path = state.backing_path.lock().unwrap().clone();
+            let video = state.video.lock().unwrap().clone();
+            write_bundle(
+                bundle,
+                &timeline,
+                grid,
+                key,
+                origin,
+                backing_path.as_deref(),
+                offset,
+                video.as_ref(),
+            )
+            .expect("write_bundle should succeed");
+        };
+
+        let state = AppState::new();
+        run_action(&state, "add_note", &json!({})).expect("add_note");
+        set_video(&state, src_video.to_string_lossy().into_owned(), -100_000);
+        set_backing(&state, backing_a.to_string_lossy().into_owned());
+
+        // Persist the piece with both media, then load it back so the state now
+        // references the bundle-local copies (the realistic edit entry point).
+        let bundle1 = dir.join("bundle1");
+        do_save(&state, &bundle1);
+        load_bundle(&state, &bundle1.to_string_lossy()).expect("load bundle1");
+        let v = query_video(&state).expect("video restored on load");
+        assert_eq!(v.offset_us, -100_000);
+        assert!(query_backing(&state).is_some(), "backing restored on load");
+
+        // Swap the backing for a different file and save again.
+        set_backing(&state, backing_b.to_string_lossy().into_owned());
+        let bundle2 = dir.join("bundle2");
+        do_save(&state, &bundle2);
+        let meta2 =
+            RecordingMeta::from_json(&std::fs::read_to_string(bundle2.join("meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            meta2.backing.expect("swapped backing present").file,
+            "backing.flac",
+            "the new backing file is saved"
+        );
+        let video2 = meta2.video.expect("video preserved through backing swap");
+        assert_eq!(video2.file, "background.mp4");
+        assert_eq!(video2.offset_us, -100_000);
+        assert!(
+            bundle2.join("background.mp4").exists(),
+            "video copied along"
+        );
+
+        // Reload the swapped bundle: the video reference is still intact.
+        load_bundle(&state, &bundle2.to_string_lossy()).expect("load bundle2");
+        assert_eq!(
+            query_video(&state).expect("video still present").offset_us,
+            -100_000
+        );
+
+        // Detaching the backing keeps the video as well.
+        clear_backing(&state);
+        let bundle3 = dir.join("bundle3");
+        do_save(&state, &bundle3);
+        let meta3 =
+            RecordingMeta::from_json(&std::fs::read_to_string(bundle3.join("meta.json")).unwrap())
+                .unwrap();
+        assert!(meta3.backing.is_none(), "detach drops the backing");
+        let video3 = meta3.video.expect("video preserved through detach");
+        assert_eq!(video3.file, "background.mp4");
+        assert_eq!(video3.offset_us, -100_000);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// M10-B: `split_bundle` writes each kept segment as its own library bundle
     /// with copied media + derived offsets and `origin = Edited`, leaving the
     /// source piece and its media untouched.

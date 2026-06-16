@@ -120,11 +120,13 @@ export function EditScreen(props: Props): JSX.Element {
   const [videoPath, setVideoPath] = createSignal<string | null>(null);
   const [offsetUs, setOffsetUs] = createSignal(0);
 
-  // ── Backing audio track (M9-E) ───────────────────────────────────────────
+  // ── Backing audio track (M9-E; swap M10-E) ────────────────────────────────
   // The attached backing file name (null = none). The relocation of the former
   // top-level "Choose backing track" menu item into this screen: `B` opens the
-  // native audio picker (or detaches), and the choice is persisted into the
-  // loaded piece's meta.backing by `save_bundle` (the backend holds the path).
+  // native audio picker to attach or **replace** the file, `Backspace` detaches,
+  // and the choice is persisted into the loaded piece's meta.backing by
+  // `save_bundle` (the backend holds the path). The backing and the background
+  // video are independent: swapping/detaching one never disturbs the other.
   const [backingName, setBackingName] = createSignal<string | null>(null);
 
   // The snapshot mirror.
@@ -329,10 +331,13 @@ export function EditScreen(props: Props): JSX.Element {
 
   // ── Backing audio track (M9-E) ──────────────────────────────────────────
 
-  /** Open the native audio picker and attach the chosen file as the backing
-   * track for the loaded piece. The path is pushed to the backend so
-   * `save_bundle` persists it into the bundle's meta.backing and the playback
-   * thread plays it under the transport (reusing attach_backing). Marks dirty. */
+  /** Open the native audio picker and attach (or **replace**) the backing track
+   * for the loaded piece (M9-E; swap added in M10-E). The path is pushed to the
+   * backend so `save_bundle` persists it into the bundle's meta.backing and the
+   * playback thread plays it under the transport (reusing attach_backing). When
+   * a track is already attached this swaps the file in place; the attached
+   * background video is independent state, so it stays visible/playing
+   * throughout. Marks dirty. */
   function attachBacking(): void {
     void openBackingFilePicker()
       .then((path) => {
@@ -353,19 +358,14 @@ export function EditScreen(props: Props): JSX.Element {
       });
   }
 
-  /** Detach the backing track (stops playback, drops it from the next save). */
+  /** Detach the backing track (stops playback, drops it from the next save).
+   * Clears only the audio — the background video, if any, is untouched (M10-E). */
   function detachBacking(): void {
     setBackingName(null);
     setDirty(true);
     void editClearBacking().catch(() => {
       /* backend down — UI state already cleared */
     });
-  }
-
-  /** `B` toggles the backing track: pick when none, detach when attached. */
-  function toggleBacking(): void {
-    if (backingName() === null) attachBacking();
-    else detachBacking();
   }
 
   /** Nudge the alignment offset and re-sync the frame immediately. The new
@@ -674,13 +674,25 @@ export function EditScreen(props: Props): JSX.Element {
       }
     }
 
-    // ── Backing audio track (M9-E), non-chord mode only ─────────────────
+    // ── Backing audio track (M9-E; swap M10-E), non-chord mode only ──────
     if (s.chord_preview === null) {
-      // `B` attaches a backing track (or detaches the current one). Relocated
-      // here from the former top-level "Choose backing track" menu item.
+      // `B` opens the picker to attach a backing track, or to **replace** the
+      // current one in place (M10-E) — the background video stays visible.
+      // Relocated here from the former top-level "Choose backing track" item.
       if (e.key === "B") {
         e.preventDefault();
-        toggleBacking();
+        attachBacking();
+        return;
+      }
+      // Backspace / Delete detaches the backing (audio only — the video, if
+      // any, remains). Only intercepted while a track is attached so the keys
+      // still bubble otherwise.
+      if (
+        (e.key === "Backspace" || e.key === "Delete") &&
+        backingName() !== null
+      ) {
+        e.preventDefault();
+        detachBacking();
         return;
       }
     }
@@ -1532,7 +1544,8 @@ function HelpOverlay(props: { onClose: () => void }): JSX.Element {
     {
       title: "Backing track",
       rows: [
-        "B             Choose / detach a backing audio track",
+        "B             Choose / replace the backing audio track",
+        "Backspace     Detach the backing (keeps the video backdrop)",
         ", / .         Nudge −/+ 10 ms",
         "; / '         Nudge −/+ 250 ms",
       ],
