@@ -26,7 +26,7 @@ use rockcraft_midi::{smf_bytes_to_events, NoteSource};
 use tokio::sync::mpsc;
 
 use crate::backing::{BackingPicker, PickerOutcome};
-use crate::edit::{EditScreen, NameOutcome, PromptOutcome};
+use crate::edit::{EditScreen, NameOutcome, PromptOutcome, SplitOutcome};
 use crate::import_screen::{
     ImportOutcome, ImportingScreen, UrlInput, UrlInputOutcome, VideoPicker, VideoPickerOutcome,
 };
@@ -247,6 +247,12 @@ impl Shell {
         } else if let Some(path) = &self.backing_path {
             edit = edit.with_backing(path.clone(), 0);
         }
+        // Carry the bundle's background video reference (if any) so splitting the
+        // piece round-trips the backdrop into the part bundles (M10-D). The TUI
+        // never decodes it.
+        if let Some((vpath, file, offset)) = load_meta_video(bundle_dir) {
+            edit = edit.with_video(vpath, file, offset);
+        }
         self.screen = Screen::Edit(Box::new(edit));
     }
 
@@ -368,6 +374,25 @@ impl Shell {
                         }
                         NameOutcome::Cancelled | NameOutcome::Pending => {}
                     }
+                } else if edit.in_split_mode() {
+                    // The split panel owns the keymap; only the actual write to
+                    // the library comes back here (the shell owns the root +
+                    // status line). Marker / segment edits are applied inside.
+                    if let SplitOutcome::SaveParts = edit.on_split_key(code) {
+                        match edit.split_into_library(&library_root()) {
+                            Ok(dirs) => {
+                                let n = dirs.len();
+                                edit.set_save_flash(format!("Saved {n} part(s) ✓"));
+                                let paths = dirs
+                                    .iter()
+                                    .map(|d| d.display().to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                self.status = format!("saved {n} part(s): {paths}");
+                            }
+                            Err(e) => self.status = format!("split failed: {e}"),
+                        }
+                    }
                 } else if edit.is_prompting_exit() {
                     // Route all keys to the prompt while it's visible.
                     match edit.on_prompt_key(code) {
@@ -419,6 +444,9 @@ impl Shell {
                         },
                         // Shift-S opens the "save to library" name overlay.
                         KeyCode::Char('S') => edit.start_save_prompt(),
+                        // `X` opens the split panel (drop markers, keep/discard
+                        // and name segments, save kept parts — M10-D).
+                        KeyCode::Char('X') => edit.enter_split_mode(),
                         // `B` opens the backing-track picker *for the loaded
                         // piece* (M9-E). Stop the editor's audition/backing,
                         // then stash the editor in the picker so the choice
@@ -938,6 +966,18 @@ fn load_meta_backing(bundle_dir: &std::path::Path) -> Option<(PathBuf, u64)> {
 fn load_meta_origin(bundle_dir: &std::path::Path) -> Option<TrackOrigin> {
     let json = std::fs::read_to_string(bundle_dir.join("meta.json")).ok()?;
     RecordingMeta::from_json(&json).ok()?.origin
+}
+
+/// Resolve a bundle's background video from its `meta.json`, returning the
+/// absolute file path (relative to the bundle dir, so it stays movable), the
+/// bundle-relative filename, and the `offset_us`. `None` when there is no
+/// manifest or no video. The TUI never decodes the file — this is only so a
+/// split round-trips the backdrop reference (M10-D).
+fn load_meta_video(bundle_dir: &std::path::Path) -> Option<(PathBuf, String, i64)> {
+    let json = std::fs::read_to_string(bundle_dir.join("meta.json")).ok()?;
+    let meta = RecordingMeta::from_json(&json).ok()?;
+    let video = meta.video?;
+    Some((bundle_dir.join(&video.file), video.file, video.offset_us))
 }
 
 /// Find the MIDI of the most recent recording under `recordings/`.
