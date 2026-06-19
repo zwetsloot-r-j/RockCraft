@@ -7,6 +7,7 @@ import {
   useContext,
   type JSX,
 } from "solid-js";
+import type { UnlistenFn } from "@tauri-apps/api/event";
 import type { Screen } from "./screens";
 import {
   midiStatus,
@@ -14,6 +15,7 @@ import {
   MOCK_KEY_SET,
   type MidiStatus,
 } from "../ipc/midi";
+import { onNavigate } from "../ipc/bridge";
 
 // ── Context ────────────────────────────────────────────────────────────────
 
@@ -105,9 +107,26 @@ export function Router(props: RouterProps): JSX.Element {
     window.addEventListener("keydown", onKeydown);
     window.addEventListener("keyup", onKeyup);
     refreshMidiStatus();
+
+    // Auto-follow: the backend pushes a `navigate` event when an agent-driven
+    // control request changes the active context, so a remote session is
+    // watchable. Dedup screens we're already on so a burst of edits (each emits
+    // `navigate → edit`) doesn't remount the screen.
+    let unlistenNav: UnlistenFn | undefined;
+    void onNavigate((next) => {
+      const cur = screen();
+      const sameDir =
+        (cur as { dir?: string }).dir === (next as { dir?: string }).dir;
+      if (cur.kind === next.kind && sameDir) return;
+      navigate(next);
+    }).then((fn) => {
+      unlistenNav = fn;
+    });
+
     onCleanup(() => {
       window.removeEventListener("keydown", onKeydown);
       window.removeEventListener("keyup", onKeyup);
+      unlistenNav?.();
     });
   });
 

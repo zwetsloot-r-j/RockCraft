@@ -10,6 +10,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open as dialogOpen } from "@tauri-apps/plugin-dialog";
 
+import type { Screen } from "../shell/screens";
 import type {
   ActionInfo,
   ActionName,
@@ -32,6 +33,12 @@ const EVENT_SNAPSHOT = "snapshot";
 const EVENT_EFFECTS = "effects";
 /** Event name the backend emits a live {@link PlayStateEvent} on (#168). */
 const EVENT_PLAY_STATE = "play_state";
+/**
+ * Event name the backend emits a {@link Screen} on when an agent-driven control
+ * request changes the active context ("auto-follow"). The shell {@link Router}
+ * subscribes and navigates so a remote session is watchable.
+ */
+const EVENT_NAVIGATE = "navigate";
 
 /**
  * Apply a named action, returning its effects and the new snapshot.
@@ -65,6 +72,14 @@ export function onSnapshot(
   cb: (snapshot: ComposerSnapshot) => void,
 ): Promise<UnlistenFn> {
   return listen<ComposerSnapshot>(EVENT_SNAPSHOT, (e) => cb(e.payload));
+}
+
+/**
+ * Subscribe to backend `navigate` events (auto-follow). Returns the Tauri
+ * unlisten function; call it in `onCleanup`.
+ */
+export function onNavigate(cb: (screen: Screen) => void): Promise<UnlistenFn> {
+  return listen<Screen>(EVENT_NAVIGATE, (e) => cb(e.payload));
 }
 
 /**

@@ -36,8 +36,8 @@
 use std::net::SocketAddr;
 
 use rockcraft_control::{
-    handle_with_host, CommandServer, HostCommand, HostError, HostServices, RemoteCommand, Request,
-    Response, SaveDest, SegmentSpec,
+    handle_run_host_command, handle_with_host, CommandServer, HostCommand, HostError, HostServices,
+    RemoteCommand, Request, Response, SaveDest, SegmentSpec,
 };
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::mpsc;
@@ -48,7 +48,7 @@ use crate::midi::MidiState;
 use crate::play::PlayState;
 use crate::record::RecordState;
 use crate::state::AppState;
-use crate::EVENT_SNAPSHOT;
+use crate::{EVENT_NAVIGATE, EVENT_SNAPSHOT};
 
 /// Default bind address: an OS-assigned loopback port. Override with
 /// `ROCKCRAFT_CONTROL_ADDR` (must stay loopback — the server refuses other
@@ -140,8 +140,28 @@ fn spawn_applier(app: AppHandle, mut cmd_rx: mpsc::Receiver<RemoteCommand>) {
             while let Some(cmd) = cmd_rx.blocking_recv() {
                 let is_host = matches!(cmd.req, Request::RunHostCommand { .. });
                 let is_action = matches!(cmd.req, Request::RunAction { .. });
+                // Auto-follow: a context-changing request brings the matching
+                // webview screen to the foreground so an agent-driven session is
+                // watchable. Computed before `cmd.req` is consumed; emitted only
+                // when the request succeeds (below).
+                let nav = navigation_intent(&cmd.req);
                 let mut host = TauriHost { app: &app };
                 let response = apply_request(&app.state::<AppState>(), Some(&mut host), cmd.req);
+                if !matches!(response, Response::Err { .. }) {
+                    if let Some(target) = &nav {
+                        let _ = app.emit(EVENT_NAVIGATE, target);
+                    }
+                }
+                // Route composer auditions (note/chord preview, all-off) to the
+                // synth — the same as the IPC `run_action` path (`lib.rs`) and
+                // the tick thread. Without this, an agent editing over the socket
+                // is silent even though the local UI auditions every edit. A
+                // no-op when no audio device is present (`synth: None`).
+                if let Response::Ok { effects, .. } = &response {
+                    if !effects.is_empty() {
+                        crate::audio::apply_effects(&app.state::<AudioState>(), effects);
+                    }
+                }
                 // Keep the webview in sync with agent-driven changes, mirroring
                 // the IPC emit. A composer `run_action` returns the post-edit
                 // snapshot inline; a host command (e.g. LoadBundle) changes the
@@ -167,11 +187,64 @@ fn spawn_applier(app: AppHandle, mut cmd_rx: mpsc::Receiver<RemoteCommand>) {
         .expect("spawn control applier thread");
 }
 
+/// The webview `Screen` a successful request should bring to the foreground for
+/// the **auto-follow** behaviour, or `None` to stay put. Read-only queries and
+/// app-level commands that don't change the active authoring/playback context
+/// (`save_bundle`, `query_*`, `*_status`, `play_finish`, `app_quit`) return
+/// `None`. The payload is the JSON shape of the front-end `Screen` union
+/// (`tauri-app/src/shell/screens.ts`) — `kind` plus an optional `dir`. This is a
+/// Tauri *view* concern, so it lives in the frontend, never in `core`.
+fn navigation_intent(req: &Request) -> Option<serde_json::Value> {
+    match req {
+        // Any composer edit or cursor move belongs to the edit screen.
+        Request::RunAction { .. } => Some(serde_json::json!({ "kind": "edit" })),
+        Request::RunHostCommand {
+            command, params, ..
+        } => match command.as_str() {
+            // Authoring-context host commands → the unified edit screen.
+            "attach_video" | "detach_video" | "set_video_offset" | "attach_backing"
+            | "detach_backing" | "load_bundle" | "record_start" | "record_stop" => {
+                Some(serde_json::json!({ "kind": "edit" }))
+            }
+            // Loading a bundle for playback → the highway, carrying its dir so
+            // the screen can stream it (the same `dir` the command was given).
+            "play_load" => params
+                .get("dir")
+                .and_then(|d| d.as_str())
+                .map(|dir| serde_json::json!({ "kind": "play", "dir": dir })),
+            // Browsing the library → the library screen.
+            "scan_library" => Some(serde_json::json!({ "kind": "library" })),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Apply one [`Request`] against the shared composer (and, for host commands,
 /// `host`) and return the wire [`Response`]. Factored out of [`spawn_applier`]
 /// so the integration seam (AppState composer ↔ control protocol) is
 /// unit-testable without a running Tauri app — composer tests pass `host: None`.
 fn apply_request(state: &AppState, host: Option<&mut dyn HostServices>, req: Request) -> Response {
+    // Host commands reach their own managed state — and several (`save_bundle`,
+    // `load_bundle`, `split_bundle`) re-lock the shared composer through
+    // `AppState`. A `std::sync::Mutex` is **not** reentrant, so holding the
+    // composer lock across host dispatch self-deadlocks the applier thread.
+    // Dispatch host commands WITHOUT the composer lock (mirroring the TUI shell,
+    // `crates/tui/src/app.rs`); only composer actions and `state` queries need it.
+    if let Request::RunHostCommand {
+        id,
+        command,
+        params,
+    } = &req
+    {
+        return match host {
+            Some(host) => handle_run_host_command(host, *id, command, params),
+            None => Response::Err {
+                id: *id,
+                error: "unavailable: host commands not supported on this server".into(),
+            },
+        };
+    }
     let mut composer = state.composer.lock().expect("composer mutex poisoned");
     handle_with_host(&mut composer, host, req)
 }
@@ -303,6 +376,26 @@ impl HostServices for TauriHost<'_> {
                 Ok(serde_json::Value::Null)
             }
 
+            // ── backing video ("the movie") ─────────────────────────────
+            HostCommand::AttachVideo { path, offset_us } => {
+                let state = app.state::<AppState>();
+                crate::state::set_video(&state, path, offset_us);
+                json_payload("attach_video", crate::state::query_video(&state))
+            }
+            HostCommand::SetVideoOffset { offset_us } => {
+                let state = app.state::<AppState>();
+                crate::state::set_video_offset(&state, offset_us);
+                json_payload("set_video_offset", crate::state::query_video(&state))
+            }
+            HostCommand::DetachVideo => {
+                crate::state::clear_video(&app.state::<AppState>());
+                Ok(serde_json::Value::Null)
+            }
+            HostCommand::QueryVideo => json_payload(
+                "query_video",
+                crate::state::query_video(&app.state::<AppState>()),
+            ),
+
             // ── import ──────────────────────────────────────────────────
             HostCommand::ImportStart { url } => {
                 match crate::import::import_start(
@@ -328,6 +421,15 @@ impl HostServices for TauriHost<'_> {
                 "record_status",
                 crate::record::record_status(app.state::<RecordState>()),
             ),
+
+            // ── app lifecycle ───────────────────────────────────────────
+            HostCommand::AppQuit => {
+                // Exit gracefully. The reply may not flush before the process
+                // tears down; the client treats a post-`app_quit` connection
+                // close as success (see the backing-movie scenario driver).
+                app.exit(0);
+                Ok(serde_json::Value::Null)
+            }
         }
     }
 }
@@ -466,6 +568,41 @@ mod tests {
                 assert!(error.starts_with("unavailable:"), "got: {error}");
             }
             other => panic!("expected Err, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_command_does_not_deadlock_when_it_relocks_the_composer() {
+        // Regression: `apply_request` must NOT hold the composer lock across host
+        // dispatch. Real host commands (`save_bundle`/`load_bundle`/`split_bundle`)
+        // re-lock the shared composer via `AppState`; with the lock still held a
+        // non-reentrant `std::sync::Mutex` self-deadlocks the applier thread.
+        // This mock re-locks the composer the same way; the call must return
+        // promptly rather than hang.
+        struct RelockHost<'a> {
+            state: &'a AppState,
+        }
+        impl HostServices for RelockHost<'_> {
+            fn dispatch(&mut self, _cmd: HostCommand) -> Result<serde_json::Value, HostError> {
+                let _composer = self.state.composer.lock().expect("composer mutex poisoned");
+                Ok(serde_json::json!("ok"))
+            }
+        }
+
+        let state = AppState::new();
+        let mut host = RelockHost { state: &state };
+        let resp = apply_request(
+            &state,
+            Some(&mut host),
+            Request::RunHostCommand {
+                id: Some(1),
+                command: "query_dirty".into(),
+                params: serde_json::json!({}),
+            },
+        );
+        match resp {
+            Response::HostResult { id: Some(1), .. } => {}
+            other => panic!("expected HostResult, got {other:?}"),
         }
     }
 

@@ -48,6 +48,10 @@ const EVENT_EFFECTS: &str = "effects";
 const EVENT_MIDI: &str = "midi_event";
 /// Event name carrying a live [`play::PlayStateEvent`] to the highway (#168).
 const EVENT_PLAY_STATE: &str = "play_state";
+/// Event name carrying a `Screen` the webview should bring to the foreground —
+/// the "auto-follow" behaviour that makes an agent-driven control session
+/// visible (the front-end otherwise stays on whatever screen the user opened).
+pub(crate) const EVENT_NAVIGATE: &str = "navigate";
 
 /// Apply a named action and return its effects plus the new snapshot.
 ///

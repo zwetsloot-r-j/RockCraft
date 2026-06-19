@@ -109,6 +109,18 @@ pub enum HostCommand {
     /// Detach the backing audio file.
     DetachBacking,
 
+    // ── backing video ("the movie") ─────────────────────────────────────
+    /// Attach (or replace) the background video by path, with an alignment
+    /// offset (`videoTime = songTime + offset_us`). Persisted into the bundle
+    /// on save. Returns the attached video reference.
+    AttachVideo { path: String, offset_us: i64 },
+    /// Update only the alignment offset of an already-attached video.
+    SetVideoOffset { offset_us: i64 },
+    /// Detach the background video.
+    DetachVideo,
+    /// The currently attached background video, or null.
+    QueryVideo,
+
     // ── import ──────────────────────────────────────────────────────────
     /// Start importing from a URL.
     ImportStart { url: String },
@@ -120,6 +132,11 @@ pub enum HostCommand {
     MidiStatus,
     /// Current record session status as JSON.
     RecordStatus,
+
+    // ── app lifecycle ───────────────────────────────────────────────────
+    /// Shut the application down gracefully (exit code 0). Lets an agent close
+    /// the app over the socket; the connection closes as the process exits.
+    AppQuit,
 }
 
 impl HostCommand {
@@ -143,10 +160,15 @@ impl HostCommand {
             HostCommand::RecordSave => "record_save",
             HostCommand::AttachBacking { .. } => "attach_backing",
             HostCommand::DetachBacking => "detach_backing",
+            HostCommand::AttachVideo { .. } => "attach_video",
+            HostCommand::SetVideoOffset { .. } => "set_video_offset",
+            HostCommand::DetachVideo => "detach_video",
+            HostCommand::QueryVideo => "query_video",
             HostCommand::ImportStart { .. } => "import_start",
             HostCommand::AudioStatus => "audio_status",
             HostCommand::MidiStatus => "midi_status",
             HostCommand::RecordStatus => "record_status",
+            HostCommand::AppQuit => "app_quit",
         }
     }
 }
@@ -260,10 +282,15 @@ pub fn host_command_names() -> &'static [&'static str] {
         "record_save",
         "attach_backing",
         "detach_backing",
+        "attach_video",
+        "set_video_offset",
+        "detach_video",
+        "query_video",
         "import_start",
         "audio_status",
         "midi_status",
         "record_status",
+        "app_quit",
     ]
 }
 
@@ -311,12 +338,19 @@ static HOST_HELP: &[HostCommandInfo] = {
         // ── backing / audio ─────────────────────────────────────────────
         HostCommandInfo { name: "attach_backing", params: &[p("path", "String")], description: "Attach a backing audio file by path." },
         HostCommandInfo { name: "detach_backing", params: &[], description: "Detach the backing audio file." },
+        // ── backing video ("the movie") ─────────────────────────────────
+        HostCommandInfo { name: "attach_video", params: &[p("path", "String"), p("offset_us", "i64")], description: "Attach (or replace) the background video by path, with an alignment offset (videoTime = songTime + offset_us). Persisted into the bundle on save. Returns the attached video reference." },
+        HostCommandInfo { name: "set_video_offset", params: &[p("offset_us", "i64")], description: "Update only the alignment offset of the already-attached background video. Returns the attached video reference." },
+        HostCommandInfo { name: "detach_video", params: &[], description: "Detach the background video." },
+        HostCommandInfo { name: "query_video", params: &[], description: "Return the currently attached background video, or null." },
         // ── import ──────────────────────────────────────────────────────
         HostCommandInfo { name: "import_start", params: &[p("url", "String")], description: "Start importing audio/video from a URL." },
         // ── status / device ──────────────────────────────────────────────
         HostCommandInfo { name: "audio_status", params: &[], description: "Return the current audio/backing status." },
         HostCommandInfo { name: "midi_status", params: &[], description: "Return the current MIDI input status." },
         HostCommandInfo { name: "record_status", params: &[], description: "Return the current record session status." },
+        // ── app lifecycle ────────────────────────────────────────────────
+        HostCommandInfo { name: "app_quit", params: &[], description: "Shut the application down gracefully (exit code 0). The connection closes as the process exits." },
     ]
 };
 
@@ -365,12 +399,20 @@ mod tests {
                 path: "song.ogg".into(),
             },
             HostCommand::DetachBacking,
+            HostCommand::AttachVideo {
+                path: "movie.mp4".into(),
+                offset_us: -100_000,
+            },
+            HostCommand::SetVideoOffset { offset_us: 50_000 },
+            HostCommand::DetachVideo,
+            HostCommand::QueryVideo,
             HostCommand::ImportStart {
                 url: "https://example.com/v".into(),
             },
             HostCommand::AudioStatus,
             HostCommand::MidiStatus,
             HostCommand::RecordStatus,
+            HostCommand::AppQuit,
         ]
     }
 
@@ -428,6 +470,7 @@ mod tests {
             for p in info.params {
                 let sample = match p.ty {
                     "bool" => json!(true),
+                    "i64" => json!(0),
                     "SaveDest" => json!({ "kind": "quick_save" }),
                     "Vec<SegmentSpec>" => {
                         json!([{ "start_us": 0, "end_us": 1, "name": "x" }])

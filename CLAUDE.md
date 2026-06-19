@@ -147,7 +147,18 @@ keyboard triggers. To drive it:
 
 Full protocol reference: [`docs/AGENT-CONTROL.md`](docs/AGENT-CONTROL.md). A
 guided session exercising every action, with the equivalent TUI keystroke per
-beat, is in [`docs/DEMO-SCENARIO.md`](docs/DEMO-SCENARIO.md).
+beat, is in [`docs/DEMO-SCENARIO.md`](docs/DEMO-SCENARIO.md). An end-to-end
+host-command session against the Tauri app — start it, author a song with a movie
+backing, save, play back, then quit, all autonomously — is in
+[`docs/BACKING-MOVIE-SCENARIO.md`](docs/BACKING-MOVIE-SCENARIO.md) (runnable via
+`cargo run -p rockcraft-control --example backing_movie_session`).
+
+**Running the desktop app on a Windows host from a WSL checkout** (GUI on
+Windows, repo in WSL) has environment-specific gotchas — the `custom-protocol`
+build flag (or the webview shows "localhost connection refused"), driving the
+control socket from WSL across the proxy/sandbox, and choosing the app cwd. The
+runbook is [`docs/RUN-ON-WINDOWS-HOST.md`](docs/RUN-ON-WINDOWS-HOST.md); the
+WSL-side driver is `scripts/drive-backing-movie.mjs`.
 
 ### Agent-control API: single source of truth
 

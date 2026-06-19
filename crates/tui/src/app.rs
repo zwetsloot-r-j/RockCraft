@@ -731,10 +731,17 @@ impl rockcraft_control::HostServices for Shell {
                 Err(HostError::Unsupported("attach_backing".into()))
             }
             HostCommand::DetachBacking => Err(HostError::Unsupported("detach_backing".into())),
+            HostCommand::AttachVideo { .. } => Err(HostError::Unsupported("attach_video".into())),
+            HostCommand::SetVideoOffset { .. } => {
+                Err(HostError::Unsupported("set_video_offset".into()))
+            }
+            HostCommand::DetachVideo => Err(HostError::Unsupported("detach_video".into())),
+            HostCommand::QueryVideo => Err(HostError::Unsupported("query_video".into())),
             HostCommand::ImportStart { .. } => Err(HostError::Unsupported("import_start".into())),
             HostCommand::AudioStatus => Err(HostError::Unsupported("audio_status".into())),
             HostCommand::MidiStatus => Err(HostError::Unsupported("midi_status".into())),
             HostCommand::RecordStatus => Err(HostError::Unsupported("record_status".into())),
+            HostCommand::AppQuit => Err(HostError::Unsupported("app_quit".into())),
         }
     }
 }
@@ -1078,10 +1085,18 @@ mod tests {
                 path: "b.ogg".into(),
             },
             HostCommand::DetachBacking,
+            HostCommand::AttachVideo {
+                path: "movie.mp4".into(),
+                offset_us: -100_000,
+            },
+            HostCommand::SetVideoOffset { offset_us: 0 },
+            HostCommand::DetachVideo,
+            HostCommand::QueryVideo,
             HostCommand::ImportStart { url: "u".into() },
             HostCommand::AudioStatus,
             HostCommand::MidiStatus,
             HostCommand::RecordStatus,
+            HostCommand::AppQuit,
         ]
     }
 
