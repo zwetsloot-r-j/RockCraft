@@ -48,6 +48,13 @@ ROCKCRAFT_CONTROL_ADDR=127.0.0.1:9001 cargo run --bin rockcraft-tauri -- --contr
 **As a human (desktop):** open the edit screen and follow the **Human action**
 column.
 
+> **Running the GUI on a Windows host from a WSL checkout?** See the runbook
+> [`RUN-ON-WINDOWS-HOST.md`](RUN-ON-WINDOWS-HOST.md) — it covers the
+> `--features tauri/custom-protocol` build flag (or the webview shows "localhost
+> connection refused"), driving the socket from WSL past the proxy/sandbox, and
+> `scripts/drive-backing-movie.mjs` (a WSL-side driver that attaches to an
+> already-running app instead of spawning one).
+
 ## Notation
 
 - **Agent** column: the request — `action`/`command` name + JSON `params`.

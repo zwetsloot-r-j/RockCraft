@@ -36,8 +36,8 @@
 use std::net::SocketAddr;
 
 use rockcraft_control::{
-    handle_with_host, CommandServer, HostCommand, HostError, HostServices, RemoteCommand, Request,
-    Response, SaveDest, SegmentSpec,
+    handle_run_host_command, handle_with_host, CommandServer, HostCommand, HostError, HostServices,
+    RemoteCommand, Request, Response, SaveDest, SegmentSpec,
 };
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::mpsc;
@@ -172,6 +172,26 @@ fn spawn_applier(app: AppHandle, mut cmd_rx: mpsc::Receiver<RemoteCommand>) {
 /// so the integration seam (AppState composer ↔ control protocol) is
 /// unit-testable without a running Tauri app — composer tests pass `host: None`.
 fn apply_request(state: &AppState, host: Option<&mut dyn HostServices>, req: Request) -> Response {
+    // Host commands reach their own managed state — and several (`save_bundle`,
+    // `load_bundle`, `split_bundle`) re-lock the shared composer through
+    // `AppState`. A `std::sync::Mutex` is **not** reentrant, so holding the
+    // composer lock across host dispatch self-deadlocks the applier thread.
+    // Dispatch host commands WITHOUT the composer lock (mirroring the TUI shell,
+    // `crates/tui/src/app.rs`); only composer actions and `state` queries need it.
+    if let Request::RunHostCommand {
+        id,
+        command,
+        params,
+    } = &req
+    {
+        return match host {
+            Some(host) => handle_run_host_command(host, *id, command, params),
+            None => Response::Err {
+                id: *id,
+                error: "unavailable: host commands not supported on this server".into(),
+            },
+        };
+    }
     let mut composer = state.composer.lock().expect("composer mutex poisoned");
     handle_with_host(&mut composer, host, req)
 }
@@ -495,6 +515,41 @@ mod tests {
                 assert!(error.starts_with("unavailable:"), "got: {error}");
             }
             other => panic!("expected Err, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_command_does_not_deadlock_when_it_relocks_the_composer() {
+        // Regression: `apply_request` must NOT hold the composer lock across host
+        // dispatch. Real host commands (`save_bundle`/`load_bundle`/`split_bundle`)
+        // re-lock the shared composer via `AppState`; with the lock still held a
+        // non-reentrant `std::sync::Mutex` self-deadlocks the applier thread.
+        // This mock re-locks the composer the same way; the call must return
+        // promptly rather than hang.
+        struct RelockHost<'a> {
+            state: &'a AppState,
+        }
+        impl HostServices for RelockHost<'_> {
+            fn dispatch(&mut self, _cmd: HostCommand) -> Result<serde_json::Value, HostError> {
+                let _composer = self.state.composer.lock().expect("composer mutex poisoned");
+                Ok(serde_json::json!("ok"))
+            }
+        }
+
+        let state = AppState::new();
+        let mut host = RelockHost { state: &state };
+        let resp = apply_request(
+            &state,
+            Some(&mut host),
+            Request::RunHostCommand {
+                id: Some(1),
+                command: "query_dirty".into(),
+                params: serde_json::json!({}),
+            },
+        );
+        match resp {
+            Response::HostResult { id: Some(1), .. } => {}
+            other => panic!("expected HostResult, got {other:?}"),
         }
     }
 

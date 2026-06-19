@@ -153,6 +153,13 @@ backing, save, play back, then quit, all autonomously — is in
 [`docs/BACKING-MOVIE-SCENARIO.md`](docs/BACKING-MOVIE-SCENARIO.md) (runnable via
 `cargo run -p rockcraft-control --example backing_movie_session`).
 
+**Running the desktop app on a Windows host from a WSL checkout** (GUI on
+Windows, repo in WSL) has environment-specific gotchas — the `custom-protocol`
+build flag (or the webview shows "localhost connection refused"), driving the
+control socket from WSL across the proxy/sandbox, and choosing the app cwd. The
+runbook is [`docs/RUN-ON-WINDOWS-HOST.md`](docs/RUN-ON-WINDOWS-HOST.md); the
+WSL-side driver is `scripts/drive-backing-movie.mjs`.
+
 ### Agent-control API: single source of truth
 
 The control surface has **two tiers**, and `query help` returns both
