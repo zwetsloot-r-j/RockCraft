@@ -48,7 +48,7 @@ use crate::midi::MidiState;
 use crate::play::PlayState;
 use crate::record::RecordState;
 use crate::state::AppState;
-use crate::EVENT_SNAPSHOT;
+use crate::{EVENT_NAVIGATE, EVENT_SNAPSHOT};
 
 /// Default bind address: an OS-assigned loopback port. Override with
 /// `ROCKCRAFT_CONTROL_ADDR` (must stay loopback — the server refuses other
@@ -140,8 +140,28 @@ fn spawn_applier(app: AppHandle, mut cmd_rx: mpsc::Receiver<RemoteCommand>) {
             while let Some(cmd) = cmd_rx.blocking_recv() {
                 let is_host = matches!(cmd.req, Request::RunHostCommand { .. });
                 let is_action = matches!(cmd.req, Request::RunAction { .. });
+                // Auto-follow: a context-changing request brings the matching
+                // webview screen to the foreground so an agent-driven session is
+                // watchable. Computed before `cmd.req` is consumed; emitted only
+                // when the request succeeds (below).
+                let nav = navigation_intent(&cmd.req);
                 let mut host = TauriHost { app: &app };
                 let response = apply_request(&app.state::<AppState>(), Some(&mut host), cmd.req);
+                if !matches!(response, Response::Err { .. }) {
+                    if let Some(target) = &nav {
+                        let _ = app.emit(EVENT_NAVIGATE, target);
+                    }
+                }
+                // Route composer auditions (note/chord preview, all-off) to the
+                // synth — the same as the IPC `run_action` path (`lib.rs`) and
+                // the tick thread. Without this, an agent editing over the socket
+                // is silent even though the local UI auditions every edit. A
+                // no-op when no audio device is present (`synth: None`).
+                if let Response::Ok { effects, .. } = &response {
+                    if !effects.is_empty() {
+                        crate::audio::apply_effects(&app.state::<AudioState>(), effects);
+                    }
+                }
                 // Keep the webview in sync with agent-driven changes, mirroring
                 // the IPC emit. A composer `run_action` returns the post-edit
                 // snapshot inline; a host command (e.g. LoadBundle) changes the
@@ -165,6 +185,39 @@ fn spawn_applier(app: AppHandle, mut cmd_rx: mpsc::Receiver<RemoteCommand>) {
             }
         })
         .expect("spawn control applier thread");
+}
+
+/// The webview `Screen` a successful request should bring to the foreground for
+/// the **auto-follow** behaviour, or `None` to stay put. Read-only queries and
+/// app-level commands that don't change the active authoring/playback context
+/// (`save_bundle`, `query_*`, `*_status`, `play_finish`, `app_quit`) return
+/// `None`. The payload is the JSON shape of the front-end `Screen` union
+/// (`tauri-app/src/shell/screens.ts`) — `kind` plus an optional `dir`. This is a
+/// Tauri *view* concern, so it lives in the frontend, never in `core`.
+fn navigation_intent(req: &Request) -> Option<serde_json::Value> {
+    match req {
+        // Any composer edit or cursor move belongs to the edit screen.
+        Request::RunAction { .. } => Some(serde_json::json!({ "kind": "edit" })),
+        Request::RunHostCommand {
+            command, params, ..
+        } => match command.as_str() {
+            // Authoring-context host commands → the unified edit screen.
+            "attach_video" | "detach_video" | "set_video_offset" | "attach_backing"
+            | "detach_backing" | "load_bundle" | "record_start" | "record_stop" => {
+                Some(serde_json::json!({ "kind": "edit" }))
+            }
+            // Loading a bundle for playback → the highway, carrying its dir so
+            // the screen can stream it (the same `dir` the command was given).
+            "play_load" => params
+                .get("dir")
+                .and_then(|d| d.as_str())
+                .map(|dir| serde_json::json!({ "kind": "play", "dir": dir })),
+            // Browsing the library → the library screen.
+            "scan_library" => Some(serde_json::json!({ "kind": "library" })),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Apply one [`Request`] against the shared composer (and, for host commands,

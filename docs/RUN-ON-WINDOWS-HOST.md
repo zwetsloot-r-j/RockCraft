@@ -104,6 +104,37 @@ only path, and mirrored networking is what makes it reachable from WSL.
 - `save_bundle` returns a **backslashed** relative dir; normalise to POSIX before
   resolving it under `/mnt/e` for file checks.
 
+## Watchable / audible demo mode
+
+The same driver doubles as a **human-watchable demo** via pacing env vars
+(full-speed `= 0` is the automated test, which asserts backend state and has
+nothing to watch/hear):
+
+- `DELAY_MS` — pause between beats (e.g. `2500`) so each step is visible.
+- `HOLD_MS` — hold the end state before `app_quit`.
+- `PLAY_MS` — in playback, turn on **`play_toggle_hear_song`** and hold a window
+  so the chart notes synthesise through the SoundFont (audible).
+- `BACKING` — Windows path to an **audio** backing track. The driver
+  `attach_backing`s it and runs `play_from_start` in the edit view so the backing
+  is audible (M5 "audible backing while editing"). Generate one with e.g.
+  `ffmpeg -y -f lavfi -i "aevalsrc='0.5*sin(2*PI*880*t)*exp(-28*mod(t,0.5))':d=8" -ac 2 E:\…\backing.wav`.
+
+**Auto-follow:** the backend pushes a `navigate` event when an agent request
+changes the active context (composer edit → edit screen, `play_load` → highway),
+so the webview *follows* the agent and the session is watchable. Without it the
+UI stays on whatever screen the user last opened
+(`control.rs::navigation_intent` → `Router` `onNavigate`).
+
+Two audio caveats worth knowing:
+- The **video backdrop is muted by design** (`<video muted>`, only `currentTime`
+  scrubbed, never `play()`ed) — audio embedded in the *movie* is never heard.
+  Audible accompaniment comes from a separate **audio backing track**
+  (`attach_backing`), not the movie.
+- `attach_backing` over the control socket only feeds the **audio thread**; it
+  does **not** set the persisted `AppState.backing_path`, so a saved bundle gets
+  `backing: null` and `play_load` has no backing. Authoring a backing *into* a
+  bundle from the agent surface is still a gap (the edit-screen UI sets both).
+
 ## Historical note — the composer self-deadlock (fixed)
 
 While first running this scenario, `save_bundle` hung forever (no reply, applier
