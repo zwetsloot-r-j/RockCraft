@@ -28,6 +28,8 @@ import { createStore } from "solid-js/store";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
+  alignmentLoad,
+  alignmentSave,
   editClearBacking,
   editClearVideo,
   editQueryBacking,
@@ -46,6 +48,7 @@ import {
   splitBundle,
   transcriptionLoad,
 } from "../../ipc/bridge";
+import type { AlignmentDto } from "../../ipc/bridge";
 import type { ComposerSnapshot } from "../../ipc/types";
 import { onMidiEvent } from "../../ipc/midi";
 import { EditCanvas } from "./EditCanvas";
@@ -73,6 +76,68 @@ const BACKDROP_NUDGE_COARSE_US = 250_000;
 /** Opacity the backdrop `<video>` renders at (dimmed under the grid). */
 const BACKDROP_OPACITY = 0.5;
 
+// ── Backdrop calibration (M-align) ─────────────────────────────────────────
+// The edit grid is the authoritative note-space (fixed: 88 keys across the
+// width, hit line ⅓ up, 16 s of vertical zoom). To let the user *register* an
+// imported movie under that grid, we apply a per-video affine transform to the
+// `<video>` element: screenPos = off + scale · containerPos (origin top-left),
+// independently on X (keyboard alignment) and Y (note density + hit-line). Time
+// alignment reuses the existing backdrop `offset_us`; review playback scrubs the
+// overlay+video at a chosen rate. All of this is a Tauri *view* concern — it
+// never touches `core` — and persists per video path in localStorage.
+/** µs spanned across the canvas height at default zoom (mirrors EditCanvas). */
+const DEFAULT_SPAN_US = 16_000_000;
+interface VideoCal {
+  /** Vertical zoom: µs across the canvas height (smaller = zoomed in). */
+  spanUs: number;
+  /** Hit-line position: fraction of the span kept below the now-line. */
+  hitFrac: number;
+  /** Horizontal keyboard zoom (1 = full 88 across the width). */
+  xScale: number;
+  /** Horizontal keyboard pan in px. */
+  xOffset: number;
+  /** Time alignment (µs); mirrors the backdrop `offset_us`. */
+  offsetUs: number;
+}
+const DEFAULT_CAL: VideoCal = {
+  spanUs: DEFAULT_SPAN_US,
+  hitFrac: 1 / 3,
+  xScale: 1,
+  xOffset: 0,
+  offsetUs: 0,
+};
+const CAL_STORE_PREFIX = "rockcraft.videocal:";
+function loadVideoCal(path: string): VideoCal | null {
+  try {
+    const j = localStorage.getItem(CAL_STORE_PREFIX + path);
+    if (j) return { ...DEFAULT_CAL, ...(JSON.parse(j) as Partial<VideoCal>) };
+  } catch {
+    /* ignore malformed / unavailable storage */
+  }
+  return null;
+}
+function saveVideoCal(path: string, c: VideoCal): void {
+  try {
+    localStorage.setItem(CAL_STORE_PREFIX + path, JSON.stringify(c));
+  } catch {
+    /* ignore quota / unavailable storage */
+  }
+}
+/** Review-playback speeds (frontend-driven scrub of overlay over the movie). */
+const REVIEW_RATES = [0.1, 0.25, 0.5, 1, 2];
+/** Grid-calibration nudge steps. */
+const GRID_ZOOM_STEP = 1.06; // multiplicative vertical zoom per press
+const GRID_SPAN_MIN = 1_000_000;
+const GRID_SPAN_MAX = 64_000_000;
+const HITFRAC_STEP = 0.02;
+const XSCALE_STEP = 0.03;
+const XOFF_STEP_PX = 6;
+/** Together-scrub steps for ↑/↓ (fine) and Shift+↑/↓ (coarse). */
+const SCRUB_STEP_US = 500_000;
+const SCRUB_STEP_COARSE_US = 5_000_000;
+/** Coarse movie-only offset step for [ / ] (find the first note quickly). */
+const OFFSET_COARSE_S_US = 1_000_000;
+
 // ── Overlay state ─────────────────────────────────────────────────────────
 
 /** What top-level overlay is currently active (at most one at a time). */
@@ -84,7 +149,9 @@ type Overlay =
   /** Text input for the save-to-library name. */
   | "save-as"
   /** Numeric input for the absolute set-BPM (tempo) value. */
-  | "set-bpm";
+  | "set-bpm"
+  /** Video-backdrop alignment: keyboard X, density/hit-line Y, time, speed. */
+  | "calibrate";
 
 // ── Chord selector helpers ────────────────────────────────────────────────
 
@@ -119,6 +186,27 @@ export function EditScreen(props: Props): JSX.Element {
   // persisted via the `transcription.json` sidecar, never the bundle schema.
   const [videoPath, setVideoPath] = createSignal<string | null>(null);
   const [offsetUs, setOffsetUs] = createSignal(0);
+
+  // ── Grid calibration + review playback (M-align) ────────────────────────
+  // The edit grid (note-space) is *resized* to register an imported movie under
+  // it — vertical zoom (spanUs) + hit-line position (hitFrac), horizontal
+  // keyboard zoom/pan (xScale/xOffset). This doubles as a general zoom. Review
+  // playback sweeps a frontend head at `reviewRate` so drift is visible without
+  // touching the core transport. The movie stays put; only the grid moves.
+  const [gridSpanUs, setGridSpanUs] = createSignal(DEFAULT_SPAN_US);
+  const [gridHitFrac, setGridHitFrac] = createSignal(1 / 3);
+  const [gridXScale, setGridXScale] = createSignal(1);
+  const [gridXOffset, setGridXOffset] = createSignal(0);
+  /** Review inspection head (µs); null = follow cursor/playhead normally. */
+  const [reviewUs, setReviewUs] = createSignal<number | null>(null);
+  /** Whether the review head auto-advances (▶) vs sits paused at a position. */
+  const [reviewPlaying, setReviewPlaying] = createSignal(false);
+  const [reviewRate, setReviewRate] = createSignal(1);
+  // Wall-clock anchor for the review sweep (re-seated on play / rate change).
+  let reviewBaseUs = 0;
+  let reviewBaseWall = 0;
+  // Debug: the live actual <video>.currentTime, polled in the RAF loop.
+  const [dbgVidTime, setDbgVidTime] = createSignal(0);
 
   // ── Backing audio track (M9-E; swap M10-E) ────────────────────────────────
   // The attached backing file name (null = none). The relocation of the former
@@ -230,6 +318,14 @@ export function EditScreen(props: Props): JSX.Element {
           }))
         : null,
     );
+    // While reviewing, a frontend-only head drives both the grid scroll and the
+    // video scrub so the overlay and movie advance together at `reviewRate`.
+    const head = reviewUs();
+    if (head !== null) {
+      engine.draw(s, head, head);
+      syncVideo(head);
+      return;
+    }
     const playhead = interpolatedPlayheadUs(s);
     engine.draw(s, playhead);
     syncVideo(anchorUsOf(s));
@@ -241,6 +337,208 @@ export function EditScreen(props: Props): JSX.Element {
     setStore("snap", s);
     setRev((r) => r + 1);
     render();
+  }
+
+  // ── Grid calibration + review playback (M-align) ────────────────────────
+
+  /** Last note's end time (µs), for bounding the review sweep. */
+  function songEndUs(): number {
+    const notes = store.snap?.notes ?? [];
+    let end = 0;
+    for (const n of notes) end = Math.max(end, n.start_us + n.dur_us);
+    return end;
+  }
+
+  /** Re-seat the review wall-clock anchor to the current head (avoids a jump on
+   * play / rate change). */
+  function reseatReview(fromUs: number): void {
+    reviewBaseUs = fromUs;
+    reviewBaseWall = performance.now();
+  }
+
+  /** The current inspection time: review head if set, else the cursor step. */
+  function currentHeadUs(): number {
+    const r = reviewUs();
+    if (r !== null) return r;
+    const s = store.snap;
+    return s ? s.cursor.step * stepUs(s.bpm, s.subdivision) : 0;
+  }
+
+  /** Open the ALIGN overlay, seeding a shared inspection head so ↑/↓ scrub from
+   * a stable position (the first note, where alignment matters) instead of
+   * teleporting the movie back to the cursor / first frame. */
+  function openCalibrate(): void {
+    if (reviewUs() === null) {
+      const notes = store.snap?.notes ?? [];
+      let seed = 0;
+      if (notes.length > 0) {
+        seed = notes.reduce((m, n) => Math.min(m, n.start_us), Infinity);
+      } else {
+        const s = store.snap;
+        seed = s ? s.cursor.step * stepUs(s.bpm, s.subdivision) : 0;
+      }
+      setReviewUs(seed);
+    }
+    setOverlay("calibrate");
+    render();
+  }
+
+  /** Play/pause the together-sweep (movie + overlay advance in lock-step). */
+  function toggleReviewPlay(): void {
+    if (reviewPlaying()) {
+      setReviewPlaying(false);
+      render();
+      return;
+    }
+    const from = currentHeadUs();
+    const seed = from >= songEndUs() ? 0 : from;
+    setReviewUs(seed);
+    reseatReview(seed);
+    setReviewPlaying(true);
+  }
+
+  /** Manual together-scrub by `deltaUs` (movie + overlay move together). */
+  function scrubTogether(deltaUs: number): void {
+    const next = Math.max(0, currentHeadUs() + deltaUs);
+    setReviewUs(next);
+    if (reviewPlaying()) reseatReview(next);
+    render();
+  }
+
+  /** Leave review mode entirely → grid follows the cursor/playhead again. */
+  function clearReview(): void {
+    setReviewPlaying(false);
+    setReviewUs(null);
+    render();
+  }
+
+  /** Step the review rate up/down through REVIEW_RATES. */
+  function changeReviewRate(dir: number): void {
+    const cur = reviewRate();
+    let idx = REVIEW_RATES.indexOf(cur);
+    if (idx < 0) idx = REVIEW_RATES.indexOf(1);
+    idx = Math.max(0, Math.min(REVIEW_RATES.length - 1, idx + dir));
+    setReviewRate(REVIEW_RATES[idx]);
+    // Re-seat so the new rate takes effect from the current head, no jump.
+    if (reviewPlaying()) reseatReview(reviewUs() ?? 0);
+  }
+
+  /** Multiplicatively zoom the vertical span (density), clamped. */
+  function zoomGrid(factor: number): void {
+    setGridSpanUs((v) =>
+      Math.max(GRID_SPAN_MIN, Math.min(GRID_SPAN_MAX, v * factor)),
+    );
+  }
+
+  /** Reset the grid calibration + time offset to defaults. */
+  function resetCalibration(): void {
+    setGridSpanUs(DEFAULT_SPAN_US);
+    setGridHitFrac(1 / 3);
+    setGridXScale(1);
+    setGridXOffset(0);
+    setOffsetUs(0);
+    void editSetVideoOffset(0).catch(() => {});
+    render();
+  }
+
+  // Push grid calibration into the canvas and repaint whenever a knob changes.
+  createEffect(() => {
+    const cal = {
+      spanUs: gridSpanUs(),
+      hitLineFrac: gridHitFrac(),
+      xScale: gridXScale(),
+      xOffset: gridXOffset(),
+    };
+    if (engine) {
+      engine.setGridCal(cal);
+      render();
+    }
+  });
+
+  // Persist calibration per video path whenever any knob changes.
+  createEffect(() => {
+    const p = videoPath();
+    const cal: VideoCal = {
+      spanUs: gridSpanUs(),
+      hitFrac: gridHitFrac(),
+      xScale: gridXScale(),
+      xOffset: gridXOffset(),
+      offsetUs: offsetUs(),
+    };
+    if (p) saveVideoCal(p, cal);
+  });
+
+  /** Attach a backdrop video and restore its saved calibration (falling back to
+   * the backend's persisted time offset when no local calibration exists). */
+  function applyVideoRef(
+    path: string,
+    backendOffsetUs: number,
+    sidecar: AlignmentDto | null,
+  ): void {
+    // Grid-calibration precedence: bundle sidecar (travels with the track) wins,
+    // else this machine's localStorage scratch, else defaults.
+    if (sidecar) {
+      setGridSpanUs(sidecar.span_us);
+      setGridHitFrac(sidecar.hit_frac);
+      setGridXScale(sidecar.x_scale);
+      setGridXOffset(sidecar.x_offset);
+    } else {
+      const local = loadVideoCal(path);
+      setGridSpanUs(local?.spanUs ?? DEFAULT_SPAN_US);
+      setGridHitFrac(local?.hitFrac ?? 1 / 3);
+      setGridXScale(local?.xScale ?? 1);
+      setGridXOffset(local?.xOffset ?? 0);
+    }
+    // The time offset is authoritative in meta.json (the backend already
+    // restored it on load_bundle); the sidecar carries grid geometry only.
+    setOffsetUs(backendOffsetUs);
+    setVideoPath(path); // last: the src-load effect fires with cal already set
+  }
+
+  /** The current grid calibration as a sidecar DTO (for save). */
+  function currentAlignmentDto(): AlignmentDto {
+    return {
+      span_us: gridSpanUs(),
+      hit_frac: gridHitFrac(),
+      x_scale: gridXScale(),
+      x_offset: gridXOffset(),
+    };
+  }
+
+  /** Re-attach the backend's current backdrop video + backing track to the view.
+   * Runs on *every* entry to the edit screen (load-by-dir AND socket/queryState
+   * load), so a bundle loaded over the control socket still shows its movie. The
+   * grid calibration comes from the bundle's `alignment.json` sidecar when the
+   * dir is known (GUI load); the socket path falls back to localStorage. */
+  function reattachBackdropAndBacking(dir: string | undefined): void {
+    void editQueryBacking()
+      .then((ref) => setBackingName(ref ? ref.name : null))
+      .catch(() => {
+        /* backend down — leave the indicator hidden */
+      });
+    const loadAlign: Promise<AlignmentDto | null> = dir
+      ? alignmentLoad(dir).catch(() => null)
+      : Promise.resolve(null);
+    void loadAlign
+      .then((sidecar) =>
+        editQueryVideo().then((ref) => {
+          if (ref) {
+            applyVideoRef(ref.path, ref.offset_us, sidecar);
+            return;
+          }
+          // Legacy transcription.json sidecar fallback (needs the bundle dir).
+          if (!dir) return;
+          return transcriptionLoad(dir).then((dto) => {
+            if (dto) {
+              applyVideoRef(dto.video, dto.offset_us, sidecar);
+              void editSetVideo(dto.video, dto.offset_us).catch(() => {});
+            }
+          });
+        }),
+      )
+      .catch(() => {
+        /* backend down — leave the backdrop detached */
+      });
   }
 
   // ── Save / load actions ─────────────────────────────────────────────────
@@ -259,6 +557,7 @@ export function EditScreen(props: Props): JSX.Element {
       .then((dir) => {
         setDirty(false);
         showFlash(`saved → ${dir}`);
+        persistAlignment(dir);
       })
       .catch((e: unknown) => {
         showFlash(`save failed: ${String(e)}`);
@@ -270,10 +569,20 @@ export function EditScreen(props: Props): JSX.Element {
       .then((dir) => {
         setDirty(false);
         showFlash(`saved to library → ${dir}`);
+        persistAlignment(dir);
       })
       .catch((e: unknown) => {
         showFlash(`save failed: ${String(e)}`);
       });
+  }
+
+  /** Write the grid calibration into the just-saved bundle so the alignment
+   * travels with the track (the time offset is already in meta.json). */
+  function persistAlignment(dir: string): void {
+    if (videoPath() === null) return;
+    void alignmentSave(dir, currentAlignmentDto()).catch(() => {
+      /* non-fatal: the bundle still saved, alignment just isn't persisted */
+    });
   }
 
   // ── Record arm / flavour (M9-A) ──────────────────────────────────────────
@@ -606,6 +915,94 @@ export function EditScreen(props: Props): JSX.Element {
       return;
     }
 
+    // ── Backdrop calibration overlay (M-align) ──────────────────────────
+    // Captures the whole keyboard while open (like save-as) so the alignment
+    // keys never collide with the editor keymap. See CalibrationPanel for the
+    // on-screen legend.
+    if (ov === "calibrate") {
+      e.preventDefault();
+      e.stopPropagation();
+      switch (e.key) {
+        case "Escape":
+        case "`":
+          clearReview();
+          setOverlay("none");
+          break;
+        // Keyboard X — pan (a/d) and zoom (A/D) the grid horizontally.
+        case "a":
+          setGridXOffset((v) => v - XOFF_STEP_PX);
+          break;
+        case "d":
+          setGridXOffset((v) => v + XOFF_STEP_PX);
+          break;
+        case "A":
+          setGridXScale((v) => Math.max(0.1, v - XSCALE_STEP));
+          break;
+        case "D":
+          setGridXScale((v) => v + XSCALE_STEP);
+          break;
+        // Vertical — hit-line position (w/s) and zoom/density (W/S).
+        case "w":
+          setGridHitFrac((v) => Math.min(0.95, v + HITFRAC_STEP)); // line up
+          break;
+        case "s":
+          setGridHitFrac((v) => Math.max(0.05, v - HITFRAC_STEP)); // line down
+          break;
+        case "W":
+          zoomGrid(1 / GRID_ZOOM_STEP); // zoom in (denser, faster notes)
+          break;
+        case "S":
+          zoomGrid(GRID_ZOOM_STEP); // zoom out
+          break;
+        // Together scrub — movie + overlay advance in lock-step. Shift = coarse.
+        case "ArrowUp":
+          scrubTogether(e.shiftKey ? SCRUB_STEP_COARSE_US : SCRUB_STEP_US);
+          break;
+        case "ArrowDown":
+          scrubTogether(e.shiftKey ? -SCRUB_STEP_COARSE_US : -SCRUB_STEP_US);
+          break;
+        case " ":
+          toggleReviewPlay();
+          break;
+        case "-":
+        case "_":
+          changeReviewRate(-1);
+          break;
+        case "=":
+        case "+":
+          changeReviewRate(1);
+          break;
+        // Movie-only time offset (find the first note): [ / ] coarse ±1 s,
+        // ; / ' mid ±250 ms, , / . fine ±10 ms.
+        case "[":
+          nudgeOffset(-OFFSET_COARSE_S_US);
+          break;
+        case "]":
+          nudgeOffset(OFFSET_COARSE_S_US);
+          break;
+        case ";":
+          nudgeOffset(-BACKDROP_NUDGE_COARSE_US);
+          break;
+        case "'":
+          nudgeOffset(BACKDROP_NUDGE_COARSE_US);
+          break;
+        case ",":
+          nudgeOffset(-BACKDROP_NUDGE_FINE_US);
+          break;
+        case ".":
+          nudgeOffset(BACKDROP_NUDGE_FINE_US);
+          break;
+        case "0":
+          resetCalibration();
+          break;
+        default:
+          break;
+      }
+      // Reflect offset/scrub nudges immediately even while paused.
+      render();
+      return;
+    }
+
     // ── Normal / chord mode ─────────────────────────────────────────────
     if (!s) return;
 
@@ -709,6 +1106,13 @@ export function EditScreen(props: Props): JSX.Element {
       // *video* offset instead (they don't collide with backing-offset because
       // they only divert here when a video is present).
       if (videoPath() !== null) {
+        // Backtick opens the alignment overlay (keyboard X, density/hit-line Y,
+        // time, review speed) for registering the movie under the grid.
+        if (e.key === "`") {
+          e.preventDefault();
+          openCalibrate();
+          return;
+        }
         switch (e.key) {
           case ",":
             e.preventDefault();
@@ -776,44 +1180,18 @@ export function EditScreen(props: Props): JSX.Element {
 
     // If a bundle dir was passed in the route payload, load it first;
     // otherwise fetch the current state.
-    const init = props.dir
-      ? loadBundle(props.dir).then((snap) => {
-          applySnapshot(snap);
-          setDirty(false);
-          // Reflect the bundle's backing track, if any (M9-E). The backend's
-          // load_bundle already restored meta.backing into backing_path and
-          // re-attached it to the playback thread; mirror its name on screen.
-          void editQueryBacking()
-            .then((ref) => setBackingName(ref ? ref.name : null))
-            .catch(() => {
-              /* backend down — leave the indicator hidden */
-            });
-          // Re-attach the persisted background video, if any. The backend's
-          // load_bundle already populated it from meta.video (M9-G); fall back
-          // to the legacy transcription.json sidecar (M7-tauri-N) so older
-          // bundles still re-attach their backdrop.
-          void editQueryVideo()
-            .then((ref) => {
-              if (ref) {
-                setVideoPath(ref.path);
-                setOffsetUs(ref.offset_us);
-                return;
-              }
-              return transcriptionLoad(props.dir!).then((dto) => {
-                if (dto) {
-                  setVideoPath(dto.video);
-                  setOffsetUs(dto.offset_us);
-                  // Promote the legacy sidecar onto the bundle field so the next
-                  // save persists it in meta.json.
-                  void editSetVideo(dto.video, dto.offset_us).catch(() => {});
-                }
-              });
-            })
-            .catch(() => {
-              /* backend down — leave the backdrop detached */
-            });
-        })
-      : queryState().then(applySnapshot);
+    const init = (
+      props.dir
+        ? loadBundle(props.dir).then((snap) => {
+            applySnapshot(snap);
+            setDirty(false);
+          })
+        : queryState().then(applySnapshot)
+    ).then(() => {
+      // Re-attach the backend's backdrop video + backing on BOTH paths so a
+      // bundle loaded over the control socket (no route dir) shows its movie.
+      reattachBackdropAndBacking(props.dir);
+    });
 
     init
       .then(() => {
@@ -846,7 +1224,23 @@ export function EditScreen(props: Props): JSX.Element {
 
     const loop = (): void => {
       const s = store.snap;
-      if (s?.playing) render();
+      // Debug: surface the element's real playback position every frame.
+      if (videoEl) setDbgVidTime(videoEl.currentTime);
+      if (reviewPlaying()) {
+        // Advance the together-sweep head by real elapsed time × rate, then
+        // pause a couple of seconds past the last note (head stays at the end).
+        const t =
+          reviewBaseUs +
+          (performance.now() - reviewBaseWall) * 1000 * reviewRate();
+        if (t >= songEndUs() + 2_000_000) {
+          setReviewPlaying(false);
+          setReviewUs(songEndUs());
+          render();
+        } else {
+          setReviewUs(t);
+          render();
+        }
+      } else if (s?.playing) render();
       // Decay the input-level meter toward zero between strikes (M9-A).
       const lvl = inputLevel();
       if (lvl > 0.001) setInputLevel(lvl * 0.9);
@@ -952,7 +1346,10 @@ export function EditScreen(props: Props): JSX.Element {
             inset: 0,
             width: "100%",
             height: "100%",
-            "object-fit": "contain",
+            // `fill` stretches the frame to the canvas box so the movie spans a
+            // known rectangle; the *grid* (not the movie) is then resized to
+            // register on it — see the M-align calibration in EditCanvas.
+            "object-fit": "fill",
             "z-index": 0,
             opacity: BACKDROP_OPACITY,
             "pointer-events": "none",
@@ -975,6 +1372,21 @@ export function EditScreen(props: Props): JSX.Element {
         {/* Backdrop HUD — current alignment offset + key hints */}
         <Show when={videoPath() !== null}>
           <BackdropHud offsetUs={offsetUs()} />
+        </Show>
+
+        {/* Calibration overlay — alignment legend + live values (M-align) */}
+        <Show when={overlay() === "calibrate"}>
+          <CalibrationPanel
+            spanUs={gridSpanUs()}
+            hitFrac={gridHitFrac()}
+            xScale={gridXScale()}
+            xOffset={gridXOffset()}
+            offsetUs={offsetUs()}
+            rate={reviewRate()}
+            playing={reviewPlaying()}
+            headUs={reviewUs()}
+            actualVidS={dbgVidTime()}
+          />
         </Show>
 
         {/* Backing-track indicator (M9-E) — shows the attached audio file and
@@ -1322,7 +1734,138 @@ function BackdropHud(props: { offsetUs: number }): JSX.Element {
         </span>
       </div>
       <div style={{ color: "#6a6e7e", "font-size": "11px" }}>
-        ,/. ±10 ms · ;/' ±250 ms · V detach
+        ,/. ±10 ms · ;/' ±250 ms · ` align · V detach
+      </div>
+    </div>
+  );
+}
+
+// ── CalibrationPanel ────────────────────────────────────────────────────────
+
+/**
+ * Alignment overlay for registering an imported movie under the fixed edit
+ * grid. Shows the live affine values (keyboard X scale/offset, density/hit-line
+ * Y scale/offset), the time offset, the review speed, and the key legend. Keys
+ * are handled in `onKeydown`'s `"calibrate"` branch.
+ */
+function CalibrationPanel(props: {
+  spanUs: number;
+  hitFrac: number;
+  xScale: number;
+  xOffset: number;
+  offsetUs: number;
+  rate: number;
+  playing: boolean;
+  headUs: number | null;
+  actualVidS: number;
+}): JSX.Element {
+  const num = (n: number): string => n.toFixed(2);
+  const ms = (): string => {
+    const v = Math.round(props.offsetUs / 1000);
+    return v >= 0 ? `+${v}` : String(v);
+  };
+  const row = (label: string, value: string, keys: string): JSX.Element => (
+    <div
+      style={{
+        display: "grid",
+        "grid-template-columns": "120px 64px 1fr",
+        gap: "8px",
+        "align-items": "baseline",
+        "font-size": "12px",
+        margin: "2px 0",
+      }}
+    >
+      <span style={{ color: "#9a9eb0" }}>{label}</span>
+      <span
+        style={{
+          color: "#e7e8ef",
+          "font-family": "'IBM Plex Mono', ui-monospace, monospace",
+          "text-align": "right",
+        }}
+      >
+        {value}
+      </span>
+      <span style={{ color: "#6a6e7e", "font-size": "11px" }}>{keys}</span>
+    </div>
+  );
+
+  return (
+    <div
+      style={{
+        position: "absolute",
+        top: "16px",
+        right: "16px",
+        background: "rgba(26,27,36,0.92)",
+        border: "1px solid #5be7c4",
+        "border-radius": "8px",
+        padding: "10px 14px",
+        "z-index": 120,
+        "backdrop-filter": "blur(3px)",
+        "font-family": "'Space Grotesk', system-ui, sans-serif",
+        "min-width": "320px",
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          "align-items": "center",
+          gap: "8px",
+          "margin-bottom": "8px",
+        }}
+      >
+        <span
+          style={{
+            background: "#5be7c4",
+            color: "#0f1016",
+            padding: "2px 8px",
+            "border-radius": "4px",
+            "font-size": "11px",
+            "font-weight": 700,
+            "letter-spacing": "0.5px",
+          }}
+        >
+          ALIGN
+        </span>
+        <span style={{ color: "#9a9eb0", "font-size": "11px" }}>
+          resize the grid to register on the movie
+        </span>
+      </div>
+      {row("Keyboard pan", `${props.xOffset}px`, "a / d")}
+      {row("Keyboard zoom", num(props.xScale), "A / D")}
+      {row("Hit-line", `${Math.round((1 - props.hitFrac) * 100)}%`, "w / s")}
+      {row("Vertical zoom", `${(props.spanUs / 1e6).toFixed(1)} s`, "W / S")}
+      {row("Time offset", `${ms()} ms`, "[ / ] ±1s · ;/' · ,/.")}
+      {row(
+        "Together / speed",
+        `${props.rate}×${props.playing ? " ▶" : ""}`,
+        "↑/↓ ·⇧coarse· Space ·-/=",
+      )}
+      <div
+        style={{
+          color: "#5be7c4",
+          "font-size": "11px",
+          "font-family": "'IBM Plex Mono', ui-monospace, monospace",
+          "margin-top": "8px",
+          "border-top": "1px solid #2a2c38",
+          "padding-top": "6px",
+        }}
+      >
+        head{" "}
+        {props.headUs === null ? "—" : `${(props.headUs / 1e6).toFixed(2)}s`} →
+        vid{" "}
+        {props.headUs === null
+          ? "—"
+          : `${((props.headUs + props.offsetUs) / 1e6).toFixed(2)}s`}{" "}
+        · act {props.actualVidS.toFixed(2)}s
+      </div>
+      <div
+        style={{
+          color: "#6a6e7e",
+          "font-size": "11px",
+          "margin-top": "4px",
+        }}
+      >
+        0 reset · ` or Esc close
       </div>
     </div>
   );

@@ -413,6 +413,40 @@ export function transcriptionLoad(dir: string): Promise<TranscriptionDto | null>
   return invoke<TranscriptionDto | null>("transcription_load", { dir });
 }
 
+// ── Grid alignment sidecar (M-align) ─────────────────────────────────────────
+
+/**
+ * Grid-calibration knobs persisted alongside the bundle as `alignment.json` so a
+ * user's overlay alignment travels with the track (and survives Save-As). View
+ * geometry only — the video path + time offset live in `meta.json`.
+ */
+export interface AlignmentDto {
+  /** µs across the canvas height (vertical zoom). */
+  span_us: number;
+  /** Fraction of the span kept below the hit/now line. */
+  hit_frac: number;
+  /** Horizontal keyboard zoom (1 = full 88 across the width). */
+  x_scale: number;
+  /** Horizontal keyboard pan in px. */
+  x_offset: number;
+}
+
+/**
+ * Write the alignment sidecar (`alignment.json`) into the bundle `dir`. Called
+ * after `save_bundle` resolves so the calibration is saved with the track.
+ */
+export function alignmentSave(dir: string, dto: AlignmentDto): Promise<void> {
+  return invoke<void>("alignment_save", { dir, dto });
+}
+
+/**
+ * Read the alignment sidecar for the bundle at `dir`, or `null` when none
+ * exists. Called on `load_bundle` to restore the calibration.
+ */
+export function alignmentLoad(dir: string): Promise<AlignmentDto | null> {
+  return invoke<AlignmentDto | null>("alignment_load", { dir });
+}
+
 // ── Background video, persisted in the bundle (M9-G) ─────────────────────────
 
 /**
