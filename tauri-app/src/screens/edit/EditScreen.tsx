@@ -205,8 +205,6 @@ export function EditScreen(props: Props): JSX.Element {
   // Wall-clock anchor for the review sweep (re-seated on play / rate change).
   let reviewBaseUs = 0;
   let reviewBaseWall = 0;
-  // Debug: the live actual <video>.currentTime, polled in the RAF loop.
-  const [dbgVidTime, setDbgVidTime] = createSignal(0);
 
   // ── Backing audio track (M9-E; swap M10-E) ────────────────────────────────
   // The attached backing file name (null = none). The relocation of the former
@@ -295,6 +293,39 @@ export function EditScreen(props: Props): JSX.Element {
    * *seek* rather than `play()` so the frame stays in lockstep with the
    * playhead (no audio, no drift); clamped to the clip's duration.
    */
+  /**
+   * Activate the backdrop `<video>` once after (re)attaching a source. WebView2
+   * (and some other engines) will not actually *seek* — decode and repaint a new
+   * frame — for a media element that has been `load()`-ed but never played: the
+   * `currentTime` setter is silently ignored and the element stays pinned on its
+   * first decoded frame. A single muted `play()`→`pause()` activates the media
+   * pipeline so subsequent scrubs take effect. Muted, so autoplay is permitted;
+   * paused again immediately so we still drive the frame purely by seeking.
+   */
+  function primeBackdrop(): void {
+    const v = videoEl;
+    if (!v) return;
+    const activate = (): void => {
+      const p = v.play();
+      if (p && typeof p.then === "function") {
+        p.then(() => {
+          v.pause();
+          syncVideo(currentHeadUs()); // re-seat the frame the play() nudged off
+        }).catch(() => {
+          /* autoplay blocked — seeking may still work; nothing else to do */
+        });
+      } else {
+        v.pause();
+        syncVideo(currentHeadUs());
+      }
+    };
+    if (v.readyState >= 2) {
+      activate();
+    } else {
+      v.addEventListener("loadeddata", activate, { once: true });
+    }
+  }
+
   function syncVideo(anchorUs: number): void {
     const v = videoEl;
     if (!v || videoPath() === null) return;
@@ -700,6 +731,7 @@ export function EditScreen(props: Props): JSX.Element {
       if (p !== null) {
         videoEl.src = convertFileSrc(p);
         videoEl.load();
+        primeBackdrop();
       } else {
         videoEl.removeAttribute("src");
         videoEl.load();
@@ -1224,8 +1256,6 @@ export function EditScreen(props: Props): JSX.Element {
 
     const loop = (): void => {
       const s = store.snap;
-      // Debug: surface the element's real playback position every frame.
-      if (videoEl) setDbgVidTime(videoEl.currentTime);
       if (reviewPlaying()) {
         // Advance the together-sweep head by real elapsed time × rate, then
         // pause a couple of seconds past the last note (head stays at the end).
@@ -1385,7 +1415,6 @@ export function EditScreen(props: Props): JSX.Element {
             rate={reviewRate()}
             playing={reviewPlaying()}
             headUs={reviewUs()}
-            actualVidS={dbgVidTime()}
           />
         </Show>
 
@@ -1757,7 +1786,6 @@ function CalibrationPanel(props: {
   rate: number;
   playing: boolean;
   headUs: number | null;
-  actualVidS: number;
 }): JSX.Element {
   const num = (n: number): string => n.toFixed(2);
   const ms = (): string => {
@@ -1855,8 +1883,7 @@ function CalibrationPanel(props: {
         vid{" "}
         {props.headUs === null
           ? "—"
-          : `${((props.headUs + props.offsetUs) / 1e6).toFixed(2)}s`}{" "}
-        · act {props.actualVidS.toFixed(2)}s
+          : `${((props.headUs + props.offsetUs) / 1e6).toFixed(2)}s`}
       </div>
       <div
         style={{

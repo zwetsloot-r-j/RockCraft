@@ -584,6 +584,42 @@ def estimate_scroll(
 # --------------------------------------------------------------------------- #
 # 4. Roll stitching
 # --------------------------------------------------------------------------- #
+def centerline_band(mask: np.ndarray, half: int) -> np.ndarray:
+    """Keep only a ``±half`` px band around each horizontal run's centroid.
+
+    A Synthesia bar is rendered *centred on its key*, but here a bar is 1.5-2.5
+    key-widths wide, so its body covers the centre columns of the flanking
+    lanes (black-key centres sit only ~half a key away, on the white
+    boundaries).  Sampling those flanking centres yields same-onset ghost twins
+    and mis-assigns a struck key to its neighbour.
+
+    Collapsing every horizontal run to a thin band around its *centroid* fixes
+    this geometrically: the band lands on the centre of the actually-struck key
+    (white or black) and not on its neighbours, so only the correct lane votes.
+    Fully vectorised — start/end columns of every run are found with running
+    max/min, giving each pixel its run's centre with no Python-level loop.
+    """
+    h, w = mask.shape
+    if w == 0:
+        return mask
+    col = np.arange(w)
+    left = np.zeros_like(mask)
+    left[:, 1:] = mask[:, :-1]
+    starts = mask & ~left  # first column of each run
+    right = np.zeros_like(mask)
+    right[:, :-1] = mask[:, 1:]
+    ends = mask & ~right  # last column of each run
+    # Within a run, every pixel's start column = the running max of start-cols
+    # (0 elsewhere); its end column = the running min-from-the-right of end-cols.
+    start_col = np.maximum.accumulate(np.where(starts, col[None, :], 0), axis=1)
+    big = w + 1
+    end_col = np.minimum.accumulate(
+        np.where(ends, col[None, :], big)[:, ::-1], axis=1
+    )[:, ::-1]
+    centroid = (start_col + end_col) * 0.5
+    return mask & (np.abs(col[None, :] - centroid) <= half)
+
+
 def build_roll(
     frames: Sequence[np.ndarray],
     fps: float,
@@ -664,6 +700,32 @@ def build_roll(
     # Rows a lane can actually observe: at least one strip column not dead.
     lane_clean = [~dead[:, x0:x1].all(axis=1) for (_pidx, x0, x1, _cx) in lanes]
 
+    # Overlay-row map: moving karaoke lyrics sit in a fixed row band but change
+    # content, so the per-pixel dead-zone never flags them — yet the coherence
+    # gate (correctly) discards the static text, taking the *bar behind it* with
+    # it.  A bar crossing those rows therefore loses votes and its coverage dips,
+    # splitting or dropping the note.  Detect the band as rows with persistently
+    # high *non-coherent* brightness (bright but not scrolling = text/animation,
+    # not a bar) and drop them from the roll, so coverage is judged only on the
+    # clean rows each song-time is also seen through.
+    row_usable = np.ones(hit, dtype=bool)
+    if n > coh_k:
+        ncoh = np.zeros(hit, dtype=np.float64)
+        ov_idx = np.linspace(0, n - 1 - coh_k, min(n - coh_k, 40)).astype(int)
+        for f in ov_idx:
+            r = raw_mask(f)
+            ncoh += (r & ~coherent_mask(f)).mean(axis=1)
+        ncoh /= len(ov_idx)
+        baseline = float(np.median(ncoh))
+        overlay = ncoh > max(0.05, 4.0 * baseline)
+        overlay = cv2.dilate(
+            overlay.astype(np.uint8)[:, None], np.ones((5, 1), np.uint8)
+        )[:, 0].astype(bool)
+        # Safety: never blank out more than 40% of the falling region.
+        if overlay.mean() < 0.4:
+            row_usable = ~overlay
+        raw_cache.clear()  # the sampling above polluted the small rolling cache
+
     rows = np.arange(hit)  # falling-region rows
     for f in range(n):
         o_f = f / fps * scroll
@@ -672,12 +734,15 @@ def build_roll(
 
         frame = frames[f]
         mask = coherent_mask(f) & ~dead
+        # Collapse each wide bar to a thin band on its centroid so it votes for
+        # the one key it is centred on, not every lane its body overlaps.
+        cmask = centerline_band(mask, sh)
         raw_cache.pop(f - coh_k, None)  # keep the cache a small rolling window
         for li, (pidx, x0, x1, cx) in enumerate(lanes):
-            observable = valid_rows & lane_clean[li]
+            observable = valid_rows & lane_clean[li] & row_usable
             # Geometric coverage: every observable row, once per frame per lane.
             np.add.at(totals[pidx], row_bins[observable], 1.0)
-            strip = mask[:, x0:x1].any(axis=1)  # colored at this lane, per row
+            strip = cmask[:, x0:x1].any(axis=1)  # bar centroid at this lane, per row
             on = strip & observable
             if not on.any():
                 continue
@@ -704,17 +769,26 @@ def extract_notes(
     *,
     threshold: float = 0.5,
     min_run_px: int = 3,
+    bridge_px: int = 0,
 ) -> list[_RawNote]:
     """Threshold per-pitch coverage into note runs.
 
     ``totals`` may be global (1-D, one value per bin) or per-lane (2-D,
     ``[pitch_index, bin]``, from the dead-zone-aware roll).
+
+    ``bridge_px`` closes coverage gaps up to that many bins: an occluder the
+    dead-zone/text-band maps don't fully cover (a logo edge, an animated sprite
+    passing through) briefly starves a held note's coverage, splitting one long
+    note into two.  Bridging short gaps re-joins them.  Kept well under the
+    spacing of genuinely repeated notes so real re-strikes stay separate.
     """
     raws: list[_RawNote] = []
     for pi, pitch in enumerate(pitches):
         tot = totals[pi] if totals.ndim == 2 else totals
         coverage = votes[pi] / np.maximum(tot, 1e-6)
         on = (coverage > threshold) & (tot > 0)
+        if bridge_px > 0:
+            on = _bridge_gaps(on, bridge_px)
         for a, b in _find_runs(on):
             if b - a < min_run_px:
                 continue
@@ -735,6 +809,93 @@ def extract_notes(
             )
     raws.sort(key=lambda r: (r.start_us, r.pitch))
     return raws
+
+
+def _bridge_gaps(on: np.ndarray, max_gap: int) -> np.ndarray:
+    """Fill `False` gaps of length <= ``max_gap`` between two `True` runs.
+
+    A morphological closing along the time axis: re-joins a held note that a
+    transient occluder split, without extending the note past its true ends
+    (only interior gaps flanked by coverage are filled).
+    """
+    out = on.copy()
+    runs = _find_runs(~on)
+    for a, b in runs:
+        if a == 0 or b == len(on):  # leading/trailing gap — not interior
+            continue
+        if b - a <= max_gap:
+            out[a:b] = True
+    return out
+
+
+def _bar_saturation(color: np.ndarray) -> float:
+    """HSV-style saturation of a mean BGR bar colour, in ``[0, 1]``.
+
+    A true bar's saturated core scores high; the soft glow/bevel a thick bar
+    bleeds onto a neighbouring lane is lighter (whiter) and scores low.  This is
+    the discriminator used to tell a real note from its same-onset ghost twin.
+    """
+    c = np.asarray(color, dtype=np.float64)
+    hi = float(c.max())
+    if hi <= 1e-6:
+        return 0.0
+    return (hi - float(c.min())) / hi
+
+
+def suppress_semitone_ghosts(raws: list[_RawNote], onset_tol_us: int) -> list[_RawNote]:
+    """Drop same-onset adjacent-semitone *ghost* notes left by thick bars.
+
+    A bar 1.5-2.5 key-widths wide fully covers its flanking black-key lane
+    centres (only ~half a key away, on the white boundaries) and sometimes the
+    next white, so a single struck key lights two, three, even four adjacent
+    semitones at the *same* onset.  The whole consecutive-semitone run is one
+    bar, not a chord, so we keep only its strongest member and drop the rest.
+
+    "Strongest" = most saturated (the real core), with coverage as a tiebreak.
+    Chord tones a whole step or more apart (gap >= 2) fall in separate runs and
+    are never touched — genuine same-onset *semitone* dyads are vanishingly rare
+    in tutorials, so collapsing the run is the right call for this content.
+    """
+    if len(raws) < 2:
+        return raws
+
+    ordered = sorted(raws, key=lambda r: (r.start_us, r.pitch))
+    # Coverage dominates (a real centred key is voted every frame; a rare
+    # ambiguous-centroid twin almost never is); saturation breaks ties.
+    score = {id(r): r.coverage + 0.01 * _bar_saturation(r.color) for r in ordered}
+    drop: set[int] = set()
+
+    # Walk simultaneous groups (onsets within tolerance of the group's first).
+    i = 0
+    n = len(ordered)
+    while i < n:
+        j = i + 1
+        group_start = ordered[i].start_us
+        while j < n and ordered[j].start_us - group_start <= onset_tol_us:
+            j += 1
+        group = sorted(ordered[i:j], key=lambda r: r.pitch)
+        # Split the group into maximal runs of consecutive semitones.
+        run: list[_RawNote] = [group[0]]
+        for note in group[1:]:
+            if note.pitch - run[-1].pitch == 1:
+                run.append(note)
+            else:
+                _keep_run_leader(run, score, drop)
+                run = [note]
+        _keep_run_leader(run, score, drop)
+        i = j
+
+    return [r for r in ordered if id(r) not in drop]
+
+
+def _keep_run_leader(run: list[_RawNote], score: dict[int, float], drop: set[int]) -> None:
+    """Within a consecutive-semitone run, keep only the leader; drop the rest."""
+    if len(run) < 2:
+        return
+    leader = max(run, key=lambda r: score[id(r)])
+    for note in run:
+        if note is not leader:
+            drop.add(id(note))
 
 
 def assign_hands(raws: list[_RawNote]) -> list[ExtractedNote]:
@@ -879,7 +1040,13 @@ def extract_chart(
         us_per_px,
         threshold=0.6,
         min_run_px=max(3, int(round(0.04 * scroll))),
+        # Re-join held notes split by a transient occluder; ~80 ms, comfortably
+        # under the spacing of genuine repeated strikes.
+        bridge_px=max(4, int(round(0.08 * scroll))),
     )
+    # Thick bars bleed onto flanking lanes, lighting 2-3 adjacent semitones at
+    # one onset; drop those glow ghosts (keep the saturated core) before hands.
+    raws = suppress_semitone_ghosts(raws, onset_tol_us=int(round(3 * us_per_px)))
     notes = assign_hands(raws)
 
     if debug_dir:
