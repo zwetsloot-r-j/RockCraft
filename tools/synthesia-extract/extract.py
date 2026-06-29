@@ -20,6 +20,7 @@ safely no-ops, leaving the visual notes untouched (see ``synthesia_extract.audio
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 from synthesia_extract.audio import fuse_chart
@@ -89,6 +90,14 @@ def main(argv: list[str] | None = None) -> int:
         "--audio", dest="audio", default=None,
         help="clean-piano WAV track for --audio-fusion (16-bit PCM)",
     )
+    parser.add_argument(
+        "--linear-keyboard", dest="linear_keyboard",
+        action="store_true",
+        default=os.environ.get("ROCKCRAFT_LINEAR_KEYBOARD", "") not in ("", "0"),
+        help="bypass keyboard detection and use a deterministic even 88-key "
+        "full-width ruler (for stylized/animated charts whose backdrop defeats "
+        "the white/black-key calibration); also via ROCKCRAFT_LINEAR_KEYBOARD=1",
+    )
     args = parser.parse_args(argv)
 
     _limit_memory()
@@ -107,6 +116,7 @@ def main(argv: list[str] | None = None) -> int:
                 scroll_override=args.scroll,
                 debug_dir=DEBUG_DIR if args.debug else None,
                 max_dense_frames=args.stream_frames,
+                force_linear_kb=args.linear_keyboard,
             )
         else:
             frames, fps = load_frames(args.inp, fps_override=args.fps)
@@ -117,6 +127,7 @@ def main(argv: list[str] | None = None) -> int:
                 anchor_c4_x=args.anchor_c4_x,
                 scroll_override=args.scroll,
                 debug_dir=DEBUG_DIR if args.debug else None,
+                force_linear_kb=args.linear_keyboard,
             )
     except (FileNotFoundError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)

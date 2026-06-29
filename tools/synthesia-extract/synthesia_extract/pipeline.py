@@ -242,6 +242,46 @@ def calibrate_keyboard(
     return kb
 
 
+def linear_keyboard(width: int, hit_line: int) -> Keyboard:
+    """A deterministic even 88-key ruler spanning the full frame width.
+
+    Bypasses image-based key detection entirely: assumes an even-lane
+    (Synthesia-style) board where MIDI 21..108 map to 88 equal columns across
+    the frame.  For stylized/animated tutorials whose cartoon backdrop and faint
+    separators defeat :func:`calibrate_keyboard` — its per-frame white/black
+    detection wobbles 76..102 keys and assigns high notes pitches up to ~11
+    semitones flat — this is both correct and stable.  Opt-in via
+    ``--linear-keyboard`` (``ROCKCRAFT_LINEAR_KEYBOARD=1``).
+    """
+    n = 88
+    lane = width / n
+    white_classes = {0, 2, 4, 5, 7, 9, 11}  # C D E F G A B (C == 0)
+    x_to_pitch = np.full(width, -1, dtype=int)
+    centers: list[tuple[int, int]] = []
+    white_centers: list[int] = []
+    white_pitches: list[int] = []
+    for i in range(n):
+        pitch = 21 + i
+        lo = int(round(i * lane))
+        hi = int(round((i + 1) * lane))
+        x_to_pitch[lo:hi] = pitch
+        xc = min(width - 1, max(0, int(round((i + 0.5) * lane))))
+        centers.append((xc, pitch))
+        if pitch % 12 in white_classes:
+            white_centers.append(xc)
+            white_pitches.append(pitch)
+    anchor_c4_x = min(width - 1, max(0, int(round((60 - 21 + 0.5) * lane))))
+    return Keyboard(
+        hit_line=hit_line,
+        x_to_pitch=x_to_pitch,
+        white_centers=white_centers,
+        white_pitches=white_pitches,
+        centers=centers,
+        strip_half=max(1, int(round(lane)) // 3),
+        anchor_c4_x=anchor_c4_x,
+    )
+
+
 def _calibrate_white_runs(
     frame: np.ndarray, hit_line: int, anchor_c4_x: Optional[int] = None
 ) -> Keyboard:
@@ -1329,6 +1369,7 @@ def extract_chart(
     anchor_c4_x: Optional[int] = None,
     scroll_override: Optional[float] = None,
     debug_dir: Optional[str] = None,
+    force_linear_kb: bool = False,
 ) -> ExtractedChart:
     """Run the full pipeline over ``frames`` and return an ``ExtractedChart``."""
     frames = list(frames)
@@ -1345,7 +1386,11 @@ def extract_chart(
     hit_line = detect_hit_line(ref)
     if hit_line <= 1 or hit_line >= ref.shape[0]:
         return ExtractedChart(notes=[], source=source)
-    kb = calibrate_keyboard(ref, hit_line, anchor_c4_x=anchor_c4_x)
+    kb = (
+        linear_keyboard(ref.shape[1], hit_line)
+        if force_linear_kb
+        else calibrate_keyboard(ref, hit_line, anchor_c4_x=anchor_c4_x)
+    )
     # Frame geometry for the overlay's auto-calibration (see SourceMeta).
     source.frame_height_px = int(ref.shape[0])
     source.hit_line_px = int(hit_line)
@@ -1523,6 +1568,7 @@ def extract_chart_streaming(
     debug_dir: Optional[str] = None,
     sample_frames: int = 480,
     max_dense_frames: int = 9000,
+    force_linear_kb: bool = False,
 ) -> ExtractedChart:
     """High-fps extraction that never holds the whole clip in RAM.
 
@@ -1549,6 +1595,7 @@ def extract_chart_streaming(
         return extract_chart(
             frames, eff_fps, title=title, anchor_c4_x=anchor_c4_x,
             scroll_override=scroll_override, debug_dir=debug_dir,
+            force_linear_kb=force_linear_kb,
         )
 
     sample, sample_fps = sparse_sample(path, sample_frames, fps_override)
@@ -1560,7 +1607,11 @@ def extract_chart_streaming(
     hit_line = detect_hit_line(ref)
     if hit_line <= 1 or hit_line >= ref.shape[0]:
         return ExtractedChart(notes=[], source=source)
-    kb = calibrate_keyboard(ref, hit_line, anchor_c4_x=anchor_c4_x)
+    kb = (
+        linear_keyboard(ref.shape[1], hit_line)
+        if force_linear_kb
+        else calibrate_keyboard(ref, hit_line, anchor_c4_x=anchor_c4_x)
+    )
     # Frame geometry for the overlay's auto-calibration (see SourceMeta). ``h``
     # is the native frame height from video_info — the true source resolution.
     source.frame_height_px = int(h)
