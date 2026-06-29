@@ -8,8 +8,13 @@ use rockcraft_core::{
     BackgroundVideo, BackingTrack, Grid, Key, NoteEvent, NoteEventKind, RecordingMeta, SliceResult,
     TrackOrigin,
 };
+use serde::Serialize;
 
-use crate::{error::ImportError, parser::chart_to_timeline, schema::ExtractedChart};
+use crate::{
+    error::ImportError,
+    parser::chart_to_timeline,
+    schema::{ExtractedChart, SourceMeta},
+};
 
 /// The canonical gitignored output root, e.g. `<workspace>/import-out`.
 ///
@@ -84,7 +89,70 @@ pub fn write_chart_bundle_full(
     meta.origin = Some(rockcraft_core::TrackOrigin::Imported);
     std::fs::write(dir.join("meta.json"), meta.to_json())?;
 
+    // When the bundle carries a source movie and the extractor measured the
+    // frame geometry, write the recommended edit-grid calibration so the Tauri
+    // overlay registers the imported chart on the movie automatically (no manual
+    // zoom). Best-effort: a chart with no video or missing geometry simply gets
+    // no sidecar, and the editor falls back to its default zoom.
+    if meta.video.is_some() {
+        if let Some(cal) = alignment_from_source(&chart.source) {
+            if let Ok(json) = serde_json::to_string_pretty(&cal) {
+                let _ = std::fs::write(dir.join("alignment.json"), json);
+            }
+        }
+    }
+
     Ok(dir.to_path_buf())
+}
+
+/// Recommended initial edit-grid calibration, written next to the bundle as
+/// `alignment.json`.
+///
+/// The field names are the contract shared with the Tauri reader
+/// (`tauri-app/src-tauri/src/alignment.rs::AlignmentDto` and the frontend
+/// `AlignmentDto`); this crate must not depend on the frontend, so the shape is
+/// duplicated here intentionally. Only the vertical knobs are derived — `x_scale`
+/// / `x_offset` default to the identity (keyboard left/right alignment stays a
+/// manual touch-up in the ALIGN overlay).
+#[derive(Serialize)]
+struct AlignmentSidecar {
+    /// µs spanned across the canvas height (vertical zoom).
+    span_us: i64,
+    /// Fraction of the span kept below the hit/now line.
+    hit_frac: f64,
+    /// Horizontal keyboard zoom (1 = full 88 across the width).
+    x_scale: f64,
+    /// Horizontal keyboard pan in px.
+    x_offset: f64,
+}
+
+/// Derive the grid calibration from the extractor's frame geometry, or `None`
+/// when any input is missing or degenerate.
+///
+/// The source movie is drawn stretched to fill the canvas, so the full native
+/// frame height always maps onto the canvas height. A note `Δt` before the
+/// hit-line sits `Δt · scroll` px above it in the movie; matching that in the
+/// grid requires the canvas to span exactly one frame-height worth of song-time
+/// (`span_us = frame_height · 1e6/scroll`) with the now-line at the hit row
+/// (`hit_frac = (H − hit)/H`). Both are independent of the canvas size.
+fn alignment_from_source(source: &SourceMeta) -> Option<AlignmentSidecar> {
+    let scroll = f64::from(source.scroll_px_per_s?);
+    let h = f64::from(source.frame_height_px?);
+    let hit = f64::from(source.hit_line_px?);
+    if scroll <= 0.0 || h <= 0.0 || !(0.0..=h).contains(&hit) {
+        return None;
+    }
+    let us_per_px = 1e6 / scroll;
+    let span_us = (h * us_per_px).round() as i64;
+    if span_us <= 0 {
+        return None;
+    }
+    Some(AlignmentSidecar {
+        span_us,
+        hit_frac: (h - hit) / h,
+        x_scale: 1.0,
+        x_offset: 0.0,
+    })
 }
 
 /// Write one kept part of a split piece as its own standalone bundle (M10-B).
@@ -219,4 +287,97 @@ fn events_to_smf_bytes(events: &[NoteEvent]) -> Vec<u8> {
     smf.write_std(&mut bytes)
         .expect("MIDI serialization is infallible");
     bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{ExtractedNote, Hand};
+    use tempfile::TempDir;
+
+    fn chart_with_source(source: SourceMeta) -> ExtractedChart {
+        ExtractedChart {
+            notes: vec![ExtractedNote {
+                pitch: 60,
+                start_us: 0,
+                dur_us: 500_000,
+                hand: Hand::Right,
+                velocity: Some(80),
+                confidence: None,
+            }],
+            source,
+        }
+    }
+
+    fn geometry_source() -> SourceMeta {
+        SourceMeta {
+            title: None,
+            fps: Some(30.0),
+            scroll_px_per_s: Some(200.0),
+            frame_height_px: Some(360),
+            hit_line_px: Some(300),
+            extractor_version: "test".into(),
+        }
+    }
+
+    fn video() -> BackgroundVideo {
+        BackgroundVideo {
+            file: "source.mp4".into(),
+            offset_us: 0,
+        }
+    }
+
+    /// A video-backed chart with frame geometry writes `alignment.json` with the
+    /// vertical calibration derived from the movie: span = H·1e6/scroll, hit_frac
+    /// = (H−hit)/H, identity horizontal knobs.
+    #[test]
+    fn alignment_sidecar_written_from_geometry() {
+        let tmp = TempDir::new().unwrap();
+        let chart = chart_with_source(geometry_source());
+        write_chart_bundle_full(&chart, tmp.path(), None, Some(video())).unwrap();
+
+        let json = std::fs::read_to_string(tmp.path().join("alignment.json"))
+            .expect("alignment.json should be written");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        // scroll 200 px/s → 5000 µs/px; 360 px tall → 1.8 s span; hit at 300/360.
+        assert_eq!(v["span_us"].as_i64(), Some(1_800_000));
+        assert!((v["hit_frac"].as_f64().unwrap() - (60.0 / 360.0)).abs() < 1e-9);
+        assert_eq!(v["x_scale"].as_f64(), Some(1.0));
+        assert_eq!(v["x_offset"].as_f64(), Some(0.0));
+    }
+
+    /// No movie → no calibration sidecar (it would have nothing to register on).
+    #[test]
+    fn no_sidecar_without_video() {
+        let tmp = TempDir::new().unwrap();
+        let chart = chart_with_source(geometry_source());
+        write_chart_bundle_full(&chart, tmp.path(), None, None).unwrap();
+        assert!(!tmp.path().join("alignment.json").exists());
+    }
+
+    /// A movie but no measured geometry → no sidecar (editor uses its default zoom).
+    #[test]
+    fn no_sidecar_without_geometry() {
+        let tmp = TempDir::new().unwrap();
+        let source = SourceMeta {
+            scroll_px_per_s: Some(200.0),
+            frame_height_px: None,
+            hit_line_px: None,
+            ..geometry_source()
+        };
+        write_chart_bundle_full(&chart_with_source(source), tmp.path(), None, Some(video()))
+            .unwrap();
+        assert!(!tmp.path().join("alignment.json").exists());
+    }
+
+    /// A degenerate hit-line outside the frame is rejected rather than producing
+    /// a nonsensical (e.g. >1 or negative) hit-fraction.
+    #[test]
+    fn degenerate_geometry_rejected() {
+        let source = SourceMeta {
+            hit_line_px: Some(9999),
+            ..geometry_source()
+        };
+        assert!(alignment_from_source(&source).is_none());
+    }
 }

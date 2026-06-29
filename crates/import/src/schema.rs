@@ -51,5 +51,15 @@ pub struct SourceMeta {
     /// Scroll speed in pixels per second used to convert positions to times.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scroll_px_per_s: Option<f32>,
+    /// Native source-frame height in pixels. With `hit_line_px` and
+    /// `scroll_px_per_s`, the importer derives the edit overlay's grid
+    /// calibration (`alignment.json`) so an imported chart registers on its
+    /// source movie automatically. `None` when the extractor could not measure it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_height_px: Option<u32>,
+    /// Hit-line row in pixels from the top of the source frame (where falling
+    /// notes are struck). Pairs with `frame_height_px` for the overlay calibration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hit_line_px: Option<u32>,
     pub extractor_version: String,
 }

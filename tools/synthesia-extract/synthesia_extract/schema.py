@@ -70,6 +70,12 @@ class SourceMeta:
     title: Optional[str] = None
     fps: Optional[float] = None
     scroll_px_per_s: Optional[float] = None
+    # Native source-frame height (px) and the hit-line row (px from the top).
+    # With ``scroll_px_per_s`` these let the Tauri edit overlay derive its grid
+    # calibration so an imported chart registers on the source movie with no
+    # manual zoom: span = frame_height * 1e6/scroll, hit_frac = (H - hit)/H.
+    frame_height_px: Optional[int] = None
+    hit_line_px: Optional[int] = None
     audio_fusion: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -80,6 +86,10 @@ class SourceMeta:
             out["fps"] = float(self.fps)
         if self.scroll_px_per_s is not None:
             out["scroll_px_per_s"] = float(self.scroll_px_per_s)
+        if self.frame_height_px is not None:
+            out["frame_height_px"] = int(self.frame_height_px)
+        if self.hit_line_px is not None:
+            out["hit_line_px"] = int(self.hit_line_px)
         if self.audio_fusion is not None:
             out["audio_fusion"] = str(self.audio_fusion)
         return out
