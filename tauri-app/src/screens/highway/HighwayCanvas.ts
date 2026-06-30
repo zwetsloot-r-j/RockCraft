@@ -16,6 +16,7 @@ import type { HighwayConfig, KeyInfo, KeyLayout, NoteSpan, SongData } from "./ty
 import {
   clamp,
   keyLayout,
+  keyNoteStyle,
   lerp,
   noteName,
   roundRect,
@@ -373,7 +374,10 @@ export class HighwayCanvas {
     const yTop = clamp(this.yOf(en, now), -40, this.hitY);
     let yBot = clamp(this.yOf(st, now), -40, this.hitY);
     if (yBot - yTop < 3) yBot = yTop + 3; // min visible height
-    const gap = lane.black ? 0.06 : c.noteGap;
+    // Per-note key treatment (slim/darker/outline for accidentals). Single
+    // source of truth shared with the edit view; see utils.ts::keyNoteStyle.
+    const ksty = keyNoteStyle(nt.note);
+    const gap = clamp(c.noteGap + ksty.inset, 0, 0.92); // accidentals = slim pill
     const halfW = (lane.w * (1 - gap)) / 2;
     const L = lane.cx - halfW,
       R = lane.cx + halfW;
@@ -381,7 +385,14 @@ export class HighwayCanvas {
       sB = this.sAt(yBot);
     const depth = 1 - clamp(yBot / this.hitY, 0, 1); // 0 far, 1 near hit
     const light = depth * 0.5;
-    const col = this.noteColor(nt, light);
+    // Darken accidentals the same way in every colour mode (replaces the old
+    // ad-hoc black-key alpha tweak) so the dimmer read is mode-independent.
+    const baseCol = this.noteColor(nt, light);
+    const col = ksty.shadeMul ? shade(baseCol, ksty.shadeMul) : baseCol;
+    // Diagonal rear (top) cutoff: a highway-only motion cue for accidentals when
+    // perspective is flat. Not part of the shared keyNoteStyle (the edit view
+    // omits it); proportional to height so short notes stay legible.
+    const cut = ksty.stroke && !c.perspective ? Math.min(7, (yBot - yTop) * 0.5) : 0;
 
     ctx.save();
     // glow
@@ -391,7 +402,17 @@ export class HighwayCanvas {
     }
     ctx.beginPath();
     if (!c.perspective) {
-      roundRect(ctx, this.xP(L, 1), yTop, halfW * 2, yBot - yTop, c.radius);
+      if (cut > 0) {
+        const xL = this.xP(L, 1),
+          xR = this.xP(R, 1);
+        ctx.moveTo(xL, yTop + cut);
+        ctx.lineTo(xR, yTop);
+        ctx.lineTo(xR, yBot);
+        ctx.lineTo(xL, yBot);
+        ctx.closePath();
+      } else {
+        roundRect(ctx, this.xP(L, 1), yTop, halfW * 2, yBot - yTop, c.radius);
+      }
     } else {
       ctx.moveTo(this.xP(L, sT), yTop);
       ctx.lineTo(this.xP(R, sT), yTop);
@@ -404,8 +425,14 @@ export class HighwayCanvas {
     g.addColorStop(0, withAlpha(col, c.glow ? 0.72 : 0.86));
     g.addColorStop(1, col);
     ctx.fillStyle = g;
-    ctx.globalAlpha = lane.black ? 0.96 : 1;
     ctx.fill();
+    // Redundant outline so accidentals read even when fills are similar; the
+    // path is still current, so trace it before restore. Naturals get none.
+    if (ksty.stroke) {
+      ctx.lineWidth = 1.25;
+      ctx.strokeStyle = ksty.stroke;
+      ctx.stroke();
+    }
     ctx.restore();
 
     // bright leading edge (nearest the hit line)

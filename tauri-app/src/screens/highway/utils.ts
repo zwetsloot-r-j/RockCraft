@@ -93,6 +93,37 @@ export function withAlpha(col: string, a: number): string {
   return col;
 }
 
+// ── Per-note key treatment ────────────────────────────────────────────────
+// Mode-independent visual cues that mark a black-key (accidental) note block as
+// distinct from a white-key (natural) one, regardless of which `colorMode` the
+// fill came from. Shared with the edit view (EditCanvas imports this), so the
+// rule lives in exactly one place and stays unit-testable. Matches the Claude
+// Design prototype's accidental look: slimmer pill + darker fill + an outline.
+//
+//   inset    extra fraction of the lane width trimmed on top of the base
+//            noteGap, so accidentals read as a thinner pill. Base gap 0.16 +
+//            0.20 ≈ the prototype's ~0.36 gap; naturals add nothing.
+//   stroke   outline colour the fill is traced with (naturals get none), so the
+//            boundary reads even when fills are similar (e.g. accent mode).
+//   shadeMul amount passed to `shade()` to darken the fill the same way in every
+//            colour mode (the prototype's `shade(..., -0.18)`); 0 leaves it.
+export interface KeyNoteStyle {
+  inset: number;
+  stroke: string | null;
+  shadeMul: number;
+}
+
+const NATURAL_STYLE: KeyNoteStyle = { inset: 0, stroke: null, shadeMul: 0 };
+const ACCIDENTAL_STYLE: KeyNoteStyle = {
+  inset: 0.2,
+  stroke: "rgba(255,255,255,0.55)",
+  shadeMul: -0.18,
+};
+
+export function keyNoteStyle(note: number): KeyNoteStyle {
+  return isBlack(note) ? ACCIDENTAL_STYLE : NATURAL_STYLE;
+}
+
 // Shade a hex color lighter (+) or darker (-); passthrough for oklch.
 export function shade(col: string, amt: number): string {
   if (!col.startsWith("#")) {
