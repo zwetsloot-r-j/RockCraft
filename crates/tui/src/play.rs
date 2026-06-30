@@ -474,26 +474,60 @@ impl PlayScreen {
                 continue;
             };
             let cell_w = if is_black_key(span.note) { 1 } else { w };
-            let glyph = "▓".repeat(cell_w as usize);
+            let active = span.start_us <= now && now < span.end_us;
+            let style = note_style(span.note, active);
+            let glyph = style.glyph.to_string().repeat(cell_w as usize);
             // Notes nearer "now" (bottom) brighter; further ahead dimmer.
             for row in rs.top_row..=rs.bottom_row {
                 let y = area.y + row;
                 if y >= area.y + area.height {
                     break;
                 }
-                let color = if span.start_us <= now && now < span.end_us {
-                    TARGET_COLOR
-                } else {
-                    Color::Indexed(33) // a calm blue for upcoming notes
-                };
                 let rect = Rect::new(col, y, cell_w, 1);
                 f.render_widget(
-                    Paragraph::new(glyph.clone()).style(Style::default().fg(color)),
+                    Paragraph::new(glyph.clone()).style(Style::default().fg(style.color)),
                     rect,
                 );
             }
         }
     }
+}
+
+/// Visual style for one highway note block: the colour to paint it and the fill
+/// glyph to repeat across its width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoteStyle {
+    pub color: Color,
+    pub glyph: char,
+}
+
+/// Choose the [`NoteStyle`] for a single highway note block.
+///
+/// Two signals are layered, so the highway stays readable even on terminals
+/// with a poor colour palette:
+///
+/// 1. **active vs upcoming** — an `active` note (sounding at the current clock
+///    position) reads in the bright play-along target hue; an upcoming note
+///    reads in a calm blue. This is the pre-existing highway signal, preserved.
+/// 2. **white key vs black key** — a black-key (accidental) note is drawn in a
+///    *dimmer* variant of whichever colour above, **and** with a lighter-shaded
+///    fill glyph (`▒`) instead of the white-key `▓`. Together with the existing
+///    1-column width for black keys, that gives three redundant cues.
+///
+/// Concrete palette (256-colour indices):
+/// - white active: yellow (`TARGET_COLOR`); black active: dim amber `Indexed(136)`
+/// - white upcoming: blue `Indexed(33)`; black upcoming: dim blue `Indexed(25)`
+pub fn note_style(note: u8, active: bool) -> NoteStyle {
+    let black = is_black_key(note);
+    let color = match (active, black) {
+        (true, false) => TARGET_COLOR,        // white key, sounding now
+        (true, true) => Color::Indexed(136),  // black key, sounding now — dim amber
+        (false, false) => Color::Indexed(33), // white key, upcoming — calm blue
+        (false, true) => Color::Indexed(25),  // black key, upcoming — dim blue
+    };
+    // Lighter shade block for accidentals so the cue survives monochrome.
+    let glyph = if black { '▒' } else { '▓' };
+    NoteStyle { color, glyph }
 }
 
 /// Expected `(pitch, start_us)` pairs feeding the [`WaitGate`]: every span's
@@ -873,5 +907,42 @@ mod tests {
             SHIFT,
             "C step is awaited again after restart"
         );
+    }
+
+    // ── highway key-note distinction (M11-A, issue #229) ─────────────────────
+
+    #[test]
+    fn black_and_white_keys_differ_in_color_and_glyph() {
+        // C (60, white) vs C# (61, black) at the same `active` value differ in
+        // BOTH cues, so neither colour nor glyph alone is the only signal.
+        for active in [true, false] {
+            let white = note_style(60, active);
+            let black = note_style(61, active);
+            assert_ne!(white.color, black.color, "active={active}: colour cue");
+            assert_ne!(white.glyph, black.glyph, "active={active}: glyph cue");
+        }
+    }
+
+    #[test]
+    fn active_and_upcoming_differ_for_a_given_pitch() {
+        // The pre-existing active/upcoming signal survives for both key kinds.
+        for note in [60u8, 61] {
+            let on = note_style(note, true);
+            let off = note_style(note, false);
+            assert_ne!(on.color, off.color, "note={note}: active vs upcoming");
+        }
+    }
+
+    #[test]
+    fn note_style_agrees_with_is_black_key_over_an_octave() {
+        // Across a full octave the helper's glyph choice tracks `is_black_key`.
+        for note in 60u8..72 {
+            let style = note_style(note, true);
+            if is_black_key(note) {
+                assert_eq!(style.glyph, '▒', "note={note} is black");
+            } else {
+                assert_eq!(style.glyph, '▓', "note={note} is white");
+            }
+        }
     }
 }
