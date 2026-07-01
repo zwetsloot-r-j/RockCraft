@@ -92,6 +92,8 @@ pub enum HostCommand {
     PlaySetWait { on: bool },
     /// Toggle "hear the song" (audible song synth) for the play session.
     PlayToggleHearSong,
+    /// Toggle pause on the active play session (freeze/thaw clock + backing).
+    PlayTogglePause,
     /// Finish the play session; returns the score summary.
     PlayFinish,
 
@@ -154,6 +156,7 @@ impl HostCommand {
             HostCommand::PlayLoad { .. } => "play_load",
             HostCommand::PlaySetWait { .. } => "play_set_wait",
             HostCommand::PlayToggleHearSong => "play_toggle_hear_song",
+            HostCommand::PlayTogglePause => "play_toggle_pause",
             HostCommand::PlayFinish => "play_finish",
             HostCommand::RecordStart { .. } => "record_start",
             HostCommand::RecordStop => "record_stop",
@@ -276,6 +279,7 @@ pub fn host_command_names() -> &'static [&'static str] {
         "play_load",
         "play_set_wait",
         "play_toggle_hear_song",
+        "play_toggle_pause",
         "play_finish",
         "record_start",
         "record_stop",
@@ -330,6 +334,7 @@ static HOST_HELP: &[HostCommandInfo] = {
         HostCommandInfo { name: "play_load", params: &[p("dir", "String")], description: "Load a bundle directory as a play session. Returns play info." },
         HostCommandInfo { name: "play_set_wait", params: &[p("on", "bool")], description: "Arm (true) or disarm (false) note-by-note wait mode for the play session." },
         HostCommandInfo { name: "play_toggle_hear_song", params: &[], description: "Toggle the audible song synth for the play session." },
+        HostCommandInfo { name: "play_toggle_pause", params: &[], description: "Toggle pause on the active play session, freezing/thawing the clock and backing at the current position. No-op when no session is active." },
         HostCommandInfo { name: "play_finish", params: &[], description: "Finish the play session and return the score summary." },
         // ── record ────────────────────────────────────────────────────────
         HostCommandInfo { name: "record_start", params: &[p("backing", "String?")], description: "Start a record session, optionally over a backing audio file path." },
@@ -391,6 +396,7 @@ mod tests {
             },
             HostCommand::PlaySetWait { on: true },
             HostCommand::PlayToggleHearSong,
+            HostCommand::PlayTogglePause,
             HostCommand::PlayFinish,
             HostCommand::RecordStart { backing: None },
             HostCommand::RecordStop,

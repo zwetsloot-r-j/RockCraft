@@ -248,6 +248,10 @@ pub struct PlaySession {
     /// Background video reference resolved from the bundle's `meta.json` (M9-G).
     video: Option<BackgroundVideoSession>,
     hear_song: bool,
+    /// Manual pause (`HostCommand::PlayTogglePause`). Freezes the clock + backing
+    /// independently of wait-mode; while set the highway and scoring clock hold
+    /// their position. The play-screen UI/keys are M12-B (#232).
+    paused: bool,
     cfg: ScoreConfig,
 
     /// Live held-note set, updated by every ingested MIDI event.
@@ -307,6 +311,7 @@ impl PlaySession {
             backing: None,
             video: None,
             hear_song: false,
+            paused: false,
             cfg: ScoreConfig::default(),
             held: BTreeSet::new(),
             played: Vec::new(),
@@ -423,7 +428,9 @@ impl PlaySession {
     /// is frozen after this step (so the caller can pause the backing).
     pub fn advance(&mut self, dt_us: u64) -> bool {
         self.wait.set_held(self.held.clone());
-        let frozen = self.wait.poll(self.clock.now_us()) == GateState::Frozen;
+        let wait_frozen = self.wait.poll(self.clock.now_us()) == GateState::Frozen;
+        // A manual pause freezes the transport just like an unsatisfied wait step.
+        let frozen = self.paused || wait_frozen;
         if frozen && self.clock.is_running() {
             self.clock.pause();
         } else if !frozen && !self.clock.is_running() {
@@ -489,6 +496,38 @@ impl PlaySession {
                 }
             }
         }
+    }
+
+    /// Toggle a manual pause of the play session (`HostCommand::PlayTogglePause`),
+    /// returning the new paused state. Freezes the clock when pausing and thaws
+    /// it when resuming, reusing the same freeze machinery wait-mode uses — so
+    /// the highway and scoring clock hold their position and continue from it.
+    /// The backing audio follows via [`advance`]'s returned frozen flag.
+    pub fn toggle_pause(&mut self) -> bool {
+        self.paused = !self.paused;
+        if self.paused {
+            if self.clock.is_running() {
+                self.clock.pause();
+            }
+        } else {
+            // Resume unless wait-mode is holding an unsatisfied step; the next
+            // `advance` re-freezes in that case.
+            self.wait.set_held(self.held.clone());
+            let wait_frozen = self.wait.poll(self.clock.now_us()) == GateState::Frozen;
+            if !wait_frozen && !self.clock.is_running() {
+                self.clock.resume();
+            }
+        }
+        self.paused
+    }
+
+    /// Is the session manually paused? Test-only for now; the live paused state
+    /// reaches the webview through [`live_state`](Self::live_state)'s `frozen`
+    /// flag, and `toggle_pause` returns the new state. The play-screen UI that
+    /// reads a dedicated indicator is M12-B (#232).
+    #[cfg(test)]
+    pub fn is_paused(&self) -> bool {
+        self.paused
     }
 
     /// Set wait-mode (`w` key). Turning it off un-freezes immediately.
@@ -565,8 +604,9 @@ impl PlaySession {
 
     /// A live snapshot for the `play_state` event.
     pub fn live_state(&mut self) -> PlayStateEvent {
-        // Re-poll the gate to surface the awaited notes (idempotent read).
-        let frozen = self.wait.poll(self.now_us()) == GateState::Frozen;
+        // Re-poll the gate to surface the awaited notes (idempotent read). A
+        // manual pause also reads as frozen so the webview sees the clock held.
+        let frozen = self.paused || self.wait.poll(self.now_us()) == GateState::Frozen;
         let awaiting = self
             .wait
             .awaiting()
@@ -699,6 +739,20 @@ pub fn play_toggle_hear_song(
             }
         }
         on
+    } else {
+        false
+    }
+}
+
+/// Toggle a manual pause of the active take (`HostCommand::PlayTogglePause`).
+/// Returns the new paused state (`false` when no session is active). The clock
+/// freeze/thaw takes effect on the next tick; the backing audio follows the
+/// clock via `tick_play`. The play-screen control/keys are M12-B (#232).
+#[tauri::command]
+pub fn play_toggle_pause(state: tauri::State<'_, PlayState>) -> bool {
+    let mut guard = state.0.lock().expect("play state mutex poisoned");
+    if let Some(s) = guard.as_mut() {
+        s.toggle_pause()
     } else {
         false
     }
@@ -923,6 +977,46 @@ mod tests {
         assert!(!s.toggle_wait_mode());
         s.advance(1_000_000);
         assert_eq!(s.now_us(), SHIFT + 1_000_000);
+    }
+
+    /// Manual pause freezes the clock at its position and resumes from it.
+    #[test]
+    fn toggle_pause_freezes_then_resumes() {
+        let mut s = session();
+        s.advance(SHIFT);
+        assert_eq!(s.now_us(), SHIFT);
+        assert!(s.toggle_pause(), "toggling on reports paused");
+        assert!(s.is_paused());
+        // Frozen: wall-time deltas do not move the playhead, and the live event
+        // reports frozen.
+        s.advance(5_000_000);
+        assert_eq!(s.now_us(), SHIFT, "clock frozen while paused");
+        assert!(
+            s.live_state().frozen,
+            "paused reads as frozen for the webview"
+        );
+        // Resume from the same position.
+        assert!(!s.toggle_pause(), "toggling off reports running");
+        s.advance(250_000);
+        assert_eq!(s.now_us(), SHIFT + 250_000, "resumes from frozen position");
+    }
+
+    /// Pause is independent of wait-mode: un-pausing while an armed step is
+    /// unsatisfied leaves the clock frozen by wait-mode.
+    #[test]
+    fn toggle_pause_respects_active_wait_step_on_resume() {
+        let mut s = session();
+        s.set_wait_mode(true);
+        s.advance(SHIFT); // parked on the first step, nothing held
+        s.toggle_pause();
+        s.advance(5_000_000);
+        assert_eq!(s.now_us(), SHIFT);
+        s.toggle_pause(); // un-pause, but wait-mode still holds the step
+        s.advance(5_000_000);
+        assert_eq!(s.now_us(), SHIFT, "wait-mode keeps the clock frozen");
+        s.ingest(on(60, SHIFT));
+        s.advance(250_000);
+        assert_eq!(s.now_us(), SHIFT + 250_000);
     }
 
     /// "Hear the song" audition fires note_on at the shifted span start, once.

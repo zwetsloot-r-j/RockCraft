@@ -332,6 +332,7 @@ impl Shell {
                     self.screen = Screen::Menu;
                 }
                 KeyCode::Char('r') => play.restart(),
+                KeyCode::Char(' ') => play.toggle_pause(),
                 KeyCode::Char('m') => play.toggle_hear_song(),
                 KeyCode::Char('w') => play.toggle_wait_mode(),
                 KeyCode::Char(c) => {
@@ -723,6 +724,19 @@ impl rockcraft_control::HostServices for Shell {
             HostCommand::PlayToggleHearSong => {
                 Err(HostError::Unsupported("play_toggle_hear_song".into()))
             }
+            // Pause/resume the live play session over the socket, mirroring the
+            // `Space` key. A no-op error (not a panic) off the play screen.
+            HostCommand::PlayTogglePause => {
+                if let Screen::Play(play) = &mut self.screen {
+                    play.toggle_pause();
+                    Ok(json!({ "paused": play.is_paused() }))
+                } else {
+                    Err(HostError::Failed {
+                        command: "play_toggle_pause".into(),
+                        detail: "no active play session".into(),
+                    })
+                }
+            }
             HostCommand::PlayFinish => Err(HostError::Unsupported("play_finish".into())),
             HostCommand::RecordStart { .. } => Err(HostError::Unsupported("record_start".into())),
             HostCommand::RecordStop => Err(HostError::Unsupported("record_stop".into())),
@@ -1077,6 +1091,7 @@ mod tests {
             },
             HostCommand::PlaySetWait { on: true },
             HostCommand::PlayToggleHearSong,
+            HostCommand::PlayTogglePause,
             HostCommand::PlayFinish,
             HostCommand::RecordStart { backing: None },
             HostCommand::RecordStop,
@@ -1123,6 +1138,21 @@ mod tests {
                     "a fresh shell (menu screen) is not dirty"
                 );
             }
+        }
+    }
+
+    /// `play_toggle_pause` off the play screen is a clean no-op error, not a
+    /// panic (there is no session to freeze).
+    #[test]
+    fn play_toggle_pause_off_play_screen_is_a_clean_error() {
+        let mut shell = make_shell();
+        assert_eq!(shell.screen_name(), "menu");
+        let err = shell.dispatch(HostCommand::PlayTogglePause).unwrap_err();
+        match err {
+            rockcraft_control::HostError::Failed { command, .. } => {
+                assert_eq!(command, "play_toggle_pause");
+            }
+            other => panic!("expected Failed, got {other:?}"),
         }
     }
 

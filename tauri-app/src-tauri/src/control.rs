@@ -336,6 +336,10 @@ impl HostServices for TauriHost<'_> {
                 );
                 Ok(serde_json::json!({ "hear_song": on }))
             }
+            HostCommand::PlayTogglePause => {
+                let paused = crate::play::play_toggle_pause(app.state::<PlayState>());
+                Ok(serde_json::json!({ "paused": paused }))
+            }
             HostCommand::PlayFinish => {
                 let summary =
                     crate::play::play_finish(app.state::<PlayState>(), app.state::<AudioState>());
