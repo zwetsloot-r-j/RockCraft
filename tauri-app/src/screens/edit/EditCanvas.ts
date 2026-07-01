@@ -17,9 +17,11 @@
 import type { ComposerSnapshot } from "../../ipc/types";
 import {
   isBlack,
+  keyNoteStyle,
   noteName,
   pitchClass,
   roundRect,
+  shade,
   spectrumHue,
   withAlpha,
 } from "../highway/utils";
@@ -222,23 +224,41 @@ export class EditCanvas {
       const y = vp.yOf(n.start_us + n.dur_us);
       const h = Math.max(2, vp.hOf(n.dur_us));
       if (y + h < 0 || y > this.h) continue;
-      const pad = Math.min(2, vp.laneW * 0.15);
+      // Per-note key treatment (slim/darker/outline for accidentals). Single
+      // source of truth shared with the highway; see utils.ts::keyNoteStyle. The
+      // edit view omits the highway's diagonal rear cutoff (a scroll-motion cue).
+      const ksty = keyNoteStyle(n.pitch);
+      // `inset` trims an extra fraction of the lane width per side on top of the
+      // base pad, so accidentals read as a thinner pill.
+      const pad = Math.min(2, vp.laneW * 0.15) + (ksty.inset * vp.laneW) / 2;
+      const w = vp.laneW - pad * 2;
       const hue = spectrumHue(n.pitch);
       // Velocity → alpha (0..127 mapped onto 0.4..1.0).
       const alpha = 0.4 + (n.velocity / 127) * 0.6;
-      const fill = `oklch(0.72 0.16 ${hue})`;
+      const base = `oklch(0.72 0.16 ${hue})`;
+      // Darken accidentals the same way the highway does (helper's shadeMul).
+      const fill = ksty.shadeMul ? shade(base, ksty.shadeMul) : base;
       ctx.save();
       ctx.globalAlpha = alpha;
       ctx.fillStyle = fill;
-      roundRect(ctx, x + pad, y, vp.laneW - pad * 2, h, 3);
+      roundRect(ctx, x + pad, y, w, h, 3);
       ctx.fill();
+      // Redundant outline so accidentals read even when fills are similar;
+      // naturals get none.
+      if (ksty.stroke) {
+        ctx.globalAlpha = Math.min(1, alpha + 0.2);
+        ctx.strokeStyle = ksty.stroke;
+        ctx.lineWidth = 1;
+        roundRect(ctx, x + pad + 0.5, y + 0.5, w - 1, h - 1, 3);
+        ctx.stroke();
+      }
       // Bright bottom edge (the onset).
       ctx.globalAlpha = Math.min(1, alpha + 0.15);
       ctx.strokeStyle = withAlpha("#ffffff", 0.5);
       ctx.lineWidth = 1.5;
       ctx.beginPath();
       ctx.moveTo(x + pad, y + h - 0.75);
-      ctx.lineTo(x + vp.laneW - pad, y + h - 0.75);
+      ctx.lineTo(x + pad + w, y + h - 0.75);
       ctx.stroke();
       ctx.restore();
     }
