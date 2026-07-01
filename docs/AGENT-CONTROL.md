@@ -414,6 +414,7 @@ below is an at-a-glance convenience only.
 | `play_load` | `{ dir: String }` | Load a bundle as a play session. Returns play info |
 | `play_set_wait` | `{ on: bool }` | Arm/disarm note-by-note wait mode |
 | `play_toggle_hear_song` | none | Toggle the audible song synth |
+| `play_toggle_pause` | none | Pause/resume the active play session, freezing/thawing the clock + backing at the current position. No-op with no active session |
 | `play_finish` | none | Finish the play session; returns the score summary |
 | `record_start` | `{ backing: String? }` | Start a record session, optionally over a backing file |
 | `record_stop` | none | Stop recording without saving |
