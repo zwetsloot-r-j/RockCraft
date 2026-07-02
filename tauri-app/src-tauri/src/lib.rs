@@ -14,6 +14,7 @@
 //! from `run_action` and tick ticks are passed to [`audio::apply_effects`];
 //! the backing track follows the transport via [`audio::sync_backing`].
 
+mod alignment;
 mod audio;
 mod control;
 mod import;
@@ -446,6 +447,8 @@ pub fn run() {
             import::import_start,
             transcription::transcription_save,
             transcription::transcription_load,
+            alignment::alignment_save,
+            alignment::alignment_load,
         ])
         .setup(|app| {
             spawn_tick_thread(app.handle().clone());

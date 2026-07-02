@@ -60,6 +60,15 @@ pub enum Action {
         delta: i16,
     },
     ToggleGrab,
+    /// Lay a chromatic run of notes from the cursor cell to `end_pitch`
+    /// (inclusive), spread evenly across `span_steps` grid steps — a one-shot
+    /// glissando/scale traced over the movie backdrop. Each note is one step
+    /// long; direction is inferred from `end_pitch` vs the cursor pitch, and any
+    /// note already occupying a target cell is replaced.
+    InsertRun {
+        end_pitch: u8,
+        span_steps: u64,
+    },
 
     // ── tempo (piece-wide; lives in the composer Grid) ──────────────────
     /// Nudge the piece tempo by `delta` BPM (clamped to a sane range).
@@ -167,6 +176,7 @@ impl Action {
             Action::ResizeNote { .. } => "resize_note",
             Action::AdjustVelocity { .. } => "adjust_velocity",
             Action::ToggleGrab => "toggle_grab",
+            Action::InsertRun { .. } => "insert_run",
             Action::AdjustBpm { .. } => "adjust_bpm",
             Action::SetBpm { .. } => "set_bpm",
             Action::EnterChordMode => "enter_chord_mode",
@@ -307,6 +317,7 @@ pub fn action_names() -> &'static [&'static str] {
         "resize_note",
         "adjust_velocity",
         "toggle_grab",
+        "insert_run",
         "adjust_bpm",
         "set_bpm",
         "enter_chord_mode",
@@ -403,6 +414,7 @@ static ACTION_HELP: &[ActionInfo] = {
         ActionInfo { name: "resize_note", params: &[p("delta_steps", "i64")], description: "Lengthen (positive) or shorten (negative) the note under the cursor by delta_steps grid steps." },
         ActionInfo { name: "adjust_velocity", params: &[p("delta", "i16")], description: "Adjust the velocity of the note under the cursor by delta (clamped 1..=127)." },
         ActionInfo { name: "toggle_grab", params: &[], description: "Grab/drop the note under the cursor so cursor moves drag it." },
+        ActionInfo { name: "insert_run", params: &[p("end_pitch", "u8"), p("span_steps", "u64")], description: "Lay a chromatic run from the cursor to end_pitch (inclusive), spread evenly across span_steps grid steps — a one-shot glissando/scale; replaces notes in target cells." },
         // ── tempo ─────────────────────────────────────────────────────────
         ActionInfo { name: "adjust_bpm", params: &[p("delta", "i32")], description: "Nudge the piece tempo by delta BPM (clamped to 20..=300)." },
         ActionInfo { name: "set_bpm", params: &[p("bpm", "u32")], description: "Set the piece tempo to bpm BPM (clamped to 20..=300)." },
@@ -477,6 +489,10 @@ mod tests {
             Action::ResizeNote { delta_steps: 2 },
             Action::AdjustVelocity { delta: -8 },
             Action::ToggleGrab,
+            Action::InsertRun {
+                end_pitch: 72,
+                span_steps: 8,
+            },
             Action::AdjustBpm { delta: -5 },
             Action::SetBpm { bpm: 90 },
             Action::EnterChordMode,

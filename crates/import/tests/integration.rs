@@ -24,6 +24,8 @@ fn c_major_scale() -> ExtractedChart {
             title: Some("Synthetic C-major scale".into()),
             fps: None,
             scroll_px_per_s: None,
+            frame_height_px: None,
+            hit_line_px: None,
             extractor_version: "synthetic-test-0.1".into(),
         },
     }

@@ -156,6 +156,119 @@ def test_chords_recovered():
     assert sorted(n.pitch for n in chart.notes) == [60, 64, 67]
 
 
+def test_suppress_semitone_ghost_with_staggered_onset():
+    """A thick bar's white/black twin lags the struck core by a frame or two, so
+    its onset is staggered.  Single-linkage onset grouping must still pair the
+    two adjacent semitones (an earlier note must not start a group that splits
+    the twin off past the tolerance window) so the ghost is dropped."""
+    from synthesia_extract.pipeline import _RawNote, suppress_semitone_ghosts
+
+    col = np.array([200.0, 100.0, 50.0])
+    raws = [
+        # An earlier note whose onset would anchor a group-from-first window.
+        _RawNote(pitch=71, start_us=0, dur_us=100_000, coverage=0.9, color=col),
+        _RawNote(pitch=47, start_us=10_000, dur_us=100_000, coverage=0.89, color=col),
+        # B2's black-key ghost, 11 ms later — 21 ms past pitch 71's onset.
+        _RawNote(pitch=46, start_us=21_000, dur_us=100_000, coverage=0.74, color=col),
+    ]
+    out = suppress_semitone_ghosts(raws, onset_tol_us=15_000)
+    pitches = sorted(r.pitch for r in out)
+    assert 46 not in pitches, "staggered white/black ghost must be dropped"
+    assert pitches == [47, 71]
+
+
+# --------------------------------------------------------------------------- #
+# Glissando / fast-run recovery (sub-threshold diagonal pulses)
+# --------------------------------------------------------------------------- #
+_GLISS_US_PER_PX = 5000.0
+
+
+def _gliss_roll(n_pitches=24, n_bins=160, base=48):
+    """Empty roll: global 1-D totals=10, votes/colour zeroed.  Coverage of a bin
+    is votes/totals, so votes=cov*10 sets a known coverage."""
+    pitches = list(range(base, base + n_pitches))
+    votes = np.zeros((n_pitches, n_bins), dtype=np.float64)
+    totals = np.full(n_bins, 10.0)
+    color = np.zeros((n_pitches, n_bins, 3), dtype=np.float64)
+    return pitches, votes, totals, color
+
+
+def _stamp(votes, color, pidx, a, b, cov):
+    votes[pidx, a:b] = cov * 10.0
+    color[pidx, a:b] = (0, 200, 0)
+
+
+def test_recover_glissando_recovers_diagonal_run():
+    from synthesia_extract.pipeline import recover_glissando_runs
+
+    pitches, votes, totals, color = _gliss_roll()
+    # Five sub-threshold taps stepping a whole tone each, onset advancing.
+    run = [(60, 10), (62, 22), (64, 34), (66, 46), (68, 58)]
+    for pitch, a in run:
+        _stamp(votes, color, pitches.index(pitch), a, a + 4, 0.4)
+    out = recover_glissando_runs(votes, totals, color, pitches, _GLISS_US_PER_PX, [])
+    assert sorted(r.pitch for r in out) == [60, 62, 64, 66, 68]
+
+
+def test_recover_glissando_ignores_scatter():
+    from synthesia_extract.pipeline import recover_glissando_runs
+
+    pitches, votes, totals, color = _gliss_roll()
+    # Weak blobs that never form a stepping, time-advancing diagonal.
+    for pitch, a in [(60, 10), (67, 12), (71, 40), (63, 80), (58, 15)]:
+        _stamp(votes, color, pitches.index(pitch), a, a + 4, 0.4)
+    out = recover_glissando_runs(votes, totals, color, pitches, _GLISS_US_PER_PX, [])
+    assert out == []
+
+
+def test_recover_glissando_skips_held_note_ghosts():
+    """A held note's sub-threshold glow on the adjacent lane must not be
+    resurrected as a run (that is what de-ghosting removed)."""
+    from synthesia_extract.pipeline import _RawNote, recover_glissando_runs
+
+    def chain_only(existing):
+        pitches, votes, totals, color = _gliss_roll()
+        for k, pitch in enumerate([61, 62, 63, 64]):
+            a = 10 + k * 12
+            _stamp(votes, color, pitches.index(pitch), a, a + 4, 0.4)
+        return recover_glissando_runs(
+            votes, totals, color, pitches, _GLISS_US_PER_PX, existing, min_span=2
+        )
+
+    # No held note next to the run -> the diagonal is recovered.
+    free = chain_only([])
+    assert sorted(r.pitch for r in free) == [61, 62, 63, 64]
+
+    # A long held note at pitch 60 makes 61 its glow ghost; dropping it breaks
+    # the chain below min_run, so nothing is recovered.
+    held = [_RawNote(pitch=60, start_us=0, dur_us=120 * int(_GLISS_US_PER_PX),
+                     coverage=0.9, color=np.array([0.0, 200.0, 0.0]))]
+    guarded = chain_only(held)
+    assert all(r.pitch != 61 for r in guarded)
+    assert len(guarded) < 4
+
+
+def test_roll_to_notes_glissando_recovery_is_opt_in():
+    """The pipeline tail must NOT run glissando recovery by default: on pale
+    bars it invents phantom diagonals, so slides are placed by hand instead.
+    The pass still works when a caller explicitly opts in."""
+    from synthesia_extract.pipeline import _roll_to_notes
+
+    pitches, votes, totals, color = _gliss_roll()
+    # A fast sub-threshold diagonal — exactly what recovery targets.
+    for pitch, a in [(60, 10), (62, 22), (64, 34), (66, 46), (68, 58)]:
+        _stamp(votes, color, pitches.index(pitch), a, a + 4, 0.4)
+    scroll = 1e6 / _GLISS_US_PER_PX  # keep us_per_px == _GLISS_US_PER_PX
+
+    off = _roll_to_notes(votes, totals, color, pitches, _GLISS_US_PER_PX, scroll)
+    assert off == [], "recovery must be off by default (no phantom diagonals)"
+
+    on = _roll_to_notes(
+        votes, totals, color, pitches, _GLISS_US_PER_PX, scroll, recover_glissandi=True
+    )
+    assert sorted(n.pitch for n in on) == [60, 62, 64, 66, 68]
+
+
 # --------------------------------------------------------------------------- #
 # Overlay style: translucent white bars over busy artwork, filmed-piano keys
 # --------------------------------------------------------------------------- #

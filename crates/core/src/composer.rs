@@ -318,6 +318,10 @@ impl Composer {
             Action::ResizeNote { delta_steps } => self.resize_note(delta_steps),
             Action::AdjustVelocity { delta } => self.adjust_velocity(delta),
             Action::ToggleGrab => self.toggle_grab(),
+            Action::InsertRun {
+                end_pitch,
+                span_steps,
+            } => self.insert_run(end_pitch, span_steps),
 
             // ── tempo ────────────────────────────────────────────────────
             // Tempo lives in the grid (single source of truth, persisted in
@@ -728,6 +732,55 @@ impl Composer {
         vec![Effect::AuditionNote {
             pitch: pitch.value(),
             velocity: velocity.value(),
+        }]
+    }
+
+    /// Lay a chromatic run from the cursor to `end_pitch` (inclusive), its notes
+    /// spread evenly across `span_steps` grid steps. A one-shot glissando/scale:
+    /// position the cursor at the run's start cell, then trace to the end pitch.
+    /// Each note is one grid step long; the run steps one semitone per note
+    /// (direction inferred from `end_pitch` vs the cursor pitch), and any note
+    /// already occupying a target cell is replaced. Auditions the final pitch.
+    fn insert_run(&mut self, end_pitch: u8, span_steps: u64) -> Vec<Effect> {
+        let start_pitch = self.cursor.pitch;
+        let end = end_pitch.clamp(LOWEST_MIDI, HIGHEST_MIDI);
+        let start_step = self.cursor.step;
+        let n = start_pitch.abs_diff(end) as u64 + 1; // one note per semitone
+        let up = end >= start_pitch;
+        let dur_us = self.grid.step_us();
+        let vel = Velocity::new(DEFAULT_NOTE_VEL).expect("80 is always valid");
+
+        self.history.checkpoint();
+        for k in 0..n {
+            let pitch_val = if up {
+                start_pitch + k as u8
+            } else {
+                start_pitch - k as u8
+            };
+            let pitch = MidiNote::new(pitch_val).expect("run pitch stays in 21..=108");
+            // Spread the k-th tap evenly across the time span (rounded to a step).
+            let step = if n > 1 {
+                start_step + (k * span_steps + (n - 1) / 2) / (n - 1)
+            } else {
+                start_step
+            };
+            let start_us = self.grid.us_of_step(step);
+            if let Some(id) = self.timeline().find_at(pitch_val, start_us) {
+                self.history.current_mut().remove(id);
+                if self.grabbed == Some(id) {
+                    self.grabbed = None;
+                }
+            }
+            self.history.current_mut().insert(Note {
+                pitch,
+                start_us,
+                dur_us,
+                velocity: vel,
+            });
+        }
+        vec![Effect::AuditionNote {
+            pitch: end,
+            velocity: vel.value(),
         }]
     }
 
@@ -1648,6 +1701,120 @@ mod tests {
         assert_eq!(c.note_count(), 1, "replaced, not stacked");
         let id2 = c.note_under_cursor().unwrap();
         assert_eq!(c.get_note(id2).unwrap().velocity.value(), DEFAULT_NOTE_VEL);
+    }
+
+    #[test]
+    fn insert_run_lays_chromatic_ascending_staircase() {
+        let mut c = Composer::new();
+        // Cursor at C4 (60), step 0. A run to E4 (64) over 4 steps = 5 notes,
+        // one semitone per grid step.
+        let effects = apply(
+            &mut c,
+            Action::InsertRun {
+                end_pitch: 64,
+                span_steps: 4,
+            },
+        );
+        assert_eq!(c.note_count(), 5);
+        assert_eq!(
+            effects,
+            vec![Effect::AuditionNote {
+                pitch: 64,
+                velocity: DEFAULT_NOTE_VEL
+            }]
+        );
+        let step = c.grid().step_us();
+        for (k, pitch) in (60u8..=64).enumerate() {
+            apply(
+                &mut c,
+                Action::SetCursor {
+                    pitch,
+                    step: k as u64,
+                },
+            );
+            let id = c
+                .note_under_cursor()
+                .unwrap_or_else(|| panic!("note at pitch {pitch} step {k}"));
+            let n = c.get_note(id).unwrap();
+            assert_eq!(n.start_us, k as u64 * step);
+            assert_eq!(n.dur_us, step, "each run note is one step long");
+        }
+    }
+
+    #[test]
+    fn insert_run_descends_when_end_below_cursor() {
+        let mut c = Composer::new();
+        apply(&mut c, Action::SetCursor { pitch: 64, step: 0 });
+        apply(
+            &mut c,
+            Action::InsertRun {
+                end_pitch: 60,
+                span_steps: 4,
+            },
+        );
+        assert_eq!(c.note_count(), 5);
+        // k-th note steps down one semitone and forward one grid step.
+        for k in 0u64..=4 {
+            let pitch = 64 - k as u8;
+            apply(&mut c, Action::SetCursor { pitch, step: k });
+            assert!(
+                c.note_under_cursor().is_some(),
+                "descending note at pitch {pitch} step {k}"
+            );
+        }
+    }
+
+    #[test]
+    fn insert_run_spreads_notes_evenly_across_span() {
+        let mut c = Composer::new();
+        // 3 notes (60,61,62) spread across 10 steps -> steps 0, 5, 10 (rounded).
+        apply(
+            &mut c,
+            Action::InsertRun {
+                end_pitch: 62,
+                span_steps: 10,
+            },
+        );
+        assert_eq!(c.note_count(), 3);
+        for (pitch, step) in [(60u8, 0u64), (61, 5), (62, 10)] {
+            apply(&mut c, Action::SetCursor { pitch, step });
+            assert!(
+                c.note_under_cursor().is_some(),
+                "note at pitch {pitch} step {step}"
+            );
+        }
+    }
+
+    #[test]
+    fn insert_run_same_pitch_is_single_note_and_run_undoes_atomically() {
+        let mut c = Composer::new();
+        // Pre-existing note in a target cell is replaced, not stacked.
+        apply(&mut c, Action::SetCursor { pitch: 61, step: 1 });
+        apply(&mut c, Action::AddNote);
+        apply(&mut c, Action::SetCursor { pitch: 60, step: 0 });
+        apply(
+            &mut c,
+            Action::InsertRun {
+                end_pitch: 62,
+                span_steps: 2,
+            },
+        );
+        assert_eq!(c.note_count(), 3, "replaced the 61 cell, did not stack");
+        // A run is one checkpoint: a single undo clears the whole staircase,
+        // leaving only the pre-existing note.
+        apply(&mut c, Action::Undo);
+        assert_eq!(c.note_count(), 1);
+
+        // end_pitch == cursor pitch collapses to a single note.
+        let mut c2 = Composer::new();
+        apply(
+            &mut c2,
+            Action::InsertRun {
+                end_pitch: DEFAULT_CURSOR_PITCH,
+                span_steps: 8,
+            },
+        );
+        assert_eq!(c2.note_count(), 1);
     }
 
     #[test]

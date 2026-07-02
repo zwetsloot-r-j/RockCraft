@@ -56,6 +56,17 @@ export class EditCanvas {
   private splits: { start_us: number; end_us: number; keep: boolean }[] | null =
     null;
 
+  // Grid calibration (M-align): vertical zoom (spanUs), hit-line position
+  // (hitLineFrac), and horizontal zoom/pan (xScale/xOffset) so the edit grid can
+  // be resized to register on a backdrop movie (and zoom in generally). Defaults
+  // reproduce the un-calibrated grid exactly.
+  private gridCal = {
+    spanUs: DEFAULT_SPAN_US,
+    hitLineFrac: 1 / 3,
+    xScale: 1,
+    xOffset: 0,
+  };
+
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
     this.ctx = canvas.getContext("2d")!;
@@ -76,6 +87,21 @@ export class EditCanvas {
    */
   setBackdrop(on: boolean): void {
     this.backdrop = on;
+  }
+
+  /**
+   * Set the grid calibration (M-align). `spanUs` is the vertical zoom (µs across
+   * the height — smaller = zoomed in), `hitLineFrac` the now-line position,
+   * `xScale`/`xOffset` the horizontal zoom/pan of the keyboard. The next `draw`
+   * picks it up.
+   */
+  setGridCal(cal: {
+    spanUs: number;
+    hitLineFrac: number;
+    xScale: number;
+    xOffset: number;
+  }): void {
+    this.gridCal = cal;
   }
 
   /**
@@ -106,7 +132,11 @@ export class EditCanvas {
    * real events for a smooth sweep; it snaps back to `snapshot.playhead_us` on
    * each event.
    */
-  draw(snapshot: ComposerSnapshot, playheadUs: number): void {
+  draw(
+    snapshot: ComposerSnapshot,
+    playheadUs: number,
+    scrollAnchorUs?: number,
+  ): void {
     const ctx = this.ctx;
     ctx.clearRect(0, 0, this.w, this.h);
     // With a backdrop attached, leave the fill translucent so the <video>
@@ -120,14 +150,23 @@ export class EditCanvas {
       snapshot.time_sig,
       snapshot.subdivision,
     );
-    // Anchor the scroll to the playhead while playing, else the cursor step.
+    // Anchor the scroll to an explicit review head when given, else to the
+    // playhead while playing, else the cursor step.
     const cursorUs = snapshot.cursor.step * g.stepUs;
-    const anchorUs = snapshot.playing ? playheadUs : cursorUs;
+    const reviewing = scrollAnchorUs !== undefined;
+    const anchorUs = reviewing
+      ? scrollAnchorUs
+      : snapshot.playing
+        ? playheadUs
+        : cursorUs;
     const vp = new Viewport({
       width: this.w,
       height: this.h,
-      spanUs: DEFAULT_SPAN_US,
+      spanUs: this.gridCal.spanUs,
       anchorUs,
+      hitLineFrac: this.gridCal.hitLineFrac,
+      xScale: this.gridCal.xScale,
+      xOffset: this.gridCal.xOffset,
     });
 
     this.drawLanes(vp);
@@ -142,7 +181,7 @@ export class EditCanvas {
     this.drawSplits(vp);
     this.drawChordPreview(snapshot, vp, cursorUs, g.stepUs);
     this.drawCursor(snapshot, vp, cursorUs, g.stepUs);
-    this.drawPlayhead(snapshot, vp, playheadUs);
+    this.drawPlayhead(snapshot, vp, reviewing ? scrollAnchorUs : playheadUs, reviewing);
     this.drawLaneLabels(vp);
   }
 
@@ -384,8 +423,9 @@ export class EditCanvas {
     snapshot: ComposerSnapshot,
     vp: Viewport,
     playheadUs: number,
+    force = false,
   ): void {
-    if (!snapshot.playing) return;
+    if (!snapshot.playing && !force) return;
     const ctx = this.ctx;
     const y = vp.yOf(playheadUs);
     if (y < 0 || y > this.h) return;

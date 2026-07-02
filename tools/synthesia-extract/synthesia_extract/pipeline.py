@@ -102,9 +102,16 @@ class BackgroundModel:
 
     plates: list[np.ndarray]
     window: int  # frames per plate
+    window_s: float = 0.0  # seconds per plate (for fps-independent lookup)
 
     def plate_for(self, f: int) -> np.ndarray:
         return self.plates[min(f // self.window, len(self.plates) - 1)]
+
+    def plate_for_time(self, t: float) -> np.ndarray:
+        """Plate covering song-time ``t`` (s) — fps-independent, so a model built
+        from a sparse sample still indexes a dense full-rate stream correctly."""
+        idx = int(t / self.window_s) if self.window_s > 0 else 0
+        return self.plates[min(max(idx, 0), len(self.plates) - 1)]
 
 
 def background_model(
@@ -130,7 +137,7 @@ def background_model(
         idx = np.linspace(lo, hi - 1, min(hi - lo, samples_per_window)).astype(int)
         stack = np.stack([frames[i] for i in idx])
         plates.append(np.percentile(stack, 30, axis=0).astype(np.uint8))
-    return BackgroundModel(plates=plates, window=win)
+    return BackgroundModel(plates=plates, window=win, window_s=window_s)
 
 
 def _plate_at(bg, f: int) -> Optional[np.ndarray]:
@@ -584,6 +591,187 @@ def estimate_scroll(
 # --------------------------------------------------------------------------- #
 # 4. Roll stitching
 # --------------------------------------------------------------------------- #
+def centerline_band(mask: np.ndarray, half: int) -> np.ndarray:
+    """Keep only a ``±half`` px band around each horizontal run's centroid.
+
+    A Synthesia bar is rendered *centred on its key*, but here a bar is 1.5-2.5
+    key-widths wide, so its body covers the centre columns of the flanking
+    lanes (black-key centres sit only ~half a key away, on the white
+    boundaries).  Sampling those flanking centres yields same-onset ghost twins
+    and mis-assigns a struck key to its neighbour.
+
+    Collapsing every horizontal run to a thin band around its *centroid* fixes
+    this geometrically: the band lands on the centre of the actually-struck key
+    (white or black) and not on its neighbours, so only the correct lane votes.
+    Fully vectorised — start/end columns of every run are found with running
+    max/min, giving each pixel its run's centre with no Python-level loop.
+    """
+    h, w = mask.shape
+    if w == 0:
+        return mask
+    col = np.arange(w)
+    left = np.zeros_like(mask)
+    left[:, 1:] = mask[:, :-1]
+    starts = mask & ~left  # first column of each run
+    right = np.zeros_like(mask)
+    right[:, :-1] = mask[:, 1:]
+    ends = mask & ~right  # last column of each run
+    # Within a run, every pixel's start column = the running max of start-cols
+    # (0 elsewhere); its end column = the running min-from-the-right of end-cols.
+    start_col = np.maximum.accumulate(np.where(starts, col[None, :], 0), axis=1)
+    big = w + 1
+    end_col = np.minimum.accumulate(
+        np.where(ends, col[None, :], big)[:, ::-1], axis=1
+    )[:, ::-1]
+    centroid = (start_col + end_col) * 0.5
+    return mask & (np.abs(col[None, :] - centroid) <= half)
+
+
+# Shared roll-building primitives — used by both the in-memory :func:`build_roll`
+# and the streaming :func:`accumulate_stream`, so the two stay bit-for-bit alike.
+_COH_KERNEL = np.ones((5, 1), dtype=np.uint8)  # +/-2 px coherence tolerance
+
+
+def _coh_params(scroll: float, fps: float) -> tuple[int, int]:
+    """Scroll-coherence frame gap ``coh_k`` and pixel shift ``coh_px``.
+
+    A true bar pixel at (frame f, row y) reappears at (f+k, y + k*scroll/fps);
+    k is chosen so the shift is at least a few px (robust as fps rises — at full
+    rate the partner is only ~1 frame away)."""
+    delta = scroll / fps
+    coh_k = max(1, int(np.ceil(4.0 / max(delta, 1e-6))))
+    return coh_k, int(round(coh_k * delta))
+
+
+def _coherent(now: np.ndarray, partner: Optional[np.ndarray], coh_px: int, ahead: bool) -> np.ndarray:
+    """Keep only ``now`` pixels that also appear, scroll-shifted, in ``partner``.
+
+    ``partner`` is the bar mask ``coh_k`` frames away; ``ahead`` selects whether
+    it is later (bars sit ``coh_px`` lower there) or earlier (the tail case)."""
+    hit = now.shape[0]
+    if partner is None or coh_px <= 0 or coh_px >= hit:
+        return now
+    aligned = np.zeros_like(now)
+    if ahead:
+        aligned[: hit - coh_px] = partner[coh_px:]
+    else:
+        aligned[coh_px:] = partner[: hit - coh_px]
+    aligned = cv2.dilate(aligned.astype(np.uint8), _COH_KERNEL).astype(bool)
+    return now & aligned
+
+
+def _lanes_for(kb: Keyboard) -> tuple[list[int], dict[int, int], list[tuple[int, int, int, int]]]:
+    """Sorted pitches, their index map, and per-key (pidx, x0, x1, cx) lanes."""
+    pitches = sorted({p for (_cx, p) in kb.centers})
+    pidx_of = {p: i for i, p in enumerate(pitches)}
+    width = kb.x_to_pitch.shape[0]
+    sh = kb.strip_half
+    lanes = [
+        (pidx_of[p], max(0, cx - sh), min(width, cx + sh + 1), cx)
+        for (cx, p) in kb.centers
+    ]
+    return pitches, pidx_of, lanes
+
+
+def _alloc_roll(n_pitches: int, max_bin: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    return (
+        np.zeros((n_pitches, max_bin), dtype=np.float32),
+        np.zeros((n_pitches, max_bin), dtype=np.float32),
+        np.zeros((n_pitches, max_bin, 3), dtype=np.float64),
+    )
+
+
+def _dead_zone(
+    frames: Sequence[np.ndarray],
+    plate,
+    hit: int,
+    width: int,
+    max_run_w: Optional[int],
+    n_samples: int = 64,
+) -> np.ndarray:
+    """Pixels mask-active for >35% of the clip — persistent overlays, not bars."""
+    n = len(frames)
+    if n == 0:
+        return np.zeros((hit, width), dtype=bool)
+    k = min(n, n_samples)
+    idx = np.linspace(0, n - 1, k).astype(int)
+    freq = np.zeros((hit, width), dtype=np.float32)
+    for f in idx:
+        freq += bar_mask(frames[f], _plate_at(plate, f), max_run_w)[:hit]
+    return (freq / k) > 0.35
+
+
+def _overlay_rows(
+    frames: Sequence[np.ndarray],
+    plate,
+    hit: int,
+    max_run_w: Optional[int],
+    coh_k: int,
+    coh_px: int,
+) -> np.ndarray:
+    """Usable-row mask: drops rows of persistent *non-coherent* brightness.
+
+    Moving karaoke lyrics sit in a fixed row band but change content, so the
+    per-pixel dead-zone never flags them — yet the coherence gate discards the
+    static text, taking the bar behind it with it.  Such rows have high
+    bright-but-not-scrolling content; excluding them from the roll lets a bar's
+    coverage be judged only on the clean rows each song-time is also seen through.
+    """
+    n = len(frames)
+    row_usable = np.ones(hit, dtype=bool)
+    if n <= coh_k:
+        return row_usable
+    cache: dict[int, np.ndarray] = {}
+
+    def raw(f: int) -> np.ndarray:
+        m = cache.get(f)
+        if m is None:
+            m = bar_mask(frames[f], _plate_at(plate, f), max_run_w)[:hit]
+            cache[f] = m
+        return m
+
+    ncoh = np.zeros(hit, dtype=np.float64)
+    idx = np.linspace(0, n - 1 - coh_k, min(n - coh_k, 40)).astype(int)
+    for f in idx:
+        r = raw(f)
+        ncoh += (r & ~_coherent(r, raw(f + coh_k), coh_px, True)).mean(axis=1)
+    ncoh /= len(idx)
+    baseline = float(np.median(ncoh))
+    overlay = ncoh > max(0.05, 4.0 * baseline)
+    overlay = cv2.dilate(overlay.astype(np.uint8)[:, None], _COH_KERNEL)[:, 0].astype(bool)
+    if overlay.mean() < 0.4:  # safety: never blank out most of the falling region
+        row_usable = ~overlay
+    return row_usable
+
+
+def _accumulate_frame(
+    votes: np.ndarray,
+    totals: np.ndarray,
+    color_sum: np.ndarray,
+    frame: np.ndarray,
+    cmask: np.ndarray,
+    row_bins: np.ndarray,
+    valid_rows: np.ndarray,
+    lanes: list[tuple[int, int, int, int]],
+    lane_clean: list[np.ndarray],
+    row_usable: np.ndarray,
+) -> None:
+    """Add one frame's per-lane centroid votes + colour into the roll arrays."""
+    for li, (pidx, x0, x1, cx) in enumerate(lanes):
+        observable = valid_rows & lane_clean[li] & row_usable
+        np.add.at(totals[pidx], row_bins[observable], 1.0)
+        strip = cmask[:, x0:x1].any(axis=1)  # bar centroid at this lane, per row
+        on = strip & observable
+        if not on.any():
+            continue
+        rb = row_bins[on]
+        np.add.at(votes[pidx], rb, 1.0)
+        bgr = frame[np.where(on)[0], cx].astype(np.float64)
+        np.add.at(color_sum[pidx], (rb, 0), bgr[:, 0])
+        np.add.at(color_sum[pidx], (rb, 1), bgr[:, 1])
+        np.add.at(color_sum[pidx], (rb, 2), bgr[:, 2])
+
+
 def build_roll(
     frames: Sequence[np.ndarray],
     fps: float,
@@ -605,40 +793,15 @@ def build_roll(
     width = kb.x_to_pitch.shape[0]
     sh = kb.strip_half
 
-    pitches = sorted({p for (_cx, p) in kb.centers})
-    pidx_of = {p: i for i, p in enumerate(pitches)}
-    # Per key: its pitch index and the centre-strip column slice.
-    lanes = [
-        (pidx_of[p], max(0, cx - sh), min(width, cx + sh + 1), cx)
-        for (cx, p) in kb.centers
-    ]
+    pitches, _pidx_of, lanes = _lanes_for(kb)
+    max_bin = int(round((n - 1) / fps * scroll + hit)) + 2
+    votes, totals, color_sum = _alloc_roll(len(pitches), max_bin)
 
-    last_off = (n - 1) / fps * scroll
-    max_bin = int(round(last_off + hit)) + 2
-
-    votes = np.zeros((len(pitches), max_bin), dtype=np.float32)
-    totals = np.zeros((len(pitches), max_bin), dtype=np.float32)
-    color_sum = np.zeros((len(pitches), max_bin, 3), dtype=np.float64)
-
-    # Dead-zone map: pixels mask-active for a large fraction of the whole clip
-    # are persistent overlays — karaoke lyrics, watermarks, logos — not bars
-    # (even a busy lane is bar-covered well under a quarter of the time).
-    # Excluded pixels also leave the per-lane totals so coverage stays fair.
-    n_dead_samples = min(n, 64)
-    dead_idx = np.linspace(0, n - 1, n_dead_samples).astype(int)
-    freq = np.zeros((hit, width), dtype=np.float32)
-    for f in dead_idx:
-        freq += bar_mask(frames[f], _plate_at(plate, f), max_run_w)[:hit]
-    dead = (freq / n_dead_samples) > 0.35
-
-    # Scroll-coherence gate: a true bar pixel at (frame f, row y) must appear
-    # again at (f+k, y + k*scroll/fps) — bars translate rigidly at the known
-    # speed, while bright *animated* artwork only matches that by accident.
-    # k is chosen so the shift is at least a few pixels (robust at high fps).
-    delta = scroll / fps  # px of travel between consecutive frames
-    coh_k = max(1, int(np.ceil(4.0 / max(delta, 1e-6))))
-    coh_px = int(round(coh_k * delta))
-    coh_kernel = np.ones((5, 1), dtype=np.uint8)  # +/-2 px tolerance
+    dead = _dead_zone(frames, plate, hit, width, max_run_w)
+    coh_k, coh_px = _coh_params(scroll, fps)
+    # Rows a lane can actually observe: at least one strip column not dead.
+    lane_clean = [~dead[:, x0:x1].all(axis=1) for (_pidx, x0, x1, _cx) in lanes]
+    row_usable = _overlay_rows(frames, plate, hit, max_run_w, coh_k, coh_px)
 
     raw_cache: dict[int, np.ndarray] = {}
 
@@ -649,47 +812,104 @@ def build_roll(
             raw_cache[f] = m
         return m
 
-    def coherent_mask(f: int) -> np.ndarray:
-        now = raw_mask(f)
-        if coh_px <= 0 or coh_px >= hit or n <= coh_k:
-            return now
-        aligned = np.zeros_like(now)
-        if f + coh_k < n:  # partner is later: bars sit coh_px lower there
-            aligned[: hit - coh_px] = raw_mask(f + coh_k)[coh_px:]
-        else:  # tail frames: partner is earlier, bars sat coh_px higher
-            aligned[coh_px:] = raw_mask(f - coh_k)[: hit - coh_px]
-        aligned = cv2.dilate(aligned.astype(np.uint8), coh_kernel).astype(bool)
-        return now & aligned
-
-    # Rows a lane can actually observe: at least one strip column not dead.
-    lane_clean = [~dead[:, x0:x1].all(axis=1) for (_pidx, x0, x1, _cx) in lanes]
-
     rows = np.arange(hit)  # falling-region rows
     for f in range(n):
         o_f = f / fps * scroll
         row_bins = np.round(o_f + hit - rows).astype(np.int64)  # one bin per row
         valid_rows = (row_bins >= 0) & (row_bins < max_bin)
 
-        frame = frames[f]
-        mask = coherent_mask(f) & ~dead
+        now = raw_mask(f)
+        if n <= coh_k:
+            partner, ahead = None, True
+        elif f + coh_k < n:  # partner later: bars sit coh_px lower there
+            partner, ahead = raw_mask(f + coh_k), True
+        else:  # tail frames: partner is earlier
+            partner, ahead = raw_mask(f - coh_k), False
+        mask = _coherent(now, partner, coh_px, ahead) & ~dead
+        # Collapse each wide bar to a thin band on its centroid so it votes for
+        # the one key it is centred on, not every lane its body overlaps.
+        cmask = centerline_band(mask, sh)
         raw_cache.pop(f - coh_k, None)  # keep the cache a small rolling window
-        for li, (pidx, x0, x1, cx) in enumerate(lanes):
-            observable = valid_rows & lane_clean[li]
-            # Geometric coverage: every observable row, once per frame per lane.
-            np.add.at(totals[pidx], row_bins[observable], 1.0)
-            strip = mask[:, x0:x1].any(axis=1)  # colored at this lane, per row
-            on = strip & observable
-            if not on.any():
-                continue
-            rb = row_bins[on]
-            # At most one vote per (lane, bin) per frame (rows -> distinct bins).
-            np.add.at(votes[pidx], rb, 1.0)
-            bgr = frame[np.where(on)[0], cx].astype(np.float64)
-            np.add.at(color_sum[pidx], (rb, 0), bgr[:, 0])
-            np.add.at(color_sum[pidx], (rb, 1), bgr[:, 1])
-            np.add.at(color_sum[pidx], (rb, 2), bgr[:, 2])
+        _accumulate_frame(
+            votes, totals, color_sum, frames[f], cmask,
+            row_bins, valid_rows, lanes, lane_clean, row_usable,
+        )
 
     return votes, totals, color_sum, pitches, us_per_px
+
+
+def accumulate_stream(
+    frame_iter,
+    fps: float,
+    kb: Keyboard,
+    scroll: float,
+    bg,
+    max_run_w: Optional[int],
+    dead: np.ndarray,
+    row_usable: np.ndarray,
+    votes: np.ndarray,
+    totals: np.ndarray,
+    color_sum: np.ndarray,
+    max_bin: int,
+) -> None:
+    """Stream frames at full rate into a pre-allocated roll (low, bounded RAM).
+
+    Unlike :func:`build_roll`, which holds the whole (decimated) clip in memory,
+    this consumes ``frame_iter`` one frame at a time and keeps only a tiny
+    coherence look-ahead (``coh_k`` frames — ~1 at native fps), so a multi-minute
+    clip is processed at full temporal density.  The global maps (``dead``,
+    ``row_usable``, calibration, ``scroll``) are computed once from a sparse
+    sample and passed in; ``bg`` is resolved per frame by *time* so a model built
+    from the sample still indexes the dense stream correctly.
+    """
+    hit = kb.hit_line
+    sh = kb.strip_half
+    _pitches, _pidx_of, lanes = _lanes_for(kb)
+    lane_clean = [~dead[:, x0:x1].all(axis=1) for (_pidx, x0, x1, _cx) in lanes]
+    coh_k, coh_px = _coh_params(scroll, fps)
+    rows = np.arange(hit)
+
+    def plate_at_time(t: float):
+        return bg.plate_for_time(t) if isinstance(bg, BackgroundModel) else bg
+
+    def emit(g: int, frame: np.ndarray, now: np.ndarray, partner, ahead: bool) -> None:
+        o_f = g / fps * scroll
+        row_bins = np.round(o_f + hit - rows).astype(np.int64)
+        valid_rows = (row_bins >= 0) & (row_bins < max_bin)
+        mask = _coherent(now, partner, coh_px, ahead) & ~dead
+        cmask = centerline_band(mask, sh)
+        _accumulate_frame(
+            votes, totals, color_sum, frame, cmask,
+            row_bins, valid_rows, lanes, lane_clean, row_usable,
+        )
+
+    # Rolling store of recent frames+masks keyed by global index. A frame g is
+    # needed as the ahead-partner of g-coh_k and the behind-partner of g+coh_k,
+    # so we retain [emitted-coh_k .. current].
+    store: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    emitted = 0
+    g = 0
+    for frame in frame_iter:
+        now = bar_mask(frame, plate_at_time(g / fps), max_run_w)[:hit]
+        store[g] = (frame, now)
+        # Emit any frame whose ahead-partner has now arrived.
+        while emitted + coh_k <= g:
+            ef, en = store[emitted]
+            pf = store[emitted + coh_k][1]
+            emit(emitted, ef, en, pf, True)
+            store.pop(emitted - coh_k, None)
+            emitted += 1
+        g += 1
+    last = g  # one past the final frame
+    # Drain the tail (no ahead-partner): use the earlier frame, like build_roll.
+    while emitted < last:
+        ef, en = store[emitted]
+        if emitted - coh_k >= 0 and emitted - coh_k in store and last > coh_k:
+            emit(emitted, ef, en, store[emitted - coh_k][1], False)
+        else:
+            emit(emitted, ef, en, None, True)
+        store.pop(emitted - coh_k, None)
+        emitted += 1
 
 
 # --------------------------------------------------------------------------- #
@@ -704,17 +924,26 @@ def extract_notes(
     *,
     threshold: float = 0.5,
     min_run_px: int = 3,
+    bridge_px: int = 0,
 ) -> list[_RawNote]:
     """Threshold per-pitch coverage into note runs.
 
     ``totals`` may be global (1-D, one value per bin) or per-lane (2-D,
     ``[pitch_index, bin]``, from the dead-zone-aware roll).
+
+    ``bridge_px`` closes coverage gaps up to that many bins: an occluder the
+    dead-zone/text-band maps don't fully cover (a logo edge, an animated sprite
+    passing through) briefly starves a held note's coverage, splitting one long
+    note into two.  Bridging short gaps re-joins them.  Kept well under the
+    spacing of genuinely repeated notes so real re-strikes stay separate.
     """
     raws: list[_RawNote] = []
     for pi, pitch in enumerate(pitches):
         tot = totals[pi] if totals.ndim == 2 else totals
         coverage = votes[pi] / np.maximum(tot, 1e-6)
         on = (coverage > threshold) & (tot > 0)
+        if bridge_px > 0:
+            on = _bridge_gaps(on, bridge_px)
         for a, b in _find_runs(on):
             if b - a < min_run_px:
                 continue
@@ -735,6 +964,222 @@ def extract_notes(
             )
     raws.sort(key=lambda r: (r.start_us, r.pitch))
     return raws
+
+
+def _bridge_gaps(on: np.ndarray, max_gap: int) -> np.ndarray:
+    """Fill `False` gaps of length <= ``max_gap`` between two `True` runs.
+
+    A morphological closing along the time axis: re-joins a held note that a
+    transient occluder split, without extending the note past its true ends
+    (only interior gaps flanked by coverage are filled).
+    """
+    out = on.copy()
+    runs = _find_runs(~on)
+    for a, b in runs:
+        if a == 0 or b == len(on):  # leading/trailing gap — not interior
+            continue
+        if b - a <= max_gap:
+            out[a:b] = True
+    return out
+
+
+def _bar_saturation(color: np.ndarray) -> float:
+    """HSV-style saturation of a mean BGR bar colour, in ``[0, 1]``.
+
+    A true bar's saturated core scores high; the soft glow/bevel a thick bar
+    bleeds onto a neighbouring lane is lighter (whiter) and scores low.  This is
+    the discriminator used to tell a real note from its same-onset ghost twin.
+    """
+    c = np.asarray(color, dtype=np.float64)
+    hi = float(c.max())
+    if hi <= 1e-6:
+        return 0.0
+    return (hi - float(c.min())) / hi
+
+
+def suppress_semitone_ghosts(raws: list[_RawNote], onset_tol_us: int) -> list[_RawNote]:
+    """Drop same-onset adjacent-semitone *ghost* notes left by thick bars.
+
+    A bar 1.5-2.5 key-widths wide fully covers its flanking black-key lane
+    centres (only ~half a key away, on the white boundaries) and sometimes the
+    next white, so a single struck key lights two, three, even four adjacent
+    semitones at the *same* onset.  The whole consecutive-semitone run is one
+    bar, not a chord, so we keep only its strongest member and drop the rest.
+
+    "Strongest" = most saturated (the real core), with coverage as a tiebreak.
+    Chord tones a whole step or more apart (gap >= 2) fall in separate runs and
+    are never touched — genuine same-onset *semitone* dyads are vanishingly rare
+    in tutorials, so collapsing the run is the right call for this content.
+    """
+    if len(raws) < 2:
+        return raws
+
+    ordered = sorted(raws, key=lambda r: (r.start_us, r.pitch))
+    # Coverage dominates (a real centred key is voted every frame; a rare
+    # ambiguous-centroid twin almost never is); saturation breaks ties.
+    score = {id(r): r.coverage + 0.01 * _bar_saturation(r.color) for r in ordered}
+    drop: set[int] = set()
+
+    # Walk simultaneous groups by *single-linkage* on onset: extend the group
+    # while each next note is within tolerance of its immediate predecessor, not
+    # of the group's first note.  A thick bar lights its flanking lanes a frame
+    # or two apart (the twin's onset lags the core's), and grouping from the first
+    # note lets that lag push the twin past the window into the next group, where
+    # it escapes de-ghosting.  Linking neighbour-to-neighbour keeps a near-
+    # simultaneous white/black pair together so the ghost is always compared with
+    # its core.  Only *consecutive-semitone* runs within a group are collapsed, so
+    # chaining a few extra notes in never touches genuine chord tones (>= a whole
+    # step apart) — it only ever removes adjacent-semitone twins.
+    i = 0
+    n = len(ordered)
+    while i < n:
+        j = i + 1
+        while j < n and ordered[j].start_us - ordered[j - 1].start_us <= onset_tol_us:
+            j += 1
+        group = sorted(ordered[i:j], key=lambda r: r.pitch)
+        # Split the group into maximal runs of consecutive semitones.
+        run: list[_RawNote] = [group[0]]
+        for note in group[1:]:
+            if note.pitch - run[-1].pitch == 1:
+                run.append(note)
+            else:
+                _keep_run_leader(run, score, drop)
+                run = [note]
+        _keep_run_leader(run, score, drop)
+        i = j
+
+    return [r for r in ordered if id(r) not in drop]
+
+
+def _keep_run_leader(run: list[_RawNote], score: dict[int, float], drop: set[int]) -> None:
+    """Within a consecutive-semitone run, keep only the leader; drop the rest."""
+    if len(run) < 2:
+        return
+    leader = max(run, key=lambda r: score[id(r)])
+    for note in run:
+        if note is not leader:
+            drop.add(id(note))
+
+
+def recover_glissando_runs(
+    votes: np.ndarray,
+    totals: np.ndarray,
+    color_sum: np.ndarray,
+    pitches: list[int],
+    us_per_px: float,
+    existing: list[_RawNote],
+    *,
+    low: float = 0.28,
+    min_run: int = 4,
+    min_span: int = 4,
+    min_pulse_px: int = 2,
+    max_pulse_px: int = 14,
+    max_onset_step_us: int = 170_000,
+) -> list[_RawNote]:
+    """Recover fast scale/glissando runs the strict coverage threshold drops.
+
+    A glissando is a staircase of brief taps — each key lit for only a frame or
+    two — so every tap sits below the 0.6 coverage floor *and* under
+    ``min_run_px``, and :func:`extract_notes` discards them all even though the
+    held notes around them pass.  This second pass looks *only* for that diagonal
+    signature: a chain of ``min_run`` or more sub-threshold pulses stepping one
+    or two semitones per tap with a monotonically advancing onset and spanning at
+    least ``min_span`` semitones overall.  Two guards keep it from re-inventing
+    what the strict and de-ghost passes deliberately removed: a pulse bleeding off
+    an *adjacent held note* (the glow ghost ``suppress_semitone_ghosts`` drops) is
+    rejected, and a chain too narrow in pitch (a tight ghost cluster, not a sweep)
+    is rejected.  So the strict global threshold — and the clean note count it
+    buys — is left untouched everywhere else.  ``existing`` are the notes the
+    strict pass already kept; pulses overlapping one (same pitch) are duplicates.
+    """
+    pidx = {p: i for i, p in enumerate(pitches)}
+    taken: dict[int, list[tuple[int, int]]] = {}
+    for r in existing:
+        a = int(round(r.start_us / us_per_px))
+        b = int(round((r.start_us + r.dur_us) / us_per_px))
+        taken.setdefault(r.pitch, []).append((a, b))
+
+    def bleeds_off_neighbour(pitch: int, a: int, b: int) -> bool:
+        """True if a kept *held* note one semitone away sounds over this pulse —
+        i.e. the pulse is that bar's glow, not a struck key."""
+        plen = max(1, b - a)
+        for q in (pitch - 1, pitch + 1):
+            for sa, sb in taken.get(q, ()):
+                overlap = min(b, sb) - max(a, sa)
+                if overlap >= 0.5 * plen and (sb - sa) >= 2 * plen:
+                    return True
+        return False
+
+    # Collect short, sub-threshold pulses — the candidate taps.
+    pulses: list[tuple[int, int, int, int]] = []  # (onset_bin, pitch, a, b)
+    for pi, pitch in enumerate(pitches):
+        tot = totals[pi] if totals.ndim == 2 else totals
+        cov = votes[pi] / np.maximum(tot, 1e-6)
+        band = (cov >= low) & (tot > 0)
+        for a, b in _find_runs(band):
+            if not (min_pulse_px <= b - a <= max_pulse_px):
+                continue
+            if any(a < eb and sb < b for sb, eb in taken.get(pitch, ())):
+                continue  # already part of a kept note
+            if bleeds_off_neighbour(pitch, a, b):
+                continue  # glow ghost of an adjacent held note
+            pulses.append((a, pitch, a, b))
+
+    if len(pulses) < min_run:
+        return []
+
+    pulses.sort()
+    n = len(pulses)
+    max_step = max(1, int(round(max_onset_step_us / us_per_px)))
+
+    # Longest monotonic diagonal ending at each pulse, in each direction; keep a
+    # chain only if it is long enough AND sweeps a wide enough pitch range.
+    accepted: set[int] = set()
+    for direction in (1, -1):
+        best = [1] * n
+        prev = [-1] * n
+        for j in range(n):
+            aj, pj = pulses[j][0], pulses[j][1]
+            for i in range(j):
+                d_on = aj - pulses[i][0]
+                if d_on <= 0 or d_on > max_step:
+                    continue
+                if (pj - pulses[i][1]) * direction in (1, 2) and best[i] + 1 > best[j]:
+                    best[j] = best[i] + 1
+                    prev[j] = i
+        for j in sorted(range(n), key=lambda x: best[x], reverse=True):
+            if best[j] < min_run:
+                break
+            chain = []
+            k = j
+            while k != -1:
+                chain.append(k)
+                k = prev[k]
+            ps = [pulses[c][1] for c in chain]
+            if max(ps) - min(ps) >= min_span:
+                accepted.update(chain)
+
+    out: list[_RawNote] = []
+    for idx in sorted(accepted):
+        _on, pitch, a, b = pulses[idx]
+        pi = pidx[pitch]
+        seg_votes = votes[pi, a:b]
+        total_votes = float(seg_votes.sum())
+        if total_votes <= 0:
+            continue
+        tot = totals[pi] if totals.ndim == 2 else totals
+        color = color_sum[pi, a:b].sum(axis=0) / total_votes
+        cov = float(np.clip((votes[pi, a:b] / np.maximum(tot[a:b], 1e-6)).mean(), 0.0, 1.0))
+        out.append(
+            _RawNote(
+                pitch=pitch,
+                start_us=int(round(a * us_per_px)),
+                dur_us=int(round((b - a) * us_per_px)),
+                coverage=cov,
+                color=color,
+            )
+        )
+    return out
 
 
 def assign_hands(raws: list[_RawNote]) -> list[ExtractedNote]:
@@ -847,6 +1292,9 @@ def extract_chart(
     if hit_line <= 1 or hit_line >= ref.shape[0]:
         return ExtractedChart(notes=[], source=source)
     kb = calibrate_keyboard(ref, hit_line, anchor_c4_x=anchor_c4_x)
+    # Frame geometry for the overlay's auto-calibration (see SourceMeta).
+    source.frame_height_px = int(ref.shape[0])
+    source.hit_line_px = int(hit_line)
 
     bg = background_model(frames, fps) or plate
 
@@ -869,8 +1317,36 @@ def extract_chart(
     votes, totals, color_sum, pitches, us_per_px = build_roll(
         frames, fps, kb, scroll, plate=bg, max_run_w=max_run_w
     )
-    # 40 ms is shorter than any playable tutorial note; in pixels it scales
-    # with the scroll speed.
+    notes = _roll_to_notes(votes, totals, color_sum, pitches, us_per_px, scroll)
+
+    if debug_dir:
+        _write_debug(debug_dir, ref, kb)
+
+    return ExtractedChart(notes=notes, source=source)
+
+
+def _roll_to_notes(
+    votes: np.ndarray,
+    totals: np.ndarray,
+    color_sum: np.ndarray,
+    pitches: list[int],
+    us_per_px: float,
+    scroll: float,
+    *,
+    recover_glissandi: bool = False,
+) -> list[ExtractedNote]:
+    """Shared tail: threshold the roll into notes, de-ghost, assign hands.
+
+    ``recover_glissandi`` is **off by default**.  The diagonal-staircase recovery
+    (:func:`recover_glissando_runs`) was written to rescue fast slides the strict
+    threshold drops, but on translucent/pale bars over busy artwork it also
+    stitches unrelated sub-threshold shimmer into *phantom* glissandi — diagonals
+    that aren't in the performance.  Since those false positives are worse than a
+    missing slide (which the editor's ``insert_run`` action now lays by hand,
+    traced over the aligned movie backdrop), the pass is disabled unless a caller
+    explicitly opts in.  The function and its unit tests are retained so the pass
+    can be re-enabled once colour-coverage voting handles pale bars (issue #148).
+    """
     raws = extract_notes(
         votes,
         totals,
@@ -878,9 +1354,148 @@ def extract_chart(
         pitches,
         us_per_px,
         threshold=0.6,
+        # 40 ms is shorter than any playable tutorial note; scales with scroll.
         min_run_px=max(3, int(round(0.04 * scroll))),
+        # Re-join held notes split by a transient occluder; ~80 ms, comfortably
+        # under the spacing of genuine repeated strikes.
+        bridge_px=max(4, int(round(0.08 * scroll))),
     )
-    notes = assign_hands(raws)
+    # Thick bars bleed onto flanking lanes, lighting 2-3 adjacent semitones at
+    # one onset; drop those glow ghosts (keep the saturated core) before hands.
+    raws = suppress_semitone_ghosts(raws, onset_tol_us=int(round(3 * us_per_px)))
+    if recover_glissandi:
+        # Fast scale/glissando taps fall below the strict threshold; recover the
+        # ones that form a diagonal staircase (run after de-ghosting so a
+        # recovered tap is never re-collapsed, and dedup keeps it from doubling a
+        # kept note).  Opt-in only — see the note above.
+        raws = raws + recover_glissando_runs(
+            votes,
+            totals,
+            color_sum,
+            pitches,
+            us_per_px,
+            raws,
+            min_pulse_px=max(2, int(round(0.012 * scroll))),
+            max_pulse_px=max(8, int(round(0.072 * scroll))),
+        )
+    raws.sort(key=lambda r: (r.start_us, r.pitch))
+    return assign_hands(raws)
+
+
+def extract_chart_streaming(
+    path: str,
+    *,
+    fps_override: Optional[float] = None,
+    title: Optional[str] = None,
+    anchor_c4_x: Optional[int] = None,
+    scroll_override: Optional[float] = None,
+    debug_dir: Optional[str] = None,
+    sample_frames: int = 480,
+    max_dense_frames: int = 9000,
+) -> ExtractedChart:
+    """High-fps extraction that never holds the whole clip in RAM.
+
+    Global setup (background plate, keyboard calibration, scroll speed,
+    dead-zone and text-band maps) is derived from a sparse sample spanning the
+    clip; the dense roll is then accumulated by streaming frames through a tiny
+    coherence look-ahead.  This recovers fast passages — quick right-hand notes,
+    hand-slide glissandi — that the decimating in-memory path drops.
+
+    Unlike the in-memory path (bounded by *memory*), streaming is bounded by
+    *time*: ``max_dense_frames`` caps how many frames are actually processed, so
+    a short clip runs at native fps while a long one is thinned to a still-much-
+    denser-than-decimated rate.  Falls back to the in-memory pipeline when frame
+    metadata is missing.
+    """
+    from .io import read_burst, sparse_sample, stream_frames, video_info
+
+    fps, n_total, w, h = video_info(path, fps_override)
+    source = SourceMeta(extractor_version=EXTRACTOR_VERSION, title=title, fps=float(fps))
+    if n_total <= 0 or w <= 0 or h <= 0:
+        from .io import load_frames
+
+        frames, eff_fps = load_frames(path, fps_override)
+        return extract_chart(
+            frames, eff_fps, title=title, anchor_c4_x=anchor_c4_x,
+            scroll_override=scroll_override, debug_dir=debug_dir,
+        )
+
+    sample, sample_fps = sparse_sample(path, sample_frames, fps_override)
+    if not sample:
+        return ExtractedChart(notes=[], source=source)
+
+    plate = background_plate(sample)
+    ref = plate if plate is not None else sample[len(sample) // 2]
+    hit_line = detect_hit_line(ref)
+    if hit_line <= 1 or hit_line >= ref.shape[0]:
+        return ExtractedChart(notes=[], source=source)
+    kb = calibrate_keyboard(ref, hit_line, anchor_c4_x=anchor_c4_x)
+    # Frame geometry for the overlay's auto-calibration (see SourceMeta). ``h``
+    # is the native frame height from video_info — the true source resolution.
+    source.frame_height_px = int(h)
+    source.hit_line_px = int(hit_line)
+    bg = background_model(sample, sample_fps) or plate
+
+    max_run_w: Optional[int] = None
+    if len(kb.white_centers) >= 2:
+        spacing = float(np.median(np.diff(sorted(kb.white_centers))))
+        max_run_w = max(8, int(round(3 * spacing)))
+
+    # Scroll must be measured from *adjacent* full-rate frames: the sparse
+    # global sample is seconds apart, far beyond a bar's per-frame travel, so a
+    # correlation on it reads a bogus tiny shift.  Estimate from a few short
+    # native-fps bursts spread across the clip and take the median.
+    if scroll_override:
+        scroll: Optional[float] = scroll_override
+    else:
+        ests: list[float] = []
+        for frac in (0.3, 0.45, 0.6, 0.75):
+            start = int(n_total * frac)
+            burst = read_burst(path, start, 120)
+            if len(burst) < 8:
+                continue
+            region_plate = (
+                bg.plate_for_time(start / fps) if isinstance(bg, BackgroundModel) else bg
+            )
+            s = estimate_scroll(burst, hit_line, fps, plate=region_plate, max_run_w=max_run_w)
+            if s and s > 0:
+                ests.append(float(s))
+        scroll = float(np.median(ests)) if ests else None
+    if not scroll or scroll <= 0:
+        source.scroll_px_per_s = None
+        return ExtractedChart(notes=[], source=source)
+    source.scroll_px_per_s = float(scroll)
+
+    # Global maps from the sample (coherence at the *sample* rate); the dense
+    # accumulation re-derives its own (denser) coherence gap from the full fps.
+    hit = kb.hit_line
+    width = kb.x_to_pitch.shape[0]
+    s_coh_k, s_coh_px = _coh_params(scroll, sample_fps)
+    dead = _dead_zone(sample, bg, hit, width, max_run_w)
+    row_usable = _overlay_rows(sample, bg, hit, max_run_w, s_coh_k, s_coh_px)
+
+    # Cap processed frames so long clips stay tractable; keep native fps when
+    # they already fit.  Every ``step``-th frame is streamed, at an effective
+    # rate the coherence + song-time math then use consistently.
+    step = max(1, int(np.ceil(n_total / max(1, max_dense_frames))))
+    eff_fps = fps / step
+    n_kept = (n_total + step - 1) // step
+
+    def kept_frames():
+        for i, fr in enumerate(stream_frames(path)):
+            if i % step == 0:
+                yield fr
+
+    pitches, _pidx_of, _lanes = _lanes_for(kb)
+    max_bin = int(round((n_kept - 1) / eff_fps * scroll + hit)) + 2
+    votes, totals, color_sum = _alloc_roll(len(pitches), max_bin)
+    accumulate_stream(
+        kept_frames(), eff_fps, kb, scroll, bg, max_run_w,
+        dead, row_usable, votes, totals, color_sum, max_bin,
+    )
+
+    us_per_px = 1e6 / scroll
+    notes = _roll_to_notes(votes, totals, color_sum, pitches, us_per_px, scroll)
 
     if debug_dir:
         _write_debug(debug_dir, ref, kb)

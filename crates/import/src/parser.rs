@@ -56,6 +56,8 @@ mod tests {
             title: Some("Test".into()),
             fps: None,
             scroll_px_per_s: None,
+            frame_height_px: None,
+            hit_line_px: None,
             extractor_version: "test-0.1".into(),
         }
     }

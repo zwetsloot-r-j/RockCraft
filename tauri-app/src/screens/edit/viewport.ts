@@ -119,6 +119,9 @@ export class Viewport {
   /** Highest visible MIDI pitch (the rightmost lane). */
   readonly pitchHi: number;
 
+  /** Horizontal pan (px) added to every lane x — backdrop keyboard alignment. */
+  readonly xOffset: number;
+
   constructor(opts: {
     width: number;
     height: number;
@@ -126,26 +129,39 @@ export class Viewport {
     spanUs: number;
     /** µs to keep anchored: cursor step time (or playhead while playing). */
     anchorUs: number;
+    /**
+     * Fraction of the span kept *below* the anchor, i.e. the hit/now line sits
+     * `(1 − hitLineFrac)` of the way down the canvas. Default ⅓ (line at ⅔
+     * down). Raising it moves the hit line toward the bottom — used to register
+     * the grid's now-line on a backdrop movie's drawn keyboard.
+     */
+    hitLineFrac?: number;
+    /** Extra horizontal zoom on the keyboard (1 = full 88 across width). */
+    xScale?: number;
+    /** Horizontal pan in px (keyboard left-edge alignment). */
+    xOffset?: number;
   }) {
     this.width = Math.max(1, opts.width);
     this.height = Math.max(1, opts.height);
     this.pxPerUs = this.height / Math.max(1, opts.spanUs);
 
-    // Anchor the time axis a third of the way up so there's history below and
-    // lookahead above the cursor/playhead.
-    this.originUs = Math.max(0, opts.anchorUs - opts.spanUs / 3);
+    // Anchor the time axis `hitLineFrac` up from the bottom so there's history
+    // below and lookahead above the cursor/playhead.
+    const hitFrac = opts.hitLineFrac ?? 1 / 3;
+    this.originUs = Math.max(0, opts.anchorUs - opts.spanUs * hitFrac);
 
-    // Fit the full 88-key range across the width: lowest key left, highest
-    // right, one lane per semitone.
+    // Fit the full 88-key range across the width (lowest key left, highest
+    // right, one lane per semitone), then apply the optional horizontal zoom.
     this.pitchLo = LOWEST_MIDI;
     this.pitchHi = HIGHEST_MIDI;
     const lanes = this.pitchHi - this.pitchLo + 1;
-    this.laneW = this.width / lanes;
+    this.laneW = ((opts.xScale ?? 1) * this.width) / lanes;
+    this.xOffset = opts.xOffset ?? 0;
   }
 
   /** MIDI pitch → left x (px) of that pitch's lane. Higher pitch → larger x. */
   xOf(pitch: number): number {
-    return (pitch - this.pitchLo) * this.laneW;
+    return this.xOffset + (pitch - this.pitchLo) * this.laneW;
   }
 
   /** Song µs → canvas y (px). Earlier time → larger y (lower on screen). */

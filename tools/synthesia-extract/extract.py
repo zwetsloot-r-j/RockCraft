@@ -23,8 +23,8 @@ import argparse
 import sys
 
 from synthesia_extract.audio import fuse_chart
-from synthesia_extract.io import load_frames, read_wav
-from synthesia_extract.pipeline import extract_chart
+from synthesia_extract.io import is_frame_dir, load_frames, read_wav
+from synthesia_extract.pipeline import extract_chart, extract_chart_streaming
 
 DEBUG_DIR = "debug-out"  # gitignored; see .gitignore
 
@@ -72,6 +72,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--debug", action="store_true", help=f"write annotated frames to ./{DEBUG_DIR}/")
     parser.add_argument(
+        "--no-stream", dest="no_stream", action="store_true",
+        help="force the in-memory (decimating) loader instead of the default "
+        "full-fps streaming extractor (video inputs only)",
+    )
+    parser.add_argument(
+        "--stream-frames", dest="stream_frames", type=int, default=9000,
+        help="max frames the streaming extractor processes (time budget); higher "
+        "recovers more fast notes but is slower (default 9000)",
+    )
+    parser.add_argument(
         "--audio-fusion", dest="audio_fusion", action="store_true",
         help="run the optional M6-F audio pass (velocity + onset refinement)",
     )
@@ -83,32 +93,38 @@ def main(argv: list[str] | None = None) -> int:
 
     _limit_memory()
 
+    # Default to the streaming extractor for video files (full fps, bounded RAM);
+    # a frames directory or --no-stream uses the in-memory decimating path.
+    use_stream = not is_frame_dir(args.inp) and not args.no_stream
+
     try:
-        frames, fps = load_frames(args.inp, fps_override=args.fps)
+        if use_stream:
+            chart = extract_chart_streaming(
+                args.inp,
+                fps_override=args.fps,
+                title=args.title,
+                anchor_c4_x=args.anchor_c4_x,
+                scroll_override=args.scroll,
+                debug_dir=DEBUG_DIR if args.debug else None,
+                max_dense_frames=args.stream_frames,
+            )
+        else:
+            frames, fps = load_frames(args.inp, fps_override=args.fps)
+            chart = extract_chart(
+                frames,
+                fps,
+                title=args.title,
+                anchor_c4_x=args.anchor_c4_x,
+                scroll_override=args.scroll,
+                debug_dir=DEBUG_DIR if args.debug else None,
+            )
     except (FileNotFoundError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
     except MemoryError:
         print(
-            "error: out of memory while loading frames — close other "
-            "applications or lower the source resolution",
-            file=sys.stderr,
-        )
-        return 3
-
-    try:
-        chart = extract_chart(
-            frames,
-            fps,
-            title=args.title,
-            anchor_c4_x=args.anchor_c4_x,
-            scroll_override=args.scroll,
-            debug_dir=DEBUG_DIR if args.debug else None,
-        )
-    except MemoryError:
-        print(
-            "error: out of memory during extraction — this is a bug guardrail, "
-            "not a crash; please report the video's resolution and length",
+            "error: out of memory during extraction — close other applications "
+            "or lower the source resolution",
             file=sys.stderr,
         )
         return 3
