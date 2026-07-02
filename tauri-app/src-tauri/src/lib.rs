@@ -441,6 +441,7 @@ pub fn run() {
             play::play_load,
             play::play_set_wait,
             play::play_toggle_hear_song,
+            play::play_toggle_pause,
             play::play_finish,
             import::import_url_available,
             import::import_start,

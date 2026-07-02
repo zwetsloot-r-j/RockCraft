@@ -71,6 +71,10 @@ pub struct PlayScreen {
     backing_handle: Option<BackingHandle>,
     /// Whether the "hear the song" feature is active.
     hear_song: bool,
+    /// Manual pause (the `Space` key / `HostCommand::PlayTogglePause`). Freezes
+    /// the clock + backing independently of wait-mode; while set the highway,
+    /// playhead, and scoring clock hold their position.
+    paused: bool,
     /// Span indices for which we have already sent note_on to the song synth.
     song_on_fired: HashSet<usize>,
     /// Span indices for which we have already sent note_off to the song synth.
@@ -119,6 +123,7 @@ impl PlayScreen {
             backing: None,
             backing_handle: None,
             hear_song: false,
+            paused: false,
             song_on_fired: HashSet::new(),
             song_off_fired: HashSet::new(),
         })
@@ -150,6 +155,8 @@ impl PlayScreen {
     pub fn restart(&mut self) {
         self.clock.reset();
         self.last_tick = None;
+        // A restart un-pauses: the clock runs again from the top.
+        self.paused = false;
         // Rebuild the wait tracker from the top, keeping wait-mode armed or not.
         let armed = self.wait.is_armed();
         self.wait = WaitGate::from_expected(&expected_steps(&self.spans));
@@ -224,7 +231,9 @@ impl PlayScreen {
     pub fn advance(&mut self, dt_us: u64) {
         let held: BTreeSet<u8> = self.held.iter().collect();
         self.wait.set_held(held);
-        let frozen = self.wait.poll(self.clock.now_us()) == GateState::Frozen;
+        let wait_frozen = self.wait.poll(self.clock.now_us()) == GateState::Frozen;
+        // A manual pause freezes the transport just like an unsatisfied wait step.
+        let frozen = self.paused || wait_frozen;
         // Only act on the running↔frozen transition so we don't spam the audio
         // thread with pause/resume commands every frame.
         if frozen && self.clock.is_running() {
@@ -239,6 +248,42 @@ impl PlayScreen {
             }
         }
         self.clock.advance(dt_us);
+    }
+
+    /// Toggle a manual pause of the play session (the `Space` key /
+    /// `HostCommand::PlayTogglePause`). Freezes the clock + backing when
+    /// pausing and thaws them when resuming, reusing the same freeze/thaw
+    /// machinery wait-mode uses — so the highway, playhead, and scoring clock
+    /// all hold their position and continue from it (no jump, no missed-note
+    /// storm).
+    pub fn toggle_pause(&mut self) {
+        self.paused = !self.paused;
+        if self.paused {
+            // Freeze now so audio stops on the keystroke, not a frame later.
+            if self.clock.is_running() {
+                self.clock.pause();
+                if let Some(h) = &self.backing_handle {
+                    h.pause();
+                }
+            }
+        } else {
+            // Resume immediately — unless wait-mode is currently holding an
+            // unsatisfied step, in which case the next `advance` re-freezes.
+            let held: BTreeSet<u8> = self.held.iter().collect();
+            self.wait.set_held(held);
+            let wait_frozen = self.wait.poll(self.clock.now_us()) == GateState::Frozen;
+            if !wait_frozen && !self.clock.is_running() {
+                self.clock.resume();
+                if let Some(h) = &self.backing_handle {
+                    h.resume();
+                }
+            }
+        }
+    }
+
+    /// Is the session manually paused? (For the play HUD / control snapshot.)
+    pub fn is_paused(&self) -> bool {
+        self.paused
     }
 
     /// Toggle note-by-note wait-mode (the `w` key / `Action::ToggleWaitMode`).
@@ -417,10 +462,23 @@ impl PlayScreen {
         } else {
             Color::DarkGray
         };
+        let pause_color = if self.paused {
+            Color::Green
+        } else {
+            Color::DarkGray
+        };
+        // While paused, the transport badge reads PAUSED (yellow) instead of the
+        // running PLAY badge, so the frozen state is unmistakable.
+        let (badge_text, badge_bg) = if self.paused {
+            (" PAUSED ", Color::Yellow)
+        } else {
+            (" PLAY ", TARGET_COLOR)
+        };
         let mut spans = vec![
-            Span::styled(" PLAY ", Style::default().fg(Color::Black).bg(TARGET_COLOR)),
+            Span::styled(badge_text, Style::default().fg(Color::Black).bg(badge_bg)),
             Span::raw(format!("  {:.1}s / {:.1}s  ", secs, total)),
             Span::raw("[r] restart  [Tab] menu  "),
+            Span::styled("[Space] pause  ", Style::default().fg(pause_color)),
             Span::styled("[m] music  ", Style::default().fg(music_color)),
             Span::styled("[w] wait  ", Style::default().fg(wait_color)),
         ];
@@ -907,6 +965,71 @@ mod tests {
             SHIFT,
             "C step is awaited again after restart"
         );
+    }
+
+    // ── manual pause/resume (M12-A, issue #231) ──────────────────────────────
+
+    #[test]
+    fn toggle_pause_freezes_then_resumes_from_the_same_position() {
+        let mut play = two_note_screen();
+        // Advance partway through the lead-in, then pause.
+        play.advance(1_000_000);
+        assert_eq!(play.now_us(), 1_000_000);
+        play.toggle_pause();
+        assert!(play.is_paused());
+        // While paused, wall-time deltas do NOT move the playhead.
+        play.advance(5_000_000);
+        play.advance(5_000_000);
+        assert_eq!(play.now_us(), 1_000_000, "clock frozen while paused");
+        // Resuming continues from exactly where it froze.
+        play.toggle_pause();
+        assert!(!play.is_paused());
+        play.advance(500_000);
+        assert_eq!(play.now_us(), 1_500_000, "resumes from the frozen position");
+    }
+
+    #[test]
+    fn pause_is_independent_of_wait_mode() {
+        // Wait-mode disarmed: pause still freezes the free-running highway.
+        let mut play = two_note_screen();
+        assert!(!play.is_wait_mode());
+        play.toggle_pause();
+        play.advance(SHIFT + 5_000_000);
+        assert_eq!(play.now_us(), 0, "paused clock never advances");
+        play.toggle_pause();
+        play.advance(SHIFT);
+        assert_eq!(play.now_us(), SHIFT);
+    }
+
+    #[test]
+    fn resuming_pause_stays_frozen_when_wait_mode_awaits_a_step() {
+        // Pause on top of an armed, unsatisfied wait step. Un-pausing must NOT
+        // thaw past the step — wait-mode still holds it until the note is held.
+        let mut play = two_note_screen();
+        play.set_wait_mode(true);
+        play.advance(SHIFT); // parked on the C step, nothing held
+        play.toggle_pause();
+        play.advance(5_000_000);
+        assert_eq!(play.now_us(), SHIFT);
+        // Un-pause: still frozen because the C step is unsatisfied.
+        play.toggle_pause();
+        play.advance(5_000_000);
+        assert_eq!(play.now_us(), SHIFT, "wait-mode keeps the clock frozen");
+        // Holding C releases both freezes and the clock advances.
+        note_on(&mut play, 60);
+        play.advance(1_000_000);
+        assert_eq!(play.now_us(), SHIFT + 1_000_000);
+    }
+
+    #[test]
+    fn restart_clears_the_pause() {
+        let mut play = two_note_screen();
+        play.toggle_pause();
+        assert!(play.is_paused());
+        play.restart();
+        assert!(!play.is_paused(), "restart un-pauses");
+        play.advance(1_000_000);
+        assert_eq!(play.now_us(), 1_000_000, "clock runs again after restart");
     }
 
     // ── highway key-note distinction (M11-A, issue #229) ─────────────────────
