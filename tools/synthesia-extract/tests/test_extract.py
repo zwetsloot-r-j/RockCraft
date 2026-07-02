@@ -156,6 +156,27 @@ def test_chords_recovered():
     assert sorted(n.pitch for n in chart.notes) == [60, 64, 67]
 
 
+def test_suppress_semitone_ghost_with_staggered_onset():
+    """A thick bar's white/black twin lags the struck core by a frame or two, so
+    its onset is staggered.  Single-linkage onset grouping must still pair the
+    two adjacent semitones (an earlier note must not start a group that splits
+    the twin off past the tolerance window) so the ghost is dropped."""
+    from synthesia_extract.pipeline import _RawNote, suppress_semitone_ghosts
+
+    col = np.array([200.0, 100.0, 50.0])
+    raws = [
+        # An earlier note whose onset would anchor a group-from-first window.
+        _RawNote(pitch=71, start_us=0, dur_us=100_000, coverage=0.9, color=col),
+        _RawNote(pitch=47, start_us=10_000, dur_us=100_000, coverage=0.89, color=col),
+        # B2's black-key ghost, 11 ms later — 21 ms past pitch 71's onset.
+        _RawNote(pitch=46, start_us=21_000, dur_us=100_000, coverage=0.74, color=col),
+    ]
+    out = suppress_semitone_ghosts(raws, onset_tol_us=15_000)
+    pitches = sorted(r.pitch for r in out)
+    assert 46 not in pitches, "staggered white/black ghost must be dropped"
+    assert pitches == [47, 71]
+
+
 # --------------------------------------------------------------------------- #
 # Glissando / fast-run recovery (sub-threshold diagonal pulses)
 # --------------------------------------------------------------------------- #
@@ -225,6 +246,27 @@ def test_recover_glissando_skips_held_note_ghosts():
     guarded = chain_only(held)
     assert all(r.pitch != 61 for r in guarded)
     assert len(guarded) < 4
+
+
+def test_roll_to_notes_glissando_recovery_is_opt_in():
+    """The pipeline tail must NOT run glissando recovery by default: on pale
+    bars it invents phantom diagonals, so slides are placed by hand instead.
+    The pass still works when a caller explicitly opts in."""
+    from synthesia_extract.pipeline import _roll_to_notes
+
+    pitches, votes, totals, color = _gliss_roll()
+    # A fast sub-threshold diagonal — exactly what recovery targets.
+    for pitch, a in [(60, 10), (62, 22), (64, 34), (66, 46), (68, 58)]:
+        _stamp(votes, color, pitches.index(pitch), a, a + 4, 0.4)
+    scroll = 1e6 / _GLISS_US_PER_PX  # keep us_per_px == _GLISS_US_PER_PX
+
+    off = _roll_to_notes(votes, totals, color, pitches, _GLISS_US_PER_PX, scroll)
+    assert off == [], "recovery must be off by default (no phantom diagonals)"
+
+    on = _roll_to_notes(
+        votes, totals, color, pitches, _GLISS_US_PER_PX, scroll, recover_glissandi=True
+    )
+    assert sorted(n.pitch for n in on) == [60, 62, 64, 66, 68]
 
 
 # --------------------------------------------------------------------------- #

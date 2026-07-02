@@ -1020,13 +1020,21 @@ def suppress_semitone_ghosts(raws: list[_RawNote], onset_tol_us: int) -> list[_R
     score = {id(r): r.coverage + 0.01 * _bar_saturation(r.color) for r in ordered}
     drop: set[int] = set()
 
-    # Walk simultaneous groups (onsets within tolerance of the group's first).
+    # Walk simultaneous groups by *single-linkage* on onset: extend the group
+    # while each next note is within tolerance of its immediate predecessor, not
+    # of the group's first note.  A thick bar lights its flanking lanes a frame
+    # or two apart (the twin's onset lags the core's), and grouping from the first
+    # note lets that lag push the twin past the window into the next group, where
+    # it escapes de-ghosting.  Linking neighbour-to-neighbour keeps a near-
+    # simultaneous white/black pair together so the ghost is always compared with
+    # its core.  Only *consecutive-semitone* runs within a group are collapsed, so
+    # chaining a few extra notes in never touches genuine chord tones (>= a whole
+    # step apart) — it only ever removes adjacent-semitone twins.
     i = 0
     n = len(ordered)
     while i < n:
         j = i + 1
-        group_start = ordered[i].start_us
-        while j < n and ordered[j].start_us - group_start <= onset_tol_us:
+        while j < n and ordered[j].start_us - ordered[j - 1].start_us <= onset_tol_us:
             j += 1
         group = sorted(ordered[i:j], key=lambda r: r.pitch)
         # Split the group into maximal runs of consecutive semitones.
@@ -1324,8 +1332,21 @@ def _roll_to_notes(
     pitches: list[int],
     us_per_px: float,
     scroll: float,
+    *,
+    recover_glissandi: bool = False,
 ) -> list[ExtractedNote]:
-    """Shared tail: threshold the roll into notes, de-ghost, assign hands."""
+    """Shared tail: threshold the roll into notes, de-ghost, assign hands.
+
+    ``recover_glissandi`` is **off by default**.  The diagonal-staircase recovery
+    (:func:`recover_glissando_runs`) was written to rescue fast slides the strict
+    threshold drops, but on translucent/pale bars over busy artwork it also
+    stitches unrelated sub-threshold shimmer into *phantom* glissandi — diagonals
+    that aren't in the performance.  Since those false positives are worse than a
+    missing slide (which the editor's ``insert_run`` action now lays by hand,
+    traced over the aligned movie backdrop), the pass is disabled unless a caller
+    explicitly opts in.  The function and its unit tests are retained so the pass
+    can be re-enabled once colour-coverage voting handles pale bars (issue #148).
+    """
     raws = extract_notes(
         votes,
         totals,
@@ -1342,19 +1363,21 @@ def _roll_to_notes(
     # Thick bars bleed onto flanking lanes, lighting 2-3 adjacent semitones at
     # one onset; drop those glow ghosts (keep the saturated core) before hands.
     raws = suppress_semitone_ghosts(raws, onset_tol_us=int(round(3 * us_per_px)))
-    # Fast scale/glissando taps fall below the strict threshold; recover the ones
-    # that form a diagonal staircase (run after de-ghosting so a recovered tap is
-    # never re-collapsed, and dedup keeps it from doubling a kept note).
-    raws = raws + recover_glissando_runs(
-        votes,
-        totals,
-        color_sum,
-        pitches,
-        us_per_px,
-        raws,
-        min_pulse_px=max(2, int(round(0.012 * scroll))),
-        max_pulse_px=max(8, int(round(0.072 * scroll))),
-    )
+    if recover_glissandi:
+        # Fast scale/glissando taps fall below the strict threshold; recover the
+        # ones that form a diagonal staircase (run after de-ghosting so a
+        # recovered tap is never re-collapsed, and dedup keeps it from doubling a
+        # kept note).  Opt-in only — see the note above.
+        raws = raws + recover_glissando_runs(
+            votes,
+            totals,
+            color_sum,
+            pitches,
+            us_per_px,
+            raws,
+            min_pulse_px=max(2, int(round(0.012 * scroll))),
+            max_pulse_px=max(8, int(round(0.072 * scroll))),
+        )
     raws.sort(key=lambda r: (r.start_us, r.pitch))
     return assign_hands(raws)
 
