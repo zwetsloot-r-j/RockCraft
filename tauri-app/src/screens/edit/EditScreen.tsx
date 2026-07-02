@@ -123,6 +123,14 @@ function saveVideoCal(path: string, c: VideoCal): void {
     /* ignore quota / unavailable storage */
   }
 }
+/** Parent directory of an absolute file path, handling both POSIX (`/`) and
+ * Windows (`\`) separators. The attached-video path is copied into its bundle
+ * next to `alignment.json`, so this recovers the bundle dir when the edit view
+ * is entered without a route dir (a control-socket load). */
+function parentDir(path: string): string | undefined {
+  const i = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+  return i > 0 ? path.slice(0, i) : undefined;
+}
 /** Review-playback speeds (frontend-driven scrub of overlay over the movie). */
 const REVIEW_RATES = [0.1, 0.25, 0.5, 1, 2];
 /** Grid-calibration nudge steps. */
@@ -547,12 +555,19 @@ export function EditScreen(props: Props): JSX.Element {
       .catch(() => {
         /* backend down — leave the indicator hidden */
       });
-    const loadAlign: Promise<AlignmentDto | null> = dir
-      ? alignmentLoad(dir).catch(() => null)
-      : Promise.resolve(null);
-    void loadAlign
-      .then((sidecar) =>
-        editQueryVideo().then((ref) => {
+    // Grid calibration comes from the bundle's `alignment.json`. The route dir
+    // (a GUI load-by-dir) is authoritative; on the socket path there is no route
+    // dir, so derive the bundle dir from the attached video's path — the video
+    // is copied into the bundle next to `alignment.json`, so its parent IS the
+    // bundle. Without this, socket-loaded bundles fell back to localStorage /
+    // defaults and never picked up the sidecar's saved vertical zoom + hit-line.
+    void editQueryVideo()
+      .then((ref) => {
+        const bundleDir = dir ?? (ref ? parentDir(ref.path) : undefined);
+        const loadAlign: Promise<AlignmentDto | null> = bundleDir
+          ? alignmentLoad(bundleDir).catch(() => null)
+          : Promise.resolve(null);
+        return loadAlign.then((sidecar) => {
           if (ref) {
             applyVideoRef(ref.path, ref.offset_us, sidecar);
             return;
@@ -565,8 +580,8 @@ export function EditScreen(props: Props): JSX.Element {
               void editSetVideo(dto.video, dto.offset_us).catch(() => {});
             }
           });
-        }),
-      )
+        });
+      })
       .catch(() => {
         /* backend down — leave the backdrop detached */
       });
