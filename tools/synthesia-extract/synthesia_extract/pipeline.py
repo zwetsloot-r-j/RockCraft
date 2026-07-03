@@ -1318,6 +1318,7 @@ def extract_chart(
         frames, fps, kb, scroll, plate=bg, max_run_w=max_run_w
     )
     notes = _roll_to_notes(votes, totals, color_sum, pitches, us_per_px, scroll)
+    notes = trim_edge_phantoms(notes, int(round(len(frames) / fps * 1e6)))
 
     if debug_dir:
         _write_debug(debug_dir, ref, kb)
@@ -1380,6 +1381,80 @@ def _roll_to_notes(
         )
     raws.sort(key=lambda r: (r.start_us, r.pitch))
     return assign_hands(raws)
+
+
+def trim_edge_phantoms(
+    notes: list[ExtractedNote],
+    video_duration_us: int,
+    *,
+    gap_us: int = 2_000_000,
+    min_cluster: int = 6,
+) -> list[ExtractedNote]:
+    """Gate detections to the window where the keyboard is actually being played.
+
+    Overlay tutorials bracket the performance with a **title card** at the head
+    and an **outro / end card** at the tail.  Those screens are bright, animated
+    graphics (a logo, sparkles, posed characters) over the very same lanes the
+    roll reads, so a handful of phantom notes get voted in before the first real
+    key-press and after the last.
+
+    The obvious fix — detect *hands on the keys* from pixels — does **not** work
+    on this class of source, and that is a measured result, not an assumption:
+
+    * the bars (and the reflected glow) light the hands with a cool/pink cast,
+      so skin-tone detection misses them for whole seconds of real playing;
+    * the pianist's hands are present in almost every frame, so they average
+      *into* the background plate — a frame-minus-plate test cancels them too;
+    * white keys and the warm-balanced keybed mimic skin, and the animated
+      backdrop moves during the title card as well.
+
+    Every cheap per-pixel signal we tried flagged real playing as "idle" for
+    long stretches (hundreds of true notes), which would delete real music — far
+    worse than leaving a stray phantom.  The signal that *does* separate cleanly
+    is **onset structure**: a performance is a dense, continuous stream of note
+    onsets, while the card phantoms are a tiny cluster stranded at the extreme
+    edge, divided from the body by a long silence.  So the robust gate is:
+
+    1. Drop any onset at or past ``video_duration_us`` — the extractor cannot
+       observe a bar beyond the final frame, so those are scroll-extrapolation
+       artifacts (not a card, but the same edge-noise family).
+    2. Split the remaining onsets on silences longer than ``gap_us`` and drop a
+       *leading* or *trailing* segment holding fewer than ``min_cluster`` notes.
+       Only the head and tail are ever trimmed; the dense middle — including
+       genuine multi-second rests between sections, whose flanking segments are
+       large — is never touched.
+
+    Conservative by construction: a real intro is either continuous with the
+    body (no ``gap_us`` split) or itself a substantial phrase (``>= min_cluster``
+    notes), so neither is trimmed.
+    """
+    if not notes:
+        return notes
+
+    if video_duration_us > 0:
+        kept = [n for n in notes if n.start_us < video_duration_us]
+    else:
+        kept = list(notes)
+    if not kept:
+        return kept
+
+    kept.sort(key=lambda n: n.start_us)
+
+    # Segment by silences longer than gap_us.
+    segments: list[list[ExtractedNote]] = [[kept[0]]]
+    for n in kept[1:]:
+        if n.start_us - segments[-1][-1].start_us > gap_us:
+            segments.append([n])
+        else:
+            segments[-1].append(n)
+
+    # Peel small leading / trailing segments (a lone card blip), never the body.
+    while len(segments) > 1 and len(segments[0]) < min_cluster:
+        segments.pop(0)
+    while len(segments) > 1 and len(segments[-1]) < min_cluster:
+        segments.pop()
+
+    return [n for seg in segments for n in seg]
 
 
 def extract_chart_streaming(
@@ -1496,6 +1571,7 @@ def extract_chart_streaming(
 
     us_per_px = 1e6 / scroll
     notes = _roll_to_notes(votes, totals, color_sum, pitches, us_per_px, scroll)
+    notes = trim_edge_phantoms(notes, int(round(n_total / fps * 1e6)))
 
     if debug_dir:
         _write_debug(debug_dir, ref, kb)
