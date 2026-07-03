@@ -7,6 +7,8 @@ venv/
 
 # Extractor debug output (annotated frames) — never commit media.
 debug-out/
+# overlay_check.py output (chart-on-video PNGs) — never commit media.
+overlay-out/
 
 # Safety net: never commit real/extracted media or charts from this tool.
 *.mp4
