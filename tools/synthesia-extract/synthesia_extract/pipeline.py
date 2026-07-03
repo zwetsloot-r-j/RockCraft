@@ -1087,116 +1087,152 @@ def recover_glissando_runs(
     us_per_px: float,
     existing: list[_RawNote],
     *,
-    low: float = 0.28,
-    min_run: int = 4,
-    min_span: int = 4,
-    min_pulse_px: int = 2,
+    low: float = 0.18,
+    min_span: int = 10,
+    slope_tol_px: int = 3,
+    slope_std_max: float = 2.5,
+    min_dur_us: int = 130_000,
     max_pulse_px: int = 14,
-    max_onset_step_us: int = 170_000,
+    uncovered_frac: float = 0.6,
 ) -> list[_RawNote]:
     """Recover fast scale/glissando runs the strict coverage threshold drops.
 
-    A glissando is a staircase of brief taps — each key lit for only a frame or
-    two — so every tap sits below the 0.6 coverage floor *and* under
-    ``min_run_px``, and :func:`extract_notes` discards them all even though the
-    held notes around them pass.  This second pass looks *only* for that diagonal
-    signature: a chain of ``min_run`` or more sub-threshold pulses stepping one
-    or two semitones per tap with a monotonically advancing onset and spanning at
-    least ``min_span`` semitones overall.  Two guards keep it from re-inventing
-    what the strict and de-ghost passes deliberately removed: a pulse bleeding off
-    an *adjacent held note* (the glow ghost ``suppress_semitone_ghosts`` drops) is
-    rejected, and a chain too narrow in pitch (a tight ghost cluster, not a sweep)
-    is rejected.  So the strict global threshold — and the clean note count it
-    buys — is left untouched everywhere else.  ``existing`` are the notes the
-    strict pass already kept; pulses overlapping one (same pitch) are duplicates.
+    A glissando is a hand-sweep: a staircase of brief taps, each key lit for only
+    a frame or two, so every tap sits below the 0.6 coverage floor and
+    :func:`extract_notes` drops the whole sweep even though the held notes around
+    it pass.  Its one unmistakable signature is *long diagonal coherence* — a
+    chain of faint pulses stepping one semitone per tap with a steady onset slope,
+    spanning ``min_span`` or more semitones.  Random sub-threshold shimmer never
+    lines up that way, which is what let earlier, looser recovery invent phantom
+    diagonals; the precise gate here keeps it honest:
+
+    * **long** — at least ``min_span`` consecutive taps (a real slide sweeps a
+      wide range; a glow-ghost cluster spans only a semitone or two);
+    * **straight** — onset-step std under ``slope_std_max`` bins (one steady
+      sweep speed, not a coincidental zig-zag through a dense chord);
+    * **missed** — at least ``uncovered_frac`` of the taps land where the chart
+      has *no* note yet (recovery adds what was dropped; it never re-traces a
+      note the strict pass already kept);
+    * **real-time** — the sweep lasts at least ``min_dur_us`` (a genuine slide
+      crosses several video frames; a near-instant cluster is a false onset).
+
+    ``existing`` are the notes the strict + de-ghost passes already kept.
     """
-    pidx = {p: i for i, p in enumerate(pitches)}
-    taken: dict[int, list[tuple[int, int]]] = {}
+    n_p = len(pitches)
+
+    # (pitch, bin) already covered — a real gliss is what the chart *missed*.
+    occupied: set[tuple[int, int]] = set()
     for r in existing:
         a = int(round(r.start_us / us_per_px))
         b = int(round((r.start_us + r.dur_us) / us_per_px))
-        taken.setdefault(r.pitch, []).append((a, b))
+        for bin_ in range(a, b + 1):
+            occupied.add((r.pitch, bin_))
 
-    def bleeds_off_neighbour(pitch: int, a: int, b: int) -> bool:
-        """True if a kept *held* note one semitone away sounds over this pulse —
-        i.e. the pulse is that bar's glow, not a struck key."""
-        plen = max(1, b - a)
-        for q in (pitch - 1, pitch + 1):
-            for sa, sb in taken.get(q, ()):
-                overlap = min(b, sb) - max(a, sa)
-                if overlap >= 0.5 * plen and (sb - sa) >= 2 * plen:
-                    return True
-        return False
-
-    # Collect short, sub-threshold pulses — the candidate taps.
-    pulses: list[tuple[int, int, int, int]] = []  # (onset_bin, pitch, a, b)
-    for pi, pitch in enumerate(pitches):
+    # Brief sub-threshold pulses per lane: (peak_bin, a, b).
+    lanes: list[list[tuple[int, int, int]]] = []
+    for pi in range(n_p):
         tot = totals[pi] if totals.ndim == 2 else totals
         cov = votes[pi] / np.maximum(tot, 1e-6)
-        band = (cov >= low) & (tot > 0)
-        for a, b in _find_runs(band):
-            if not (min_pulse_px <= b - a <= max_pulse_px):
+        band = (cov > low) & (tot > 0)
+        pulses = [
+            (a + int(np.argmax(cov[a:b])), a, b)
+            for a, b in _find_runs(band)
+            if b - a <= max_pulse_px
+        ]
+        lanes.append(sorted(pulses))
+    peaks = [[p[0] for p in lane] for lane in lanes]
+
+    def nearest(pi: int, t_exp: int, tol: int):
+        best = None
+        for t in peaks[pi]:
+            if abs(t - t_exp) <= tol and (best is None or abs(t - t_exp) < abs(best - t_exp)):
+                best = t
+        return best
+
+    def grow(pi0: int, peak0: int, step_dir: int) -> list[tuple[int, int]]:
+        """Extend a diagonal from (lane pi0, onset peak0) one lane at a time,
+        locking the onset slope after the first step and tolerating one gap."""
+        chain = [(pi0, peak0)]
+        slope = None
+        last = peak0
+        pi = pi0 + step_dir
+        missed = 0
+        while 0 <= pi < n_p:
+            if slope is None:
+                found = None
+                for t in peaks[pi]:
+                    adv = t - last
+                    if 1 <= adv <= 9 and (found is None or adv < found - last):
+                        found = t
+            else:
+                found = nearest(pi, last + slope, slope_tol_px)
+            if found is None:
+                missed += 1
+                if missed > 1:
+                    break
+                pi += step_dir
                 continue
-            if any(a < eb and sb < b for sb, eb in taken.get(pitch, ())):
-                continue  # already part of a kept note
-            if bleeds_off_neighbour(pitch, a, b):
-                continue  # glow ghost of an adjacent held note
-            pulses.append((a, pitch, a, b))
+            if slope is None:
+                slope = found - last
+            chain.append((pi, found))
+            last = found
+            missed = 0
+            pi += step_dir
+        return chain
 
-    if len(pulses) < min_run:
-        return []
-
-    pulses.sort()
-    n = len(pulses)
-    max_step = max(1, int(round(max_onset_step_us / us_per_px)))
-
-    # Longest monotonic diagonal ending at each pulse, in each direction; keep a
-    # chain only if it is long enough AND sweeps a wide enough pitch range.
-    accepted: set[int] = set()
-    for direction in (1, -1):
-        best = [1] * n
-        prev = [-1] * n
-        for j in range(n):
-            aj, pj = pulses[j][0], pulses[j][1]
-            for i in range(j):
-                d_on = aj - pulses[i][0]
-                if d_on <= 0 or d_on > max_step:
+    chains: list[list[tuple[int, int]]] = []
+    for step_dir in (1, -1):
+        for pi0 in range(n_p):
+            for peak0 in peaks[pi0]:
+                chain = grow(pi0, peak0, step_dir)
+                if len(chain) < min_span:
                     continue
-                if (pj - pulses[i][1]) * direction in (1, 2) and best[i] + 1 > best[j]:
-                    best[j] = best[i] + 1
-                    prev[j] = i
-        for j in sorted(range(n), key=lambda x: best[x], reverse=True):
-            if best[j] < min_run:
-                break
-            chain = []
-            k = j
-            while k != -1:
-                chain.append(k)
-                k = prev[k]
-            ps = [pulses[c][1] for c in chain]
-            if max(ps) - min(ps) >= min_span:
-                accepted.update(chain)
+                if float(np.diff([t for _, t in chain]).std()) > slope_std_max:
+                    continue
+                uncovered = sum(
+                    (pitches[pi], t) not in occupied for pi, t in chain
+                ) / len(chain)
+                if uncovered < uncovered_frac:
+                    continue
+                onsets = [t for _, t in chain]
+                if (max(onsets) - min(onsets)) * us_per_px < min_dur_us:
+                    continue
+                chains.append(chain)
 
-    out: list[_RawNote] = []
-    for idx in sorted(accepted):
-        _on, pitch, a, b = pulses[idx]
-        pi = pidx[pitch]
-        seg_votes = votes[pi, a:b]
-        total_votes = float(seg_votes.sum())
-        if total_votes <= 0:
+    # One sweep is found from many start pulses; keep the longest per time span.
+    chains.sort(key=len, reverse=True)
+    kept: list[list[tuple[int, int]]] = []
+    for chain in chains:
+        onsets = [t for _, t in chain]
+        lo, hi = min(onsets), max(onsets)
+        if any(
+            not (hi < min(t for _, t in k) - 30 or lo > max(t for _, t in k) + 30)
+            for k in kept
+        ):
             continue
-        tot = totals[pi] if totals.ndim == 2 else totals
-        color = color_sum[pi, a:b].sum(axis=0) / total_votes
-        cov = float(np.clip((votes[pi, a:b] / np.maximum(tot[a:b], 1e-6)).mean(), 0.0, 1.0))
-        out.append(
-            _RawNote(
-                pitch=pitch,
-                start_us=int(round(a * us_per_px)),
-                dur_us=int(round((b - a) * us_per_px)),
-                coverage=cov,
-                color=color,
+        kept.append(chain)
+
+    # Map each accepted tap back to its pulse extent -> a note.
+    peak_to_pulse = [{pk: (pk, a, b) for pk, a, b in lane} for lane in lanes]
+    out: list[_RawNote] = []
+    for chain in kept:
+        for pi, peak in chain:
+            _pk, a, b = peak_to_pulse[pi][peak]
+            total_votes = float(votes[pi, a:b].sum())
+            if total_votes <= 0:
+                continue
+            tot = totals[pi] if totals.ndim == 2 else totals
+            color = color_sum[pi, a:b].sum(axis=0) / total_votes
+            cov = float(np.clip((votes[pi, a:b] / np.maximum(tot[a:b], 1e-6)).mean(), 0.0, 1.0))
+            out.append(
+                _RawNote(
+                    pitch=pitches[pi],
+                    start_us=int(round(a * us_per_px)),
+                    dur_us=int(round((b - a) * us_per_px)),
+                    coverage=cov,
+                    color=color,
+                )
             )
-        )
     return out
 
 
@@ -1352,19 +1388,17 @@ def _roll_to_notes(
     us_per_px: float,
     scroll: float,
     *,
-    recover_glissandi: bool = False,
+    recover_glissandi: bool = True,
 ) -> list[ExtractedNote]:
-    """Shared tail: threshold the roll into notes, de-ghost, assign hands.
+    """Shared tail: threshold the roll into notes, de-ghost, recover glissandi,
+    assign hands.
 
-    ``recover_glissandi`` is **off by default**.  The diagonal-staircase recovery
-    (:func:`recover_glissando_runs`) was written to rescue fast slides the strict
-    threshold drops, but on translucent/pale bars over busy artwork it also
-    stitches unrelated sub-threshold shimmer into *phantom* glissandi — diagonals
-    that aren't in the performance.  Since those false positives are worse than a
-    missing slide (which the editor's ``insert_run`` action now lays by hand,
-    traced over the aligned movie backdrop), the pass is disabled unless a caller
-    explicitly opts in.  The function and its unit tests are retained so the pass
-    can be re-enabled once colour-coverage voting handles pale bars (issue #148).
+    ``recover_glissandi`` is **on by default**.  An earlier, looser version of
+    :func:`recover_glissando_runs` was disabled because on pale bars over busy
+    artwork it stitched unrelated sub-threshold shimmer into *phantom* diagonals.
+    The pass now keys on strict long-diagonal coherence (a wide, straight sweep
+    the chart actually missed, lasting several frames), which no random shimmer
+    produces — precise enough to run unconditionally.  Pass ``False`` to skip it.
     """
     raws = extract_notes(
         votes,
@@ -1388,10 +1422,10 @@ def _roll_to_notes(
     # one onset; drop those glow ghosts (keep the saturated core) before hands.
     raws = suppress_semitone_ghosts(raws, onset_tol_us=int(round(3 * us_per_px)))
     if recover_glissandi:
-        # Fast scale/glissando taps fall below the strict threshold; recover the
-        # ones that form a diagonal staircase (run after de-ghosting so a
-        # recovered tap is never re-collapsed, and dedup keeps it from doubling a
-        # kept note).  Opt-in only — see the note above.
+        # Fast glissando taps fall below the strict threshold; recover whole
+        # sweeps by their long diagonal coherence.  Run after de-ghosting (so a
+        # recovered tap is never re-collapsed) and pass the kept notes as
+        # ``existing`` so a sweep is only laid where the chart actually missed it.
         raws = raws + recover_glissando_runs(
             votes,
             totals,
@@ -1399,7 +1433,6 @@ def _roll_to_notes(
             pitches,
             us_per_px,
             raws,
-            min_pulse_px=max(2, int(round(0.012 * scroll))),
             max_pulse_px=max(8, int(round(0.072 * scroll))),
         )
     raws.sort(key=lambda r: (r.start_us, r.pitch))

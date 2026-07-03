@@ -198,16 +198,31 @@ def _stamp(votes, color, pidx, a, b, cov):
     color[pidx, a:b] = (0, 200, 0)
 
 
-def test_recover_glissando_recovers_diagonal_run():
+def _stamp_sweep(votes, color, pitches, base, count, step, *, cov=0.4, run=3):
+    """Stamp a diagonal of ``count`` sub-threshold taps, one semitone apart,
+    onset advancing ``step`` bins each — a synthetic glissando."""
+    for k in range(count):
+        a = 10 + k * step
+        _stamp(votes, color, pitches.index(base + k), a, a + run, cov)
+
+
+def test_recover_glissando_recovers_long_sweep():
     from synthesia_extract.pipeline import recover_glissando_runs
 
     pitches, votes, totals, color = _gliss_roll()
-    # Five sub-threshold taps stepping a whole tone each, onset advancing.
-    run = [(60, 10), (62, 22), (64, 34), (66, 46), (68, 58)]
-    for pitch, a in run:
-        _stamp(votes, color, pitches.index(pitch), a, a + 4, 0.4)
+    _stamp_sweep(votes, color, pitches, 48, 12, 3)  # wide, straight, > min_dur
     out = recover_glissando_runs(votes, totals, color, pitches, _GLISS_US_PER_PX, [])
-    assert sorted(r.pitch for r in out) == [60, 62, 64, 66, 68]
+    assert sorted(r.pitch for r in out) == list(range(48, 60))
+
+
+def test_recover_glissando_ignores_short_run():
+    """A 5-tap diagonal is below ``min_span`` — the guard that stopped the old
+    pass from inventing phantom diagonals out of tight ghost clusters."""
+    from synthesia_extract.pipeline import recover_glissando_runs
+
+    pitches, votes, totals, color = _gliss_roll()
+    _stamp_sweep(votes, color, pitches, 48, 5, 3)
+    assert recover_glissando_runs(votes, totals, color, pitches, _GLISS_US_PER_PX, []) == []
 
 
 def test_recover_glissando_ignores_scatter():
@@ -215,58 +230,53 @@ def test_recover_glissando_ignores_scatter():
 
     pitches, votes, totals, color = _gliss_roll()
     # Weak blobs that never form a stepping, time-advancing diagonal.
-    for pitch, a in [(60, 10), (67, 12), (71, 40), (63, 80), (58, 15)]:
-        _stamp(votes, color, pitches.index(pitch), a, a + 4, 0.4)
-    out = recover_glissando_runs(votes, totals, color, pitches, _GLISS_US_PER_PX, [])
-    assert out == []
+    for pitch, a in [(60, 10), (67, 12), (71, 40), (63, 80), (58, 15), (69, 55), (50, 30)]:
+        _stamp(votes, color, pitches.index(pitch), a, a + 3, 0.4)
+    assert recover_glissando_runs(votes, totals, color, pitches, _GLISS_US_PER_PX, []) == []
 
 
-def test_recover_glissando_skips_held_note_ghosts():
-    """A held note's sub-threshold glow on the adjacent lane must not be
-    resurrected as a run (that is what de-ghosting removed)."""
+def test_recover_glissando_skips_what_chart_already_has():
+    """A long diagonal already covered by kept notes is not a *missing* sweep;
+    the uncovered guard stops recovery re-tracing the strict pass's own notes."""
     from synthesia_extract.pipeline import _RawNote, recover_glissando_runs
 
-    def chain_only(existing):
-        pitches, votes, totals, color = _gliss_roll()
-        for k, pitch in enumerate([61, 62, 63, 64]):
-            a = 10 + k * 12
-            _stamp(votes, color, pitches.index(pitch), a, a + 4, 0.4)
-        return recover_glissando_runs(
-            votes, totals, color, pitches, _GLISS_US_PER_PX, existing, min_span=2
-        )
-
-    # No held note next to the run -> the diagonal is recovered.
-    free = chain_only([])
-    assert sorted(r.pitch for r in free) == [61, 62, 63, 64]
-
-    # A long held note at pitch 60 makes 61 its glow ghost; dropping it breaks
-    # the chain below min_run, so nothing is recovered.
-    held = [_RawNote(pitch=60, start_us=0, dur_us=120 * int(_GLISS_US_PER_PX),
-                     coverage=0.9, color=np.array([0.0, 200.0, 0.0]))]
-    guarded = chain_only(held)
-    assert all(r.pitch != 61 for r in guarded)
-    assert len(guarded) < 4
+    pitches, votes, totals, color = _gliss_roll()
+    _stamp_sweep(votes, color, pitches, 48, 12, 3)
+    existing = [
+        _RawNote(pitch=48 + k, start_us=int((10 + k * 3) * _GLISS_US_PER_PX),
+                 dur_us=int(3 * _GLISS_US_PER_PX), coverage=0.9,
+                 color=np.array([0.0, 200.0, 0.0]))
+        for k in range(12)
+    ]
+    assert recover_glissando_runs(votes, totals, color, pitches, _GLISS_US_PER_PX, existing) == []
 
 
-def test_roll_to_notes_glissando_recovery_is_opt_in():
-    """The pipeline tail must NOT run glissando recovery by default: on pale
-    bars it invents phantom diagonals, so slides are placed by hand instead.
-    The pass still works when a caller explicitly opts in."""
+def test_recover_glissando_ignores_near_instant_cluster():
+    """Twelve lanes firing almost together (< min_dur) is a false onset burst,
+    not a real slide that crosses several video frames."""
+    from synthesia_extract.pipeline import recover_glissando_runs
+
+    pitches, votes, totals, color = _gliss_roll()
+    _stamp_sweep(votes, color, pitches, 48, 12, 1, run=2)  # onset step 1 bin -> ~55 ms
+    assert recover_glissando_runs(votes, totals, color, pitches, _GLISS_US_PER_PX, []) == []
+
+
+def test_roll_to_notes_recovers_glissando_by_default():
+    """Recovery is on by default now; a clear sweep is laid, and it can still
+    be switched off."""
     from synthesia_extract.pipeline import _roll_to_notes
 
     pitches, votes, totals, color = _gliss_roll()
-    # A fast sub-threshold diagonal — exactly what recovery targets.
-    for pitch, a in [(60, 10), (62, 22), (64, 34), (66, 46), (68, 58)]:
-        _stamp(votes, color, pitches.index(pitch), a, a + 4, 0.4)
+    _stamp_sweep(votes, color, pitches, 48, 12, 3)
     scroll = 1e6 / _GLISS_US_PER_PX  # keep us_per_px == _GLISS_US_PER_PX
 
-    off = _roll_to_notes(votes, totals, color, pitches, _GLISS_US_PER_PX, scroll)
-    assert off == [], "recovery must be off by default (no phantom diagonals)"
+    on = _roll_to_notes(votes, totals, color, pitches, _GLISS_US_PER_PX, scroll)
+    assert sorted(n.pitch for n in on) == list(range(48, 60))
 
-    on = _roll_to_notes(
-        votes, totals, color, pitches, _GLISS_US_PER_PX, scroll, recover_glissandi=True
+    off = _roll_to_notes(
+        votes, totals, color, pitches, _GLISS_US_PER_PX, scroll, recover_glissandi=False
     )
-    assert sorted(n.pitch for n in on) == [60, 62, 64, 66, 68]
+    assert off == []
 
 
 # --------------------------------------------------------------------------- #
