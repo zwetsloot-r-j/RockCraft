@@ -388,3 +388,60 @@ def test_cli_frames_dir(tmp_path):
     assert result.returncode == 0, result.stderr
     data = json.loads(out.read_text())
     assert sorted(n["pitch"] for n in data["notes"]) == sorted(n.pitch for n in notes)
+
+
+def _note(pitch: int, start_us: int, dur_us: int = 120_000) -> "schema.ExtractedNote":
+    return schema.ExtractedNote(pitch=pitch, start_us=start_us, dur_us=dur_us)
+
+
+def _dense(start_us: int, count: int, step_us: int = 200_000) -> list:
+    """A continuous run of ``count`` onsets — stands in for real playing."""
+    return [_note(60 + (i % 12), start_us + i * step_us) for i in range(count)]
+
+
+def test_trim_edge_phantoms_drops_intro_card_and_beyond_video():
+    from synthesia_extract.pipeline import trim_edge_phantoms
+
+    duration_us = 60_000_000  # 60 s clip
+    intro = [_note(77, 160_000), _note(74, 190_000), _note(64, 540_000)]  # title card
+    body = _dense(5_000_000, 40)  # real performance, continuous
+    beyond = [_note(55, 61_000_000), _note(57, 61_000_000)]  # past final frame
+    notes = intro + body + beyond
+
+    kept = trim_edge_phantoms(notes, duration_us)
+    kept_keys = {(n.pitch, n.start_us) for n in kept}
+
+    # Both edge clusters gone, the whole body retained.
+    assert all((n.pitch, n.start_us) not in kept_keys for n in intro + beyond)
+    assert all((n.pitch, n.start_us) in kept_keys for n in body)
+    assert len(kept) == len(body)
+
+
+def test_trim_edge_phantoms_keeps_continuous_intro():
+    """An intro that flows straight into the body (no long silence) is music."""
+    from synthesia_extract.pipeline import trim_edge_phantoms
+
+    # Three onsets then immediately the body, no gap > gap_us anywhere.
+    notes = [_note(60, 0), _note(62, 200_000), _note(64, 400_000)] + _dense(600_000, 40)
+    kept = trim_edge_phantoms(notes, 60_000_000)
+    assert len(kept) == len(notes)
+
+
+def test_trim_edge_phantoms_keeps_substantial_leading_phrase():
+    """A real intro phrase (>= min_cluster) behind a gap is not a card blip."""
+    from synthesia_extract.pipeline import trim_edge_phantoms
+
+    phrase = _dense(100_000, 8)  # 8 notes — a genuine pickup phrase
+    body = _dense(10_000_000, 40)  # separated by a long rest
+    kept = trim_edge_phantoms(phrase + body, 60_000_000)
+    assert len(kept) == len(phrase) + len(body)
+
+
+def test_trim_edge_phantoms_never_deletes_the_only_segment():
+    from synthesia_extract.pipeline import trim_edge_phantoms
+
+    # A short lonely clip (< min_cluster, single segment) must survive intact —
+    # there is no "body" to prefer it against.
+    notes = [_note(60, 0), _note(62, 200_000)]
+    kept = trim_edge_phantoms(notes, 60_000_000)
+    assert len(kept) == 2
