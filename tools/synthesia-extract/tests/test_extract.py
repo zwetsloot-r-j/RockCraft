@@ -445,3 +445,45 @@ def test_trim_edge_phantoms_never_deletes_the_only_segment():
     notes = [_note(60, 0), _note(62, 200_000)]
     kept = trim_edge_phantoms(notes, 60_000_000)
     assert len(kept) == 2
+
+
+def test_extract_notes_hysteresis_keeps_pale_note_whole():
+    """A pale bar dips below the strict cut mid-note; hysteresis holds it as one
+    note instead of fragmenting it into two (which min_run then culls)."""
+    from synthesia_extract.pipeline import extract_notes
+
+    pitches, votes, totals, color = _gliss_roll()
+    pi = pitches.index(60)
+    _stamp(votes, color, pi, 10, 14, 0.7)   # seed above threshold
+    _stamp(votes, color, pi, 14, 30, 0.45)  # pale middle: < 0.6 but > 0.4
+    _stamp(votes, color, pi, 30, 34, 0.7)   # seed above threshold
+
+    strict = extract_notes(
+        votes, totals, color, pitches, _GLISS_US_PER_PX,
+        threshold=0.6, min_run_px=2, bridge_px=0,
+    )
+    assert len([r for r in strict if r.pitch == 60]) == 2
+
+    hyst = extract_notes(
+        votes, totals, color, pitches, _GLISS_US_PER_PX,
+        threshold=0.6, sustain_threshold=0.4, min_run_px=2, bridge_px=0,
+    )
+    kept = [r for r in hyst if r.pitch == 60]
+    assert len(kept) == 1
+    assert kept[0].start_us == 10 * int(_GLISS_US_PER_PX)
+    assert kept[0].dur_us == 24 * int(_GLISS_US_PER_PX)  # spans bins 10..34
+
+
+def test_extract_notes_hysteresis_invents_no_onset():
+    """Sub-threshold shimmer never seeded above ``threshold`` yields no note —
+    hysteresis only *extends* real onsets, it does not create them."""
+    from synthesia_extract.pipeline import extract_notes
+
+    pitches, votes, totals, color = _gliss_roll()
+    _stamp(votes, color, pitches.index(60), 10, 40, 0.45)  # wholly < 0.6
+
+    got = extract_notes(
+        votes, totals, color, pitches, _GLISS_US_PER_PX,
+        threshold=0.6, sustain_threshold=0.4, min_run_px=2, bridge_px=0,
+    )
+    assert all(r.pitch != 60 for r in got)

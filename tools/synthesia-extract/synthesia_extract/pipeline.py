@@ -923,6 +923,7 @@ def extract_notes(
     us_per_px: float,
     *,
     threshold: float = 0.5,
+    sustain_threshold: Optional[float] = None,
     min_run_px: int = 3,
     bridge_px: int = 0,
 ) -> list[_RawNote]:
@@ -930,6 +931,16 @@ def extract_notes(
 
     ``totals`` may be global (1-D, one value per bin) or per-lane (2-D,
     ``[pitch_index, bin]``, from the dead-zone-aware roll).
+
+    ``sustain_threshold`` (when set below ``threshold``) turns the single cut
+    into a **hysteresis** gate: a run must still be *seeded* by coverage above
+    ``threshold`` — so no onset is invented from weak shimmer — but once seeded
+    it extends through neighbouring bins down to ``sustain_threshold``.  Pale /
+    translucent bars over busy artwork dip below the strict cut along their
+    length (issue #148), so a single threshold truncates the note's tail or
+    fragments it into sub-``min_run_px`` scraps that then vanish; the weaker
+    sustain level keeps the note whole.  Right-hand bars are the palest, so this
+    is where the missing/too-short notes concentrate.
 
     ``bridge_px`` closes coverage gaps up to that many bins: an occluder the
     dead-zone/text-band maps don't fully cover (a logo edge, an animated sprite
@@ -942,6 +953,13 @@ def extract_notes(
         tot = totals[pi] if totals.ndim == 2 else totals
         coverage = votes[pi] / np.maximum(tot, 1e-6)
         on = (coverage > threshold) & (tot > 0)
+        if sustain_threshold is not None and sustain_threshold < threshold:
+            warm = (coverage > sustain_threshold) & (tot > 0)
+            extended = np.zeros_like(on)
+            for a, b in _find_runs(warm):
+                if on[a:b].any():  # only grow runs already seeded above threshold
+                    extended[a:b] = True
+            on = extended
         if bridge_px > 0:
             on = _bridge_gaps(on, bridge_px)
         for a, b in _find_runs(on):
@@ -1355,6 +1373,11 @@ def _roll_to_notes(
         pitches,
         us_per_px,
         threshold=0.6,
+        # Hysteresis floor: a note is *seeded* at 0.6 but held down to 0.4 so a
+        # pale bar's dips don't truncate its tail or fragment it away (issue
+        # #148). Recovers missing/too-short right-hand notes; no new onset is
+        # invented below 0.6.
+        sustain_threshold=0.4,
         # 40 ms is shorter than any playable tutorial note; scales with scroll.
         min_run_px=max(3, int(round(0.04 * scroll))),
         # Re-join held notes split by a transient occluder; ~80 ms, comfortably
