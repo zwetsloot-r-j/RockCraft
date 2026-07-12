@@ -145,6 +145,22 @@ const SCRUB_STEP_US = 500_000;
 const SCRUB_STEP_COARSE_US = 5_000_000;
 /** Coarse movie-only offset step for [ / ] (find the first note quickly). */
 const OFFSET_COARSE_S_US = 1_000_000;
+/** Forward playhead delta beyond which the phase-locked clock snaps ahead (a
+ * seek forward, or the frontend having fallen far behind). Snapping *forward* is
+ * acceptable. */
+const SEEK_FWD_US = 400_000;
+/** Backward delta beyond which the clock snaps back — reserved for a *genuine*
+ * discontinuity (loop-wrap, play-from-start, deliberate scrub). Ordinary drift
+ * (the frontend clock outrunning the backend) never reaches this: the rate servo
+ * brakes it smoothly first, so the rendered playhead never jumps backward. Kept
+ * well above the worst-case drift so only real seeks trip it. */
+const SEEK_BACK_US = 2_000_000;
+/** Rate-servo clamp. Wide enough that the clock can reach the true frontend↔
+ * backend rate ratio and *lock* (WebView's performance.now() need not tick at
+ * the backend's rate), instead of saturating at the floor and sliding into a
+ * backward snap. Floor stays positive so the rendered playhead is monotonic. */
+const CLOCK_RATE_MIN = 0.4;
+const CLOCK_RATE_MAX = 1.6;
 
 // ── Overlay state ─────────────────────────────────────────────────────────
 
@@ -276,13 +292,22 @@ export function EditScreen(props: Props): JSX.Element {
   const [saveFlash, setSaveFlash] = createSignal<string | null>(null);
   let flashTimeout = 0;
 
-  // Wall-clock anchor for playhead interpolation.
+  // Phase-locked playhead clock. The frontend runs its own smooth wall-clock
+  // (basePlayheadUs at baseWallMs, advancing at `clockRate`×) and *servos* that
+  // rate toward the backend playhead each snapshot rather than snapping its
+  // position — so the rendered playhead is strictly monotonic (no backward
+  // shake) yet can't drift unbounded from the transport. Only a real seek /
+  // loop-wrap (delta beyond SEEK_FWD_US / SEEK_BACK_US) snaps the position.
   let basePlayheadUs = 0;
   let baseWallMs = 0;
+  let clockRate = 1;
+  // Wall-clock of the last backdrop seek, to throttle seeking during playback
+  // (see driveVideo). Reset to 0 when paused so the next scrub seeks immediately.
+  let lastVideoSeekMs = 0;
 
   function interpolatedPlayheadUs(s: ComposerSnapshot): number {
     if (!s.playing) return s.playhead_us;
-    const elapsedUs = (performance.now() - baseWallMs) * 1000;
+    const elapsedUs = (performance.now() - baseWallMs) * 1000 * clockRate;
     return basePlayheadUs + elapsedUs;
   }
 
@@ -343,6 +368,46 @@ export function EditScreen(props: Props): JSX.Element {
     v.currentTime = Math.min(Math.max(t, 0), dur);
   }
 
+  /**
+   * Drive the backdrop during normal playback. Seeking (`syncVideo`) is right
+   * for a paused editor — a cursor move or scrub jumps the frame exactly — but
+   * WebView2 cannot decode-and-repaint a `currentTime` set 30-60×/second, so
+   * seeking every RAF frame while playing blacks the element out (the "movie
+   * drops during playback" bug). Instead we *play* the clip natively: seed it at
+   * the right offset once, then let it run at 1× — the song clock also runs at
+   * 1×, so they stay locked — re-seeking only when drift exceeds ~200 ms (e.g.
+   * after a mid-play offset nudge). Paused, we pause the element and seek.
+   */
+  function driveVideo(s: ComposerSnapshot): void {
+    const v = videoEl;
+    if (!v || videoPath() === null) return;
+    const dur = v.duration;
+    if (!Number.isFinite(dur) || dur <= 0) return;
+    const want = Math.min(Math.max((anchorUsOf(s) + offsetUs()) / 1e6, 0), dur);
+    if (!s.playing) {
+      if (!v.paused) v.pause();
+      lastVideoSeekMs = 0;
+      v.currentTime = want; // paused: seek exactly (scrub / cursor move)
+      return;
+    }
+    // Prefer native playback: if the webview honours a muted play(), the element
+    // decodes smoothly on its own clock (song clock also runs at 1×) and we only
+    // correct drift. If muted-autoplay is blocked — common in WebView2 — v stays
+    // paused; then fall back to a *throttled* seek (~12 fps). Setting currentTime
+    // every RAF frame (60 fps) blacks the element out because the decoder can't
+    // repaint that fast; at ~12 fps it keeps up (choppy but visible).
+    if (v.paused) void v.play().catch(() => {});
+    if (v.paused) {
+      const now = performance.now();
+      if (now - lastVideoSeekMs >= 80) {
+        lastVideoSeekMs = now;
+        v.currentTime = want;
+      }
+    } else if (Math.abs(v.currentTime - want) > 0.25) {
+      v.currentTime = want; // drift-correct native playback
+    }
+  }
+
   function render(): void {
     const s = store.snap;
     if (!engine || !s) return;
@@ -367,15 +432,59 @@ export function EditScreen(props: Props): JSX.Element {
     }
     const playhead = interpolatedPlayheadUs(s);
     engine.draw(s, playhead);
-    syncVideo(anchorUsOf(s));
+    driveVideo(s);
   }
 
   function applySnapshot(s: ComposerSnapshot): void {
-    basePlayheadUs = s.playhead_us;
-    baseWallMs = performance.now();
+    const now = performance.now();
+    const wasPlaying = store.snap?.playing ?? false;
+    if (s.playing && wasPlaying) {
+      // Continuing playback: the backend playhead is ground truth, but its
+      // snapshots arrive with jittery IPC/tick latency (~125 Hz, irregular).
+      // Hard-snapping the frontend clock to each one made the highway shake and
+      // jump *backward* whenever a snapshot landed behind our extrapolation.
+      // Instead, phase-lock: re-anchor the base to the value we're *currently*
+      // displaying (continuous — zero visible step) and nudge the clock RATE to
+      // close the error over ~1 s. The rate stays clamped near 1× and strictly
+      // positive, so the rendered playhead only ever moves forward — smooth, no
+      // backward jitter — while still converging on the transport.
+      const predicted = basePlayheadUs + (now - baseWallMs) * 1000 * clockRate;
+      const error = s.playhead_us - predicted; // +: backend ahead of our clock
+      if (error > SEEK_FWD_US || error < -SEEK_BACK_US) {
+        // Genuine discontinuity — a forward seek / large fall-behind (positive)
+        // or a loop-wrap / deliberate backward seek (very negative). Snapping is
+        // correct here; reset the rate.
+        basePlayheadUs = s.playhead_us;
+        baseWallMs = now;
+        clockRate = 1;
+      } else {
+        // Ordinary drift: NEVER snap. Re-anchor to the value we're currently
+        // displaying (continuous — zero step) and servo the *rate* to converge.
+        // A negative error (frontend ahead) brakes the rate below 1×; the clock
+        // still advances (floor > 0), so it's smooth and strictly monotonic —
+        // no backward jump. The wide clamp lets it actually reach the backend's
+        // effective rate and lock instead of saturating.
+        basePlayheadUs = predicted;
+        baseWallMs = now;
+        clockRate = Math.max(
+          CLOCK_RATE_MIN,
+          Math.min(CLOCK_RATE_MAX, 1 + error / 1_000_000),
+        );
+      }
+    } else {
+      // Play just started, or paused/idle: take the backend value directly.
+      basePlayheadUs = s.playhead_us;
+      baseWallMs = now;
+      clockRate = 1;
+    }
     setStore("snap", s);
     setRev((r) => r + 1);
-    render();
+    // During playback the RAF loop already redraws every animation frame with a
+    // smoothly interpolated playhead. Rendering *again* here on each snapshot
+    // (~125 Hz, irregular) interleaves extra off-cadence repaints with the RAF
+    // frames — visible as stutter. So only draw here when *not* playing (edits,
+    // cursor moves, scrubs need an immediate repaint).
+    if (!s.playing) render();
   }
 
   // ── Grid calibration + review playback (M-align) ────────────────────────
