@@ -28,7 +28,7 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use rockcraft_audio::{play_file_at, AudioOut, BackingHandle, SynthHandle};
+use rockcraft_audio::{AudioOut, BackingHandle, SynthHandle};
 use rockcraft_core::Effect;
 use serde::Serialize;
 
@@ -113,8 +113,9 @@ impl AudioState {
             };
             let synth = out.synth();
             let _ = synth_tx.send(Some(synth));
-            // `out` stays alive here, keeping the device stream open.
-            let _out = out;
+            // `out` stays alive for the whole loop, keeping the device stream
+            // open — and the backing plays through *its* stream (below) so it
+            // isn't opening a silent second stream on Windows.
 
             let mut path: Option<PathBuf> = None;
             let mut handle: Option<BackingHandle> = None;
@@ -140,7 +141,10 @@ impl AudioState {
                             h.seek(pos);
                             h.set_paused(false);
                         } else {
-                            match play_file_at(p, pos) {
+                            // Share the synth's output stream (one device stream,
+                            // second sink) — a separate stream is silent on
+                            // Windows/WASAPI.
+                            match out.play_backing_at(p, pos) {
                                 Ok(h) => handle = Some(h),
                                 Err(e) => {
                                     eprintln!("[rockcraft-tauri] backing: play failed: {e}")

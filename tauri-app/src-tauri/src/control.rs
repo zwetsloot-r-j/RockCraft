@@ -299,7 +299,21 @@ impl HostServices for TauriHost<'_> {
             }
             HostCommand::LoadBundle { dir } => {
                 match crate::state::load_bundle(&app.state::<AppState>(), &dir) {
-                    Ok(snapshot) => json_payload("load_bundle", snapshot),
+                    Ok(snapshot) => {
+                        // Attach the bundle's backing track to the audio thread so
+                        // the transport plays it — parity with the Tauri
+                        // `load_bundle` command (lib.rs). Without this, a bundle
+                        // loaded over the control socket shows the backing chip but
+                        // is silent (the audio thread never got the path).
+                        match crate::state::query_backing(&app.state::<AppState>()) {
+                            Some(b) => crate::audio::attach_backing_inner(
+                                &app.state::<AudioState>(),
+                                std::path::PathBuf::from(b.path),
+                            ),
+                            None => crate::audio::detach_backing_inner(&app.state::<AudioState>()),
+                        }
+                        json_payload("load_bundle", snapshot)
+                    }
                     Err(e) => failed("load_bundle", e),
                 }
             }
