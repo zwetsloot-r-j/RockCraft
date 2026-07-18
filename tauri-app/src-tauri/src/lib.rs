@@ -38,13 +38,26 @@ use crate::play::PlayState;
 use crate::record::RecordState;
 use crate::state::{ActionReply, AppState, BackingRef, SaveDest, SplitSegment, VideoRef};
 
-/// Tick cadence for the transport-advance thread (~4 ms ≈ 250 Hz).
+/// Tick cadence for the transport-advance thread (~4 ms ≈ 250 Hz). Fine-grained
+/// so the injected `dt_us` for scoring / audition boundaries is precise.
 const TICK_PERIOD: std::time::Duration = std::time::Duration::from_millis(4);
+
+/// Minimum spacing between the lightweight `playhead` pushes **while the
+/// transport is playing** (~30 Hz). At the 250 Hz tick rate this would flood the
+/// WebView IPC channel; the payload is tiny (position + flag), but the frontend
+/// interpolates between pushes anyway, so a modest correction cadence is all it
+/// needs. Structural changes (edits / effects) still emit a full snapshot
+/// immediately, regardless of this throttle.
+const PLAYHEAD_EMIT_PERIOD: std::time::Duration = std::time::Duration::from_millis(33);
 
 /// Event name carrying a fresh [`ComposerSnapshot`] to the webview.
 pub(crate) const EVENT_SNAPSHOT: &str = "snapshot";
 /// Event name carrying a batch of effects to the webview.
 const EVENT_EFFECTS: &str = "effects";
+/// Event name carrying a lightweight [`PlayheadEvent`] during playback — just
+/// the moving position + playing flag, so the highway scrolls without shipping
+/// the whole note list every frame (see the tick thread).
+const EVENT_PLAYHEAD: &str = "playhead";
 /// Event name carrying a serialised [`NoteEvent`] to the webview.
 const EVENT_MIDI: &str = "midi_event";
 /// Event name carrying a live [`play::PlayStateEvent`] to the highway (#168).
@@ -73,7 +86,7 @@ fn run_action(
 ) -> Result<ActionReply, String> {
     let reply = state::run_action(&state, &name, &params)?;
     // Route effects to the synth (note audition, chord preview, all-off).
-    audio::apply_effects(&audio, &reply.effects);
+    audio::apply_effects(&audio, state::is_playing(&state), &reply.effects);
     // Sync the backing track to the new transport state.
     {
         let mut prev = prev_transport
@@ -275,6 +288,15 @@ struct TransportSnapshot {
     offset_us: u64,
 }
 
+/// Lightweight playback push (see [`EVENT_PLAYHEAD`]): the moving playhead and
+/// the playing flag, without the note list. Serialised to the webview ~30×/s
+/// during playback so the highway scrolls cheaply.
+#[derive(Clone, Copy, serde::Serialize)]
+struct PlayheadEvent {
+    playhead_us: u64,
+    playing: bool,
+}
+
 /// Tauri-managed wrapper for `TransportSnapshot`.
 struct PrevTransport(Mutex<TransportSnapshot>);
 
@@ -310,6 +332,8 @@ pub(crate) fn record_bundle_backing_filename(path: &std::path::Path) -> String {
 fn spawn_tick_thread(app: tauri::AppHandle) {
     std::thread::spawn(move || {
         let mut last = Instant::now();
+        // Wall-clock of the last pushed `playhead` event, to throttle it.
+        let mut last_playhead_emit = Instant::now();
         loop {
             std::thread::sleep(TICK_PERIOD);
             let now = Instant::now();
@@ -358,11 +382,13 @@ fn spawn_tick_thread(app: tauri::AppHandle) {
 
             let effects = state::tick_advance(&app_state, dt_us);
             let all_effects: Vec<_> = midi_effects.into_iter().chain(effects).collect();
-            let snapshot = state::query_state(&app_state);
+            // Cheap transport read (no note list); the full snapshot is built
+            // only when the notes actually change (see the emit below).
+            let (playing, playhead_us, backing_offset_us) = state::transport_fields(&app_state);
 
             // Route effects to the synth.
             if !all_effects.is_empty() {
-                audio::apply_effects(&audio, &all_effects);
+                audio::apply_effects(&audio, playing, &all_effects);
             }
 
             // Sync backing to transport state.
@@ -373,25 +399,40 @@ fn spawn_tick_thread(app: tauri::AppHandle) {
                     .expect("prev_transport mutex poisoned");
                 audio::sync_backing(
                     &audio,
-                    snapshot.playing,
-                    snapshot.playhead_us,
-                    snapshot.backing_offset_us,
+                    playing,
+                    playhead_us,
+                    backing_offset_us,
                     prev.playing,
                     prev.playhead_us,
                     prev.offset_us,
                 );
                 *prev = TransportSnapshot {
-                    playing: snapshot.playing,
-                    playhead_us: snapshot.playhead_us,
-                    offset_us: snapshot.backing_offset_us,
+                    playing,
+                    playhead_us,
+                    offset_us: backing_offset_us,
                 };
             }
 
-            // Push the snapshot while playing (so the highway scrolls) and on
-            // any tick that produced effects. Idle-and-stopped ticks stay
-            // silent so we don't spam the webview with identical snapshots.
-            if snapshot.playing || !all_effects.is_empty() || !midi_events.is_empty() {
+            // Emit strategy (the #1 performance fix): a *structural* change
+            // (edit / MIDI / effect) ships the full ~900-note snapshot at once;
+            // ordinary playback ticks ship only the lightweight `playhead` push,
+            // throttled to ~30 Hz. So the note list is serialised on edits, not
+            // 250×/second — which is what backlogged the IPC channel and dragged
+            // the highway behind real time. Idle-and-stopped ticks stay silent.
+            let changed = !all_effects.is_empty() || !midi_events.is_empty();
+            if changed {
+                let snapshot = state::query_state(&app_state);
                 let _ = app.emit(EVENT_SNAPSHOT, &snapshot);
+                last_playhead_emit = now;
+            } else if playing && now.duration_since(last_playhead_emit) >= PLAYHEAD_EMIT_PERIOD {
+                let _ = app.emit(
+                    EVENT_PLAYHEAD,
+                    &PlayheadEvent {
+                        playhead_us,
+                        playing,
+                    },
+                );
+                last_playhead_emit = now;
             }
             if !all_effects.is_empty() {
                 let _ = app.emit(EVENT_EFFECTS, &all_effects);

@@ -410,9 +410,9 @@ export class EditCanvas {
     ctx.fillStyle = "rgba(217,107,255,0.28)";
     ctx.fillRect(x + 1, y + 1, vp.laneW - 2, h - 2);
     ctx.strokeStyle = "#d96bff"; // magenta, matching the TUI cursor
+    // No shadowBlur: too costly to repaint every frame; the filled cell + bright
+    // outline stay unmistakable without the glow.
     ctx.lineWidth = 2;
-    ctx.shadowColor = "#d96bff";
-    ctx.shadowBlur = 6;
     ctx.strokeRect(x + 1, y + 1, vp.laneW - 2, h - 2);
     ctx.restore();
   }
@@ -430,10 +430,11 @@ export class EditCanvas {
     const y = vp.yOf(playheadUs);
     if (y < 0 || y > this.h) return;
     ctx.save();
+    // No shadowBlur here: canvas-2D shadows are very expensive per frame and
+    // this line is redrawn every RAF during playback. A crisp 2px line reads
+    // fine without the glow.
     ctx.strokeStyle = "#5be7c4";
     ctx.lineWidth = 2;
-    ctx.shadowColor = "#5be7c4";
-    ctx.shadowBlur = 8;
     ctx.beginPath();
     ctx.moveTo(0, y + 0.5);
     ctx.lineTo(this.w, y + 0.5);

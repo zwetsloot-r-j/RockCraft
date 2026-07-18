@@ -159,7 +159,8 @@ fn spawn_applier(app: AppHandle, mut cmd_rx: mpsc::Receiver<RemoteCommand>) {
                 // no-op when no audio device is present (`synth: None`).
                 if let Response::Ok { effects, .. } = &response {
                     if !effects.is_empty() {
-                        crate::audio::apply_effects(&app.state::<AudioState>(), effects);
+                        let playing = crate::state::is_playing(&app.state::<AppState>());
+                        crate::audio::apply_effects(&app.state::<AudioState>(), playing, effects);
                     }
                 }
                 // Keep the webview in sync with agent-driven changes, mirroring

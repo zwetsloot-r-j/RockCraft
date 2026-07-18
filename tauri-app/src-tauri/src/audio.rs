@@ -287,24 +287,46 @@ impl Default for AudioState {
 
 // ── Effect routing ───────────────────────────────────────────────────────────
 
-/// Route a batch of [`Effect`]s from the composer to the synth.
+/// Route a batch of [`Effect`]s from the composer to the synth, mirroring the
+/// TUI's `run_effects` so both frontends sound identically.
 ///
-/// - `AuditionNote` → `all_off` then `note_on`.
-/// - `AuditionChord` → `all_off` then `note_on` each pitch.
+/// The composer uses `AuditionNote { velocity: 0 }` as a note-*off* (a playback
+/// span end or a metronome click release), and emits a fresh `AuditionNote` per
+/// note as the playhead crosses it during playback. So:
+///
+/// - `AuditionNote { velocity: 0 }` → `note_off(pitch)` — release just that note
+///   (NOT `all_off`; otherwise every span end silences the whole chord, which is
+///   what left playback inaudible).
+/// - `AuditionNote { velocity > 0 }` **while playing** → a polyphonic `note_on`
+///   (no `all_off`): many notes ring together, as a piano piece must.
+/// - `AuditionNote { velocity > 0 }` **while stopped** → an edit preview:
+///   `all_off` then `note_on`, so moving the cursor replaces the single note.
+/// - `AuditionChord` → `all_off` then `note_on` each pitch (chord preview).
 /// - `AllOff` → `all_off`.
 ///
 /// If `audio.synth` is `None` this is a no-op (headless CI path).
-pub fn apply_effects(audio: &AudioState, effects: &[Effect]) {
+pub fn apply_effects(audio: &AudioState, playing: bool, effects: &[Effect]) {
     let Some(synth) = &audio.synth else { return };
     for effect in effects {
         match effect {
             Effect::AuditionNote { pitch, velocity } => {
-                synth.all_off();
-                if let (Some(note), Some(vel)) = (
-                    rockcraft_core::MidiNote::new(*pitch),
-                    rockcraft_core::Velocity::new(*velocity),
-                ) {
-                    synth.note_on(note, vel);
+                let Some(note) = rockcraft_core::MidiNote::new(*pitch) else {
+                    continue;
+                };
+                if *velocity == 0 {
+                    // Explicit note-off (playback span end / click release).
+                    synth.note_off(note);
+                } else if playing {
+                    // Polyphonic playback note-on — let it ring with the rest.
+                    if let Some(vel) = rockcraft_core::Velocity::new(*velocity) {
+                        synth.note_on(note, vel);
+                    }
+                } else {
+                    // Stopped: a single edit audition replaces the previous.
+                    synth.all_off();
+                    if let Some(vel) = rockcraft_core::Velocity::new(*velocity) {
+                        synth.note_on(note, vel);
+                    }
                 }
             }
             Effect::AuditionChord { pitches } => {
@@ -463,6 +485,7 @@ mod tests {
         };
         apply_effects(
             &audio,
+            true,
             &[
                 Effect::AuditionNote {
                     pitch: 60,

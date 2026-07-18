@@ -648,6 +648,30 @@ pub fn tick_advance(state: &AppState, dt_us: u64) -> Vec<Effect> {
     composer.advance(dt_us)
 }
 
+/// Whether the composer transport is currently playing. Used to route synth
+/// effects: during playback note-ons are polyphonic (many notes ring together),
+/// while a stopped edit audition replaces the single previewed note.
+pub fn is_playing(state: &AppState) -> bool {
+    state
+        .composer
+        .lock()
+        .expect("composer mutex poisoned")
+        .is_playing()
+}
+
+/// Cheap transport read — `(playing, playhead_us, backing_offset_us)` — without
+/// building the full (all-notes) snapshot. The tick thread calls this every tick
+/// for backing sync and the lightweight playhead push, so the ~900-note snapshot
+/// is only serialised when the notes actually change, not 250×/second.
+pub fn transport_fields(state: &AppState) -> (bool, u64, u64) {
+    let composer = state.composer.lock().expect("composer mutex poisoned");
+    (
+        composer.is_playing(),
+        composer.playhead_us(),
+        composer.backing_offset_us(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -800,8 +824,8 @@ mod tests {
             snap_before.notes.len(),
             "loaded note count must match saved note count"
         );
-        let mut pitches_before: Vec<u8> = snap_before.notes.iter().map(|n| n.pitch as u8).collect();
-        let mut pitches_after: Vec<u8> = snap_after.notes.iter().map(|n| n.pitch as u8).collect();
+        let mut pitches_before: Vec<u8> = snap_before.notes.iter().map(|n| n.pitch).collect();
+        let mut pitches_after: Vec<u8> = snap_after.notes.iter().map(|n| n.pitch).collect();
         pitches_before.sort_unstable();
         pitches_after.sort_unstable();
         assert_eq!(pitches_before, pitches_after, "pitches must round-trip");

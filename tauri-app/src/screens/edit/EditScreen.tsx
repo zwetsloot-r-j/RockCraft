@@ -38,6 +38,7 @@ import {
   editSetVideo,
   editSetVideoOffset,
   loadBundle,
+  onPlayhead,
   onSnapshot,
   openBackingFilePicker,
   openVideoFilePicker,
@@ -301,6 +302,9 @@ export function EditScreen(props: Props): JSX.Element {
   let basePlayheadUs = 0;
   let baseWallMs = 0;
   let clockRate = 1;
+  // Was-playing latch for the clock, tracked here (not off store.snap) so the
+  // lightweight `playhead` push and the full snapshot share one servo.
+  let clockPlaying = false;
   // Wall-clock of the last backdrop seek, to throttle seeking during playback
   // (see driveVideo). Reset to 0 when paused so the next scrub seeks immediately.
   let lastVideoSeekMs = 0;
@@ -435,35 +439,37 @@ export function EditScreen(props: Props): JSX.Element {
     driveVideo(s);
   }
 
-  function applySnapshot(s: ComposerSnapshot): void {
+  /**
+   * Drive the phase-locked clock from an authoritative backend playhead. Called
+   * both by a full snapshot and by the lightweight `playhead` push, so the two
+   * paths share one clock. Tracks its own `clockPlaying` (was-playing) so it is
+   * independent of when the note store last updated.
+   *
+   * While playback continues, the backend playhead is ground truth but arrives
+   * with jittery IPC/tick latency. Hard-snapping the frontend clock to each push
+   * made the highway shake and jump *backward*. Instead, phase-lock: re-anchor
+   * the base to the value we're *currently* displaying (continuous — zero step)
+   * and nudge the clock RATE to converge. The rate stays clamped strictly
+   * positive, so the rendered playhead only moves forward — smooth, no backward
+   * jitter — while still locking onto the transport.
+   */
+  function updateClock(playheadUs: number, isPlaying: boolean): void {
     const now = performance.now();
-    const wasPlaying = store.snap?.playing ?? false;
-    if (s.playing && wasPlaying) {
-      // Continuing playback: the backend playhead is ground truth, but its
-      // snapshots arrive with jittery IPC/tick latency (~125 Hz, irregular).
-      // Hard-snapping the frontend clock to each one made the highway shake and
-      // jump *backward* whenever a snapshot landed behind our extrapolation.
-      // Instead, phase-lock: re-anchor the base to the value we're *currently*
-      // displaying (continuous — zero visible step) and nudge the clock RATE to
-      // close the error over ~1 s. The rate stays clamped near 1× and strictly
-      // positive, so the rendered playhead only ever moves forward — smooth, no
-      // backward jitter — while still converging on the transport.
+    const wasPlaying = clockPlaying;
+    if (isPlaying && wasPlaying) {
       const predicted = basePlayheadUs + (now - baseWallMs) * 1000 * clockRate;
-      const error = s.playhead_us - predicted; // +: backend ahead of our clock
+      const error = playheadUs - predicted; // +: backend ahead of our clock
       if (error > SEEK_FWD_US || error < -SEEK_BACK_US) {
         // Genuine discontinuity — a forward seek / large fall-behind (positive)
-        // or a loop-wrap / deliberate backward seek (very negative). Snapping is
-        // correct here; reset the rate.
-        basePlayheadUs = s.playhead_us;
+        // or a loop-wrap / deliberate backward seek (very negative). Snap + reset.
+        basePlayheadUs = playheadUs;
         baseWallMs = now;
         clockRate = 1;
       } else {
-        // Ordinary drift: NEVER snap. Re-anchor to the value we're currently
-        // displaying (continuous — zero step) and servo the *rate* to converge.
-        // A negative error (frontend ahead) brakes the rate below 1×; the clock
-        // still advances (floor > 0), so it's smooth and strictly monotonic —
-        // no backward jump. The wide clamp lets it actually reach the backend's
-        // effective rate and lock instead of saturating.
+        // Ordinary drift: NEVER snap. Re-anchor to the current displayed value
+        // (continuous) and servo the *rate* to converge; the floor > 0 keeps the
+        // playhead strictly monotonic, the wide clamp lets it lock on the
+        // backend's effective rate instead of saturating.
         basePlayheadUs = predicted;
         baseWallMs = now;
         clockRate = Math.max(
@@ -473,18 +479,32 @@ export function EditScreen(props: Props): JSX.Element {
       }
     } else {
       // Play just started, or paused/idle: take the backend value directly.
-      basePlayheadUs = s.playhead_us;
+      basePlayheadUs = playheadUs;
       baseWallMs = now;
       clockRate = 1;
     }
+    clockPlaying = isPlaying;
+  }
+
+  function applySnapshot(s: ComposerSnapshot): void {
+    updateClock(s.playhead_us, s.playing);
     setStore("snap", s);
     setRev((r) => r + 1);
-    // During playback the RAF loop already redraws every animation frame with a
-    // smoothly interpolated playhead. Rendering *again* here on each snapshot
-    // (~125 Hz, irregular) interleaves extra off-cadence repaints with the RAF
-    // frames — visible as stutter. So only draw here when *not* playing (edits,
-    // cursor moves, scrubs need an immediate repaint).
+    // During playback the RAF loop already redraws every frame with a smoothly
+    // interpolated playhead; drawing again here would interleave off-cadence
+    // repaints (stutter). So only draw here when *not* playing (edits, cursor
+    // moves, scrubs need an immediate repaint).
     if (!s.playing) render();
+  }
+
+  /**
+   * Apply a lightweight `playhead` push (the #1 perf path): advance the clock
+   * without touching the note store or Solid reactivity — the RAF loop renders
+   * off the servo. During playback the note list is unchanged, so a full
+   * snapshot would be pure waste; only the moving position matters here.
+   */
+  function applyPlayhead(p: { playhead_us: number; playing: boolean }): void {
+    updateClock(p.playhead_us, p.playing);
   }
 
   // ── Grid calibration + review playback (M-align) ────────────────────────
@@ -1333,6 +1353,11 @@ export function EditScreen(props: Props): JSX.Element {
     onSnapshot(applySnapshot).then((fn) => {
       unlisten = fn;
     });
+    // Lightweight playback scroll: advances the clock without re-storing notes.
+    let unlistenPlayhead: UnlistenFn | undefined;
+    onPlayhead(applyPlayhead).then((fn) => {
+      unlistenPlayhead = fn;
+    });
 
     // If a bundle dir was passed in the route payload, load it first;
     // otherwise fetch the current state.
@@ -1409,6 +1434,7 @@ export function EditScreen(props: Props): JSX.Element {
       cancelAnimationFrame(raf);
       clearTimeout(flashTimeout);
       unlisten?.();
+      unlistenPlayhead?.();
       unlistenMidi?.();
       engine?.dispose();
       engine = null;
