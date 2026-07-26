@@ -18,15 +18,23 @@ use ratatui::{
     widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph},
     Frame,
 };
-use rockcraft_import::{import_source, ImportInput, Progress};
+use rockcraft_import::{import_source, omr_summary, ImportInput, Progress};
 
 // ── Source file picker ─────────────────────────────────────────────────────────
 
 const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mkv", "avi", "mov", "webm", "flv", "wmv", "m4v"];
 
-/// Score formats the M13-A sidecar reads. Mirrors the documented/tested set in
-/// `tools/score-import/README.md`.
-const SCORE_EXTENSIONS: &[&str] = &["musicxml", "xml", "mxl", "abc", "krn"];
+/// Inputs the score sidecar reads. Mirrors the documented/tested set in
+/// `tools/score-import/README.md`: score files, which convert exactly (M13-A),
+/// plus scans and PDFs, which the sidecar transcribes with an OMR engine first
+/// and which therefore need reviewing (M13-B).
+///
+/// Both kinds enter through [`SourceKind::Score`] on purpose — the sidecar
+/// decides which is which, so the picker never has to.
+const SCORE_EXTENSIONS: &[&str] = &[
+    "musicxml", "xml", "mxl", "abc", "krn", // score files
+    "pdf", "png", "jpg", "jpeg", "tif", "tiff", "bmp", // scans
+];
 
 /// Which import source a [`SourcePicker`] browses for.
 ///
@@ -50,7 +58,9 @@ impl SourceKind {
     fn noun(self) -> &'static str {
         match self {
             SourceKind::Video => "video",
-            SourceKind::Score => "score",
+            // Both kinds sit under one picker, so the label has to name both —
+            // otherwise the `.pdf`s in the list look like a bug.
+            SourceKind::Score => "score or scan",
         }
     }
 
@@ -327,6 +337,9 @@ pub struct ImportingScreen {
     rx: mpsc::Receiver<WorkerEvent>,
     running: RunningState,
     log: VecDeque<String>,
+    /// The OMR confidence summary lifted out of the log stream (M13-B), shown on
+    /// its own status line. `None` for every import that has nothing to doubt.
+    summary: Option<String>,
     outcome: Option<ImportOutcome>,
 }
 
@@ -353,6 +366,20 @@ impl ImportingScreen {
             rx,
             running: RunningState::Starting,
             log: VecDeque::new(),
+            summary: None,
+            outcome: None,
+        }
+    }
+
+    /// A screen fed by `rx` instead of a live pipeline, so the log/summary
+    /// handling is testable without a Python sidecar on the machine.
+    #[cfg(test)]
+    fn from_receiver(rx: mpsc::Receiver<WorkerEvent>) -> Self {
+        Self {
+            rx,
+            running: RunningState::Starting,
+            log: VecDeque::new(),
+            summary: None,
             outcome: None,
         }
     }
@@ -363,6 +390,12 @@ impl ImportingScreen {
             match event {
                 WorkerEvent::Running(s) => self.running = s,
                 WorkerEvent::Log(line) => {
+                    // A scan import's confidence summary rides the same log
+                    // stream as the engine's chatter; promote it out of the pane
+                    // so the counts are readable without scrolling.
+                    if let Some(summary) = omr_summary(&line) {
+                        self.summary = Some(summary.to_string());
+                    }
                     if self.log.len() == MAX_LOG_LINES {
                         self.log.pop_front();
                     }
@@ -384,11 +417,17 @@ impl ImportingScreen {
         matches!(self.outcome, Some(ImportOutcome::Failed(_)))
     }
 
+    /// The OMR confidence summary, once the sidecar has reported one.
+    pub fn summary(&self) -> Option<&str> {
+        self.summary.as_deref()
+    }
+
     pub fn draw(&self, f: &mut Frame, area: Rect) {
         let chunks = Layout::vertical([
             Constraint::Length(2),
             Constraint::Length(3),
             Constraint::Length(1),
+            Constraint::Length(if self.summary.is_some() { 1 } else { 0 }),
             Constraint::Min(0),
         ])
         .split(area);
@@ -433,7 +472,18 @@ impl ImportingScreen {
             None => {}
         }
 
-        self.draw_log_pane(f, chunks[3]);
+        // A scan import's own status line: how much of the chart it doubts. Shown
+        // as soon as the sidecar reports it, so it is on screen before the
+        // "Done:" line and stays there afterwards.
+        if let Some(summary) = &self.summary {
+            f.render_widget(
+                Paragraph::new(Line::from(summary.as_str()))
+                    .style(Style::default().fg(Color::Yellow)),
+                chunks[3],
+            );
+        }
+
+        self.draw_log_pane(f, chunks[4]);
     }
 
     /// Render the last N captured output lines (N = visible pane height) in a
@@ -653,6 +703,62 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    // ── Scan picker (M13-B) ───────────────────────────────────────────────────
+
+    /// Scans and PDFs are offered by the same picker as score files: both go to
+    /// the score sidecar, which decides for itself which one needs OMR.
+    #[test]
+    fn score_list_also_offers_scans_and_pdfs() {
+        let dir = temp_dir("scan_ext");
+        for name in [
+            "page.pdf",
+            "photo.JPG",
+            "shot.jpeg",
+            "sheet.png",
+            "old.tif",
+            "old2.tiff",
+            "raw.bmp",
+            "scale.musicxml",
+        ] {
+            touch(&dir, name);
+        }
+        touch(&dir, "clip.mp4");
+
+        let names: Vec<String> = list_source_files(&dir, SourceKind::Score)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        for expected in [
+            "page.pdf",
+            "photo.JPG",
+            "shot.jpeg",
+            "sheet.png",
+            "old.tif",
+            "old2.tiff",
+            "raw.bmp",
+            "scale.musicxml",
+        ] {
+            assert!(names.contains(&expected.to_string()), "missing {expected}");
+        }
+        assert!(
+            !names.contains(&"clip.mp4".to_string()),
+            "a video is not a scan"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A scan picked under `Score` still becomes an `ImportInput::Score` — there
+    /// is deliberately no third input kind, because the Rust side does not decide
+    /// whether OMR runs.
+    #[test]
+    fn a_scan_uses_the_same_score_input() {
+        let path = PathBuf::from("/tmp/page.pdf");
+        assert!(matches!(
+            SourceKind::Score.input_for(path.clone()),
+            ImportInput::Score(p) if p == path
+        ));
+    }
+
     // ── UrlInput ──────────────────────────────────────────────────────────────
 
     #[test]
@@ -696,6 +802,44 @@ mod tests {
     }
 
     // ── ImportingScreen ───────────────────────────────────────────────────────
+
+    /// The OMR confidence summary is promoted out of the log pane onto its own
+    /// status line, while still remaining in the log with the engine's chatter.
+    #[test]
+    fn importing_screen_promotes_the_omr_summary_to_the_status_line() {
+        let (tx, rx) = mpsc::channel();
+        let mut screen = ImportingScreen::from_receiver(rx);
+        assert_eq!(screen.summary(), None);
+
+        for line in [
+            "using OMR engine oemer: /usr/bin/oemer",
+            "suspect measures (2): 12, 40",
+            "omr: imported 412 notes, 37 flagged — review in the editor",
+        ] {
+            tx.send(WorkerEvent::Log(line.to_string())).unwrap();
+        }
+        screen.poll();
+
+        assert_eq!(
+            screen.summary(),
+            Some("imported 412 notes, 37 flagged — review in the editor")
+        );
+        assert_eq!(screen.log.len(), 3, "the summary stays in the log too");
+    }
+
+    /// A score-file import reports no summary, so the extra status line never
+    /// appears for a conversion that has nothing to doubt.
+    #[test]
+    fn importing_screen_has_no_summary_without_an_omr_line() {
+        let (tx, rx) = mpsc::channel();
+        let mut screen = ImportingScreen::from_receiver(rx);
+        tx.send(WorkerEvent::Log(
+            "dropped 1 grace note(s) (by design)".to_string(),
+        ))
+        .unwrap();
+        screen.poll();
+        assert_eq!(screen.summary(), None);
+    }
 
     #[test]
     fn importing_screen_missing_file_fails() {

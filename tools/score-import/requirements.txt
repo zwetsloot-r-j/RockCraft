@@ -1,8 +1,17 @@
-# Score-file importer (M13-A) — runtime + test deps.
+# Score importer (M13-A score files, M13-B scans) — runtime + test deps.
 # music21 is the only runtime dependency: it parses MusicXML/ABC/Humdrum and
 # gives us the notated tempo, metre, key and staff layout directly. No CV, no
-# ML, no network — this path is a deterministic transform.
+# ML, no network — the score-file path is a deterministic transform.
 music21>=9.1
 
 # Test-only:
 pytest>=7.0
+
+# NOT listed here, on purpose: the OMR engine (M13-B).
+#
+# An engine is an *optional system dependency*, resolved at run time from
+# $ROCKCRAFT_OMR_CMD, then `audiveris`, then `oemer` on PATH — the same posture as
+# ffmpeg on the video path. Installing it here would make every score-file import
+# and every CI run pay for a dependency that only scans need, and `oemer` in
+# particular drags in a deep-learning stack. Install one yourself if you want to
+# import scans; see README.md § OMR. CI never runs OMR, so CI never needs one.

@@ -102,7 +102,7 @@ ML and no inference on this path.
   `ExtractedChart` JSON on stdout.
 - **Formats**: `.musicxml`, `.xml`, `.mxl`, `.abc`, `.krn` (whatever `music21`
   reads; those five are the documented and tested set). Scanned PDFs and images
-  are **not** handled — optical music recognition is a separate follow-up.
+  go through the OMR tier below, which feeds this same converter.
 - **Optional dependency**: `music21` is the only requirement, and it is optional
   for RockCraft as a whole. The Rust build never links it; without the venv a
   score import fails with an actionable error naming
@@ -115,9 +115,95 @@ ML and no inference on this path.
   bar lines drift after the first change. Such a score imports with a loud
   warning on stderr rather than being rejected or silently mangled.
 
-Entry points: the TUI's *"Import score file…"* menu item, or the `import_score`
+Entry points: the TUI's *"Import score or scan…"* menu item, or the `import_score`
 host command over the agent-control socket. Full conversion rules and known
 limitations: `tools/score-import/README.md`.
+
+## Scanned sheet music (OMR, M13-B)
+
+A **scan or photograph** of a page — `.pdf`, `.png`, `.jpg`, `.jpeg`, `.tif`,
+`.tiff`, `.bmp` — is the third import source. It is the same entry point as a
+score file (`import_score`, the same TUI menu item, the same
+`ImportInput::Score`): the sidecar looks at the extension and decides for itself
+whether the input needs optical music recognition first. Nothing on the Rust side
+knows or cares.
+
+**This tier is inference, not transformation.** M13-A converts what a file
+*states*; OMR *guesses* what a picture shows. Clean engraved scores transcribe
+well. Handwritten scores, dense piano writing, skewed phone photos and
+low-resolution scans produce real errors. So the result is presented as something
+to review, never as fact.
+
+### Engines (all optional, none bundled)
+
+Resolved in this order, mirroring how the fetch hook and ffmpeg are treated:
+
+1. **`$ROCKCRAFT_OMR_CMD`** — any engine or wrapper you already have, invoked as
+   `<cmd> <scan-file> <output.musicxml>`. It must write MusicXML to that second
+   path. Assumed to handle whatever it is given, PDFs included.
+2. **[Audiveris](https://github.com/Audiveris/audiveris)** on `PATH` — the
+   strongest open engine. Needs a JVM; reads multi-page PDFs whole and exports
+   compressed `.mxl`, which the sidecar unpacks to plain XML.
+3. **[`oemer`](https://github.com/BreezeWhite/oemer)** — `pip install oemer`.
+   Pure Python, no JVM, weaker on dense scores, and **single-image only**: a PDF
+   is rasterized page by page with `pdftoppm` (poppler-utils, overridable with
+   `$ROCKCRAFT_PDFTOPPM`) and the pages are concatenated in order. Page-boundary
+   joins are where measures go missing, so this path says so loudly on stderr.
+4. **None installed** → the import fails with a message naming all three and how
+   to install them. Never a silent fallback, never a crash, and never a build
+   failure: the Rust build links none of this, and every other import path is
+   unaffected. **CI never runs OMR** — no engine, no model weights, no scans.
+
+Which engine ran is recorded in the bundle's `extractor_version`, e.g.
+`omr-audiveris-5.3+score-import-0.1`, so a chart that reads wrong is traceable to
+the engine that produced it.
+
+### Confidence — why the import tells you to review it
+
+OMR engines generally report no per-note confidence, so it is derived
+*structurally* from what the transcription says about itself:
+
+| Check | Confidence |
+|-------|------------|
+| A measure whose notes and rests don't cover its time signature — the highest-yield OMR error there is | `0.5` for every note in it |
+| A pitch outside a piano's range (below A0, above C8) — a misread ledger line, clef or octave mark | `0.25` |
+| Confidence the engine itself reported, when it reports one | taken as a further minimum |
+| Everything else | `0.9` — **never `1.0`**; that value means "the source stated this", which only M13-A can claim |
+
+Both checks are pure functions over the parsed score, so they are fully tested in
+CI without an engine ever running (`tools/score-import/tests/test_confidence.py`).
+
+The import reports the outcome on its status line in both frontends:
+
+```
+imported 412 notes, 37 flagged — review in the editor
+```
+
+with the suspect measure numbers in the log pane below it. **That message is the
+whole review affordance today.** The per-note values live on the
+`ExtractedChart` JSON, which is where M6-E's review step will read them, but
+`chart_to_timeline` does not yet thread them into `core`'s `Timeline` — so what
+survives into the written bundle is the counts you were told, not a per-note
+marking. Highlighting flagged notes inside the editor is M6-E's job and a separate
+issue.
+
+### Content policy for scans
+
+Same rule, no exceptions: **the tool is shared, the songs are not.** A `.pdf` is
+rejected anywhere in the tree by `scripts/check-no-media.sh` — it is a published
+work and unreviewable in a diff. Scan **images** cannot be banned by extension,
+because the repo legitimately tracks `.png` design mockups and app icons; the
+rule there is human, not mechanical: never commit a scan. Keep your scans outside
+the repo (or under the gitignored `import-cache/`), and note that no fixture,
+test or CI step here needs one — the manual end-to-end check reads a scan from
+`$ROCKCRAFT_OMR_SCAN` on your own machine.
+
+There is also, deliberately, **no LLM or vision model on this path.** It was
+considered and rejected: VLMs lose ledger lines, mis-scope accidentals and drift
+on vertical alignment in chords, and a hallucinated bar is worse than an OMR error
+because it is plausible rather than obviously broken. If a model ever enters this
+pipeline it belongs *after* OMR, as a validator over structured output — never as
+the transcriber.
 
 ## Where downloading lives
 

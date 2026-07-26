@@ -79,7 +79,7 @@ const MENU_ITEMS_BASE: &[&str] = &[
     "Continue last",
     "Play last recording",
     "Import from video file…",
-    "Import score file…",
+    "Import score or scan…",
     "Library…",
 ];
 
@@ -301,7 +301,7 @@ impl Shell {
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 self.screen = Screen::SourcePicker(SourcePicker::new(cwd, SourceKind::Video));
             }
-            "Import score file…" => {
+            "Import score or scan…" => {
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 self.screen = Screen::SourcePicker(SourcePicker::new(cwd, SourceKind::Score));
             }
@@ -1908,7 +1908,7 @@ mod tests {
         assert_eq!(shell.screen_name(), "video_picker");
     }
 
-    /// "Import score file…" is always offered (a score needs no fetch hook) and
+    /// "Import score or scan…" is always offered (a score needs no fetch hook) and
     /// opens the score picker, not the video one.
     #[test]
     fn import_score_menu_item_opens_score_picker() {
@@ -1918,7 +1918,7 @@ mod tests {
         let idx = shell
             .menu_items()
             .iter()
-            .position(|s| *s == "Import score file…")
+            .position(|s| *s == "Import score or scan…")
             .expect("score import item present without a fetch command");
         for _ in 0..idx {
             shell.on_key(KeyCode::Down);
