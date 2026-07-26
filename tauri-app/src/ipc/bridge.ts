@@ -337,7 +337,11 @@ export function onPlayState(
 export type ImportInputDto =
   | { kind: "File"; value: string }
   | { kind: "Url"; value: string }
-  /** A local digital score file (MusicXML and friends) — the M13-A path. */
+  /**
+   * A local score file (MusicXML and friends) — the M13-A path — or a scan/PDF,
+   * which the same sidecar transcribes with an OMR engine first (M13-B). There is
+   * deliberately no third kind: the sidecar decides which of the two an input is.
+   */
   | { kind: "Score"; value: string };
 
 /**

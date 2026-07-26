@@ -18,15 +18,37 @@ const VIDEO_BASENAME: &str = "source";
 /// How many trailing fetch-hook output lines to retain for failure messages.
 const FETCH_TAIL_LINES: usize = 20;
 
+/// Marker the score sidecar puts on its one-line OMR confidence summary (M13-B).
+///
+/// A scan import is a lossy inference step, so the sidecar reports how much of it
+/// it doubts (`omr: imported 412 notes, 37 flagged — review in the editor`). That
+/// summary rides the existing [`Progress::Log`] stream rather than a new channel,
+/// and this prefix is how a frontend picks it out of the surrounding engine
+/// chatter to put on its import status line. Mirrored in Python as
+/// `score_import.confidence.SUMMARY_PREFIX` — change both or neither.
+pub const OMR_SUMMARY_PREFIX: &str = "omr: ";
+
+/// The OMR summary carried by a [`Progress::Log`] line, or `None` for any other
+/// line. Frontends call this on every log line and keep the last match.
+pub fn omr_summary(line: &str) -> Option<&str> {
+    line.trim().strip_prefix(OMR_SUMMARY_PREFIX).map(str::trim)
+}
+
 /// Input to the import pipeline.
 pub enum ImportInput {
     /// A local video file that already exists on disk.
     File(PathBuf),
     /// A URL to download via the configured fetch hook.
     Url(String),
-    /// A local digital score file (MusicXML and friends) that already exists on
-    /// disk. Converted by the M13-A sidecar — a deterministic transform with no
-    /// fetch, no ffmpeg and no retained video.
+    /// A local score file (MusicXML and friends) — or a scan/PDF — that already
+    /// exists on disk. Handled by the score sidecar with no fetch, no ffmpeg and
+    /// no retained video either way.
+    ///
+    /// One variant covers both deliberately: a score file converts exactly
+    /// (M13-A), while a scan is transcribed by an OMR engine first and comes back
+    /// with per-note confidence (M13-B) — and **the sidecar decides which**, from
+    /// the file extension. Nothing on this side has to know, which is what keeps
+    /// the whole OMR tier out of the Rust build.
     Score(PathBuf),
 }
 
@@ -372,10 +394,13 @@ fn find_sidecar(workspace: &Path) -> Result<PathBuf, ImportError> {
     }
 }
 
-/// Run the M13-A score converter over `score_path`, returning its chart JSON.
+/// Run the M13-A/M13-B score converter over `score_path`, returning its chart JSON.
 ///
 /// Same subprocess contract as [`run_sidecar`]: stdout is the JSON, stderr is
-/// diagnostics (dropped-note counts, tempo warnings) surfaced only on failure.
+/// diagnostics. Unlike the video path, the diagnostics are forwarded on **success**
+/// too, as [`Progress::Log`] events: a scan import (M13-B) reports how many of its
+/// notes it doubts there, and a summary nobody sees is no review affordance at all.
+/// The sidecar decides which input needs OMR, so this side stays one contract.
 fn run_score_sidecar(
     score_path: &Path,
     on_progress: &mut dyn FnMut(Progress),
@@ -400,6 +425,11 @@ fn run_score_sidecar(
         return Err(ImportError::SidecarFailed(
             String::from_utf8_lossy(&output.stderr).into_owned(),
         ));
+    }
+    for line in String::from_utf8_lossy(&output.stderr).lines() {
+        if !line.trim().is_empty() {
+            on_progress(Progress::Log(line.to_string()));
+        }
     }
     on_progress(Progress::Extracting(1.0));
     String::from_utf8(output.stdout)
@@ -1040,5 +1070,113 @@ mod tests {
             &ctx,
         );
         assert!(matches!(result, Err(ImportError::Io(_))), "{result:?}");
+    }
+
+    // ── Scan import (M13-B) ──────────────────────────────────────────────────
+
+    /// Install a stub score sidecar that also writes `stderr_text` to stderr,
+    /// standing in for the OMR path's confidence report.
+    fn stub_score_sidecar_with_stderr(tmp: &TempDir, stderr_text: &str) {
+        stub_score_sidecar(tmp);
+        let sidecar = tmp.path().join("tools/score-import/convert.py");
+        let existing = std::fs::read_to_string(&sidecar).unwrap();
+        std::fs::write(
+            &sidecar,
+            format!("{existing}sys.stderr.write({stderr_text:?})\n"),
+        )
+        .unwrap();
+    }
+
+    /// The sidecar's diagnostics must reach the frontends on a **successful**
+    /// import, not only in a failure message: on the OMR path they carry the
+    /// flagged-note counts that are the whole review affordance.
+    #[test]
+    fn score_import_forwards_sidecar_diagnostics_as_log_events() {
+        let tmp = TempDir::new().unwrap();
+        stub_score_sidecar_with_stderr(
+            &tmp,
+            "using OMR engine oemer\n\nomr: imported 412 notes, 37 flagged — review in the editor\n",
+        );
+        let scan = tmp.path().join("page.pdf");
+        std::fs::write(&scan, b"%PDF-1.4").unwrap();
+
+        let mut logs = Vec::new();
+        let ctx = ctx_no_fetch(&tmp);
+        run_pipeline(
+            ImportInput::Score(scan),
+            &mut |p| {
+                if let Progress::Log(line) = p {
+                    logs.push(line);
+                }
+            },
+            &ctx,
+        )
+        .expect("a scan import is the same pipeline as a score import");
+
+        assert!(
+            logs.iter().any(|l| l.contains("using OMR engine oemer")),
+            "engine chatter belongs in the log pane: {logs:?}"
+        );
+        let summary = logs
+            .iter()
+            .find_map(|l| omr_summary(l))
+            .expect("the summary line must be recoverable from the log stream");
+        assert_eq!(
+            summary,
+            "imported 412 notes, 37 flagged — review in the editor"
+        );
+        assert!(
+            !logs.iter().any(|l| l.trim().is_empty()),
+            "blank stderr lines are not log events: {logs:?}"
+        );
+    }
+
+    /// A plain score file emits no OMR summary, so nothing claims a confidence
+    /// story the exact transform does not have.
+    #[test]
+    fn a_score_file_import_reports_no_omr_summary() {
+        let tmp = TempDir::new().unwrap();
+        stub_score_sidecar_with_stderr(&tmp, "dropped 1 grace note(s) (by design)\n");
+        let score = tmp.path().join("scale.musicxml");
+        std::fs::write(&score, b"<score-partwise/>").unwrap();
+
+        let mut logs = Vec::new();
+        let ctx = ctx_no_fetch(&tmp);
+        run_pipeline(
+            ImportInput::Score(score),
+            &mut |p| {
+                if let Progress::Log(line) = p {
+                    logs.push(line);
+                }
+            },
+            &ctx,
+        )
+        .unwrap();
+
+        assert!(!logs.is_empty(), "by-design drops are still worth showing");
+        assert!(logs.iter().all(|l| omr_summary(l).is_none()), "{logs:?}");
+    }
+
+    /// The prefix is a marker, not a substring match: only a line that starts
+    /// with it is the summary.
+    #[test]
+    fn omr_summary_matches_only_the_marked_line() {
+        assert_eq!(
+            omr_summary("omr: imported 8 notes, 0 flagged"),
+            Some("imported 8 notes, 0 flagged")
+        );
+        assert_eq!(
+            omr_summary("  omr: imported 8 notes, 0 flagged  "),
+            Some("imported 8 notes, 0 flagged"),
+            "the sidecar's line may arrive padded"
+        );
+        for other in [
+            "using OMR engine oemer",
+            "suspect measures (2): 12, 13",
+            "warning: no tempo mark in the score",
+            "",
+        ] {
+            assert!(omr_summary(other).is_none(), "{other:?} is not the summary");
+        }
     }
 }

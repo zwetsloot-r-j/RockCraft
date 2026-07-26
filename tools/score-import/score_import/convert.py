@@ -1,10 +1,18 @@
-"""Score file → :class:`ExtractedChart` conversion (M13-A).
+"""Score file → :class:`ExtractedChart` conversion (M13-A), and the scan
+routing that feeds it (M13-B).
 
 The whole module is a **deterministic transform**. Everything it emits — pitch,
 onset, duration, tempo, metre, key, staff→hand — is stated explicitly by the
 source score. Nothing is inferred, and nothing that the source does not state is
 invented: an absent tempo mark becomes a documented 120 BPM assumption with a
 warning, not a guess derived from the notes.
+
+A **scan or PDF** (M13-B) is not stated by anything: it goes through
+:mod:`score_import.omr` first, which drives an external OMR engine to produce
+MusicXML, and then through this same transform — with the one difference that
+:mod:`score_import.confidence` replaces rule 9's exact ``1.0`` with a structural
+per-note confidence. :func:`convert_input` is the entry point that decides which
+of the two an input is.
 
 Conversion rules (each one has a test in ``tests/test_convert.py``):
 
@@ -20,17 +28,23 @@ Conversion rules (each one has a test in ``tests/test_convert.py``):
 7. Velocity stays ``None`` unless the source states one.
 8. Grace notes, ornament realizations, unpitched/percussion notes, pedal marks,
    articulations and lyrics are dropped — counted, never silently swallowed.
-9. Every note gets ``confidence = 1.0``: this transform is exact.
+9. Every note gets ``confidence = 1.0``: this transform is exact. The one
+   exception is the OMR path, which opts into ``confidence_check=True`` because
+   an engine reading pixels is not exact — see :mod:`score_import.confidence`.
 """
 
 from __future__ import annotations
 
+import tempfile
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from pathlib import Path
+from typing import Any, Callable, Optional
 
 from music21 import bar, chord, converter, key as m21key, note as m21note, repeat, stream, tempo
 from music21 import meter as m21meter
 
+from . import confidence as conf
+from . import omr
 from .schema import (
     EXTRACTOR_VERSION,
     ExtractedChart,
@@ -78,6 +92,8 @@ class ConversionReport:
     dropped: dict[str, int] = field(default_factory=dict)
     #: Distinct quarter-note BPMs found in the score, in order of appearance.
     tempos: list[float] = field(default_factory=list)
+    #: What the confidence pass found — ``None`` unless it ran (the OMR path).
+    confidence: Optional[conf.ConfidenceSummary] = None
 
     def warn(self, message: str) -> None:
         self.warnings.append(message)
@@ -91,6 +107,8 @@ class ConversionReport:
         out = [f"warning: {w}" for w in self.warnings]
         for category in sorted(self.dropped):
             out.append(f"dropped {self.dropped[category]} {category} (by design)")
+        if self.confidence is not None:
+            out.extend(self.confidence.detail_lines())
         return out
 
 
@@ -124,17 +142,57 @@ def parse_hand_map(spec: Optional[str]) -> dict[int, Hand]:
     return mapping
 
 
+def convert_input(
+    path: str,
+    *,
+    hand_map: Optional[dict[int, Hand]] = None,
+    title: Optional[str] = None,
+    log: Callable[[str], None] = omr._log,
+) -> tuple[ExtractedChart, ConversionReport]:
+    """Convert any supported input — a score file, or a scan via OMR (M13-B).
+
+    This is the one entry point the CLI uses, which is what keeps the Rust side
+    on a single sidecar contract: same ``--in``/``--out``, same JSON on stdout,
+    whether the input was MusicXML or a photograph of a page.
+
+    A score file goes straight to :func:`convert_score`. A scan or PDF is
+    transcribed to MusicXML in a temporary directory first — the intermediate is
+    never left behind next to the user's scan — and then converted with the
+    confidence pass enabled and the engine recorded in ``extractor_version``.
+    """
+    if not omr.is_scan(path):
+        return convert_score(path, hand_map=hand_map, title=title)
+
+    with tempfile.TemporaryDirectory(prefix="rockcraft-omr-") as work:
+        musicxml = Path(work) / "transcribed.musicxml"
+        engine = omr.transcribe(path, musicxml, log=log)
+        return convert_score(
+            str(musicxml),
+            hand_map=hand_map,
+            title=title,
+            confidence_check=True,
+            extractor_version=engine.label(),
+        )
+
+
 def convert_score(
     path: str,
     *,
     hand_map: Optional[dict[int, Hand]] = None,
     title: Optional[str] = None,
+    confidence_check: bool = False,
+    extractor_version: str = EXTRACTOR_VERSION,
 ) -> tuple[ExtractedChart, ConversionReport]:
     """Convert the score at `path` into an :class:`ExtractedChart`.
 
     Returns the chart and a :class:`ConversionReport` of warnings and
     by-design drops. Raises whatever ``music21`` raises for an unreadable or
     unsupported file — the CLI turns that into a non-zero exit.
+
+    `confidence_check` swaps rule 9's exact ``confidence = 1.0`` for
+    :mod:`score_import.confidence`'s structural per-note score, and fills in
+    ``report.confidence``. It is off by default: only the OMR path, whose input
+    was *inferred* rather than stated, turns it on.
     """
     report = ConversionReport()
     score = converter.parse(path)
@@ -145,16 +203,24 @@ def convert_score(
     parts = _parts(score)
     hands = _resolve_hands(parts, hand_map or {}, report)
 
+    # Audited *after* the repeat/tie rewrites, because both copy their elements
+    # and the policy is keyed on the identity of the notes actually emitted.
+    audit = conf.audit(score) if confidence_check else None
+    note_confidence = audit.policy.confidence_for if audit else _exact_confidence
+
     notes: list[ExtractedNote] = []
     for index, part in enumerate(parts):
-        notes.extend(_part_notes(part, hands[index], tempo_map, report))
+        notes.extend(_part_notes(part, hands[index], tempo_map, report, note_confidence))
     notes.sort(key=lambda n: (n.start_us, n.pitch))
+
+    if audit is not None:
+        report.confidence = conf.summarize(notes, audit)
 
     return (
         ExtractedChart(
             notes=notes,
             source=SourceMeta(
-                extractor_version=EXTRACTOR_VERSION,
+                extractor_version=extractor_version,
                 title=title if title is not None else _title(score),
             ),
             notation=_notation(score, tempo_map, report),
@@ -290,11 +356,17 @@ def _us(seconds: float) -> int:
 # ── Notes ────────────────────────────────────────────────────────────────────
 
 
+def _exact_confidence(_element: Any, _pitch: int) -> float:
+    """Rule 9: a score *states* its notes, so the transform is fully confident."""
+    return 1.0
+
+
 def _part_notes(
     part: stream.Part,
     hand: Hand,
     tempo_map: list[tuple[float, float]],
     report: ConversionReport,
+    note_confidence: Callable[[Any, int], float] = _exact_confidence,
 ) -> list[ExtractedNote]:
     notes: list[ExtractedNote] = []
     for element in part.flatten().notes:
@@ -319,7 +391,7 @@ def _part_notes(
                     dur_us=dur_us,
                     hand=hand,
                     velocity=velocity,
-                    confidence=1.0,
+                    confidence=note_confidence(element, pitch),
                 )
             )
     return notes

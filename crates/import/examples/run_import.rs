@@ -7,8 +7,10 @@
 //!
 //!   cargo run -p rockcraft-import --example run_import -- <file-or-url>
 //!
-//! A score file (`.musicxml`, `.xml`, `.mxl`, `.abc`, `.krn`) routes to the
-//! M13-A score converter; any other local path is treated as a video.
+//! A score file (`.musicxml`, `.xml`, `.mxl`, `.abc`, `.krn`) or a scan
+//! (`.pdf`, `.png`, `.jpg`, …) routes to the score sidecar; any other local path
+//! is treated as a video. The sidecar itself decides whether an input needs OMR
+//! first, so both kinds enter through the same [`ImportInput::Score`].
 //!
 //! Prints the resulting bundle directory on success.
 
@@ -17,8 +19,13 @@ use std::path::Path;
 use rockcraft_import::{import_source, ImportInput, Progress};
 
 /// Extensions routed to the score sidecar rather than the video extractor.
-/// Mirrors the documented/tested set in `tools/score-import/README.md`.
-const SCORE_EXTENSIONS: &[&str] = &["musicxml", "xml", "mxl", "abc", "krn"];
+/// Mirrors the documented/tested set in `tools/score-import/README.md`: score
+/// files (M13-A) plus scans and PDFs, which the sidecar puts through OMR first
+/// (M13-B).
+const SCORE_EXTENSIONS: &[&str] = &[
+    "musicxml", "xml", "mxl", "abc", "krn", // score files — a deterministic transform
+    "pdf", "png", "jpg", "jpeg", "tif", "tiff", "bmp", // scans — OMR, and lossy
+];
 
 fn is_score_file(path: &Path) -> bool {
     path.extension()
