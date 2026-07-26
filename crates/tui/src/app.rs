@@ -867,40 +867,7 @@ pub fn run_loop<B: ratatui::backend::Backend>(
         }
 
         // Poll the import pipeline and handle completion.
-        let import_result = if let Screen::Importing(imp) = &mut shell.screen {
-            match imp.poll() {
-                Some(ImportOutcome::Done(path)) => Some(Ok(path.clone())),
-                Some(ImportOutcome::Failed(msg)) => Some(Err(msg.clone())),
-                None => None,
-            }
-        } else {
-            None
-        };
-        match import_result {
-            Some(Ok(bundle)) => {
-                let midi = bundle.join("song.mid");
-                match load_play_screen(&midi, shell.synth.clone()) {
-                    Ok(play) => {
-                        shell.status = format!("imported: {}", bundle.display());
-                        // Audition the imported chart immediately: without a live
-                        // piano part, an import would otherwise be silent (#152).
-                        shell.screen = Screen::Play(Box::new(play.with_hear_song(true)));
-                    }
-                    Err(e) => {
-                        shell.status = format!("import succeeded but load failed: {e}");
-                        shell.screen = Screen::Menu;
-                    }
-                }
-            }
-            Some(Err(msg)) => {
-                // Keep the Importing screen up so its output tail stays visible
-                // next to the error; Esc dismisses it back to the menu. Status
-                // carries only the first line (the rest is shown in the pane).
-                let first = msg.lines().next().unwrap_or(&msg);
-                shell.status = format!("import failed: {first}");
-            }
-            None => {}
-        }
+        apply_import_outcome(shell);
 
         let completed = terminal.draw(|f| draw(f, shell))?;
         shell.terminal_size = (completed.area.width, completed.area.height);
@@ -1050,9 +1017,55 @@ pub(crate) fn latest_recording_from(base: &std::path::Path) -> Option<std::path:
     candidates.pop().map(|(_, midi)| midi)
 }
 
+/// Poll a running import and act on its outcome; a no-op on every other screen.
+///
+/// Success loads the finished bundle into Play through the same
+/// [`load_play_screen`] the library path uses, so an imported piece and the same
+/// bundle re-opened later behave identically (#247). Failure leaves the
+/// Importing screen up so its output tail stays readable next to the error.
+///
+/// Split out of `run_loop` so the completion branch is reachable headlessly.
+fn apply_import_outcome(shell: &mut Shell) {
+    let import_result = if let Screen::Importing(imp) = &mut shell.screen {
+        match imp.poll() {
+            Some(ImportOutcome::Done(path)) => Some(Ok(path.clone())),
+            Some(ImportOutcome::Failed(msg)) => Some(Err(msg.clone())),
+            None => None,
+        }
+    } else {
+        None
+    };
+    match import_result {
+        Some(Ok(bundle)) => {
+            let midi = bundle.join("song.mid");
+            match load_play_screen(&midi, shell.synth.clone()) {
+                Ok(play) => {
+                    shell.status = format!("imported: {}", bundle.display());
+                    shell.screen = Screen::Play(Box::new(play));
+                }
+                Err(e) => {
+                    shell.status = format!("import succeeded but load failed: {e}");
+                    shell.screen = Screen::Menu;
+                }
+            }
+        }
+        Some(Err(msg)) => {
+            // Status carries only the first line (the rest is shown in the pane).
+            let first = msg.lines().next().unwrap_or(&msg);
+            shell.status = format!("import failed: {first}");
+        }
+        None => {}
+    }
+}
+
 /// Build a [`PlayScreen`] for the MIDI at `midi_path`, attaching the bundle's
 /// backing track when its sibling `meta.json` declares one. Loose `.mid` files
 /// (no sibling manifest) load MIDI-only, exactly as before.
+///
+/// "Hear the song" defaults to on exactly when the piece has no backing track
+/// (#247): a MIDI-only bundle would otherwise open silent unless a live piano is
+/// connected, while a piece with a real recording behind it doesn't need the
+/// synth doubling the melody. The `m` key still toggles it either way.
 fn load_play_screen(
     midi_path: &std::path::Path,
     synth: Option<SynthHandle>,
@@ -1067,16 +1080,18 @@ fn load_play_screen(
 
     // A bundle keeps its manifest next to song.mid; resolve the backing track
     // (if any) relative to that directory so the bundle stays movable.
+    let mut has_backing = false;
     if let Some(dir) = midi_path.parent() {
         if let Ok(json) = std::fs::read_to_string(dir.join("meta.json")) {
             if let Ok(meta) = RecordingMeta::from_json(&json) {
                 if let Some(backing) = meta.backing {
                     play = play.with_backing(dir.join(&backing.file), backing.audio_start_us);
+                    has_backing = true;
                 }
             }
         }
     }
-    Ok(play)
+    Ok(play.with_hear_song(!has_backing))
 }
 
 #[cfg(test)]
@@ -2192,6 +2207,137 @@ mod tests {
             outcome,
             Some(true),
             "missing-file import must surface a Failed outcome"
+        );
+    }
+
+    // ── "hear the song" default (issue #247) ────────────────────────────────
+
+    /// The committed fixture bundle: four notes, MIDI-only (its `meta.json`
+    /// declares no backing track).
+    fn midi_only_fixture() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("fixtures")
+            .join("play-bundle")
+    }
+
+    /// Copy the fixture's `song.mid` into a fresh temp bundle and write a
+    /// `meta.json` that declares `backing` (or not).
+    fn bundle_with_backing(tag: &str, backing: bool) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rockcraft_hear_{tag}_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::copy(midi_only_fixture().join("song.mid"), dir.join("song.mid")).unwrap();
+        let meta = RecordingMeta {
+            midi_file: "song.mid".into(),
+            backing: backing.then(|| rockcraft_core::BackingTrack {
+                file: "backing.ogg".into(),
+                audio_start_us: 0,
+            }),
+            grid: None,
+            key: None,
+            origin: Some(TrackOrigin::Composed),
+            video: None,
+            version: 1,
+        };
+        std::fs::write(dir.join("meta.json"), meta.to_json()).unwrap();
+        if backing {
+            std::fs::write(dir.join("backing.ogg"), b"").unwrap();
+        }
+        dir
+    }
+
+    /// A MIDI-only piece would open silent without a live piano, so the synth
+    /// audition defaults ON at load.
+    #[test]
+    fn hear_song_defaults_on_for_midi_only_bundle() {
+        let play = load_play_screen(&midi_only_fixture().join("song.mid"), None)
+            .expect("load fixture bundle");
+        assert!(
+            play.is_hear_song(),
+            "a bundle with no backing track must audition itself"
+        );
+    }
+
+    /// A piece with a real recording behind it doesn't need the synth doubling
+    /// the melody, so the audition defaults OFF.
+    #[test]
+    fn hear_song_defaults_off_when_bundle_has_backing() {
+        let dir = bundle_with_backing("backed", true);
+        let play = load_play_screen(&dir.join("song.mid"), None).expect("load backed bundle");
+        assert!(
+            !play.is_hear_song(),
+            "a bundle with a backing track must not audition over it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `m` toggle still flips in both directions from whichever default
+    /// applied — the default only picks the starting side.
+    #[test]
+    fn m_toggles_hear_song_from_either_default() {
+        let mut shell = make_shell();
+
+        // MIDI-only: starts on, `m` turns it off, `m` again turns it back on.
+        let play = load_play_screen(&midi_only_fixture().join("song.mid"), None).unwrap();
+        shell.screen = Screen::Play(Box::new(play));
+        shell.on_key(KeyCode::Char('m'));
+        assert!(!play_screen(&shell).is_hear_song(), "m turns it off");
+        shell.on_key(KeyCode::Char('m'));
+        assert!(play_screen(&shell).is_hear_song(), "m turns it back on");
+
+        // Backed: starts off, and `m` still lights it.
+        let dir = bundle_with_backing("toggle", true);
+        let play = load_play_screen(&dir.join("song.mid"), None).unwrap();
+        shell.screen = Screen::Play(Box::new(play));
+        assert!(!play_screen(&shell).is_hear_song(), "backed starts off");
+        shell.on_key(KeyCode::Char('m'));
+        assert!(play_screen(&shell).is_hear_song(), "m turns it on");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn play_screen(shell: &Shell) -> &PlayScreen {
+        match &shell.screen {
+            Screen::Play(play) => play,
+            _ => panic!("expected the play screen, got {}", shell.screen_name()),
+        }
+    }
+
+    /// The regression the deleted import-only special case used to hide: a
+    /// MIDI-only bundle opened straight off an import and the *same* bundle
+    /// opened later from the library land in the same audition state.
+    #[test]
+    fn import_completion_and_library_load_agree_on_hear_song() {
+        use crate::import_screen::{ImportingScreen, WorkerEvent};
+
+        let bundle = midi_only_fixture();
+
+        // Library path: load the bundle the way the browser does.
+        let via_library = load_play_screen(&bundle.join("song.mid"), None).unwrap();
+
+        // Import path: a finished worker hands the bundle dir to the shell.
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(WorkerEvent::Done(bundle.clone())).unwrap();
+        drop(tx);
+        let mut shell = make_shell();
+        shell.screen = Screen::Importing(ImportingScreen::from_receiver(rx));
+        apply_import_outcome(&mut shell);
+
+        assert_eq!(shell.screen_name(), "play", "a done import opens Play");
+        assert!(
+            play_screen(&shell).is_hear_song(),
+            "an imported MIDI-only piece must be audible"
+        );
+        assert_eq!(
+            play_screen(&shell).is_hear_song(),
+            via_library.is_hear_song(),
+            "import and library loads must agree"
         );
     }
 }

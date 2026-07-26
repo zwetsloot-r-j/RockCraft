@@ -313,14 +313,14 @@ impl UrlInput {
 /// Most log lines we retain in memory for the scrolling output pane.
 const MAX_LOG_LINES: usize = 500;
 
-enum RunningState {
+pub(crate) enum RunningState {
     Starting,
     Fetching,
     Extracting(f32),
     Writing,
 }
 
-enum WorkerEvent {
+pub(crate) enum WorkerEvent {
     Running(RunningState),
     Log(String),
     Done(PathBuf),
@@ -372,9 +372,10 @@ impl ImportingScreen {
     }
 
     /// A screen fed by `rx` instead of a live pipeline, so the log/summary
-    /// handling is testable without a Python sidecar on the machine.
+    /// handling — and the shell's completion branch — are testable without a
+    /// Python sidecar on the machine.
     #[cfg(test)]
-    fn from_receiver(rx: mpsc::Receiver<WorkerEvent>) -> Self {
+    pub(crate) fn from_receiver(rx: mpsc::Receiver<WorkerEvent>) -> Self {
         Self {
             rx,
             running: RunningState::Starting,
