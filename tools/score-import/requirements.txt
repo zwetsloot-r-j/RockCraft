@@ -1,0 +1,8 @@
+# Score-file importer (M13-A) — runtime + test deps.
+# music21 is the only runtime dependency: it parses MusicXML/ABC/Humdrum and
+# gives us the notated tempo, metre, key and staff layout directly. No CV, no
+# ML, no network — this path is a deterministic transform.
+music21>=9.1
+
+# Test-only:
+pytest>=7.0

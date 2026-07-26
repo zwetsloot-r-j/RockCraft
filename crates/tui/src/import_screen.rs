@@ -1,7 +1,7 @@
-//! Import flow: video-file picker → URL input → progress screen.
+//! Import flow: source-file picker → URL input → progress screen.
 //!
 //! Three self-contained sub-screens that `app.rs` routes through:
-//! 1. `VideoPicker`    — browse for a local video file.
+//! 1. `SourcePicker`   — browse for a local video or score file.
 //! 2. `UrlInput`       — type a URL.
 //! 3. `ImportingScreen`— shows pipeline progress; on completion yields a bundle path.
 
@@ -18,17 +18,57 @@ use ratatui::{
     widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph},
     Frame,
 };
-use rockcraft_import::{import_video, ImportInput, Progress};
+use rockcraft_import::{import_source, ImportInput, Progress};
 
-// ── Video file picker ──────────────────────────────────────────────────────────
+// ── Source file picker ─────────────────────────────────────────────────────────
 
 const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mkv", "avi", "mov", "webm", "flv", "wmv", "m4v"];
 
-/// Return video files in `dir`, sorted by name.
-pub fn list_video_files(dir: &Path) -> Vec<PathBuf> {
+/// Score formats the M13-A sidecar reads. Mirrors the documented/tested set in
+/// `tools/score-import/README.md`.
+const SCORE_EXTENSIONS: &[&str] = &["musicxml", "xml", "mxl", "abc", "krn"];
+
+/// Which import source a [`SourcePicker`] browses for.
+///
+/// The two paths differ in more than the file filter: video goes through
+/// fetch/extract/ffmpeg, a score is a deterministic conversion. The kind travels
+/// with the picker so the selected path becomes the right [`ImportInput`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceKind {
+    Video,
+    Score,
+}
+
+impl SourceKind {
+    fn extensions(self) -> &'static [&'static str] {
+        match self {
+            SourceKind::Video => VIDEO_EXTENSIONS,
+            SourceKind::Score => SCORE_EXTENSIONS,
+        }
+    }
+
+    fn noun(self) -> &'static str {
+        match self {
+            SourceKind::Video => "video",
+            SourceKind::Score => "score",
+        }
+    }
+
+    /// The pipeline input for a file the user picked under this kind.
+    pub fn input_for(self, path: PathBuf) -> ImportInput {
+        match self {
+            SourceKind::Video => ImportInput::File(path),
+            SourceKind::Score => ImportInput::Score(path),
+        }
+    }
+}
+
+/// Return the files in `dir` matching `kind`, sorted by name.
+pub fn list_source_files(dir: &Path, kind: SourceKind) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return vec![];
     };
+    let extensions = kind.extensions();
     let mut files: Vec<PathBuf> = entries
         .flatten()
         .map(|e| e.path())
@@ -36,7 +76,7 @@ pub fn list_video_files(dir: &Path) -> Vec<PathBuf> {
             p.is_file()
                 && p.extension()
                     .and_then(|e| e.to_str())
-                    .map(|e| VIDEO_EXTENSIONS.contains(&e.to_lowercase().as_str()))
+                    .map(|e| extensions.contains(&e.to_lowercase().as_str()))
                     .unwrap_or(false)
         })
         .collect();
@@ -45,56 +85,62 @@ pub fn list_video_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum VideoPickerOutcome {
+pub enum SourcePickerOutcome {
     Selected(PathBuf),
     Cancelled,
     Pending,
 }
 
-pub struct VideoPicker {
+pub struct SourcePicker {
     dir: PathBuf,
+    kind: SourceKind,
     files: Vec<PathBuf>,
     state: ListState,
-    outcome: Option<VideoPickerOutcome>,
+    outcome: Option<SourcePickerOutcome>,
 }
 
-impl VideoPicker {
-    pub fn new(dir: PathBuf) -> Self {
-        let files = list_video_files(&dir);
+impl SourcePicker {
+    pub fn new(dir: PathBuf, kind: SourceKind) -> Self {
+        let files = list_source_files(&dir, kind);
         let mut state = ListState::default();
         if !files.is_empty() {
             state.select(Some(0));
         }
         Self {
             dir,
+            kind,
             files,
             state,
             outcome: None,
         }
     }
 
-    pub fn on_key(&mut self, code: KeyCode) -> &VideoPickerOutcome {
+    pub fn kind(&self) -> SourceKind {
+        self.kind
+    }
+
+    pub fn on_key(&mut self, code: KeyCode) -> &SourcePickerOutcome {
         match code {
             KeyCode::Up | KeyCode::Char('k') => self.move_sel(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_sel(1),
             KeyCode::Enter => {
                 if let Some(idx) = self.state.selected() {
                     if let Some(path) = self.files.get(idx) {
-                        self.outcome = Some(VideoPickerOutcome::Selected(path.clone()));
+                        self.outcome = Some(SourcePickerOutcome::Selected(path.clone()));
                     }
                 }
                 if self.outcome.is_none() {
-                    self.outcome = Some(VideoPickerOutcome::Cancelled);
+                    self.outcome = Some(SourcePickerOutcome::Cancelled);
                 }
             }
             KeyCode::Esc => {
-                self.outcome = Some(VideoPickerOutcome::Cancelled);
+                self.outcome = Some(SourcePickerOutcome::Cancelled);
             }
             _ => {}
         }
         self.outcome
             .as_ref()
-            .unwrap_or(&VideoPickerOutcome::Pending)
+            .unwrap_or(&SourcePickerOutcome::Pending)
     }
 
     fn move_sel(&mut self, delta: isize) {
@@ -117,14 +163,18 @@ impl VideoPicker {
 
         f.render_widget(
             Paragraph::new(Line::from(format!(
-                "Import from video file  (dir: {})  — ↑/↓/j/k move · Enter select · Esc cancel",
+                "Import from {} file  (dir: {})  — ↑/↓/j/k move · Enter select · Esc cancel",
+                self.kind.noun(),
                 self.dir.display()
             ))),
             chunks[0],
         );
 
         let items: Vec<ListItem> = if self.files.is_empty() {
-            vec![ListItem::new("(no video files found in this directory)")]
+            vec![ListItem::new(format!(
+                "(no {} files found in this directory)",
+                self.kind.noun()
+            ))]
         } else {
             self.files
                 .iter()
@@ -142,7 +192,7 @@ impl VideoPicker {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" video files "),
+                    .title(format!(" {} files ", self.kind.noun())),
             )
             .highlight_style(
                 Style::default()
@@ -285,7 +335,7 @@ impl ImportingScreen {
     pub fn start(input: ImportInput) -> Self {
         let (tx, rx) = mpsc::channel::<WorkerEvent>();
         thread::spawn(move || {
-            let result = import_video(input, &mut |p| {
+            let result = import_source(input, &mut |p| {
                 let event = match p {
                     Progress::Fetching => WorkerEvent::Running(RunningState::Fetching),
                     Progress::Log(line) => WorkerEvent::Log(line),
@@ -345,7 +395,7 @@ impl ImportingScreen {
 
         let header = match &self.outcome {
             Some(ImportOutcome::Failed(_)) => "Import failed.  (Esc to dismiss)",
-            _ => "Importing video — please wait…  (Esc to cancel)",
+            _ => "Importing — please wait…  (Esc to cancel)",
         };
         f.render_widget(Paragraph::new(Line::from(header)), chunks[0]);
 
@@ -428,7 +478,7 @@ mod tests {
         fs::write(dir.join(name), b"").unwrap();
     }
 
-    // ── list_video_files ──────────────────────────────────────────────────────
+    // ── list_source_files ─────────────────────────────────────────────────────
 
     #[test]
     fn video_list_returns_only_video_extensions() {
@@ -439,7 +489,7 @@ mod tests {
         touch(&dir, "readme.txt");
         fs::create_dir_all(dir.join("subdir")).unwrap();
 
-        let files = list_video_files(&dir);
+        let files = list_source_files(&dir, SourceKind::Video);
         let names: Vec<_> = files
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
@@ -459,7 +509,7 @@ mod tests {
         touch(&dir, "aaa.mkv");
         touch(&dir, "mmm.avi");
 
-        let files = list_video_files(&dir);
+        let files = list_source_files(&dir, SourceKind::Video);
         let names: Vec<_> = files
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
@@ -470,20 +520,23 @@ mod tests {
 
     #[test]
     fn video_list_empty_on_nonexistent_dir() {
-        let files = list_video_files(Path::new("/nonexistent/path/rockcraft_test"));
+        let files = list_source_files(
+            Path::new("/nonexistent/path/rockcraft_test"),
+            SourceKind::Video,
+        );
         assert!(files.is_empty());
     }
 
-    // ── VideoPicker ───────────────────────────────────────────────────────────
+    // ── SourcePicker ──────────────────────────────────────────────────────────
 
     #[test]
     fn video_picker_esc_cancels() {
         let dir = temp_dir("vpick_esc");
         touch(&dir, "clip.mp4");
 
-        let mut picker = VideoPicker::new(dir.clone());
+        let mut picker = SourcePicker::new(dir.clone(), SourceKind::Video);
         let outcome = picker.on_key(KeyCode::Esc).clone();
-        assert_eq!(outcome, VideoPickerOutcome::Cancelled);
+        assert_eq!(outcome, SourcePickerOutcome::Cancelled);
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -493,10 +546,10 @@ mod tests {
         touch(&dir, "alpha.mp4");
         touch(&dir, "beta.mkv");
 
-        let mut picker = VideoPicker::new(dir.clone());
+        let mut picker = SourcePicker::new(dir.clone(), SourceKind::Video);
         let outcome = picker.on_key(KeyCode::Enter).clone();
         match outcome {
-            VideoPickerOutcome::Selected(p) => {
+            SourcePickerOutcome::Selected(p) => {
                 assert_eq!(
                     p.file_name().unwrap().to_string_lossy().as_ref(),
                     "alpha.mp4"
@@ -513,11 +566,11 @@ mod tests {
         touch(&dir, "alpha.mp4");
         touch(&dir, "beta.mkv");
 
-        let mut picker = VideoPicker::new(dir.clone());
+        let mut picker = SourcePicker::new(dir.clone(), SourceKind::Video);
         picker.on_key(KeyCode::Down);
         let outcome = picker.on_key(KeyCode::Enter).clone();
         match outcome {
-            VideoPickerOutcome::Selected(p) => {
+            SourcePickerOutcome::Selected(p) => {
                 assert_eq!(
                     p.file_name().unwrap().to_string_lossy().as_ref(),
                     "beta.mkv"
@@ -531,9 +584,72 @@ mod tests {
     #[test]
     fn video_picker_empty_dir_enter_cancels() {
         let dir = temp_dir("vpick_empty");
-        let mut picker = VideoPicker::new(dir.clone());
+        let mut picker = SourcePicker::new(dir.clone(), SourceKind::Video);
         let outcome = picker.on_key(KeyCode::Enter).clone();
-        assert_eq!(outcome, VideoPickerOutcome::Cancelled);
+        assert_eq!(outcome, SourcePickerOutcome::Cancelled);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── Score picker (M13-A) ──────────────────────────────────────────────────
+
+    /// The score picker lists score formats and hides the videos sitting next to
+    /// them (and vice-versa — the two kinds must not bleed into each other).
+    #[test]
+    fn score_list_returns_only_score_extensions() {
+        let dir = temp_dir("score_ext");
+        touch(&dir, "scale.musicxml");
+        touch(&dir, "tune.MXL");
+        touch(&dir, "chorale.krn");
+        touch(&dir, "clip.mp4");
+        touch(&dir, "readme.txt");
+
+        let names: Vec<String> = list_source_files(&dir, SourceKind::Score)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains(&"scale.musicxml".to_string()));
+        assert!(names.contains(&"tune.MXL".to_string()), "case-insensitive");
+        assert!(names.contains(&"chorale.krn".to_string()));
+        assert!(!names.contains(&"clip.mp4".to_string()));
+        assert!(!names.contains(&"readme.txt".to_string()));
+
+        let videos: Vec<String> = list_source_files(&dir, SourceKind::Video)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(videos, vec!["clip.mp4".to_string()]);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A file picked under `Score` becomes an `ImportInput::Score`, not a video.
+    #[test]
+    fn score_kind_builds_score_input() {
+        let path = PathBuf::from("/tmp/scale.musicxml");
+        assert!(matches!(
+            SourceKind::Score.input_for(path.clone()),
+            ImportInput::Score(p) if p == path
+        ));
+        assert!(matches!(
+            SourceKind::Video.input_for(path.clone()),
+            ImportInput::File(p) if p == path
+        ));
+    }
+
+    #[test]
+    fn score_picker_enter_selects_first() {
+        let dir = temp_dir("spick_enter");
+        touch(&dir, "alpha.musicxml");
+        touch(&dir, "beta.abc");
+
+        let mut picker = SourcePicker::new(dir.clone(), SourceKind::Score);
+        assert_eq!(picker.kind(), SourceKind::Score);
+        match picker.on_key(KeyCode::Enter).clone() {
+            SourcePickerOutcome::Selected(p) => assert_eq!(
+                p.file_name().unwrap().to_string_lossy().as_ref(),
+                "alpha.musicxml"
+            ),
+            other => panic!("expected Selected, got {other:?}"),
+        }
         fs::remove_dir_all(&dir).ok();
     }
 

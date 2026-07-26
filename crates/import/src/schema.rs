@@ -1,14 +1,39 @@
 use serde::{Deserialize, Serialize};
 
-/// A chart extracted from a video source by the M6-C sidecar.
+/// A chart extracted from a source by an importer sidecar.
 ///
-/// This type is the wire format between the Python extractor and the Rust
-/// pipeline. It must never be committed with real song data; synthetic
-/// fixtures only (see M6-B gitignore guard).
+/// This type is the wire format between a Python extractor and the Rust
+/// pipeline — the M6-C video extractor and the M13-A score-file converter both
+/// emit it. It must never be committed with real song data; synthetic fixtures
+/// only (see M6-B gitignore guard).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ExtractedChart {
     pub notes: Vec<ExtractedNote>,
     pub source: SourceMeta,
+    /// Notated musical context, when the source carries it. Score files do;
+    /// video does not. Drives `meta.grid` / `meta.key` in the written bundle.
+    ///
+    /// `#[serde(default)]` keeps every chart written before M13-A — including
+    /// the committed `tests/fixtures/synthetic_chart.json` — deserializable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notation: Option<NotationMeta>,
+}
+
+/// Tempo / metre / key as *notated* in the source score.
+///
+/// Only a source that states these explicitly should fill them in — nothing here
+/// is inferred. A `None` field means "the source did not say", not "default".
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct NotationMeta {
+    /// Tempo at the start of the piece, in BPM. The writer clamps it to
+    /// [`Grid::MIN_BPM`](rockcraft_core::Grid::MIN_BPM)..=[`Grid::MAX_BPM`](rockcraft_core::Grid::MAX_BPM);
+    /// out-of-range is not an error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bpm: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_sig: Option<rockcraft_core::TimeSig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<rockcraft_core::Key>,
 }
 
 /// One detected note in an extracted chart.

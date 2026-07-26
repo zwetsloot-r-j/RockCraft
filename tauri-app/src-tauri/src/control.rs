@@ -411,6 +411,16 @@ impl HostServices for TauriHost<'_> {
                     Err(e) => failed("import_start", e),
                 }
             }
+            HostCommand::ImportScore { path } => {
+                match crate::import::import_start(
+                    app.clone(),
+                    app.state::<ImportRunning>(),
+                    ImportInputDto::Score(path),
+                ) {
+                    Ok(()) => Ok(serde_json::Value::Null),
+                    Err(e) => failed("import_score", e),
+                }
+            }
 
             // ── status / device (read-only) ─────────────────────────────
             HostCommand::AudioStatus => json_payload(
