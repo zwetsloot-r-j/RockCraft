@@ -13,7 +13,7 @@ use serde::Serialize;
 use crate::{
     error::ImportError,
     parser::chart_to_timeline,
-    schema::{ExtractedChart, SourceMeta},
+    schema::{ExtractedChart, NotationMeta, SourceMeta},
 };
 
 /// The canonical gitignored output root, e.g. `<workspace>/import-out`.
@@ -87,6 +87,13 @@ pub fn write_chart_bundle_full(
     meta.backing = backing;
     meta.video = video;
     meta.origin = Some(rockcraft_core::TrackOrigin::Imported);
+    // A source that carries notated context (M13-A score files) seeds the
+    // editor's grid and key. Video extraction carries none, so its bundles keep
+    // `grid`/`key` null exactly as before.
+    if let Some(notation) = chart.notation {
+        meta.grid = Some(grid_from_notation(&notation));
+        meta.key = notation.key;
+    }
     std::fs::write(dir.join("meta.json"), meta.to_json())?;
 
     // When the bundle carries a source movie and the extractor measured the
@@ -103,6 +110,25 @@ pub fn write_chart_bundle_full(
     }
 
     Ok(dir.to_path_buf())
+}
+
+/// Build the bundle's [`Grid`] from a score's notated context.
+///
+/// Starts from [`Grid::default_120`] so a field the source did not state keeps
+/// the editor's default. `bpm` goes through [`Grid::set_bpm`], which clamps to
+/// the editable range — an unplayably fast or slow marking lands on a bound
+/// rather than failing the import. `subdivision` is deliberately *not* derived
+/// from the score's smallest note value: it is a snap preference the user
+/// re-picks in the editor.
+fn grid_from_notation(notation: &NotationMeta) -> Grid {
+    let mut grid = Grid::default_120();
+    if let Some(bpm) = notation.bpm {
+        grid.set_bpm(bpm);
+    }
+    if let Some(time_sig) = notation.time_sig {
+        grid.time_sig = time_sig;
+    }
+    grid
 }
 
 /// Recommended initial edit-grid calibration, written next to the bundle as
@@ -306,6 +332,7 @@ mod tests {
                 confidence: None,
             }],
             source,
+            notation: None,
         }
     }
 
@@ -379,5 +406,112 @@ mod tests {
             ..geometry_source()
         };
         assert!(alignment_from_source(&source).is_none());
+    }
+
+    // ── Notated context → meta.grid / meta.key (M13-A) ───────────────────────
+
+    fn plain_source() -> SourceMeta {
+        SourceMeta {
+            title: None,
+            fps: None,
+            scroll_px_per_s: None,
+            frame_height_px: None,
+            hit_line_px: None,
+            extractor_version: "score-import-0.1".into(),
+        }
+    }
+
+    /// Write a bundle for a chart carrying `notation` and read its `meta.json` back.
+    fn meta_for_notation(tmp: &TempDir, notation: Option<NotationMeta>) -> RecordingMeta {
+        let chart = ExtractedChart {
+            notation,
+            ..chart_with_source(plain_source())
+        };
+        write_chart_bundle_full(&chart, tmp.path(), None, None).unwrap();
+        let json = std::fs::read_to_string(tmp.path().join("meta.json")).unwrap();
+        RecordingMeta::from_json(&json).unwrap()
+    }
+
+    /// A score's notated tempo, metre and key land on the bundle's grid/key so
+    /// the piece opens in the editor already snapping to its own bars.
+    #[test]
+    fn notation_populates_grid_and_key() {
+        let tmp = TempDir::new().unwrap();
+        let meta = meta_for_notation(
+            &tmp,
+            Some(NotationMeta {
+                bpm: Some(90),
+                time_sig: Some(rockcraft_core::TimeSig {
+                    beats_per_bar: 3,
+                    beat_unit: 4,
+                }),
+                key: Some(Key {
+                    root_pc: 7,
+                    scale: rockcraft_core::Scale::Major,
+                }),
+            }),
+        );
+
+        let grid = meta.grid.expect("notation must produce a grid");
+        assert_eq!(grid.bpm, 90);
+        assert_eq!(grid.time_sig.beats_per_bar, 3);
+        assert_eq!(grid.time_sig.beat_unit, 4);
+        assert_eq!(
+            grid.subdivision,
+            rockcraft_core::Subdivision::Sixteenth,
+            "subdivision stays the editor default — it is a snap preference, \
+             not a property of the score"
+        );
+        assert_eq!(
+            meta.key,
+            Some(Key {
+                root_pc: 7,
+                scale: rockcraft_core::Scale::Major,
+            })
+        );
+    }
+
+    /// The video path carries no notation, and must keep writing `grid`/`key`
+    /// as null exactly as it did before M13-A.
+    #[test]
+    fn no_notation_leaves_grid_and_key_null() {
+        let tmp = TempDir::new().unwrap();
+        let meta = meta_for_notation(&tmp, None);
+        assert_eq!(meta.grid, None);
+        assert_eq!(meta.key, None);
+    }
+
+    /// A tempo outside the editable range clamps rather than failing the import.
+    #[test]
+    fn notation_bpm_is_clamped() {
+        for (notated, expected) in [(5u32, Grid::MIN_BPM), (5000, Grid::MAX_BPM)] {
+            let tmp = TempDir::new().unwrap();
+            let meta = meta_for_notation(
+                &tmp,
+                Some(NotationMeta {
+                    bpm: Some(notated),
+                    time_sig: None,
+                    key: None,
+                }),
+            );
+            assert_eq!(meta.grid.unwrap().bpm, expected, "bpm {notated} clamps");
+        }
+    }
+
+    /// A notation block that states nothing still yields the editor default grid
+    /// (and no key) — partial notation must never leave a half-built grid.
+    #[test]
+    fn empty_notation_yields_default_grid() {
+        let tmp = TempDir::new().unwrap();
+        let meta = meta_for_notation(
+            &tmp,
+            Some(NotationMeta {
+                bpm: None,
+                time_sig: None,
+                key: None,
+            }),
+        );
+        assert_eq!(meta.grid, Some(Grid::default_120()));
+        assert_eq!(meta.key, None);
     }
 }

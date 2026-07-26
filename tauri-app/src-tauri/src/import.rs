@@ -18,7 +18,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use rockcraft_import::{fetch_command_configured, import_video, ImportInput, Progress};
+use rockcraft_import::{fetch_command_configured, import_source, ImportInput, Progress};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 
@@ -54,6 +54,8 @@ pub struct ImportProgressEvent {
 pub enum ImportInputDto {
     File(String),
     Url(String),
+    /// A local digital score file (MusicXML and friends) — the M13-A path.
+    Score(String),
 }
 
 /// Map a `Progress` event to an `ImportProgressEvent` given the current stage.
@@ -136,12 +138,13 @@ pub fn import_start(
     let import_input = match input {
         ImportInputDto::File(p) => ImportInput::File(std::path::PathBuf::from(p)),
         ImportInputDto::Url(u) => ImportInput::Url(u),
+        ImportInputDto::Score(p) => ImportInput::Score(std::path::PathBuf::from(p)),
     };
 
     std::thread::spawn(move || {
         let mut current_stage = String::from("fetching");
 
-        let result = import_video(import_input, &mut |p| {
+        let result = import_source(import_input, &mut |p| {
             let event = progress_to_event(p, &mut current_stage);
             let _ = app.emit(EVENT_IMPORT_PROGRESS, &event);
         });

@@ -336,7 +336,9 @@ export function onPlayState(
  */
 export type ImportInputDto =
   | { kind: "File"; value: string }
-  | { kind: "Url"; value: string };
+  | { kind: "Url"; value: string }
+  /** A local digital score file (MusicXML and friends) — the M13-A path. */
+  | { kind: "Score"; value: string };
 
 /**
  * Progress event payload emitted by the backend during an import.

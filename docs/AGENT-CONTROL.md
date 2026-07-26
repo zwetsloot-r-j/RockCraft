@@ -426,6 +426,7 @@ below is an at-a-glance convenience only.
 | `detach_video` | none | Detach the background video |
 | `query_video` | none | The attached background video, or `null` |
 | `import_start` | `{ url: String }` | Start importing from a URL |
+| `import_score` | `{ path: String }` | Start importing a local score file (MusicXML/`.xml`/`.mxl`/`.abc`/`.krn`). The notated tempo, metre and key seed the new bundle's grid |
 | `audio_status` / `midi_status` / `record_status` | none | Read-only status snapshots |
 | `app_quit` | none | Shut the app down gracefully (exit 0); the socket closes as the process exits |
 

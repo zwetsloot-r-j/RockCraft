@@ -24,9 +24,13 @@ pub enum ImportInput {
     File(PathBuf),
     /// A URL to download via the configured fetch hook.
     Url(String),
+    /// A local digital score file (MusicXML and friends) that already exists on
+    /// disk. Converted by the M13-A sidecar — a deterministic transform with no
+    /// fetch, no ffmpeg and no retained video.
+    Score(PathBuf),
 }
 
-/// Coarse progress events emitted by [`import_video`].
+/// Coarse progress events emitted by [`import_source`].
 pub enum Progress {
     /// Downloading via the fetch hook.
     Fetching,
@@ -53,10 +57,11 @@ pub fn fetch_command_configured() -> bool {
 
 /// Resolve → extract → write. `on_progress` lets the TUI render status.
 ///
-/// Fetch hook: resolves `ROCKCRAFT_FETCH_CMD` first, then
-/// `scripts/local/fetch.sh` relative to the workspace root.
-/// If neither is present, returns [`ImportError::NoFetchCommand`].
-pub fn import_video(
+/// Handles every [`ImportInput`]: a local video, a URL to fetch, or a local
+/// score file. Fetch hook (URL inputs only): resolves `ROCKCRAFT_FETCH_CMD`
+/// first, then `scripts/local/fetch.sh` relative to the workspace root. If
+/// neither is present, returns [`ImportError::NoFetchCommand`].
+pub fn import_source(
     input: ImportInput,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<PathBuf, ImportError> {
@@ -86,6 +91,11 @@ fn run_pipeline(
     on_progress: &mut dyn FnMut(Progress),
     ctx: &PipelineCtx,
 ) -> Result<PathBuf, ImportError> {
+    // A score file is a deterministic transform, not a media pipeline: no fetch,
+    // no ffmpeg, no retained movie and no overlay calibration to derive.
+    if let ImportInput::Score(path) = input {
+        return run_score_pipeline(&path, on_progress, ctx);
+    }
     let video_path = resolve_input(input, on_progress, ctx)?;
     let chart_json = run_sidecar(&video_path, on_progress, &ctx.workspace)?;
     let chart = from_json(&chart_json)?;
@@ -103,6 +113,37 @@ fn run_pipeline(
     // a copy failure leaves `video: null` and the import still succeeds.
     let video = retain_source_video(&video_path, &out_dir);
     let bundle = write_chart_bundle_full(&chart, &out_dir, backing, video)?;
+    on_progress(Progress::Done(bundle.clone()));
+    Ok(bundle)
+}
+
+/// Convert a digital score file into a chart bundle (M13-A).
+///
+/// The score sidecar emits the same [`crate::ExtractedChart`] JSON the video
+/// extractor does — including a `notation` block the writer turns into the
+/// bundle's grid and key — so the parse/write half is shared verbatim. The
+/// bundle is MIDI-only: a score has no audio and no movie, so there is nothing
+/// to extract, retain or align against.
+fn run_score_pipeline(
+    score_path: &Path,
+    on_progress: &mut dyn FnMut(Progress),
+    ctx: &PipelineCtx,
+) -> Result<PathBuf, ImportError> {
+    if !score_path.exists() {
+        return Err(ImportError::Io(format!(
+            "file not found: {}",
+            score_path.display()
+        )));
+    }
+    let chart_json = run_score_sidecar(score_path, on_progress, &ctx.workspace)?;
+    let chart = from_json(&chart_json)?;
+    on_progress(Progress::Writing);
+    let out_dir = ctx
+        .workspace
+        .join("import-out")
+        .join(slug_stamp(score_path));
+    std::fs::create_dir_all(&out_dir)?;
+    let bundle = write_chart_bundle_full(&chart, &out_dir, None, None)?;
     on_progress(Progress::Done(bundle.clone()));
     Ok(bundle)
 }
@@ -182,7 +223,10 @@ fn resolve_input(
     ctx: &PipelineCtx,
 ) -> Result<PathBuf, ImportError> {
     match input {
-        ImportInput::File(p) => {
+        // `Score` never reaches here — `run_pipeline` intercepts it — but
+        // treating it as the local file it is keeps the match total without an
+        // `unreachable!`.
+        ImportInput::File(p) | ImportInput::Score(p) => {
             if !p.exists() {
                 return Err(ImportError::Io(format!("file not found: {}", p.display())));
             }
@@ -323,6 +367,54 @@ fn find_sidecar(workspace: &Path) -> Result<PathBuf, ImportError> {
             "sidecar not found at {}; ensure tools/synthesia-extract/ is present \
              and the venv is installed — run `pip install -r \
              tools/synthesia-extract/requirements.txt` in a venv (see docs/IMPORT.md)",
+            script.display()
+        )))
+    }
+}
+
+/// Run the M13-A score converter over `score_path`, returning its chart JSON.
+///
+/// Same subprocess contract as [`run_sidecar`]: stdout is the JSON, stderr is
+/// diagnostics (dropped-note counts, tempo warnings) surfaced only on failure.
+fn run_score_sidecar(
+    score_path: &Path,
+    on_progress: &mut dyn FnMut(Progress),
+    workspace: &Path,
+) -> Result<String, ImportError> {
+    on_progress(Progress::Extracting(0.0));
+    let sidecar = find_score_sidecar(workspace)?;
+    let output = Command::new("python3")
+        .arg(&sidecar)
+        .arg("--in")
+        .arg(score_path)
+        .arg("--out")
+        .arg("-")
+        .output()
+        .map_err(|e| {
+            ImportError::SidecarMissing(format!(
+                "could not launch python3: {e}; install python3 and set up \
+                 tools/score-import/ (see docs/IMPORT.md)"
+            ))
+        })?;
+    if !output.status.success() {
+        return Err(ImportError::SidecarFailed(
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ));
+    }
+    on_progress(Progress::Extracting(1.0));
+    String::from_utf8(output.stdout)
+        .map_err(|e| ImportError::SidecarFailed(format!("sidecar output is not valid UTF-8: {e}")))
+}
+
+fn find_score_sidecar(workspace: &Path) -> Result<PathBuf, ImportError> {
+    let script = workspace.join("tools/score-import/convert.py");
+    if script.exists() {
+        Ok(script)
+    } else {
+        Err(ImportError::SidecarMissing(format!(
+            "score sidecar not found at {}; ensure tools/score-import/ is present \
+             and the venv is installed — run `pip install -r \
+             tools/score-import/requirements.txt` in a venv (see docs/IMPORT.md)",
             script.display()
         )))
     }
@@ -823,5 +915,130 @@ mod tests {
             !out_dir.join(BACKING_FILENAME).exists(),
             "empty output file must be cleaned up"
         );
+    }
+
+    // ── Score import (M13-A) ─────────────────────────────────────────────────
+
+    /// Chart JSON a stub score sidecar emits: one note plus a notation block.
+    const SCORE_JSON: &str = r#"{
+      "notes": [{"pitch": 67, "start_us": 0, "dur_us": 500000, "hand": "Right", "confidence": 1.0}],
+      "source": {"extractor_version": "score-import-0.1"},
+      "notation": {"bpm": 90, "time_sig": {"beats_per_bar": 3, "beat_unit": 4},
+                   "key": {"root_pc": 7, "scale": "Major"}}
+    }"#;
+
+    /// Install a stub `tools/score-import/convert.py` under `tmp` that echoes
+    /// `SCORE_JSON` on stdout, standing in for the music21 converter.
+    fn stub_score_sidecar(tmp: &TempDir) {
+        let fixture_path = tmp.path().join("score-fixture.json");
+        std::fs::write(&fixture_path, SCORE_JSON).unwrap();
+        let sidecar_dir = tmp.path().join("tools/score-import");
+        std::fs::create_dir_all(&sidecar_dir).unwrap();
+        std::fs::write(
+            sidecar_dir.join("convert.py"),
+            format!(
+                "import sys\nwith open('{}') as f:\n    sys.stdout.write(f.read())\n",
+                fixture_path.display()
+            ),
+        )
+        .unwrap();
+    }
+
+    /// A score import writes a MIDI-only bundle whose `meta.json` carries the
+    /// notated grid and key — and no movie, backing or alignment sidecar.
+    #[test]
+    fn score_import_writes_notated_bundle() {
+        let tmp = TempDir::new().unwrap();
+        stub_score_sidecar(&tmp);
+        let score = tmp.path().join("scale.musicxml");
+        std::fs::write(&score, b"<score-partwise/>").unwrap();
+
+        let ctx = ctx_no_fetch(&tmp);
+        let bundle = run_pipeline(ImportInput::Score(score), &mut |_| {}, &ctx)
+            .expect("score import succeeds with a stub sidecar");
+
+        let json = std::fs::read_to_string(bundle.join("meta.json")).unwrap();
+        let meta = RecordingMeta::from_json(&json).unwrap();
+        let grid = meta.grid.expect("notated grid must reach meta.json");
+        assert_eq!(grid.bpm, 90);
+        assert_eq!(grid.time_sig.beats_per_bar, 3);
+        assert_eq!(
+            meta.key,
+            Some(rockcraft_core::Key {
+                root_pc: 7,
+                scale: rockcraft_core::Scale::Major,
+            })
+        );
+        assert!(meta.backing.is_none(), "a score has no audio");
+        assert!(meta.video.is_none(), "a score has no movie");
+        assert!(bundle.join("song.mid").exists());
+        assert!(
+            !bundle.join("alignment.json").exists(),
+            "no movie → nothing to calibrate an overlay against"
+        );
+    }
+
+    /// A score import reports Extracting → Writing → Done, and never Fetching.
+    #[test]
+    fn score_import_progress_skips_fetching() {
+        let tmp = TempDir::new().unwrap();
+        stub_score_sidecar(&tmp);
+        let score = tmp.path().join("scale.musicxml");
+        std::fs::write(&score, b"<score-partwise/>").unwrap();
+
+        let mut stages = Vec::new();
+        let ctx = ctx_no_fetch(&tmp);
+        run_pipeline(
+            ImportInput::Score(score),
+            &mut |p| {
+                stages.push(match p {
+                    Progress::Fetching => "fetching",
+                    Progress::Log(_) => "log",
+                    Progress::Extracting(_) => "extracting",
+                    Progress::Writing => "writing",
+                    Progress::Done(_) => "done",
+                });
+            },
+            &ctx,
+        )
+        .unwrap();
+
+        assert!(!stages.contains(&"fetching"), "score import never fetches");
+        assert_eq!(stages.last(), Some(&"done"));
+        assert!(stages.contains(&"extracting") && stages.contains(&"writing"));
+    }
+
+    /// A workspace with no score sidecar names `tools/score-import/` in the error
+    /// — not the video extractor's requirements file.
+    #[test]
+    fn missing_score_sidecar_returns_actionable_error() {
+        let tmp = TempDir::new().unwrap();
+        let score = tmp.path().join("scale.musicxml");
+        std::fs::write(&score, b"<score-partwise/>").unwrap();
+        let ctx = ctx_no_fetch(&tmp);
+
+        let err = run_pipeline(ImportInput::Score(score), &mut |_| {}, &ctx)
+            .expect_err("no sidecar must fail");
+        match err {
+            ImportError::SidecarMissing(msg) => assert!(
+                msg.contains("tools/score-import/requirements.txt"),
+                "error must point at the score sidecar's deps: {msg}"
+            ),
+            other => panic!("expected SidecarMissing, got {other:?}"),
+        }
+    }
+
+    /// A score path that does not exist fails before the sidecar is consulted.
+    #[test]
+    fn missing_score_file_returns_io_error() {
+        let tmp = TempDir::new().unwrap();
+        stub_score_sidecar(&tmp);
+        let ctx = ctx_no_fetch(&tmp);
+        let result = run_pipeline(
+            ImportInput::Score(tmp.path().join("nope.musicxml")),
+            &mut |_| {},
+            &ctx,
+        );
+        assert!(matches!(result, Err(ImportError::Io(_))), "{result:?}");
     }
 }

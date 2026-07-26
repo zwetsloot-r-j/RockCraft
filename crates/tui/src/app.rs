@@ -28,7 +28,8 @@ use tokio::sync::mpsc;
 use crate::backing::{BackingPicker, PickerOutcome};
 use crate::edit::{EditScreen, NameOutcome, PromptOutcome, SplitOutcome};
 use crate::import_screen::{
-    ImportOutcome, ImportingScreen, UrlInput, UrlInputOutcome, VideoPicker, VideoPickerOutcome,
+    ImportOutcome, ImportingScreen, SourceKind, SourcePicker, SourcePickerOutcome, UrlInput,
+    UrlInputOutcome,
 };
 use crate::key_source::{CrosstermKeys, KeySource};
 use crate::library::{default_scan_roots, library_root};
@@ -55,8 +56,8 @@ pub(crate) enum Screen {
         picker: BackingPicker,
         return_to: Box<EditScreen>,
     },
-    /// Browse for a local video file to import.
-    VideoPicker(VideoPicker),
+    /// Browse for a local video or score file to import.
+    SourcePicker(SourcePicker),
     /// Text input for a video URL to import.
     UrlInput(UrlInput),
     /// Running the import pipeline, showing progress.
@@ -78,6 +79,7 @@ const MENU_ITEMS_BASE: &[&str] = &[
     "Continue last",
     "Play last recording",
     "Import from video file…",
+    "Import score file…",
     "Library…",
 ];
 
@@ -297,7 +299,11 @@ impl Shell {
             }
             "Import from video file…" => {
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                self.screen = Screen::VideoPicker(VideoPicker::new(cwd));
+                self.screen = Screen::SourcePicker(SourcePicker::new(cwd, SourceKind::Video));
+            }
+            "Import score file…" => {
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                self.screen = Screen::SourcePicker(SourcePicker::new(cwd, SourceKind::Score));
             }
             "Import from URL…" => {
                 self.screen = Screen::UrlInput(UrlInput::new());
@@ -497,17 +503,18 @@ impl Shell {
                     PickerOutcome::Pending => {}
                 }
             }
-            Screen::VideoPicker(picker) => {
+            Screen::SourcePicker(picker) => {
+                let kind = picker.kind();
                 let outcome = picker.on_key(code).clone();
                 match outcome {
-                    VideoPickerOutcome::Selected(path) => {
+                    SourcePickerOutcome::Selected(path) => {
                         self.screen =
-                            Screen::Importing(ImportingScreen::start(ImportInput::File(path)));
+                            Screen::Importing(ImportingScreen::start(kind.input_for(path)));
                     }
-                    VideoPickerOutcome::Cancelled => {
+                    SourcePickerOutcome::Cancelled => {
                         self.screen = Screen::Menu;
                     }
-                    VideoPickerOutcome::Pending => {}
+                    SourcePickerOutcome::Pending => {}
                 }
             }
             Screen::UrlInput(ui) => {
@@ -643,7 +650,10 @@ impl Shell {
             Screen::Play(_) => "play",
             Screen::Edit(_) => "edit",
             Screen::BackingPicker { .. } => "backing_picker",
-            Screen::VideoPicker(_) => "video_picker",
+            Screen::SourcePicker(p) => match p.kind() {
+                SourceKind::Video => "video_picker",
+                SourceKind::Score => "score_picker",
+            },
             Screen::UrlInput(_) => "url_input",
             Screen::Importing(_) => "importing",
             Screen::Library(_) => "library",
@@ -752,6 +762,7 @@ impl rockcraft_control::HostServices for Shell {
             HostCommand::DetachVideo => Err(HostError::Unsupported("detach_video".into())),
             HostCommand::QueryVideo => Err(HostError::Unsupported("query_video".into())),
             HostCommand::ImportStart { .. } => Err(HostError::Unsupported("import_start".into())),
+            HostCommand::ImportScore { .. } => Err(HostError::Unsupported("import_score".into())),
             HostCommand::AudioStatus => Err(HostError::Unsupported("audio_status".into())),
             HostCommand::MidiStatus => Err(HostError::Unsupported("midi_status".into())),
             HostCommand::RecordStatus => Err(HostError::Unsupported("record_status".into())),
@@ -822,7 +833,7 @@ pub fn run_loop<B: ratatui::backend::Backend>(
                 // These screens ignore live MIDI input.
                 Screen::Menu
                 | Screen::BackingPicker { .. }
-                | Screen::VideoPicker(_)
+                | Screen::SourcePicker(_)
                 | Screen::UrlInput(_)
                 | Screen::Importing(_)
                 | Screen::Library(_) => {}
@@ -910,7 +921,7 @@ fn draw(f: &mut Frame, shell: &Shell) {
         Screen::Play(play) => play.draw(f, f.area()),
         Screen::Edit(edit) => edit.draw(f, f.area()),
         Screen::BackingPicker { picker, .. } => picker.draw(f, f.area()),
-        Screen::VideoPicker(picker) => picker.draw(f, f.area()),
+        Screen::SourcePicker(picker) => picker.draw(f, f.area()),
         Screen::UrlInput(ui) => ui.draw(f, f.area()),
         Screen::Importing(imp) => imp.draw(f, f.area()),
         Screen::Library(lib) => lib.draw(f, f.area()),
@@ -1108,6 +1119,9 @@ mod tests {
             HostCommand::DetachVideo,
             HostCommand::QueryVideo,
             HostCommand::ImportStart { url: "u".into() },
+            HostCommand::ImportScore {
+                path: "s.musicxml".into(),
+            },
             HostCommand::AudioStatus,
             HostCommand::MidiStatus,
             HostCommand::RecordStatus,
@@ -1139,6 +1153,21 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The TUI drives import through its interactive screens, not the socket,
+    /// so `import_score` is an explicit `Unsupported` — matching `import_start`.
+    #[test]
+    fn import_score_is_unsupported_in_the_tui() {
+        let mut shell = make_shell();
+        assert_eq!(
+            shell
+                .dispatch(HostCommand::ImportScore {
+                    path: "s.musicxml".into(),
+                })
+                .unwrap_err(),
+            rockcraft_control::HostError::Unsupported("import_score".into())
+        );
     }
 
     /// `play_toggle_pause` off the play screen is a clean no-op error, not a
@@ -1877,6 +1906,30 @@ mod tests {
         shell.on_key(KeyCode::Enter);
 
         assert_eq!(shell.screen_name(), "video_picker");
+    }
+
+    /// "Import score file…" is always offered (a score needs no fetch hook) and
+    /// opens the score picker, not the video one.
+    #[test]
+    fn import_score_menu_item_opens_score_picker() {
+        let mut shell = make_shell();
+        shell.set_has_fetch_cmd(false);
+
+        let idx = shell
+            .menu_items()
+            .iter()
+            .position(|s| *s == "Import score file…")
+            .expect("score import item present without a fetch command");
+        for _ in 0..idx {
+            shell.on_key(KeyCode::Down);
+        }
+        shell.on_key(KeyCode::Enter);
+
+        assert_eq!(shell.screen_name(), "score_picker");
+
+        // Esc returns to the menu, like every other import sub-screen.
+        shell.on_key(KeyCode::Esc);
+        assert_eq!(shell.screen_name(), "menu");
     }
 
     /// Pressing Esc on the video picker returns to the menu.
