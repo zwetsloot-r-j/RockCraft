@@ -129,11 +129,12 @@ impl PlayScreen {
         })
     }
 
-    /// Start with the "hear the song" audition on or off. Imported charts enable
-    /// this so loading a bundle immediately synthesizes its notes (issue #152);
-    /// play-along recordings leave it off so the song doesn't sound over the
-    /// player. The `m` key still toggles it at runtime either way. Scoring keys
-    /// off live MIDI timestamps regardless, never this audio.
+    /// Start with the "hear the song" audition on or off. Bundle loading passes
+    /// `meta.backing.is_none()` here (#247): a MIDI-only piece auditions itself
+    /// so it isn't silent without a live piano, while a piece with a backing
+    /// track leaves it off so the synth doesn't double the recording. The `m`
+    /// key still toggles it at runtime either way. Scoring keys off live MIDI
+    /// timestamps regardless, never this audio.
     pub fn with_hear_song(mut self, on: bool) -> Self {
         self.hear_song = on;
         self
