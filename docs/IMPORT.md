@@ -110,6 +110,13 @@ ML and no inference on this path.
 - **Notated context**: unlike video, a score states its tempo, time signature and
   key, so the written bundle's `meta.grid` / `meta.key` are populated and the
   imported piece opens in the editor already snapping to its own bars.
+- **Velocity from the notated dynamics**: levels (`ppp`…`fff`), hairpin ramps and
+  accent/marcato, resolved *per staff* so a `p` left hand under an `f` right hand
+  stays two curves. This matters more here than on the video path, which fills
+  velocity from the source audio and ships a real `backing.wav` — a score import
+  has neither, so the synth is the only sound. `mf` maps to the parser's
+  `DEFAULT_VELOCITY`, and a passage with no dynamic in effect stays `null`, so a
+  score with no markings sounds exactly as it did before the pass existed.
 - **Single-tempo limitation**: note times are absolute microseconds and stay
   correct across a tempo change, but `core::Grid` holds one BPM, so the editor's
   bar lines drift after the first change. Such a score imports with a loud

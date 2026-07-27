@@ -25,9 +25,13 @@ Conversion rules (each one has a test in ``tests/test_convert.py``):
    change mid-piece moves every later note correctly.
 6. Hand comes from the staff/part: upper → Right, lower → Left; a single staff
    or 3+ parts → Unknown, overridable with an explicit hand map.
-7. Velocity stays ``None`` unless the source states one.
+7. Velocity comes from the notated dynamics, resolved per staff by
+   :mod:`score_import.dynamics` — levels, hairpin ramps, accent and marcato. A
+   velocity the source states outright wins over the derived one, and a passage
+   with no dynamic in effect stays ``None`` rather than being invented.
 8. Grace notes, ornament realizations, unpitched/percussion notes, pedal marks,
-   articulations and lyrics are dropped — counted, never silently swallowed.
+   duration-changing articulations and lyrics are dropped — counted, never
+   silently swallowed.
 9. Every note gets ``confidence = 1.0``: this transform is exact. The one
    exception is the OMR path, which opts into ``confidence_check=True`` because
    an engine reading pixels is not exact — see :mod:`score_import.confidence`.
@@ -44,6 +48,7 @@ from music21 import bar, chord, converter, key as m21key, note as m21note, repea
 from music21 import meter as m21meter
 
 from . import confidence as conf
+from . import dynamics as dyn
 from . import omr
 from .schema import (
     EXTRACTOR_VERSION,
@@ -94,6 +99,9 @@ class ConversionReport:
     tempos: list[float] = field(default_factory=list)
     #: What the confidence pass found — ``None`` unless it ran (the OMR path).
     confidence: Optional[conf.ConfidenceSummary] = None
+    #: Explicit-vs-default velocity counts — ``None`` unless the dynamics pass
+    #: ran, which is every conversion except one asking for ``--no-dynamics``.
+    velocities: Optional[dyn.VelocitySummary] = None
 
     def warn(self, message: str) -> None:
         self.warnings.append(message)
@@ -107,6 +115,8 @@ class ConversionReport:
         out = [f"warning: {w}" for w in self.warnings]
         for category in sorted(self.dropped):
             out.append(f"dropped {self.dropped[category]} {category} (by design)")
+        if self.velocities is not None:
+            out.extend(self.velocities.lines())
         if self.confidence is not None:
             out.extend(self.confidence.detail_lines())
         return out
@@ -147,6 +157,7 @@ def convert_input(
     *,
     hand_map: Optional[dict[int, Hand]] = None,
     title: Optional[str] = None,
+    read_dynamics: bool = True,
     log: Callable[[str], None] = omr._log,
 ) -> tuple[ExtractedChart, ConversionReport]:
     """Convert any supported input — a score file, or a scan via OMR (M13-B).
@@ -161,7 +172,7 @@ def convert_input(
     confidence pass enabled and the engine recorded in ``extractor_version``.
     """
     if not omr.is_scan(path):
-        return convert_score(path, hand_map=hand_map, title=title)
+        return convert_score(path, hand_map=hand_map, title=title, read_dynamics=read_dynamics)
 
     with tempfile.TemporaryDirectory(prefix="rockcraft-omr-") as work:
         musicxml = Path(work) / "transcribed.musicxml"
@@ -170,6 +181,7 @@ def convert_input(
             str(musicxml),
             hand_map=hand_map,
             title=title,
+            read_dynamics=read_dynamics,
             confidence_check=True,
             extractor_version=engine.label(),
         )
@@ -180,6 +192,7 @@ def convert_score(
     *,
     hand_map: Optional[dict[int, Hand]] = None,
     title: Optional[str] = None,
+    read_dynamics: bool = True,
     confidence_check: bool = False,
     extractor_version: str = EXTRACTOR_VERSION,
 ) -> tuple[ExtractedChart, ConversionReport]:
@@ -188,6 +201,11 @@ def convert_score(
     Returns the chart and a :class:`ConversionReport` of warnings and
     by-design drops. Raises whatever ``music21`` raises for an unreadable or
     unsupported file — the CLI turns that into a non-zero exit.
+
+    `read_dynamics` is rule 7's velocity pass (M13-D). Turning it off restores
+    M13-A's behaviour wholesale — velocity only where the source states one
+    outright — which is what ``--no-dynamics`` is for: an A/B against the flat
+    default, and an escape hatch for a score whose markings resolve badly.
 
     `confidence_check` swaps rule 9's exact ``confidence = 1.0`` for
     :mod:`score_import.confidence`'s structural per-note score, and fills in
@@ -210,9 +228,18 @@ def convert_score(
 
     notes: list[ExtractedNote] = []
     for index, part in enumerate(parts):
-        notes.extend(_part_notes(part, hands[index], tempo_map, report, note_confidence))
+        # Dynamics resolve per staff, so each part gets its own reader: a left
+        # hand marked `p` under a right hand marked `f` is ordinary piano writing.
+        staff_dynamics = (
+            dyn.read(part, warn=report.warn, drop=report.drop) if read_dynamics else dyn.SILENT
+        )
+        notes.extend(
+            _part_notes(part, hands[index], tempo_map, report, note_confidence, staff_dynamics)
+        )
     notes.sort(key=lambda n: (n.start_us, n.pitch))
 
+    if read_dynamics:
+        report.velocities = dyn.summarize(notes)
     if audit is not None:
         report.confidence = conf.summarize(notes, audit)
 
@@ -367,6 +394,7 @@ def _part_notes(
     tempo_map: list[tuple[float, float]],
     report: ConversionReport,
     note_confidence: Callable[[Any, int], float] = _exact_confidence,
+    staff_dynamics: dyn.StaffDynamics = dyn.SILENT,
 ) -> list[ExtractedNote]:
     notes: list[ExtractedNote] = []
     for element in part.flatten().notes:
@@ -381,7 +409,7 @@ def _part_notes(
         start_us = _us(_seconds_at(offset, tempo_map))
         end_us = _us(_seconds_at(offset + float(element.duration.quarterLength), tempo_map))
         dur_us = max(1, end_us - start_us)
-        velocity = _velocity(element)
+        velocity = _velocity(element, staff_dynamics, offset)
 
         for pitch in pitches:
             notes.append(
@@ -408,16 +436,24 @@ def _pitches(element: Any, report: ConversionReport) -> list[int]:
     return []
 
 
-def _velocity(element: Any) -> Optional[int]:
-    """The velocity the source states, or ``None``.
+def _velocity(
+    element: Any,
+    staff_dynamics: dyn.StaffDynamics,
+    offset_ql: float,
+) -> Optional[int]:
+    """The velocity for `element`: stated first, then read off the dynamics.
 
-    Deliberately does *not* synthesize a velocity from dynamics markings: the
-    Rust parser applies its own ``DEFAULT_VELOCITY`` for ``None``, and a made-up
-    number here would be indistinguishable from a real one downstream.
+    A velocity the file states outright is the strongest signal there is, so it
+    wins over anything derived. Failing that, :mod:`score_import.dynamics`
+    resolves the notated level, hairpin ramp and accent for this staff (M13-D).
+    ``None`` survives both — the Rust parser's ``DEFAULT_VELOCITY`` then applies,
+    and "the source didn't say" stays distinguishable from a real value.
     """
     volume = getattr(element, "volume", None)
     velocity = getattr(volume, "velocity", None)
-    return int(velocity) if velocity is not None else None
+    if velocity is not None:
+        return int(velocity)
+    return staff_dynamics.velocity_for(element, offset_ql)
 
 
 # ── Hands ────────────────────────────────────────────────────────────────────

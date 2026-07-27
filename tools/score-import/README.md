@@ -41,7 +41,7 @@ an actionable `SidecarMissing` error naming this file.
 
 ```bash
 python convert.py --in <score-file|scan> --out <chart.json>|-   # '-' = stdout
-                  [--title "Name"] [--hand-map 0=right,1=left]
+                  [--title "Name"] [--hand-map 0=right,1=left] [--no-dynamics]
 ```
 
 **stdout carries only the JSON.** Warnings, dropped-element counts, OMR engine
@@ -83,17 +83,54 @@ Each rule has a test in `tests/test_convert.py`.
    lower staff (or second part) → `Left`. A single staff, or 3+ parts, →
    `Unknown` — one staff simply carries no hand information, and guessing would
    be worse than saying so. `--hand-map` overrides both.
-7. **Velocity** is `null` unless the source states one explicitly, letting the
-   Rust parser's `DEFAULT_VELOCITY` apply. Dynamics markings are *not* turned
-   into velocities: a synthesized number would be indistinguishable from a real
-   one downstream.
+7. **Velocity** comes from the **notated dynamics**, resolved *per staff* — see
+   the next section. A velocity the source states outright still wins, and a
+   passage with no dynamic in effect stays `null` so the Rust parser's
+   `DEFAULT_VELOCITY` applies.
 8. **Dropped by design** — counted on stderr, never silently swallowed: grace
    notes, ornament realizations (the principal note is kept), unpitched and
-   percussion notes, pedal marks, articulations, lyrics.
+   percussion notes, pedal marks, duration-changing articulations, lyrics.
 9. **`confidence: 1.0`** on every note. This transform is exact. The OMR path is
    the one exception — see below.
 10. **`notation`** carries the tempo, time signature and key as *notated*, which
     is what gives an imported piece a grid its bars actually snap to.
+
+## Dynamics → velocity (M13-D)
+
+A score import has no `backing.wav` and no source audio to lift velocity from —
+the synth is the *only* sound, so a flat velocity is the entire listening
+experience. `dynamics.py` reads the notated dynamics instead.
+
+| dynamic  | ppp | pp | p  | mp | mf | f  | ff  | fff |
+|----------|-----|----|----|----|----|----|-----|-----|
+| velocity | 16  | 33 | 49 | 64 | 80 | 96 | 112 | 126 |
+
+`mf` is **80 on purpose** — it is `parser::DEFAULT_VELOCITY`, so a score whose
+only marking is `mf` sounds exactly as it did before this pass existed.
+
+- **Per staff.** A left hand marked `p` under a right hand marked `f` is ordinary
+  piano writing; the two are resolved independently and never blended.
+- **Hairpins** ramp linearly from the dynamic in effect where the wedge starts to
+  the first one stated after it, by the note's offset within the wedge — so the
+  last note under a `p` → `f` cresc. lands exactly on `f`. A wedge nothing
+  resolves ramps one rung of the ladder and warns.
+- **Accent `+15`, marcato `+25`**, stacked on the level and clamped to 127. They
+  modify a level, they do not state one: with no dynamic in effect, an accent on
+  its own still leaves the note `null`.
+- **Nothing in effect → `null`, not 80.** The null is the honest signal "the
+  source didn't say"; `DEFAULT_VELOCITY` still applies downstream, and a score
+  with zero dynamics markings comes out byte-identical to `--no-dynamics`.
+- `sf`, `sfz`, `fp`, `rfz` and friends are **dropped, not mapped**: they are
+  accents or shapes, not levels, and forcing one onto a rung would set the
+  loudness of everything after it to a value the score never asked for.
+- **`--no-dynamics`** turns the whole pass off, for an A/B against the flat
+  default and as an escape hatch for a score whose markings resolve badly.
+
+Not here, deliberately: the **sustain pedal** (`SynthCommand` is
+`NoteOn`/`NoteOff`/`AllOff` and `NoteEvent` has no control-change concept — CC64
+needs a control-event model in `core` first) and **duration-changing marks**
+(staccato, tenuto, fermata would move the highway blocks and the scoring windows,
+not just the volume). Velocity only; timing stays exactly as notated.
 
 ## OMR: scans and PDFs (M13-B)
 

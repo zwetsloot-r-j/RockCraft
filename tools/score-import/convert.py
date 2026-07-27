@@ -14,7 +14,7 @@ stderr.
 
 Usage:
     python convert.py --in <score-file|scan> --out <chart.json>|- [--title T]
-                      [--hand-map 0=right,1=left]
+                      [--hand-map 0=right,1=left] [--no-dynamics]
 
 **stdout carries only the JSON.** Warnings, dropped-element counts, engine
 output and the summary all go to stderr, because ``crates/import``'s
@@ -45,6 +45,11 @@ def main(argv: list[str] | None = None) -> int:
         help="explicit part-index→hand assignment, e.g. '0=right,1=left'; "
         "overrides the staff heuristic for scores it cannot split",
     )
+    parser.add_argument(
+        "--no-dynamics", dest="read_dynamics", action="store_false",
+        help="do not read velocity from the notated dynamics; leave every note to "
+        "the importer's default velocity, as before M13-D",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -54,7 +59,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
-        chart, report = convert_input(args.inp, hand_map=hand_map, title=args.title)
+        chart, report = convert_input(
+            args.inp,
+            hand_map=hand_map,
+            title=args.title,
+            read_dynamics=args.read_dynamics,
+        )
     except FileNotFoundError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
