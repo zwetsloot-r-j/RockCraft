@@ -13,6 +13,7 @@ Two tiers, one output format:
 
 from .confidence import ConfidenceSummary
 from .convert import ConversionReport, convert_input, convert_score
+from .dynamics import StaffDynamics, VelocitySummary
 from .omr import Engine, EngineMissing, OmrError
 
 __all__ = [
@@ -21,6 +22,8 @@ __all__ = [
     "Engine",
     "EngineMissing",
     "OmrError",
+    "StaffDynamics",
+    "VelocitySummary",
     "convert_input",
     "convert_score",
 ]

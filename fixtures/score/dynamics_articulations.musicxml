@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="3.1">
+  <work><work-title>Synthetic accent and marcato (fixture)</work-title></work>
+  <identification>
+    <miscellaneous>
+      <miscellaneous-field name="provenance">Synthetic RockCraft test fixture — fabricated by hand, not a real piece.</miscellaneous-field>
+    </miscellaneous>
+  </identification>
+  <part-list>
+    <score-part id="P1"><part-name>Piano</part-name></score-part>
+  </part-list>
+  <part id="P1">
+    <measure number="1">
+      <attributes>
+        <divisions>1</divisions>
+        <key><fifths>0</fifths><mode>major</mode></key>
+        <time><beats>2</beats><beat-type>4</beat-type></time>
+        <clef><sign>G</sign><line>2</line></clef>
+      </attributes>
+      <direction placement="above">
+        <direction-type>
+          <metronome><beat-unit>quarter</beat-unit><per-minute>120</per-minute></metronome>
+        </direction-type>
+        <sound tempo="120"/>
+      </direction>
+      <direction placement="below">
+        <direction-type><dynamics><mf/></dynamics></direction-type>
+      </direction>
+      <note><pitch><step>C</step><octave>4</octave></pitch><duration>1</duration><type>quarter</type></note>
+      <note>
+        <pitch><step>D</step><octave>4</octave></pitch>
+        <duration>1</duration>
+        <type>quarter</type>
+        <notations><articulations><accent/></articulations></notations>
+      </note>
+    </measure>
+    <measure number="2">
+      <direction placement="below">
+        <direction-type><dynamics><fff/></dynamics></direction-type>
+      </direction>
+      <note><pitch><step>E</step><octave>4</octave></pitch><duration>1</duration><type>quarter</type></note>
+      <note>
+        <pitch><step>F</step><octave>4</octave></pitch>
+        <duration>1</duration>
+        <type>quarter</type>
+        <notations><articulations><strong-accent/></articulations></notations>
+      </note>
+    </measure>
+  </part>
+</score-partwise>
