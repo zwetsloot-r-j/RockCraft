@@ -75,3 +75,26 @@ jobs:
           npm ci
           npx tsc --noEmit
           npm test
+
+      # Sidecar gate: tools/score-import is a standalone Python process, not a
+      # workspace crate, so `cargo test` never sees it. It lives in this job
+      # rather than a parallel one because branch protection requires exactly
+      # this check ("fmt · clippy · test") — a separate job would not block a
+      # merge until that setting is changed by hand.
+      #
+      # The interpreter is pinned so a runner-image bump can't silently change
+      # what the suite runs against. No pip cache: `music21` installs in ~17 s,
+      # which is noise next to the Rust build this job already pays for.
+      - name: Set up Python (score-import sidecar)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # No OMR engine is installed and nothing under the `omr` marker runs —
+      # `pytest.ini` supplies `-m "not omr"`, and that posture is deliberate
+      # (see docs/IMPORT.md § Scanned sheet music). Expect 1 deselected test.
+      - name: score-import sidecar tests
+        working-directory: tools/score-import
+        run: |
+          python3 -m pip install -r requirements.txt
+          python3 -m pytest
