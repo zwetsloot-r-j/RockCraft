@@ -28,6 +28,12 @@ rockcraft-import = { workspace = true }
 rockcraft-control = { workspace = true }
 tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2"
+# Guarantees a single running instance: a second launch focuses the existing
+# window instead of spawning a second WebView2 on the shared user-data dir
+# (identifier `dev.rockcraft.app`). Two WebView2 environments contending over
+# that dir + GPU surfaces was the on-our-side trigger for the compositor/driver
+# instability that ended in an nvlddmkm bugcheck.
+tauri-plugin-single-instance = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

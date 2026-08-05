@@ -159,7 +159,8 @@ fn spawn_applier(app: AppHandle, mut cmd_rx: mpsc::Receiver<RemoteCommand>) {
                 // no-op when no audio device is present (`synth: None`).
                 if let Response::Ok { effects, .. } = &response {
                     if !effects.is_empty() {
-                        crate::audio::apply_effects(&app.state::<AudioState>(), effects);
+                        let playing = crate::state::is_playing(&app.state::<AppState>());
+                        crate::audio::apply_effects(&app.state::<AudioState>(), playing, effects);
                     }
                 }
                 // Keep the webview in sync with agent-driven changes, mirroring
@@ -299,7 +300,21 @@ impl HostServices for TauriHost<'_> {
             }
             HostCommand::LoadBundle { dir } => {
                 match crate::state::load_bundle(&app.state::<AppState>(), &dir) {
-                    Ok(snapshot) => json_payload("load_bundle", snapshot),
+                    Ok(snapshot) => {
+                        // Attach the bundle's backing track to the audio thread so
+                        // the transport plays it — parity with the Tauri
+                        // `load_bundle` command (lib.rs). Without this, a bundle
+                        // loaded over the control socket shows the backing chip but
+                        // is silent (the audio thread never got the path).
+                        match crate::state::query_backing(&app.state::<AppState>()) {
+                            Some(b) => crate::audio::attach_backing_inner(
+                                &app.state::<AudioState>(),
+                                std::path::PathBuf::from(b.path),
+                            ),
+                            None => crate::audio::detach_backing_inner(&app.state::<AudioState>()),
+                        }
+                        json_payload("load_bundle", snapshot)
+                    }
                     Err(e) => failed("load_bundle", e),
                 }
             }

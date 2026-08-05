@@ -53,6 +53,13 @@ pub struct Grid {
     pub bpm: u32,
     pub time_sig: TimeSig,
     pub subdivision: Subdivision,
+    /// Phase offset (µs) of the grid: the song time at which bar 1, beat 1,
+    /// step 0 falls. `0` (the default) reproduces the original origin-at-zero
+    /// behaviour. Set it to a piece's first downbeat so bar/beat/step lines land
+    /// on the performance when the music doesn't start at song time 0 (e.g. an
+    /// imported chart whose first note is several seconds in).
+    #[serde(default)]
+    pub origin_us: u64,
 }
 
 impl Grid {
@@ -82,7 +89,23 @@ impl Grid {
                 beat_unit: 4,
             },
             subdivision: Subdivision::Sixteenth,
+            origin_us: 0,
         }
+    }
+
+    /// Set the grid phase origin: the song time bar 1 / beat 1 / step 0 lands on.
+    pub fn set_origin_us(&mut self, origin_us: u64) {
+        self.origin_us = origin_us;
+    }
+
+    /// Snap `us` to the nearest multiple of `step` from the grid origin — the
+    /// generalisation of [`snap`](Grid::snap) to an arbitrary resolution (used by
+    /// region quantise, which may snap a bar at a coarser step than the live
+    /// grid subdivision). Positions at/below the origin snap to the origin.
+    pub fn snap_to_step(&self, us: u64, step: u64) -> u64 {
+        let step = step.max(1);
+        let rel = us.saturating_sub(self.origin_us);
+        self.origin_us + (rel + step / 2) / step * step
     }
 
     pub fn quarter_us(&self) -> u64 {
@@ -102,16 +125,15 @@ impl Grid {
     }
 
     pub fn snap(&self, us: u64) -> u64 {
-        let step = self.step_us();
-        (us + step / 2) / step * step
+        self.snap_to_step(us, self.step_us())
     }
 
     pub fn step_index(&self, us: u64) -> u64 {
-        us / self.step_us()
+        us.saturating_sub(self.origin_us) / self.step_us()
     }
 
     pub fn us_of_step(&self, step: u64) -> u64 {
-        step * self.step_us()
+        self.origin_us + step * self.step_us()
     }
 
     pub fn bar_us(&self) -> u64 {
@@ -121,9 +143,16 @@ impl Grid {
     pub fn bar_beat_of(&self, us: u64) -> (u64, u64) {
         let bar_us = self.bar_us();
         let beat_us = self.beat_us();
-        let bar = us / bar_us;
-        let beat = (us % bar_us) / beat_us;
+        let rel = us.saturating_sub(self.origin_us);
+        let bar = rel / bar_us;
+        let beat = (rel % bar_us) / beat_us;
         (bar, beat)
+    }
+
+    /// Song time (µs) of bar `bar` (0-indexed from the origin): `origin + bar ·
+    /// bar_us`. The left edge of the `bar`-th bar, for region quantise.
+    pub fn us_of_bar(&self, bar: u64) -> u64 {
+        self.origin_us + bar * self.bar_us()
     }
 
     /// Duration of one beat (the time-signature beat unit) in µs.
@@ -135,7 +164,7 @@ impl Grid {
     /// Returns 0 when the subdivision is coarser than or equal to one beat.
     pub fn step_in_beat(&self, us: u64) -> u64 {
         let beat = self.beat_us().max(1);
-        let in_beat = us % beat;
+        let in_beat = us.saturating_sub(self.origin_us) % beat;
         in_beat / self.step_us().max(1)
     }
 }
@@ -152,6 +181,7 @@ mod tests {
                 beat_unit: 4,
             },
             subdivision: sub,
+            origin_us: 0,
         }
     }
 

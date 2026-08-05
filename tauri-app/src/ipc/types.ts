@@ -64,6 +64,12 @@ export interface ComposerSnapshot {
   notes: NoteView[];
   cursor: Cursor;
   bpm: number;
+  /**
+   * Grid phase origin (µs): the song time bar 1 / beat 1 / step 0 lands on.
+   * Absent/0 for a grid that starts at song time 0. Bar/beat gridlines and the
+   * cursor position are phased by this so they align to the performance.
+   */
+  grid_origin_us?: number;
   time_sig: TimeSig;
   subdivision: Subdivision;
   input_mode: InputMode;
@@ -78,6 +84,17 @@ export interface ComposerSnapshot {
   clipboard_len: number;
   /** Backing-track alignment offset (`audio_start_us`); 0 when none. */
   backing_offset_us: number;
+  /** Whether note-by-note wait mode ("pause on note") is armed. */
+  wait_mode?: boolean;
+  /**
+   * Whether the transport is frozen on an unsatisfied wait step. `playing` stays
+   * `true` while frozen (so the highway anchors on the playhead); the frontend
+   * treats `playing && frozen` as a pause — holding the highway, the backdrop
+   * video, and the backing audio until the awaited note is played.
+   */
+  frozen?: boolean;
+  /** While frozen, the MIDI pitches to strike to advance; null otherwise. */
+  awaiting?: number[] | null;
 }
 
 /**

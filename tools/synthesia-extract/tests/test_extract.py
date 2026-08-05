@@ -27,6 +27,7 @@ from synthesia_extract.pipeline import (  # noqa: E402
     detect_hit_line,
     estimate_scroll,
     extract_chart,
+    linear_keyboard,
 )
 from synthesia_extract.synth import (  # noqa: E402
     SynthConfig,
@@ -75,6 +76,24 @@ def test_calibration_recovers_pitches_and_middle_c():
         span = kb_truth.pitch_x_range(n.pitch)
         cx = (span[0] + span[1]) // 2
         assert kb.x_to_pitch[cx] == n.pitch
+
+
+def test_linear_keyboard_is_even_full_width_88():
+    # The deterministic ruler used for stylized charts that defeat image-based
+    # key detection: 88 keys spanning the full frame width, evenly per semitone.
+    kb = linear_keyboard(1280, 491)
+    assert kb.hit_line == 491
+    pitches = kb.x_to_pitch[kb.x_to_pitch >= 0]
+    assert pitches.min() == 21 and pitches.max() == 108  # A0..C8
+    assert len(kb.centers) == 88
+    assert len(kb.white_centers) == 52  # 52 white keys on an 88-key board
+    # Middle C sits near the full-width position, not the wobbly detected one.
+    lane = 1280 / 88
+    assert abs(kb.anchor_c4_x - (60 - 21 + 0.5) * lane) <= 1
+    # Monotonic, gap-free ruler: pitch rises by exactly 1 per lane.
+    for i in range(88):
+        x = int(round((i + 0.5) * lane))
+        assert kb.x_to_pitch[min(1279, x)] == 21 + i
 
 
 def test_estimate_scroll_speed():

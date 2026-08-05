@@ -69,6 +69,17 @@ pub enum Action {
         end_pitch: u8,
         span_steps: u64,
     },
+    /// Quantise every note whose onset falls in `[start_us, end_us)` onto the
+    /// grid at resolution `step_us` (µs), snapping **both** the onset and the end
+    /// to the nearest grid line (phased from the grid origin); a note never
+    /// shrinks below one `step_us`. A per-bar "snap this bar to 1/8" tool — pick
+    /// `step_us` for the bar's fastest note, and simply skip bars (e.g. glissandi)
+    /// you don't want touched.
+    QuantizeRegion {
+        start_us: u64,
+        end_us: u64,
+        step_us: u64,
+    },
 
     // ── tempo (piece-wide; lives in the composer Grid) ──────────────────
     /// Nudge the piece tempo by `delta` BPM (clamped to a sane range).
@@ -78,6 +89,12 @@ pub enum Action {
     /// Set the piece tempo to `bpm` BPM (clamped to a sane range).
     SetBpm {
         bpm: u32,
+    },
+    /// Set the grid **phase origin** (µs): the song time bar 1 / beat 1 / step 0
+    /// lands on. Align it to a piece's first downbeat so bar/beat lines fall on
+    /// the performance when the music doesn't start at song time 0.
+    SetGridOrigin {
+        us: u64,
     },
 
     // ── chord selector ──────────────────────────────────────────────────
@@ -119,6 +136,15 @@ pub enum Action {
     /// earlier. Editor-side state; a no-op for frontends with no backing.
     NudgeBackingOffset {
         delta_us: i64,
+    },
+
+    // ── playback speed ──────────────────────────────────────────────────
+    /// Set the transport speed multiplier in permille (1000 = 1× real time;
+    /// 500 = half speed). Clamped to 0.25×–2×. Stretches song time for
+    /// practice/review without altering the chart; frontends match their
+    /// backing-audio speed to it.
+    SetPlaybackRate {
+        rate_permille: u16,
     },
 
     // ── loop / metronome / count-in ─────────────────────────────────────
@@ -179,6 +205,8 @@ impl Action {
             Action::InsertRun { .. } => "insert_run",
             Action::AdjustBpm { .. } => "adjust_bpm",
             Action::SetBpm { .. } => "set_bpm",
+            Action::SetGridOrigin { .. } => "set_grid_origin",
+            Action::QuantizeRegion { .. } => "quantize_region",
             Action::EnterChordMode => "enter_chord_mode",
             Action::CommitChord => "commit_chord",
             Action::CancelChord => "cancel_chord",
@@ -195,6 +223,7 @@ impl Action {
             Action::Play { .. } => "play",
             Action::SetPlayhead { .. } => "set_playhead",
             Action::NudgeBackingOffset { .. } => "nudge_backing_offset",
+            Action::SetPlaybackRate { .. } => "set_playback_rate",
             Action::ToggleLoop => "toggle_loop",
             Action::ToggleMetronome => "toggle_metronome",
             Action::StartCountInRecord => "start_count_in_record",
@@ -320,6 +349,8 @@ pub fn action_names() -> &'static [&'static str] {
         "insert_run",
         "adjust_bpm",
         "set_bpm",
+        "set_grid_origin",
+        "quantize_region",
         "enter_chord_mode",
         "commit_chord",
         "cancel_chord",
@@ -336,6 +367,7 @@ pub fn action_names() -> &'static [&'static str] {
         "play",
         "set_playhead",
         "nudge_backing_offset",
+        "set_playback_rate",
         "toggle_loop",
         "toggle_metronome",
         "start_count_in_record",
@@ -418,6 +450,8 @@ static ACTION_HELP: &[ActionInfo] = {
         // ── tempo ─────────────────────────────────────────────────────────
         ActionInfo { name: "adjust_bpm", params: &[p("delta", "i32")], description: "Nudge the piece tempo by delta BPM (clamped to 20..=300)." },
         ActionInfo { name: "set_bpm", params: &[p("bpm", "u32")], description: "Set the piece tempo to bpm BPM (clamped to 20..=300)." },
+        ActionInfo { name: "set_grid_origin", params: &[p("us", "u64")], description: "Set the grid phase origin (us): the song time bar 1/beat 1/step 0 lands on. Align to the first downbeat so bar lines fall on the performance." },
+        ActionInfo { name: "quantize_region", params: &[p("start_us", "u64"), p("end_us", "u64"), p("step_us", "u64")], description: "Snap notes whose onset is in [start_us, end_us) onto the grid at resolution step_us (both onset and end, phased from the grid origin; min one step long). Per-bar snapping — skip bars you don't want touched (e.g. glissandi)." },
         // ── chord selector ──────────────────────────────────────────────
         ActionInfo { name: "enter_chord_mode", params: &[], description: "Open the chord selector at the cursor and start previewing a chord." },
         ActionInfo { name: "commit_chord", params: &[], description: "Write the previewed chord into the timeline and close the selector." },
@@ -439,6 +473,7 @@ static ACTION_HELP: &[ActionInfo] = {
         ActionInfo { name: "set_playhead", params: &[p("us", "u64")], description: "Move the playhead to us microseconds." },
         // ── backing alignment ───────────────────────────────────────────
         ActionInfo { name: "nudge_backing_offset", params: &[p("delta_us", "i64")], description: "Slide the backing track's audio_start_us by delta_us (clamped at 0) to align it under the highway." },
+        ActionInfo { name: "set_playback_rate", params: &[p("rate_permille", "u16")], description: "Set playback speed in permille (1000 = 1x, 500 = half speed), clamped 0.25x-2x. Slows/speeds the transport for practice without changing the chart." },
         // ── loop / metronome / count-in ─────────────────────────────────
         ActionInfo { name: "toggle_loop", params: &[], description: "Toggle looped playback over the loop region." },
         ActionInfo { name: "toggle_metronome", params: &[], description: "Toggle the metronome click." },
@@ -495,6 +530,12 @@ mod tests {
             },
             Action::AdjustBpm { delta: -5 },
             Action::SetBpm { bpm: 90 },
+            Action::SetGridOrigin { us: 5_191_846 },
+            Action::QuantizeRegion {
+                start_us: 5_000_000,
+                end_us: 7_000_000,
+                step_us: 174_418,
+            },
             Action::EnterChordMode,
             Action::CommitChord,
             Action::CancelChord,
@@ -511,6 +552,7 @@ mod tests {
             Action::Play { from_us: 1_000 },
             Action::SetPlayhead { us: 2_000 },
             Action::NudgeBackingOffset { delta_us: 10_000 },
+            Action::SetPlaybackRate { rate_permille: 500 },
             Action::ToggleLoop,
             Action::ToggleMetronome,
             Action::StartCountInRecord,

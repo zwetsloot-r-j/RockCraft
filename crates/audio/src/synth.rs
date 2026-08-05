@@ -186,8 +186,18 @@ pub fn synth_from_sf2_bytes(
     let sound_font =
         Arc::new(SoundFont::new(&mut reader).map_err(|e| SynthError::SoundFont(e.to_string()))?);
     let settings = SynthesizerSettings::new(sample_rate as i32);
-    let synth =
+    let mut synth =
         Synthesizer::new(&sound_font, &settings).map_err(|e| SynthError::Synth(e.to_string()))?;
+    // Optional distinct instrument: set `ROCKCRAFT_SYNTH_PROGRAM` to a General
+    // MIDI program number (e.g. 12 = marimba) to make the synth's notes stand
+    // out over a same-timbre backing — useful for checking a chart's alignment
+    // against the source audio by ear. Unset ⇒ the SoundFont's default (piano).
+    if let Some(prog) = std::env::var("ROCKCRAFT_SYNTH_PROGRAM")
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+    {
+        synth.process_midi_message(MIDI_CHANNEL, 0xC0, prog, 0);
+    }
     let block = synth.get_block_size();
 
     let (tx, rx) = mpsc::channel();

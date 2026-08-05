@@ -31,6 +31,9 @@ import type {
 const EVENT_SNAPSHOT = "snapshot";
 /** Event name the backend emits a batch of {@link Effect}s on. */
 const EVENT_EFFECTS = "effects";
+/** Event name the backend emits a lightweight {@link PlayheadEvent} on during
+ * playback (just the moving position + flag, no note list). */
+const EVENT_PLAYHEAD = "playhead";
 /** Event name the backend emits a live {@link PlayStateEvent} on (#168). */
 const EVENT_PLAY_STATE = "play_state";
 /**
@@ -88,6 +91,24 @@ export function onNavigate(cb: (screen: Screen) => void): Promise<UnlistenFn> {
  */
 export function onEffects(cb: (effects: Effect[]) => void): Promise<UnlistenFn> {
   return listen<Effect[]>(EVENT_EFFECTS, (e) => cb(e.payload));
+}
+
+/** Lightweight playback push: the moving playhead + playing flag, without the
+ * note list. Emitted ~30×/s during playback so the highway scrolls cheaply; the
+ * full {@link ComposerSnapshot} is re-sent only when the notes change. */
+export interface PlayheadEvent {
+  playhead_us: number;
+  playing: boolean;
+}
+
+/**
+ * Subscribe to lightweight `playhead` events (playback scroll). Returns the
+ * Tauri unlisten function; call it in `onCleanup`.
+ */
+export function onPlayhead(
+  cb: (p: PlayheadEvent) => void,
+): Promise<UnlistenFn> {
+  return listen<PlayheadEvent>(EVENT_PLAYHEAD, (e) => cb(e.payload));
 }
 
 /**

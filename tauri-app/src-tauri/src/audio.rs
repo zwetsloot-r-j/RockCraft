@@ -28,7 +28,7 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use rockcraft_audio::{play_file_at, AudioOut, BackingHandle, SynthHandle};
+use rockcraft_audio::{AudioOut, BackingHandle, SynthHandle};
 use rockcraft_core::Effect;
 use serde::Serialize;
 
@@ -46,6 +46,9 @@ enum BackingMsg {
     Seek(u64),
     /// Pause the current playback.
     Pause,
+    /// Set the playback speed multiplier (resamples; pitch shifts with speed).
+    /// Keeps the backing in step with a slowed/sped transport.
+    SetSpeed(f32),
     /// Query the current backing file name (reply on the one-shot channel).
     QueryFileName(Sender<Option<String>>),
 }
@@ -113,11 +116,15 @@ impl AudioState {
             };
             let synth = out.synth();
             let _ = synth_tx.send(Some(synth));
-            // `out` stays alive here, keeping the device stream open.
-            let _out = out;
+            // `out` stays alive for the whole loop, keeping the device stream
+            // open — and the backing plays through *its* stream (below) so it
+            // isn't opening a silent second stream on Windows.
 
             let mut path: Option<PathBuf> = None;
             let mut handle: Option<BackingHandle> = None;
+            // Current speed multiplier, re-applied whenever a fresh sink is made
+            // (a new BackingHandle starts at 1.0×) so slow-mo survives a restart.
+            let mut speed: f32 = 1.0;
 
             for msg in backing_rx {
                 match msg {
@@ -140,8 +147,14 @@ impl AudioState {
                             h.seek(pos);
                             h.set_paused(false);
                         } else {
-                            match play_file_at(p, pos) {
-                                Ok(h) => handle = Some(h),
+                            // Share the synth's output stream (one device stream,
+                            // second sink) — a separate stream is silent on
+                            // Windows/WASAPI.
+                            match out.play_backing_at(p, pos) {
+                                Ok(h) => {
+                                    h.set_speed(speed); // carry slow-mo across restarts
+                                    handle = Some(h);
+                                }
                                 Err(e) => {
                                     eprintln!("[rockcraft-tauri] backing: play failed: {e}")
                                 }
@@ -156,6 +169,12 @@ impl AudioState {
                     BackingMsg::Pause => {
                         if let Some(h) = &handle {
                             h.set_paused(true);
+                        }
+                    }
+                    BackingMsg::SetSpeed(s) => {
+                        speed = s;
+                        if let Some(h) = &handle {
+                            h.set_speed(s);
                         }
                     }
                     BackingMsg::QueryFileName(reply) => {
@@ -196,6 +215,12 @@ impl AudioState {
         if let Some(tx) = guard.as_ref() {
             let _ = tx.send(msg);
         }
+    }
+
+    /// Set the backing-audio playback speed (1.0 = normal) to match a slowed or
+    /// sped transport. Resamples, so the pitch shifts with the speed.
+    pub fn set_backing_speed(&self, speed: f32) {
+        self.send_backing(BackingMsg::SetSpeed(speed));
     }
 
     // ── Play-mode backing coupling (#168) ───────────────────────────────────
@@ -283,24 +308,46 @@ impl Default for AudioState {
 
 // ── Effect routing ───────────────────────────────────────────────────────────
 
-/// Route a batch of [`Effect`]s from the composer to the synth.
+/// Route a batch of [`Effect`]s from the composer to the synth, mirroring the
+/// TUI's `run_effects` so both frontends sound identically.
 ///
-/// - `AuditionNote` → `all_off` then `note_on`.
-/// - `AuditionChord` → `all_off` then `note_on` each pitch.
+/// The composer uses `AuditionNote { velocity: 0 }` as a note-*off* (a playback
+/// span end or a metronome click release), and emits a fresh `AuditionNote` per
+/// note as the playhead crosses it during playback. So:
+///
+/// - `AuditionNote { velocity: 0 }` → `note_off(pitch)` — release just that note
+///   (NOT `all_off`; otherwise every span end silences the whole chord, which is
+///   what left playback inaudible).
+/// - `AuditionNote { velocity > 0 }` **while playing** → a polyphonic `note_on`
+///   (no `all_off`): many notes ring together, as a piano piece must.
+/// - `AuditionNote { velocity > 0 }` **while stopped** → an edit preview:
+///   `all_off` then `note_on`, so moving the cursor replaces the single note.
+/// - `AuditionChord` → `all_off` then `note_on` each pitch (chord preview).
 /// - `AllOff` → `all_off`.
 ///
 /// If `audio.synth` is `None` this is a no-op (headless CI path).
-pub fn apply_effects(audio: &AudioState, effects: &[Effect]) {
+pub fn apply_effects(audio: &AudioState, playing: bool, effects: &[Effect]) {
     let Some(synth) = &audio.synth else { return };
     for effect in effects {
         match effect {
             Effect::AuditionNote { pitch, velocity } => {
-                synth.all_off();
-                if let (Some(note), Some(vel)) = (
-                    rockcraft_core::MidiNote::new(*pitch),
-                    rockcraft_core::Velocity::new(*velocity),
-                ) {
-                    synth.note_on(note, vel);
+                let Some(note) = rockcraft_core::MidiNote::new(*pitch) else {
+                    continue;
+                };
+                if *velocity == 0 {
+                    // Explicit note-off (playback span end / click release).
+                    synth.note_off(note);
+                } else if playing {
+                    // Polyphonic playback note-on — let it ring with the rest.
+                    if let Some(vel) = rockcraft_core::Velocity::new(*velocity) {
+                        synth.note_on(note, vel);
+                    }
+                } else {
+                    // Stopped: a single edit audition replaces the previous.
+                    synth.all_off();
+                    if let Some(vel) = rockcraft_core::Velocity::new(*velocity) {
+                        synth.note_on(note, vel);
+                    }
                 }
             }
             Effect::AuditionChord { pitches } => {
@@ -459,6 +506,7 @@ mod tests {
         };
         apply_effects(
             &audio,
+            true,
             &[
                 Effect::AuditionNote {
                     pitch: 60,

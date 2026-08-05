@@ -26,7 +26,7 @@ import {
 } from "solid-js";
 import { createStore } from "solid-js/store";
 import { convertFileSrc } from "@tauri-apps/api/core";
-import type { UnlistenFn } from "@tauri-apps/api/event";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   alignmentLoad,
   alignmentSave,
@@ -38,6 +38,7 @@ import {
   editSetVideo,
   editSetVideoOffset,
   loadBundle,
+  onPlayhead,
   onSnapshot,
   openBackingFilePicker,
   openVideoFilePicker,
@@ -145,6 +146,24 @@ const SCRUB_STEP_US = 500_000;
 const SCRUB_STEP_COARSE_US = 5_000_000;
 /** Coarse movie-only offset step for [ / ] (find the first note quickly). */
 const OFFSET_COARSE_S_US = 1_000_000;
+/** Forward playhead delta beyond which the phase-locked clock snaps ahead (a
+ * seek forward, or the frontend having fallen far behind). Snapping *forward* is
+ * acceptable. */
+const SEEK_FWD_US = 400_000;
+/** Backward delta beyond which the clock snaps back — reserved for a *genuine*
+ * discontinuity (loop-wrap, play-from-start, deliberate scrub). Ordinary drift
+ * (the frontend clock outrunning the backend) never reaches this: the rate servo
+ * brakes it smoothly first, so the rendered playhead never jumps backward. Kept
+ * well above the worst-case drift (~150 ms) but low enough that a short
+ * practice/review loop-wrap (down to ~0.6 s) still snaps cleanly instead of the
+ * servo crawling the playhead back over the whole loop. */
+const SEEK_BACK_US = 500_000;
+/** Rate-servo clamp. Wide enough that the clock can reach the true frontend↔
+ * backend rate ratio and *lock* (WebView's performance.now() need not tick at
+ * the backend's rate), instead of saturating at the floor and sliding into a
+ * backward snap. Floor stays positive so the rendered playhead is monotonic. */
+const CLOCK_RATE_MIN = 0.4;
+const CLOCK_RATE_MAX = 1.6;
 
 // ── Overlay state ─────────────────────────────────────────────────────────
 
@@ -187,6 +206,11 @@ export function EditScreen(props: Props): JSX.Element {
   let videoEl: HTMLVideoElement | undefined;
   let engine: EditCanvas | null = null;
   let raf = 0;
+  // Live set of MIDI pitches held on the piano, driven by `midi_event`. Passed
+  // to the canvas keyboard strip (by shared reference, so mutations show up on
+  // the next draw) to light the keys you are playing — next to the wait-mode
+  // target key — for precise note-by-note verification.
+  const heldNotes = new Set<number>();
 
   // ── Video backdrop state (M7-tauri-N) ───────────────────────────────────
   // The attached backdrop path (null = none) and its alignment offset, applied
@@ -276,13 +300,30 @@ export function EditScreen(props: Props): JSX.Element {
   const [saveFlash, setSaveFlash] = createSignal<string | null>(null);
   let flashTimeout = 0;
 
-  // Wall-clock anchor for playhead interpolation.
+  // Phase-locked playhead clock. The frontend runs its own smooth wall-clock
+  // (basePlayheadUs at baseWallMs, advancing at `clockRate`×) and *servos* that
+  // rate toward the backend playhead each snapshot rather than snapping its
+  // position — so the rendered playhead is strictly monotonic (no backward
+  // shake) yet can't drift unbounded from the transport. Only a real seek /
+  // loop-wrap (delta beyond SEEK_FWD_US / SEEK_BACK_US) snaps the position.
   let basePlayheadUs = 0;
   let baseWallMs = 0;
+  let clockRate = 1;
+  // Was-playing latch for the clock, tracked here (not off store.snap) so the
+  // lightweight `playhead` push and the full snapshot share one servo.
+  let clockPlaying = false;
+  // Wall-clock of the last backdrop seek, to throttle seeking during playback
+  // (see driveVideo). Reset to 0 when paused so the next scrub seeks immediately.
+  let lastVideoSeekMs = 0;
+  // Previous video target time (s), to detect a backward jump — a loop wrap or a
+  // scrub-back — which must SEEK the backdrop to the new spot, not slow it down.
+  let prevVideoWant = -1;
 
   function interpolatedPlayheadUs(s: ComposerSnapshot): number {
-    if (!s.playing) return s.playhead_us;
-    const elapsedUs = (performance.now() - baseWallMs) * 1000;
+    // Frozen on a wait-mode note (or stopped): pin exactly to the backend
+    // playhead so the note sits dead-still under the green line for inspection.
+    if (!s.playing || s.frozen) return s.playhead_us;
+    const elapsedUs = (performance.now() - baseWallMs) * 1000 * clockRate;
     return basePlayheadUs + elapsedUs;
   }
 
@@ -293,7 +334,8 @@ export function EditScreen(props: Props): JSX.Element {
    */
   function anchorUsOf(s: ComposerSnapshot): number {
     if (s.playing) return interpolatedPlayheadUs(s);
-    return s.cursor.step * stepUs(s.bpm, s.subdivision);
+    // Cursor step 0 sits at the grid origin, not song time 0.
+    return (s.grid_origin_us ?? 0) + s.cursor.step * stepUs(s.bpm, s.subdivision);
   }
 
   /**
@@ -343,6 +385,109 @@ export function EditScreen(props: Props): JSX.Element {
     v.currentTime = Math.min(Math.max(t, 0), dur);
   }
 
+  /**
+   * Drive the backdrop during normal playback. Seeking (`syncVideo`) is right
+   * for a paused editor — a cursor move or scrub jumps the frame exactly — but
+   * WebView2 cannot decode-and-repaint a `currentTime` set 30-60×/second, so
+   * seeking every RAF frame while playing blacks the element out (the "movie
+   * drops during playback" bug) and even occasional drift seeks flicker it. So
+   * during playback we *play* the clip natively and correct drift by nudging its
+   * `playbackRate` (phase-lock, no seek) rather than seeking — only a large
+   * desync hard-seeks. Paused, we pause the element and seek exactly.
+   */
+  function driveVideo(s: ComposerSnapshot): void {
+    const v = videoEl;
+    if (!v || videoPath() === null) return;
+    const dur = v.duration;
+    if (!Number.isFinite(dur) || dur <= 0) return;
+    const want = Math.min(Math.max((anchorUsOf(s) + offsetUs()) / 1e6, 0), dur);
+    // Stopped editor: pause the element and seek exactly to the frame under the
+    // playhead (scrub / cursor move). Safe here because the element is idle.
+    if (!s.playing) {
+      if (!v.paused) v.pause();
+      if (v.playbackRate !== 1) v.playbackRate = 1; // clear any servo residue
+      lastVideoSeekMs = 0;
+      prevVideoWant = -1; // next play re-seats without a false back-jump
+      v.currentTime = want; // paused: seek exactly (scrub / cursor move)
+      return;
+    }
+    // Wait-mode freeze: pause and hold the note's frame. A note reached by
+    // playing through is already parked on-frame (native playback was phase-locked
+    // to the playhead), so we hold it as-is — NO seek, no flash. Only a LARGE gap
+    // (playback started mid-song, the element still near frame 0) gets ONE seek to
+    // the note, then we leave the element alone so WebView2 can finish decoding
+    // and hold it. Re-seeking every frame would keep it in a permanent seek-stall
+    // (readyState→1 → black), the "backdrop invisible while frozen" bug.
+    if (s.frozen) {
+      if (!v.paused) v.pause();
+      if (v.playbackRate !== 1) v.playbackRate = 1;
+      // Hold the note's frame. Retry the seek (throttled) until it actually
+      // LANDS: WebView2 silently ignores a seek on an element that is still
+      // loading or hasn't been primed (play→pause), leaving currentTime at 0
+      // (the intro frame) — the "stuck on the first frame" bug. So while the
+      // real gap is large and the element isn't mid-seek, keep nudging every
+      // ~250 ms; once currentTime reaches `want` the gap closes and we stop, so
+      // a landed frame is held steady (no per-frame reseek → no permanent black).
+      const gap = Math.abs(want - v.currentTime);
+      const now = performance.now();
+      if (gap > 0.1 && !v.seeking && now - lastVideoSeekMs >= 250) {
+        lastVideoSeekMs = now;
+        v.currentTime = want;
+      }
+      prevVideoWant = -1; // resume re-seats without a false back-jump
+      return;
+    }
+    // Prefer native playback: if the webview honours a muted play(), the element
+    // decodes smoothly on its own clock (song clock also runs at 1×). If
+    // muted-autoplay is blocked — common in WebView2 — v stays paused; then fall
+    // back to a *throttled* seek (~12 fps). Setting currentTime every RAF frame
+    // (60 fps) blacks the element out because the decoder can't repaint that fast.
+    if (v.paused) void v.play().catch(() => {});
+    if (v.paused) {
+      const now = performance.now();
+      if (now - lastVideoSeekMs >= 80) {
+        lastVideoSeekMs = now;
+        v.currentTime = want;
+      }
+      return;
+    }
+    // Native playback: correct drift ONLY by nudging playbackRate — NEVER seek
+    // per-frame. Every `currentTime` set drops the element into "seeking"
+    // (readyState 1, no current frame → the canvas samples black), and doing it
+    // each RAF collapses the decoder into a permanent seek-stall that itself
+    // grows the drift, so it can never recover — the "flicker once notes hit"
+    // bug. A muted backdrop briefly running at up to 2× to close a gap is
+    // invisible; the decoder stays at readyState 4 the whole time. A wide gain +
+    // range lets even a large drift converge in a couple of seconds with no seek.
+    // A backward jump in the target (loop wrap or scrub-back) must SEEK, not
+    // servo: `want` dropped, so the video is now far *ahead*; slowing it to let
+    // the clock "catch up" never converges (the clock is looping), which is the
+    // "movie crawls in a loop" bug. One seek per wrap re-seats the frame.
+    const backJump = prevVideoWant >= 0 && want < prevVideoWant - 0.2;
+    prevVideoWant = want;
+    const drift = want - v.currentTime; // +: video behind, must speed up
+    // Emergency resync: a backward jump, or a large forward discontinuity the
+    // servo can't close in reasonable time. Forward seeks are throttled so they
+    // can never become a per-frame reseek loop; a wrap seek fires immediately
+    // (it is naturally once-per-loop and must feel snappy).
+    if (backJump) {
+      v.currentTime = want;
+      v.playbackRate = 1;
+      lastVideoSeekMs = performance.now();
+      return;
+    }
+    if (drift > 3) {
+      const now = performance.now();
+      if (now - lastVideoSeekMs >= 1000) {
+        lastVideoSeekMs = now;
+        v.currentTime = want;
+        v.playbackRate = 1;
+      }
+      return;
+    }
+    v.playbackRate = Math.max(0.5, Math.min(2, 1 + drift * 0.8));
+  }
+
   function render(): void {
     const s = store.snap;
     if (!engine || !s) return;
@@ -367,15 +512,83 @@ export function EditScreen(props: Props): JSX.Element {
     }
     const playhead = interpolatedPlayheadUs(s);
     engine.draw(s, playhead);
-    syncVideo(anchorUsOf(s));
+    driveVideo(s);
+  }
+
+  /**
+   * Drive the phase-locked clock from an authoritative backend playhead. Called
+   * both by a full snapshot and by the lightweight `playhead` push, so the two
+   * paths share one clock. Tracks its own `clockPlaying` (was-playing) so it is
+   * independent of when the note store last updated.
+   *
+   * While playback continues, the backend playhead is ground truth but arrives
+   * with jittery IPC/tick latency. Hard-snapping the frontend clock to each push
+   * made the highway shake and jump *backward*. Instead, phase-lock: re-anchor
+   * the base to the value we're *currently* displaying (continuous — zero step)
+   * and nudge the clock RATE to converge. The rate stays clamped strictly
+   * positive, so the rendered playhead only moves forward — smooth, no backward
+   * jitter — while still locking onto the transport.
+   */
+  function updateClock(
+    playheadUs: number,
+    isPlaying: boolean,
+    frozen = false,
+  ): void {
+    const now = performance.now();
+    // A wait-mode freeze is a pause as far as the clock is concerned: hold the
+    // playhead at the backend value with rate 1 (the RAF renders the frozen
+    // playhead directly), and re-seat cleanly when playback resumes.
+    const advancing = isPlaying && !frozen;
+    const wasPlaying = clockPlaying;
+    if (advancing && wasPlaying) {
+      const predicted = basePlayheadUs + (now - baseWallMs) * 1000 * clockRate;
+      const error = playheadUs - predicted; // +: backend ahead of our clock
+      if (error > SEEK_FWD_US || error < -SEEK_BACK_US) {
+        // Genuine discontinuity — a forward seek / large fall-behind (positive)
+        // or a loop-wrap / deliberate backward seek (very negative). Snap + reset.
+        basePlayheadUs = playheadUs;
+        baseWallMs = now;
+        clockRate = 1;
+      } else {
+        // Ordinary drift: NEVER snap. Re-anchor to the current displayed value
+        // (continuous) and servo the *rate* to converge; the floor > 0 keeps the
+        // playhead strictly monotonic, the wide clamp lets it lock on the
+        // backend's effective rate instead of saturating.
+        basePlayheadUs = predicted;
+        baseWallMs = now;
+        clockRate = Math.max(
+          CLOCK_RATE_MIN,
+          Math.min(CLOCK_RATE_MAX, 1 + error / 1_000_000),
+        );
+      }
+    } else {
+      // Play just started, or paused/idle: take the backend value directly.
+      basePlayheadUs = playheadUs;
+      baseWallMs = now;
+      clockRate = 1;
+    }
+    clockPlaying = advancing;
   }
 
   function applySnapshot(s: ComposerSnapshot): void {
-    basePlayheadUs = s.playhead_us;
-    baseWallMs = performance.now();
+    updateClock(s.playhead_us, s.playing, s.frozen ?? false);
     setStore("snap", s);
     setRev((r) => r + 1);
-    render();
+    // During playback the RAF loop already redraws every frame with a smoothly
+    // interpolated playhead; drawing again here would interleave off-cadence
+    // repaints (stutter). So only draw here when *not* playing (edits, cursor
+    // moves, scrubs need an immediate repaint).
+    if (!s.playing) render();
+  }
+
+  /**
+   * Apply a lightweight `playhead` push (the #1 perf path): advance the clock
+   * without touching the note store or Solid reactivity — the RAF loop renders
+   * off the servo. During playback the note list is unchanged, so a full
+   * snapshot would be pure waste; only the moving position matters here.
+   */
+  function applyPlayhead(p: { playhead_us: number; playing: boolean }): void {
+    updateClock(p.playhead_us, p.playing);
   }
 
   // ── Grid calibration + review playback (M-align) ────────────────────────
@@ -400,7 +613,9 @@ export function EditScreen(props: Props): JSX.Element {
     const r = reviewUs();
     if (r !== null) return r;
     const s = store.snap;
-    return s ? s.cursor.step * stepUs(s.bpm, s.subdivision) : 0;
+    return s
+      ? (s.grid_origin_us ?? 0) + s.cursor.step * stepUs(s.bpm, s.subdivision)
+      : 0;
   }
 
   /** Open the ALIGN overlay, seeding a shared inspection head so ↑/↓ scrub from
@@ -414,7 +629,9 @@ export function EditScreen(props: Props): JSX.Element {
         seed = notes.reduce((m, n) => Math.min(m, n.start_us), Infinity);
       } else {
         const s = store.snap;
-        seed = s ? s.cursor.step * stepUs(s.bpm, s.subdivision) : 0;
+        seed = s
+          ? (s.grid_origin_us ?? 0) + s.cursor.step * stepUs(s.bpm, s.subdivision)
+          : 0;
       }
       setReviewUs(seed);
     }
@@ -1219,10 +1436,52 @@ export function EditScreen(props: Props): JSX.Element {
 
   onMount(() => {
     engine = new EditCanvas(canvasEl);
+    // Composite the backdrop movie *through* the canvas (drawImage the current
+    // frame) instead of showing the <video> element through a translucent
+    // canvas — sidesteps the WebView2 seek-to-black flicker. See EditCanvas.
+    if (videoEl) engine.setBackdropVideo(videoEl);
+    // Share the held-notes set with the keyboard strip (by reference).
+    engine.setHeldNotes(heldNotes);
+
+    // Recomposite when the backdrop decodes a new frame. While STOPPED the RAF
+    // loop doesn't redraw, so a seek that lands (or the clip finishing loading)
+    // would otherwise never reach the canvas — the "movie invisible until you
+    // play" bug. Redraw on decode events, but only when paused (playback already
+    // redraws every RAF frame).
+    if (videoEl) {
+      const recomposite = (): void => {
+        if (!store.snap?.playing) render();
+      };
+      videoEl.addEventListener("seeked", recomposite);
+      videoEl.addEventListener("loadeddata", recomposite);
+      onCleanup(() => {
+        videoEl?.removeEventListener("seeked", recomposite);
+        videoEl?.removeEventListener("loadeddata", recomposite);
+      });
+    }
 
     let unlisten: UnlistenFn | undefined;
     onSnapshot(applySnapshot).then((fn) => {
       unlisten = fn;
+    });
+
+    // Re-attach the backdrop/backing when a bundle is (re)loaded over the control
+    // socket. The backend pushes a `navigate → edit` on load, but a same-screen
+    // nav does NOT remount this component (see Router), so `onMount`'s one-shot
+    // reattach never re-runs — leaving a socket-loaded bundle with no movie.
+    // Listening here re-queries the video/backing on every edit-nav; it is
+    // idempotent for an unchanged source (setVideoPath skips equal values) and
+    // correctly swaps when a different bundle loads.
+    let unlistenNav: UnlistenFn | undefined;
+    void listen<{ kind: string }>("navigate", (e) => {
+      if (e.payload?.kind === "edit") reattachBackdropAndBacking(undefined);
+    }).then((fn) => {
+      unlistenNav = fn;
+    });
+    // Lightweight playback scroll: advances the clock without re-storing notes.
+    let unlistenPlayhead: UnlistenFn | undefined;
+    onPlayhead(applyPlayhead).then((fn) => {
+      unlistenPlayhead = fn;
     });
 
     // If a bundle dir was passed in the route payload, load it first;
@@ -1256,7 +1515,17 @@ export function EditScreen(props: Props): JSX.Element {
     // decays in the render loop; a strike snaps it up to the note velocity.
     let unlistenMidi: UnlistenFn | undefined;
     onMidiEvent((ev) => {
-      if (ev.on) setInputLevel(Math.min(1, ev.velocity / 127));
+      // Maintain the held-key set for the keyboard strip (a note-on with zero
+      // velocity is the running-status note-off convention).
+      if (ev.on && ev.velocity > 0) {
+        heldNotes.add(ev.note);
+        setInputLevel(Math.min(1, ev.velocity / 127));
+      } else {
+        heldNotes.delete(ev.note);
+      }
+      // While playing (incl. a wait-mode freeze) the RAF loop already redraws;
+      // when stopped, repaint so the keyboard reflects the key immediately.
+      if (!store.snap?.playing) render();
     }).then((fn) => {
       unlistenMidi = fn;
     });
@@ -1300,7 +1569,9 @@ export function EditScreen(props: Props): JSX.Element {
       cancelAnimationFrame(raf);
       clearTimeout(flashTimeout);
       unlisten?.();
+      unlistenPlayhead?.();
       unlistenMidi?.();
+      unlistenNav?.();
       engine?.dispose();
       engine = null;
     });

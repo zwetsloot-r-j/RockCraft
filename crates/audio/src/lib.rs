@@ -16,7 +16,7 @@ pub use synth::{synth_from_sf2_bytes, SynthError, SynthHandle, SynthSource};
 
 use std::path::PathBuf;
 
-use rodio::OutputStream;
+use rodio::{OutputStream, OutputStreamHandle};
 
 /// Output sample rate the synth renders at. rodio resamples to the device rate
 /// if it differs.
@@ -71,6 +71,9 @@ pub struct AudioOut {
     // Keeps the device stream (and thus the synth source) alive; dropping it
     // stops all audio.
     _stream: OutputStream,
+    // Kept so the backing track can share this one device stream (a second
+    // `Sink`) rather than opening its own — see `play_backing_at`.
+    stream_handle: OutputStreamHandle,
     handle: SynthHandle,
 }
 
@@ -101,6 +104,7 @@ impl AudioOut {
             .map_err(|e| AudioError::Play(e.to_string()))?;
         Ok(Self {
             _stream: stream,
+            stream_handle,
             handle,
         })
     }
@@ -108,6 +112,26 @@ impl AudioOut {
     /// A cloneable handle for sounding notes from the app thread.
     pub fn synth(&self) -> SynthHandle {
         self.handle.clone()
+    }
+
+    /// Play a backing-track file on the **same** output stream as the synth.
+    ///
+    /// Sharing the synth's `OutputStream` (one device stream, a second `Sink`)
+    /// is rodio's supported pattern for concurrent playback. Opening a *second*
+    /// `OutputStream` (as the standalone [`play_file_at`] does) is silent on some
+    /// hosts — notably Windows/WASAPI, where the second stream opens without
+    /// error yet never reaches the device. Use this whenever a synth stream
+    /// already exists so the backing is actually audible alongside the synth.
+    pub fn play_backing_at(
+        &self,
+        path: &std::path::Path,
+        start: std::time::Duration,
+    ) -> Result<BackingHandle, AudioError> {
+        let sink = backing_sink(&self.stream_handle, path, start)?;
+        Ok(BackingHandle {
+            _stream: None,
+            sink,
+        })
     }
 }
 
@@ -126,8 +150,11 @@ fn sf2_path() -> PathBuf {
 /// Drop (or call [`stop`](BackingHandle::stop)) to stop playback; the device
 /// stream is released on drop.
 pub struct BackingHandle {
-    // Keeps the device stream alive for the duration of playback.
-    _stream: OutputStream,
+    // Keeps the device stream alive when this handle *owns* one (standalone
+    // [`play_file_at`]). `None` when the backing shares the synth's stream via
+    // [`AudioOut::play_backing_at`] — there the synth's `AudioOut` owns and
+    // keeps the stream alive, so a second stream is neither held nor opened.
+    _stream: Option<OutputStream>,
     sink: rodio::Sink,
 }
 
@@ -175,6 +202,13 @@ impl BackingHandle {
         // Best-effort: ignore decoders that don't support seeking.
         let _ = self.sink.try_seek(pos);
     }
+
+    /// Set the playback speed multiplier (1.0 = normal). Resamples, so the pitch
+    /// shifts with the speed — a slow-down practice mode, not time-stretch. Used
+    /// to keep the backing audio in step with a slowed transport.
+    pub fn set_speed(&self, speed: f32) {
+        self.sink.set_speed(speed);
+    }
 }
 
 /// Decode and start playing `path` on the default output device.
@@ -198,7 +232,23 @@ pub fn play_file_at(
 ) -> Result<BackingHandle, AudioError> {
     let (stream, stream_handle) =
         OutputStream::try_default().map_err(|e| AudioError::Device(e.to_string()))?;
-    let sink = rodio::Sink::try_new(&stream_handle).map_err(|e| AudioError::Play(e.to_string()))?;
+    let sink = backing_sink(&stream_handle, path, start)?;
+    Ok(BackingHandle {
+        _stream: Some(stream),
+        sink,
+    })
+}
+
+/// Build a paused-or-playing backing `Sink` on an existing output stream:
+/// decode `path`, append it, and seek to `start` (best-effort). Shared by the
+/// standalone [`play_file_at`] (own stream) and [`AudioOut::play_backing_at`]
+/// (synth's stream).
+fn backing_sink(
+    stream_handle: &OutputStreamHandle,
+    path: &std::path::Path,
+    start: std::time::Duration,
+) -> Result<rodio::Sink, AudioError> {
+    let sink = rodio::Sink::try_new(stream_handle).map_err(|e| AudioError::Play(e.to_string()))?;
     let file = std::fs::File::open(path).map_err(AudioError::Io)?;
     let source = rodio::Decoder::new(std::io::BufReader::new(file))
         .map_err(|e| AudioError::Decode(e.to_string()))?;
@@ -207,8 +257,5 @@ pub fn play_file_at(
         // Best-effort: ignore decoders that don't support seeking.
         let _ = sink.try_seek(start);
     }
-    Ok(BackingHandle {
-        _stream: stream,
-        sink,
-    })
+    Ok(sink)
 }
