@@ -471,6 +471,18 @@ fn spawn_tick_thread(app: tauri::AppHandle) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // MUST be the first plugin registered (tauri-plugin-single-instance
+        // contract). When a second launch is attempted, this callback runs in
+        // the *already-running* instance and the new process exits — so we never
+        // get two WebView2 environments sharing one user-data dir / GPU surfaces.
+        // The callback just brings the existing window forward.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.unminimize();
+                let _ = w.show();
+                let _ = w.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::new())
         .manage(AudioState::new())
