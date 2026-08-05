@@ -34,6 +34,13 @@ target
 # Windows-side build output (native midir/TUI work; WSL uses /target)
 /target-win/
 
+# Python sidecars (tools/*) — virtualenvs and bytecode caches are per-machine.
+# Every sidecar's README tells you to create its venv in-tree, so these must not
+# be committable; running the sidecars' tests would otherwise dirty the tree.
+**/.venv/
+**/__pycache__/
+*.pyc
+
 # Output of `cargo run --example screenshot --features screenshot` (M4-H)
 /screenshot.png
 /render.txt

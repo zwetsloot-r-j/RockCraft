@@ -1,4 +1,5 @@
-//! Import pipeline data contract for RockCraft's M6 video import path.
+//! Import pipeline data contract for RockCraft's import paths — M6 video
+//! extraction, M13-A score files and M13-B scans.
 //!
 //! Provides:
 //! - [`ExtractedChart`] / [`ExtractedNote`] — the JSON schema a Python extractor emits.
@@ -18,9 +19,11 @@ pub mod writer;
 
 pub use error::ImportError;
 pub use parser::{chart_to_timeline, from_json, to_json};
-pub use pipeline::{fetch_command_configured, import_video, ImportInput, Progress};
+pub use pipeline::{
+    fetch_command_configured, import_source, omr_summary, ImportInput, Progress, OMR_SUMMARY_PREFIX,
+};
 pub use rockcraft_core::{BackgroundVideo, BackingTrack, RecordingMeta, Timeline};
-pub use schema::{ExtractedChart, ExtractedNote, Hand, SourceMeta};
+pub use schema::{ExtractedChart, ExtractedNote, Hand, NotationMeta, SourceMeta};
 pub use writer::{
     import_output_dir, write_chart_bundle, write_chart_bundle_full,
     write_chart_bundle_with_backing, write_part_bundle,

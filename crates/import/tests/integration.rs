@@ -1,6 +1,7 @@
+use rockcraft_core::{Key, Scale, TimeSig};
 use rockcraft_import::{
     chart_to_timeline, from_json, to_json, write_chart_bundle, ExtractedChart, ExtractedNote, Hand,
-    ImportError, RecordingMeta, SourceMeta,
+    ImportError, NotationMeta, RecordingMeta, SourceMeta,
 };
 use std::fs;
 
@@ -28,6 +29,7 @@ fn c_major_scale() -> ExtractedChart {
             hit_line_px: None,
             extractor_version: "synthetic-test-0.1".into(),
         },
+        notation: None,
     }
 }
 
@@ -129,5 +131,42 @@ fn write_bundle_rejects_tracked_workspace_path() {
     assert!(
         matches!(result, Err(ImportError::PathNotAllowed(_))),
         "must refuse to write inside workspace source tree"
+    );
+}
+
+// ── Notated context (M13-A) ──────────────────────────────────────────────────
+
+/// The `notation` block survives a JSON round-trip intact.
+#[test]
+fn notation_round_trips() {
+    let chart = ExtractedChart {
+        notation: Some(NotationMeta {
+            bpm: Some(90),
+            time_sig: Some(TimeSig {
+                beats_per_bar: 3,
+                beat_unit: 4,
+            }),
+            key: Some(Key {
+                root_pc: 7,
+                scale: Scale::Major,
+            }),
+        }),
+        ..c_major_scale()
+    };
+    let back = from_json(&to_json(&chart)).unwrap();
+    assert_eq!(chart, back);
+    assert_eq!(back.notation.unwrap().bpm, Some(90));
+}
+
+/// A chart with no `notation` key — every chart the video extractor has ever
+/// emitted — must still deserialize, and must not gain the key on the way out.
+#[test]
+fn chart_without_notation_still_parses() {
+    let fixture = include_str!("fixtures/synthetic_chart.json");
+    let chart = from_json(fixture).expect("pre-M13-A fixture must still parse");
+    assert_eq!(chart.notation, None);
+    assert!(
+        !to_json(&chart).contains("notation"),
+        "a chart with no notation must not serialize the key"
     );
 }

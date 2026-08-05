@@ -126,6 +126,10 @@ pub enum HostCommand {
     // ── import ──────────────────────────────────────────────────────────
     /// Start importing from a URL.
     ImportStart { url: String },
+    /// Start importing a local score file (MusicXML and friends), or a scan/PDF
+    /// that an OMR engine transcribes first. One variant covers both: the
+    /// sidecar decides which an input is, so the frontends never have to.
+    ImportScore { path: String },
 
     // ── status / device (read-only) ─────────────────────────────────────
     /// Current audio/backing status as JSON.
@@ -168,6 +172,7 @@ impl HostCommand {
             HostCommand::DetachVideo => "detach_video",
             HostCommand::QueryVideo => "query_video",
             HostCommand::ImportStart { .. } => "import_start",
+            HostCommand::ImportScore { .. } => "import_score",
             HostCommand::AudioStatus => "audio_status",
             HostCommand::MidiStatus => "midi_status",
             HostCommand::RecordStatus => "record_status",
@@ -291,6 +296,7 @@ pub fn host_command_names() -> &'static [&'static str] {
         "detach_video",
         "query_video",
         "import_start",
+        "import_score",
         "audio_status",
         "midi_status",
         "record_status",
@@ -350,6 +356,7 @@ static HOST_HELP: &[HostCommandInfo] = {
         HostCommandInfo { name: "query_video", params: &[], description: "Return the currently attached background video, or null." },
         // ── import ──────────────────────────────────────────────────────
         HostCommandInfo { name: "import_start", params: &[p("url", "String")], description: "Start importing audio/video from a URL." },
+        HostCommandInfo { name: "import_score", params: &[p("path", "String")], description: "Start importing a local score file (MusicXML/.xml/.mxl/.abc/.krn) or a scan (.pdf/.png/.jpg/.jpeg/.tif/.tiff/.bmp). A score file is a deterministic transform whose notated tempo, metre and key seed the new bundle's grid. A scan goes through an optical music recognition engine first, which is lossy: its notes carry a derived confidence, the import log reports how many were flagged, and it needs an OMR engine installed (see docs/IMPORT.md)." },
         // ── status / device ──────────────────────────────────────────────
         HostCommandInfo { name: "audio_status", params: &[], description: "Return the current audio/backing status." },
         HostCommandInfo { name: "midi_status", params: &[], description: "Return the current MIDI input status." },
@@ -414,6 +421,9 @@ mod tests {
             HostCommand::QueryVideo,
             HostCommand::ImportStart {
                 url: "https://example.com/v".into(),
+            },
+            HostCommand::ImportScore {
+                path: "score.musicxml".into(),
             },
             HostCommand::AudioStatus,
             HostCommand::MidiStatus,

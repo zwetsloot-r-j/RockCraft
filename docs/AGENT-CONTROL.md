@@ -426,6 +426,8 @@ below is an at-a-glance convenience only.
 | `detach_video` | none | Detach the background video |
 | `query_video` | none | The attached background video, or `null` |
 | `import_start` | `{ url: String }` | Start importing from a URL |
+| `import_score` | `{ path: String }` | Start importing a local score file (MusicXML/`.xml`/`.mxl`/`.abc`/`.krn`). The notated tempo, metre and key seed the new bundle's grid |
+| `import_score` (scan) | `{ path: String }` | The same command with a `.pdf`/`.png`/`.jpg`/`.jpeg`/`.tif`/`.tiff`/`.bmp` path runs optical music recognition first. Lossy: notes carry a derived `confidence`, and the import log emits `omr: imported N notes, M flagged …`. Needs an OMR engine installed — see [`IMPORT.md`](IMPORT.md#scanned-sheet-music-omr-m13-b) |
 | `audio_status` / `midi_status` / `record_status` | none | Read-only status snapshots |
 | `app_quit` | none | Shut the app down gracefully (exit 0); the socket closes as the process exits |
 

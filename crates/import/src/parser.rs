@@ -66,6 +66,7 @@ mod tests {
         ExtractedChart {
             notes,
             source: source(),
+            notation: None,
         }
     }
 

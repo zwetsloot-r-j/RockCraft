@@ -28,7 +28,8 @@ use tokio::sync::mpsc;
 use crate::backing::{BackingPicker, PickerOutcome};
 use crate::edit::{EditScreen, NameOutcome, PromptOutcome, SplitOutcome};
 use crate::import_screen::{
-    ImportOutcome, ImportingScreen, UrlInput, UrlInputOutcome, VideoPicker, VideoPickerOutcome,
+    ImportOutcome, ImportingScreen, SourceKind, SourcePicker, SourcePickerOutcome, UrlInput,
+    UrlInputOutcome,
 };
 use crate::key_source::{CrosstermKeys, KeySource};
 use crate::library::{default_scan_roots, library_root};
@@ -55,8 +56,8 @@ pub(crate) enum Screen {
         picker: BackingPicker,
         return_to: Box<EditScreen>,
     },
-    /// Browse for a local video file to import.
-    VideoPicker(VideoPicker),
+    /// Browse for a local video or score file to import.
+    SourcePicker(SourcePicker),
     /// Text input for a video URL to import.
     UrlInput(UrlInput),
     /// Running the import pipeline, showing progress.
@@ -78,6 +79,7 @@ const MENU_ITEMS_BASE: &[&str] = &[
     "Continue last",
     "Play last recording",
     "Import from video file…",
+    "Import score or scan…",
     "Library…",
 ];
 
@@ -297,7 +299,11 @@ impl Shell {
             }
             "Import from video file…" => {
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                self.screen = Screen::VideoPicker(VideoPicker::new(cwd));
+                self.screen = Screen::SourcePicker(SourcePicker::new(cwd, SourceKind::Video));
+            }
+            "Import score or scan…" => {
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                self.screen = Screen::SourcePicker(SourcePicker::new(cwd, SourceKind::Score));
             }
             "Import from URL…" => {
                 self.screen = Screen::UrlInput(UrlInput::new());
@@ -497,17 +503,18 @@ impl Shell {
                     PickerOutcome::Pending => {}
                 }
             }
-            Screen::VideoPicker(picker) => {
+            Screen::SourcePicker(picker) => {
+                let kind = picker.kind();
                 let outcome = picker.on_key(code).clone();
                 match outcome {
-                    VideoPickerOutcome::Selected(path) => {
+                    SourcePickerOutcome::Selected(path) => {
                         self.screen =
-                            Screen::Importing(ImportingScreen::start(ImportInput::File(path)));
+                            Screen::Importing(ImportingScreen::start(kind.input_for(path)));
                     }
-                    VideoPickerOutcome::Cancelled => {
+                    SourcePickerOutcome::Cancelled => {
                         self.screen = Screen::Menu;
                     }
-                    VideoPickerOutcome::Pending => {}
+                    SourcePickerOutcome::Pending => {}
                 }
             }
             Screen::UrlInput(ui) => {
@@ -643,7 +650,10 @@ impl Shell {
             Screen::Play(_) => "play",
             Screen::Edit(_) => "edit",
             Screen::BackingPicker { .. } => "backing_picker",
-            Screen::VideoPicker(_) => "video_picker",
+            Screen::SourcePicker(p) => match p.kind() {
+                SourceKind::Video => "video_picker",
+                SourceKind::Score => "score_picker",
+            },
             Screen::UrlInput(_) => "url_input",
             Screen::Importing(_) => "importing",
             Screen::Library(_) => "library",
@@ -752,6 +762,7 @@ impl rockcraft_control::HostServices for Shell {
             HostCommand::DetachVideo => Err(HostError::Unsupported("detach_video".into())),
             HostCommand::QueryVideo => Err(HostError::Unsupported("query_video".into())),
             HostCommand::ImportStart { .. } => Err(HostError::Unsupported("import_start".into())),
+            HostCommand::ImportScore { .. } => Err(HostError::Unsupported("import_score".into())),
             HostCommand::AudioStatus => Err(HostError::Unsupported("audio_status".into())),
             HostCommand::MidiStatus => Err(HostError::Unsupported("midi_status".into())),
             HostCommand::RecordStatus => Err(HostError::Unsupported("record_status".into())),
@@ -822,7 +833,7 @@ pub fn run_loop<B: ratatui::backend::Backend>(
                 // These screens ignore live MIDI input.
                 Screen::Menu
                 | Screen::BackingPicker { .. }
-                | Screen::VideoPicker(_)
+                | Screen::SourcePicker(_)
                 | Screen::UrlInput(_)
                 | Screen::Importing(_)
                 | Screen::Library(_) => {}
@@ -856,40 +867,7 @@ pub fn run_loop<B: ratatui::backend::Backend>(
         }
 
         // Poll the import pipeline and handle completion.
-        let import_result = if let Screen::Importing(imp) = &mut shell.screen {
-            match imp.poll() {
-                Some(ImportOutcome::Done(path)) => Some(Ok(path.clone())),
-                Some(ImportOutcome::Failed(msg)) => Some(Err(msg.clone())),
-                None => None,
-            }
-        } else {
-            None
-        };
-        match import_result {
-            Some(Ok(bundle)) => {
-                let midi = bundle.join("song.mid");
-                match load_play_screen(&midi, shell.synth.clone()) {
-                    Ok(play) => {
-                        shell.status = format!("imported: {}", bundle.display());
-                        // Audition the imported chart immediately: without a live
-                        // piano part, an import would otherwise be silent (#152).
-                        shell.screen = Screen::Play(Box::new(play.with_hear_song(true)));
-                    }
-                    Err(e) => {
-                        shell.status = format!("import succeeded but load failed: {e}");
-                        shell.screen = Screen::Menu;
-                    }
-                }
-            }
-            Some(Err(msg)) => {
-                // Keep the Importing screen up so its output tail stays visible
-                // next to the error; Esc dismisses it back to the menu. Status
-                // carries only the first line (the rest is shown in the pane).
-                let first = msg.lines().next().unwrap_or(&msg);
-                shell.status = format!("import failed: {first}");
-            }
-            None => {}
-        }
+        apply_import_outcome(shell);
 
         let completed = terminal.draw(|f| draw(f, shell))?;
         shell.terminal_size = (completed.area.width, completed.area.height);
@@ -910,7 +888,7 @@ fn draw(f: &mut Frame, shell: &Shell) {
         Screen::Play(play) => play.draw(f, f.area()),
         Screen::Edit(edit) => edit.draw(f, f.area()),
         Screen::BackingPicker { picker, .. } => picker.draw(f, f.area()),
-        Screen::VideoPicker(picker) => picker.draw(f, f.area()),
+        Screen::SourcePicker(picker) => picker.draw(f, f.area()),
         Screen::UrlInput(ui) => ui.draw(f, f.area()),
         Screen::Importing(imp) => imp.draw(f, f.area()),
         Screen::Library(lib) => lib.draw(f, f.area()),
@@ -1039,9 +1017,55 @@ pub(crate) fn latest_recording_from(base: &std::path::Path) -> Option<std::path:
     candidates.pop().map(|(_, midi)| midi)
 }
 
+/// Poll a running import and act on its outcome; a no-op on every other screen.
+///
+/// Success loads the finished bundle into Play through the same
+/// [`load_play_screen`] the library path uses, so an imported piece and the same
+/// bundle re-opened later behave identically (#247). Failure leaves the
+/// Importing screen up so its output tail stays readable next to the error.
+///
+/// Split out of `run_loop` so the completion branch is reachable headlessly.
+fn apply_import_outcome(shell: &mut Shell) {
+    let import_result = if let Screen::Importing(imp) = &mut shell.screen {
+        match imp.poll() {
+            Some(ImportOutcome::Done(path)) => Some(Ok(path.clone())),
+            Some(ImportOutcome::Failed(msg)) => Some(Err(msg.clone())),
+            None => None,
+        }
+    } else {
+        None
+    };
+    match import_result {
+        Some(Ok(bundle)) => {
+            let midi = bundle.join("song.mid");
+            match load_play_screen(&midi, shell.synth.clone()) {
+                Ok(play) => {
+                    shell.status = format!("imported: {}", bundle.display());
+                    shell.screen = Screen::Play(Box::new(play));
+                }
+                Err(e) => {
+                    shell.status = format!("import succeeded but load failed: {e}");
+                    shell.screen = Screen::Menu;
+                }
+            }
+        }
+        Some(Err(msg)) => {
+            // Status carries only the first line (the rest is shown in the pane).
+            let first = msg.lines().next().unwrap_or(&msg);
+            shell.status = format!("import failed: {first}");
+        }
+        None => {}
+    }
+}
+
 /// Build a [`PlayScreen`] for the MIDI at `midi_path`, attaching the bundle's
 /// backing track when its sibling `meta.json` declares one. Loose `.mid` files
 /// (no sibling manifest) load MIDI-only, exactly as before.
+///
+/// "Hear the song" defaults to on exactly when the piece has no backing track
+/// (#247): a MIDI-only bundle would otherwise open silent unless a live piano is
+/// connected, while a piece with a real recording behind it doesn't need the
+/// synth doubling the melody. The `m` key still toggles it either way.
 fn load_play_screen(
     midi_path: &std::path::Path,
     synth: Option<SynthHandle>,
@@ -1056,16 +1080,18 @@ fn load_play_screen(
 
     // A bundle keeps its manifest next to song.mid; resolve the backing track
     // (if any) relative to that directory so the bundle stays movable.
+    let mut has_backing = false;
     if let Some(dir) = midi_path.parent() {
         if let Ok(json) = std::fs::read_to_string(dir.join("meta.json")) {
             if let Ok(meta) = RecordingMeta::from_json(&json) {
                 if let Some(backing) = meta.backing {
                     play = play.with_backing(dir.join(&backing.file), backing.audio_start_us);
+                    has_backing = true;
                 }
             }
         }
     }
-    Ok(play)
+    Ok(play.with_hear_song(!has_backing))
 }
 
 #[cfg(test)]
@@ -1108,6 +1134,9 @@ mod tests {
             HostCommand::DetachVideo,
             HostCommand::QueryVideo,
             HostCommand::ImportStart { url: "u".into() },
+            HostCommand::ImportScore {
+                path: "s.musicxml".into(),
+            },
             HostCommand::AudioStatus,
             HostCommand::MidiStatus,
             HostCommand::RecordStatus,
@@ -1139,6 +1168,21 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The TUI drives import through its interactive screens, not the socket,
+    /// so `import_score` is an explicit `Unsupported` — matching `import_start`.
+    #[test]
+    fn import_score_is_unsupported_in_the_tui() {
+        let mut shell = make_shell();
+        assert_eq!(
+            shell
+                .dispatch(HostCommand::ImportScore {
+                    path: "s.musicxml".into(),
+                })
+                .unwrap_err(),
+            rockcraft_control::HostError::Unsupported("import_score".into())
+        );
     }
 
     /// `play_toggle_pause` off the play screen is a clean no-op error, not a
@@ -1880,6 +1924,30 @@ mod tests {
         assert_eq!(shell.screen_name(), "video_picker");
     }
 
+    /// "Import score or scan…" is always offered (a score needs no fetch hook) and
+    /// opens the score picker, not the video one.
+    #[test]
+    fn import_score_menu_item_opens_score_picker() {
+        let mut shell = make_shell();
+        shell.set_has_fetch_cmd(false);
+
+        let idx = shell
+            .menu_items()
+            .iter()
+            .position(|s| *s == "Import score or scan…")
+            .expect("score import item present without a fetch command");
+        for _ in 0..idx {
+            shell.on_key(KeyCode::Down);
+        }
+        shell.on_key(KeyCode::Enter);
+
+        assert_eq!(shell.screen_name(), "score_picker");
+
+        // Esc returns to the menu, like every other import sub-screen.
+        shell.on_key(KeyCode::Esc);
+        assert_eq!(shell.screen_name(), "menu");
+    }
+
     /// Pressing Esc on the video picker returns to the menu.
     #[test]
     fn video_picker_esc_returns_to_menu() {
@@ -2140,6 +2208,137 @@ mod tests {
             outcome,
             Some(true),
             "missing-file import must surface a Failed outcome"
+        );
+    }
+
+    // ── "hear the song" default (issue #247) ────────────────────────────────
+
+    /// The committed fixture bundle: four notes, MIDI-only (its `meta.json`
+    /// declares no backing track).
+    fn midi_only_fixture() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("fixtures")
+            .join("play-bundle")
+    }
+
+    /// Copy the fixture's `song.mid` into a fresh temp bundle and write a
+    /// `meta.json` that declares `backing` (or not).
+    fn bundle_with_backing(tag: &str, backing: bool) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rockcraft_hear_{tag}_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::copy(midi_only_fixture().join("song.mid"), dir.join("song.mid")).unwrap();
+        let meta = RecordingMeta {
+            midi_file: "song.mid".into(),
+            backing: backing.then(|| rockcraft_core::BackingTrack {
+                file: "backing.ogg".into(),
+                audio_start_us: 0,
+            }),
+            grid: None,
+            key: None,
+            origin: Some(TrackOrigin::Composed),
+            video: None,
+            version: 1,
+        };
+        std::fs::write(dir.join("meta.json"), meta.to_json()).unwrap();
+        if backing {
+            std::fs::write(dir.join("backing.ogg"), b"").unwrap();
+        }
+        dir
+    }
+
+    /// A MIDI-only piece would open silent without a live piano, so the synth
+    /// audition defaults ON at load.
+    #[test]
+    fn hear_song_defaults_on_for_midi_only_bundle() {
+        let play = load_play_screen(&midi_only_fixture().join("song.mid"), None)
+            .expect("load fixture bundle");
+        assert!(
+            play.is_hear_song(),
+            "a bundle with no backing track must audition itself"
+        );
+    }
+
+    /// A piece with a real recording behind it doesn't need the synth doubling
+    /// the melody, so the audition defaults OFF.
+    #[test]
+    fn hear_song_defaults_off_when_bundle_has_backing() {
+        let dir = bundle_with_backing("backed", true);
+        let play = load_play_screen(&dir.join("song.mid"), None).expect("load backed bundle");
+        assert!(
+            !play.is_hear_song(),
+            "a bundle with a backing track must not audition over it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `m` toggle still flips in both directions from whichever default
+    /// applied — the default only picks the starting side.
+    #[test]
+    fn m_toggles_hear_song_from_either_default() {
+        let mut shell = make_shell();
+
+        // MIDI-only: starts on, `m` turns it off, `m` again turns it back on.
+        let play = load_play_screen(&midi_only_fixture().join("song.mid"), None).unwrap();
+        shell.screen = Screen::Play(Box::new(play));
+        shell.on_key(KeyCode::Char('m'));
+        assert!(!play_screen(&shell).is_hear_song(), "m turns it off");
+        shell.on_key(KeyCode::Char('m'));
+        assert!(play_screen(&shell).is_hear_song(), "m turns it back on");
+
+        // Backed: starts off, and `m` still lights it.
+        let dir = bundle_with_backing("toggle", true);
+        let play = load_play_screen(&dir.join("song.mid"), None).unwrap();
+        shell.screen = Screen::Play(Box::new(play));
+        assert!(!play_screen(&shell).is_hear_song(), "backed starts off");
+        shell.on_key(KeyCode::Char('m'));
+        assert!(play_screen(&shell).is_hear_song(), "m turns it on");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn play_screen(shell: &Shell) -> &PlayScreen {
+        match &shell.screen {
+            Screen::Play(play) => play,
+            _ => panic!("expected the play screen, got {}", shell.screen_name()),
+        }
+    }
+
+    /// The regression the deleted import-only special case used to hide: a
+    /// MIDI-only bundle opened straight off an import and the *same* bundle
+    /// opened later from the library land in the same audition state.
+    #[test]
+    fn import_completion_and_library_load_agree_on_hear_song() {
+        use crate::import_screen::{ImportingScreen, WorkerEvent};
+
+        let bundle = midi_only_fixture();
+
+        // Library path: load the bundle the way the browser does.
+        let via_library = load_play_screen(&bundle.join("song.mid"), None).unwrap();
+
+        // Import path: a finished worker hands the bundle dir to the shell.
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(WorkerEvent::Done(bundle.clone())).unwrap();
+        drop(tx);
+        let mut shell = make_shell();
+        shell.screen = Screen::Importing(ImportingScreen::from_receiver(rx));
+        apply_import_outcome(&mut shell);
+
+        assert_eq!(shell.screen_name(), "play", "a done import opens Play");
+        assert!(
+            play_screen(&shell).is_hear_song(),
+            "an imported MIDI-only piece must be audible"
+        );
+        assert_eq!(
+            play_screen(&shell).is_hear_song(),
+            via_library.is_hear_song(),
+            "import and library loads must agree"
         );
     }
 }

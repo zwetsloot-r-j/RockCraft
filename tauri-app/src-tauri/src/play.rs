@@ -346,10 +346,11 @@ impl PlaySession {
         self.video.as_ref()
     }
 
-    /// Start with "hear the song" on (imported charts opt in; play-along leaves
-    /// it off so the song doesn't sound over the player). Test-only for now —
-    /// the live path leaves it off and toggles via `play_toggle_hear_song`.
-    #[cfg(test)]
+    /// Start with "hear the song" on or off. Bundle loading passes
+    /// `meta.backing.is_none()` here (#247): a MIDI-only piece auditions itself
+    /// so it isn't silent without a live piano, while a piece with a backing
+    /// track leaves it off so the synth doesn't double the recording.
+    /// `play_toggle_hear_song` still flips it at runtime either way.
     pub fn with_hear_song(mut self, on: bool) -> Self {
         self.hear_song = on;
         self
@@ -666,6 +667,9 @@ pub struct PlayState(pub Mutex<Option<PlaySession>>);
 /// Mirrors the TUI `load_play_screen`: parse `song.mid`, then attach the backing
 /// track relative to the bundle dir when `meta.json` declares one. The backing
 /// path stays absolute (resolved against the dir) so the bundle is movable.
+///
+/// "Hear the song" defaults to on exactly when the piece has no backing track
+/// (#247), so a MIDI-only bundle isn't silent without a live piano.
 fn load_session_from_dir(dir: &Path) -> Result<PlaySession, String> {
     let midi_path = dir.join("song.mid");
     let bytes = std::fs::read(&midi_path).map_err(|e| format!("read song.mid failed: {e}"))?;
@@ -675,17 +679,19 @@ fn load_session_from_dir(dir: &Path) -> Result<PlaySession, String> {
         .unwrap_or_else(|| "song".into());
     let mut session = PlaySession::from_smf_bytes(title, &bytes)?;
 
+    let mut has_backing = false;
     if let Ok(json) = std::fs::read_to_string(dir.join("meta.json")) {
         if let Ok(meta) = RecordingMeta::from_json(&json) {
             if let Some(backing) = meta.backing {
                 session = session.with_backing(dir.join(&backing.file), backing.audio_start_us);
+                has_backing = true;
             }
             if let Some(video) = meta.video {
                 session = session.with_video(dir.join(&video.file), video.offset_us);
             }
         }
     }
-    Ok(session)
+    Ok(session.with_hear_song(!has_backing))
 }
 
 // ── Tauri commands ───────────────────────────────────────────────────────────
@@ -1070,6 +1076,89 @@ mod tests {
         assert_eq!(summary.misses, 0);
         assert_eq!(summary.perfect, 4);
         assert_eq!(summary.accuracy_bp, 10_000);
+    }
+
+    // ── "hear the song" default (issue #247) ────────────────────────────────
+
+    /// The committed fixture bundle, whose `meta.json` declares no backing.
+    fn midi_only_fixture() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("fixtures")
+            .join("play-bundle")
+    }
+
+    /// Copy the fixture's `song.mid` into a temp bundle whose `meta.json`
+    /// declares a backing track.
+    fn backed_bundle(tmp: &tempfile::TempDir) -> PathBuf {
+        let dir = tmp.path().to_path_buf();
+        std::fs::copy(midi_only_fixture().join("song.mid"), dir.join("song.mid")).unwrap();
+        let meta = RecordingMeta {
+            midi_file: "song.mid".into(),
+            backing: Some(rockcraft_core::BackingTrack {
+                file: "backing.ogg".into(),
+                audio_start_us: 0,
+            }),
+            grid: None,
+            key: None,
+            origin: Some(rockcraft_core::TrackOrigin::Composed),
+            video: None,
+            version: 1,
+        };
+        std::fs::write(dir.join("meta.json"), meta.to_json()).unwrap();
+        std::fs::write(dir.join("backing.ogg"), b"").unwrap();
+        dir
+    }
+
+    /// A MIDI-only piece would open silent without a live piano, so the synth
+    /// audition defaults ON at load — and the webview sees it in `PlayInfo`.
+    #[test]
+    fn hear_song_defaults_on_for_midi_only_bundle() {
+        let s = load_session_from_dir(&midi_only_fixture()).expect("load fixture bundle");
+        assert!(
+            s.info().hear_song,
+            "a bundle with no backing track must audition itself"
+        );
+    }
+
+    /// A piece with a real recording behind it doesn't need the synth doubling
+    /// the melody, so the audition defaults OFF.
+    #[test]
+    fn hear_song_defaults_off_when_bundle_has_backing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = load_session_from_dir(&backed_bundle(&tmp)).expect("load backed bundle");
+        assert!(
+            !s.info().hear_song,
+            "a bundle with a backing track must not audition over it"
+        );
+    }
+
+    /// The toggle still flips in both directions from whichever default applied,
+    /// and turning it off still clears the audition bookkeeping.
+    #[test]
+    fn toggle_hear_song_works_from_either_default() {
+        let mut s = load_session_from_dir(&midi_only_fixture()).unwrap();
+        s.advance(SHIFT);
+        let (on_idx, _) = s.pending_song_triggers();
+        assert_eq!(on_idx, vec![0], "MIDI-only starts auditioning");
+        s.mark_song_fired(&on_idx, &[]);
+        assert!(!s.toggle_hear_song(), "toggling off reports off");
+        assert!(
+            s.pending_song_triggers().0.is_empty(),
+            "no triggers while off"
+        );
+        assert!(s.toggle_hear_song(), "toggling back on reports on");
+        assert_eq!(
+            s.pending_song_triggers().0,
+            vec![0],
+            "cleared bookkeeping re-arms the sounding span"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut backed = load_session_from_dir(&backed_bundle(&tmp)).unwrap();
+        assert!(!backed.info().hear_song, "backed starts off");
+        assert!(backed.toggle_hear_song(), "toggle lights it");
     }
 
     /// is_finished trips only after the song plus its tail pause.

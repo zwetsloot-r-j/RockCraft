@@ -1,7 +1,7 @@
-//! Import flow: video-file picker → URL input → progress screen.
+//! Import flow: source-file picker → URL input → progress screen.
 //!
 //! Three self-contained sub-screens that `app.rs` routes through:
-//! 1. `VideoPicker`    — browse for a local video file.
+//! 1. `SourcePicker`   — browse for a local video or score file.
 //! 2. `UrlInput`       — type a URL.
 //! 3. `ImportingScreen`— shows pipeline progress; on completion yields a bundle path.
 
@@ -18,17 +18,67 @@ use ratatui::{
     widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph},
     Frame,
 };
-use rockcraft_import::{import_video, ImportInput, Progress};
+use rockcraft_import::{import_source, omr_summary, ImportInput, Progress};
 
-// ── Video file picker ──────────────────────────────────────────────────────────
+// ── Source file picker ─────────────────────────────────────────────────────────
 
 const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mkv", "avi", "mov", "webm", "flv", "wmv", "m4v"];
 
-/// Return video files in `dir`, sorted by name.
-pub fn list_video_files(dir: &Path) -> Vec<PathBuf> {
+/// Inputs the score sidecar reads. Mirrors the documented/tested set in
+/// `tools/score-import/README.md`: score files, which convert exactly (M13-A),
+/// plus scans and PDFs, which the sidecar transcribes with an OMR engine first
+/// and which therefore need reviewing (M13-B).
+///
+/// Both kinds enter through [`SourceKind::Score`] on purpose — the sidecar
+/// decides which is which, so the picker never has to.
+const SCORE_EXTENSIONS: &[&str] = &[
+    "musicxml", "xml", "mxl", "abc", "krn", // score files
+    "pdf", "png", "jpg", "jpeg", "tif", "tiff", "bmp", // scans
+];
+
+/// Which import source a [`SourcePicker`] browses for.
+///
+/// The two paths differ in more than the file filter: video goes through
+/// fetch/extract/ffmpeg, a score is a deterministic conversion. The kind travels
+/// with the picker so the selected path becomes the right [`ImportInput`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceKind {
+    Video,
+    Score,
+}
+
+impl SourceKind {
+    fn extensions(self) -> &'static [&'static str] {
+        match self {
+            SourceKind::Video => VIDEO_EXTENSIONS,
+            SourceKind::Score => SCORE_EXTENSIONS,
+        }
+    }
+
+    fn noun(self) -> &'static str {
+        match self {
+            SourceKind::Video => "video",
+            // Both kinds sit under one picker, so the label has to name both —
+            // otherwise the `.pdf`s in the list look like a bug.
+            SourceKind::Score => "score or scan",
+        }
+    }
+
+    /// The pipeline input for a file the user picked under this kind.
+    pub fn input_for(self, path: PathBuf) -> ImportInput {
+        match self {
+            SourceKind::Video => ImportInput::File(path),
+            SourceKind::Score => ImportInput::Score(path),
+        }
+    }
+}
+
+/// Return the files in `dir` matching `kind`, sorted by name.
+pub fn list_source_files(dir: &Path, kind: SourceKind) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return vec![];
     };
+    let extensions = kind.extensions();
     let mut files: Vec<PathBuf> = entries
         .flatten()
         .map(|e| e.path())
@@ -36,7 +86,7 @@ pub fn list_video_files(dir: &Path) -> Vec<PathBuf> {
             p.is_file()
                 && p.extension()
                     .and_then(|e| e.to_str())
-                    .map(|e| VIDEO_EXTENSIONS.contains(&e.to_lowercase().as_str()))
+                    .map(|e| extensions.contains(&e.to_lowercase().as_str()))
                     .unwrap_or(false)
         })
         .collect();
@@ -45,56 +95,62 @@ pub fn list_video_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum VideoPickerOutcome {
+pub enum SourcePickerOutcome {
     Selected(PathBuf),
     Cancelled,
     Pending,
 }
 
-pub struct VideoPicker {
+pub struct SourcePicker {
     dir: PathBuf,
+    kind: SourceKind,
     files: Vec<PathBuf>,
     state: ListState,
-    outcome: Option<VideoPickerOutcome>,
+    outcome: Option<SourcePickerOutcome>,
 }
 
-impl VideoPicker {
-    pub fn new(dir: PathBuf) -> Self {
-        let files = list_video_files(&dir);
+impl SourcePicker {
+    pub fn new(dir: PathBuf, kind: SourceKind) -> Self {
+        let files = list_source_files(&dir, kind);
         let mut state = ListState::default();
         if !files.is_empty() {
             state.select(Some(0));
         }
         Self {
             dir,
+            kind,
             files,
             state,
             outcome: None,
         }
     }
 
-    pub fn on_key(&mut self, code: KeyCode) -> &VideoPickerOutcome {
+    pub fn kind(&self) -> SourceKind {
+        self.kind
+    }
+
+    pub fn on_key(&mut self, code: KeyCode) -> &SourcePickerOutcome {
         match code {
             KeyCode::Up | KeyCode::Char('k') => self.move_sel(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_sel(1),
             KeyCode::Enter => {
                 if let Some(idx) = self.state.selected() {
                     if let Some(path) = self.files.get(idx) {
-                        self.outcome = Some(VideoPickerOutcome::Selected(path.clone()));
+                        self.outcome = Some(SourcePickerOutcome::Selected(path.clone()));
                     }
                 }
                 if self.outcome.is_none() {
-                    self.outcome = Some(VideoPickerOutcome::Cancelled);
+                    self.outcome = Some(SourcePickerOutcome::Cancelled);
                 }
             }
             KeyCode::Esc => {
-                self.outcome = Some(VideoPickerOutcome::Cancelled);
+                self.outcome = Some(SourcePickerOutcome::Cancelled);
             }
             _ => {}
         }
         self.outcome
             .as_ref()
-            .unwrap_or(&VideoPickerOutcome::Pending)
+            .unwrap_or(&SourcePickerOutcome::Pending)
     }
 
     fn move_sel(&mut self, delta: isize) {
@@ -117,14 +173,18 @@ impl VideoPicker {
 
         f.render_widget(
             Paragraph::new(Line::from(format!(
-                "Import from video file  (dir: {})  — ↑/↓/j/k move · Enter select · Esc cancel",
+                "Import from {} file  (dir: {})  — ↑/↓/j/k move · Enter select · Esc cancel",
+                self.kind.noun(),
                 self.dir.display()
             ))),
             chunks[0],
         );
 
         let items: Vec<ListItem> = if self.files.is_empty() {
-            vec![ListItem::new("(no video files found in this directory)")]
+            vec![ListItem::new(format!(
+                "(no {} files found in this directory)",
+                self.kind.noun()
+            ))]
         } else {
             self.files
                 .iter()
@@ -142,7 +202,7 @@ impl VideoPicker {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" video files "),
+                    .title(format!(" {} files ", self.kind.noun())),
             )
             .highlight_style(
                 Style::default()
@@ -253,14 +313,14 @@ impl UrlInput {
 /// Most log lines we retain in memory for the scrolling output pane.
 const MAX_LOG_LINES: usize = 500;
 
-enum RunningState {
+pub(crate) enum RunningState {
     Starting,
     Fetching,
     Extracting(f32),
     Writing,
 }
 
-enum WorkerEvent {
+pub(crate) enum WorkerEvent {
     Running(RunningState),
     Log(String),
     Done(PathBuf),
@@ -277,6 +337,9 @@ pub struct ImportingScreen {
     rx: mpsc::Receiver<WorkerEvent>,
     running: RunningState,
     log: VecDeque<String>,
+    /// The OMR confidence summary lifted out of the log stream (M13-B), shown on
+    /// its own status line. `None` for every import that has nothing to doubt.
+    summary: Option<String>,
     outcome: Option<ImportOutcome>,
 }
 
@@ -285,7 +348,7 @@ impl ImportingScreen {
     pub fn start(input: ImportInput) -> Self {
         let (tx, rx) = mpsc::channel::<WorkerEvent>();
         thread::spawn(move || {
-            let result = import_video(input, &mut |p| {
+            let result = import_source(input, &mut |p| {
                 let event = match p {
                     Progress::Fetching => WorkerEvent::Running(RunningState::Fetching),
                     Progress::Log(line) => WorkerEvent::Log(line),
@@ -303,6 +366,21 @@ impl ImportingScreen {
             rx,
             running: RunningState::Starting,
             log: VecDeque::new(),
+            summary: None,
+            outcome: None,
+        }
+    }
+
+    /// A screen fed by `rx` instead of a live pipeline, so the log/summary
+    /// handling — and the shell's completion branch — are testable without a
+    /// Python sidecar on the machine.
+    #[cfg(test)]
+    pub(crate) fn from_receiver(rx: mpsc::Receiver<WorkerEvent>) -> Self {
+        Self {
+            rx,
+            running: RunningState::Starting,
+            log: VecDeque::new(),
+            summary: None,
             outcome: None,
         }
     }
@@ -313,6 +391,12 @@ impl ImportingScreen {
             match event {
                 WorkerEvent::Running(s) => self.running = s,
                 WorkerEvent::Log(line) => {
+                    // A scan import's confidence summary rides the same log
+                    // stream as the engine's chatter; promote it out of the pane
+                    // so the counts are readable without scrolling.
+                    if let Some(summary) = omr_summary(&line) {
+                        self.summary = Some(summary.to_string());
+                    }
                     if self.log.len() == MAX_LOG_LINES {
                         self.log.pop_front();
                     }
@@ -334,18 +418,24 @@ impl ImportingScreen {
         matches!(self.outcome, Some(ImportOutcome::Failed(_)))
     }
 
+    /// The OMR confidence summary, once the sidecar has reported one.
+    pub fn summary(&self) -> Option<&str> {
+        self.summary.as_deref()
+    }
+
     pub fn draw(&self, f: &mut Frame, area: Rect) {
         let chunks = Layout::vertical([
             Constraint::Length(2),
             Constraint::Length(3),
             Constraint::Length(1),
+            Constraint::Length(if self.summary.is_some() { 1 } else { 0 }),
             Constraint::Min(0),
         ])
         .split(area);
 
         let header = match &self.outcome {
             Some(ImportOutcome::Failed(_)) => "Import failed.  (Esc to dismiss)",
-            _ => "Importing video — please wait…  (Esc to cancel)",
+            _ => "Importing — please wait…  (Esc to cancel)",
         };
         f.render_widget(Paragraph::new(Line::from(header)), chunks[0]);
 
@@ -383,7 +473,18 @@ impl ImportingScreen {
             None => {}
         }
 
-        self.draw_log_pane(f, chunks[3]);
+        // A scan import's own status line: how much of the chart it doubts. Shown
+        // as soon as the sidecar reports it, so it is on screen before the
+        // "Done:" line and stays there afterwards.
+        if let Some(summary) = &self.summary {
+            f.render_widget(
+                Paragraph::new(Line::from(summary.as_str()))
+                    .style(Style::default().fg(Color::Yellow)),
+                chunks[3],
+            );
+        }
+
+        self.draw_log_pane(f, chunks[4]);
     }
 
     /// Render the last N captured output lines (N = visible pane height) in a
@@ -428,7 +529,7 @@ mod tests {
         fs::write(dir.join(name), b"").unwrap();
     }
 
-    // ── list_video_files ──────────────────────────────────────────────────────
+    // ── list_source_files ─────────────────────────────────────────────────────
 
     #[test]
     fn video_list_returns_only_video_extensions() {
@@ -439,7 +540,7 @@ mod tests {
         touch(&dir, "readme.txt");
         fs::create_dir_all(dir.join("subdir")).unwrap();
 
-        let files = list_video_files(&dir);
+        let files = list_source_files(&dir, SourceKind::Video);
         let names: Vec<_> = files
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
@@ -459,7 +560,7 @@ mod tests {
         touch(&dir, "aaa.mkv");
         touch(&dir, "mmm.avi");
 
-        let files = list_video_files(&dir);
+        let files = list_source_files(&dir, SourceKind::Video);
         let names: Vec<_> = files
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
@@ -470,20 +571,23 @@ mod tests {
 
     #[test]
     fn video_list_empty_on_nonexistent_dir() {
-        let files = list_video_files(Path::new("/nonexistent/path/rockcraft_test"));
+        let files = list_source_files(
+            Path::new("/nonexistent/path/rockcraft_test"),
+            SourceKind::Video,
+        );
         assert!(files.is_empty());
     }
 
-    // ── VideoPicker ───────────────────────────────────────────────────────────
+    // ── SourcePicker ──────────────────────────────────────────────────────────
 
     #[test]
     fn video_picker_esc_cancels() {
         let dir = temp_dir("vpick_esc");
         touch(&dir, "clip.mp4");
 
-        let mut picker = VideoPicker::new(dir.clone());
+        let mut picker = SourcePicker::new(dir.clone(), SourceKind::Video);
         let outcome = picker.on_key(KeyCode::Esc).clone();
-        assert_eq!(outcome, VideoPickerOutcome::Cancelled);
+        assert_eq!(outcome, SourcePickerOutcome::Cancelled);
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -493,10 +597,10 @@ mod tests {
         touch(&dir, "alpha.mp4");
         touch(&dir, "beta.mkv");
 
-        let mut picker = VideoPicker::new(dir.clone());
+        let mut picker = SourcePicker::new(dir.clone(), SourceKind::Video);
         let outcome = picker.on_key(KeyCode::Enter).clone();
         match outcome {
-            VideoPickerOutcome::Selected(p) => {
+            SourcePickerOutcome::Selected(p) => {
                 assert_eq!(
                     p.file_name().unwrap().to_string_lossy().as_ref(),
                     "alpha.mp4"
@@ -513,11 +617,11 @@ mod tests {
         touch(&dir, "alpha.mp4");
         touch(&dir, "beta.mkv");
 
-        let mut picker = VideoPicker::new(dir.clone());
+        let mut picker = SourcePicker::new(dir.clone(), SourceKind::Video);
         picker.on_key(KeyCode::Down);
         let outcome = picker.on_key(KeyCode::Enter).clone();
         match outcome {
-            VideoPickerOutcome::Selected(p) => {
+            SourcePickerOutcome::Selected(p) => {
                 assert_eq!(
                     p.file_name().unwrap().to_string_lossy().as_ref(),
                     "beta.mkv"
@@ -531,10 +635,129 @@ mod tests {
     #[test]
     fn video_picker_empty_dir_enter_cancels() {
         let dir = temp_dir("vpick_empty");
-        let mut picker = VideoPicker::new(dir.clone());
+        let mut picker = SourcePicker::new(dir.clone(), SourceKind::Video);
         let outcome = picker.on_key(KeyCode::Enter).clone();
-        assert_eq!(outcome, VideoPickerOutcome::Cancelled);
+        assert_eq!(outcome, SourcePickerOutcome::Cancelled);
         fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── Score picker (M13-A) ──────────────────────────────────────────────────
+
+    /// The score picker lists score formats and hides the videos sitting next to
+    /// them (and vice-versa — the two kinds must not bleed into each other).
+    #[test]
+    fn score_list_returns_only_score_extensions() {
+        let dir = temp_dir("score_ext");
+        touch(&dir, "scale.musicxml");
+        touch(&dir, "tune.MXL");
+        touch(&dir, "chorale.krn");
+        touch(&dir, "clip.mp4");
+        touch(&dir, "readme.txt");
+
+        let names: Vec<String> = list_source_files(&dir, SourceKind::Score)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains(&"scale.musicxml".to_string()));
+        assert!(names.contains(&"tune.MXL".to_string()), "case-insensitive");
+        assert!(names.contains(&"chorale.krn".to_string()));
+        assert!(!names.contains(&"clip.mp4".to_string()));
+        assert!(!names.contains(&"readme.txt".to_string()));
+
+        let videos: Vec<String> = list_source_files(&dir, SourceKind::Video)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(videos, vec!["clip.mp4".to_string()]);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A file picked under `Score` becomes an `ImportInput::Score`, not a video.
+    #[test]
+    fn score_kind_builds_score_input() {
+        let path = PathBuf::from("/tmp/scale.musicxml");
+        assert!(matches!(
+            SourceKind::Score.input_for(path.clone()),
+            ImportInput::Score(p) if p == path
+        ));
+        assert!(matches!(
+            SourceKind::Video.input_for(path.clone()),
+            ImportInput::File(p) if p == path
+        ));
+    }
+
+    #[test]
+    fn score_picker_enter_selects_first() {
+        let dir = temp_dir("spick_enter");
+        touch(&dir, "alpha.musicxml");
+        touch(&dir, "beta.abc");
+
+        let mut picker = SourcePicker::new(dir.clone(), SourceKind::Score);
+        assert_eq!(picker.kind(), SourceKind::Score);
+        match picker.on_key(KeyCode::Enter).clone() {
+            SourcePickerOutcome::Selected(p) => assert_eq!(
+                p.file_name().unwrap().to_string_lossy().as_ref(),
+                "alpha.musicxml"
+            ),
+            other => panic!("expected Selected, got {other:?}"),
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── Scan picker (M13-B) ───────────────────────────────────────────────────
+
+    /// Scans and PDFs are offered by the same picker as score files: both go to
+    /// the score sidecar, which decides for itself which one needs OMR.
+    #[test]
+    fn score_list_also_offers_scans_and_pdfs() {
+        let dir = temp_dir("scan_ext");
+        for name in [
+            "page.pdf",
+            "photo.JPG",
+            "shot.jpeg",
+            "sheet.png",
+            "old.tif",
+            "old2.tiff",
+            "raw.bmp",
+            "scale.musicxml",
+        ] {
+            touch(&dir, name);
+        }
+        touch(&dir, "clip.mp4");
+
+        let names: Vec<String> = list_source_files(&dir, SourceKind::Score)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        for expected in [
+            "page.pdf",
+            "photo.JPG",
+            "shot.jpeg",
+            "sheet.png",
+            "old.tif",
+            "old2.tiff",
+            "raw.bmp",
+            "scale.musicxml",
+        ] {
+            assert!(names.contains(&expected.to_string()), "missing {expected}");
+        }
+        assert!(
+            !names.contains(&"clip.mp4".to_string()),
+            "a video is not a scan"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A scan picked under `Score` still becomes an `ImportInput::Score` — there
+    /// is deliberately no third input kind, because the Rust side does not decide
+    /// whether OMR runs.
+    #[test]
+    fn a_scan_uses_the_same_score_input() {
+        let path = PathBuf::from("/tmp/page.pdf");
+        assert!(matches!(
+            SourceKind::Score.input_for(path.clone()),
+            ImportInput::Score(p) if p == path
+        ));
     }
 
     // ── UrlInput ──────────────────────────────────────────────────────────────
@@ -580,6 +803,44 @@ mod tests {
     }
 
     // ── ImportingScreen ───────────────────────────────────────────────────────
+
+    /// The OMR confidence summary is promoted out of the log pane onto its own
+    /// status line, while still remaining in the log with the engine's chatter.
+    #[test]
+    fn importing_screen_promotes_the_omr_summary_to_the_status_line() {
+        let (tx, rx) = mpsc::channel();
+        let mut screen = ImportingScreen::from_receiver(rx);
+        assert_eq!(screen.summary(), None);
+
+        for line in [
+            "using OMR engine oemer: /usr/bin/oemer",
+            "suspect measures (2): 12, 40",
+            "omr: imported 412 notes, 37 flagged — review in the editor",
+        ] {
+            tx.send(WorkerEvent::Log(line.to_string())).unwrap();
+        }
+        screen.poll();
+
+        assert_eq!(
+            screen.summary(),
+            Some("imported 412 notes, 37 flagged — review in the editor")
+        );
+        assert_eq!(screen.log.len(), 3, "the summary stays in the log too");
+    }
+
+    /// A score-file import reports no summary, so the extra status line never
+    /// appears for a conversion that has nothing to doubt.
+    #[test]
+    fn importing_screen_has_no_summary_without_an_omr_line() {
+        let (tx, rx) = mpsc::channel();
+        let mut screen = ImportingScreen::from_receiver(rx);
+        tx.send(WorkerEvent::Log(
+            "dropped 1 grace note(s) (by design)".to_string(),
+        ))
+        .unwrap();
+        screen.poll();
+        assert_eq!(screen.summary(), None);
+    }
 
     #[test]
     fn importing_screen_missing_file_fails() {

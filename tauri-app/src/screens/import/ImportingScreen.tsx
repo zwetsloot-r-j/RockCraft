@@ -4,6 +4,8 @@
 //   - Stage label (fetching / extracting / writing / done / failed)
 //   - Progress bar (0–100 %; only meaningful for "extracting"; indeterminate for others)
 //   - Scrolling log pane (last 200 lines)
+//   - OMR confidence summary on its own status line (M13-B), when the import was
+//     a scan and the sidecar reported one
 //   - No Esc-cancel while running (TUI parity; cancellation is not implemented)
 //   - "done"   → navigate to library (with new bundle highlighted)
 //   - "failed" → error panel; Esc → menu
@@ -18,6 +20,7 @@ import {
   type JSX,
 } from "solid-js";
 import { onImportProgress, type ImportProgressEvent } from "../../ipc/bridge";
+import { omrSummary } from "../../ipc/omr";
 import { useRouter } from "../../shell/Router";
 
 // Maximum log lines retained (TUI parity).
@@ -27,6 +30,7 @@ const BG = "#0f1016";
 const FG = "#e7e8ef";
 const DIM = "#8a8e9c";
 const ACCENT = "#4fa3e3";
+const WARN = "#e5c07b";
 const FONT = "'Space Grotesk', system-ui, sans-serif";
 
 interface ImportingScreenProps {
@@ -65,6 +69,7 @@ export function ImportingScreen(_props: ImportingScreenProps): JSX.Element {
   const [stage, setStage] = createSignal<Stage>("idle");
   const [progress, setProgress] = createSignal<number | null>(null);
   const [logLines, setLogLines] = createSignal<string[]>([]);
+  const [summary, setSummary] = createSignal<string | null>(null);
   const [error, setError] = createSignal<string | null>(null);
   const [_bundleDir, setBundleDir] = createSignal<string | null>(null);
   const [failed, setFailed] = createSignal(false);
@@ -85,6 +90,10 @@ export function ImportingScreen(_props: ImportingScreenProps): JSX.Element {
     }
     if (ev.log) {
       addLog(ev.log);
+      // A scan import's confidence counts arrive on the log stream; promote them
+      // out of the pane so they are readable without scrolling.
+      const found = omrSummary(ev.log);
+      if (found !== null) setSummary(found);
     }
     if (ev.stage === "done" && ev.bundle_dir) {
       setBundleDir(ev.bundle_dir);
@@ -181,6 +190,13 @@ export function ImportingScreen(_props: ImportingScreenProps): JSX.Element {
           }}
         />
       </div>
+
+      {/* OMR confidence summary — a scan import's own status line (M13-B). Shown
+          as soon as the sidecar reports it and kept for the rest of the screen,
+          because a chart read off a scan is meant to be reviewed. */}
+      <Show when={summary() !== null}>
+        <div style={{ "font-size": "13px", color: WARN }}>{summary()}</div>
+      </Show>
 
       {/* Stage label for extracting */}
       <Show when={stage() === "extracting"}>
