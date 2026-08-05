@@ -27,6 +27,12 @@ import {
 } from "../highway/utils";
 import { gridTiming, Viewport } from "./viewport";
 
+/** Euclidean modulo (non-negative result), for classifying step indices that
+ * may be negative when the viewport bottom edge sits before the grid origin. */
+function mod(a: number, b: number): number {
+  return ((a % b) + b) % b;
+}
+
 const BG = "#0f1016";
 /** Translucent dim used over a video backdrop (lets the frame read through). */
 const BG_BACKDROP = "rgba(15,16,22,0.45)";
@@ -44,10 +50,21 @@ export class EditCanvas {
   private w = 1;
   private h = 1;
 
-  // When a video backdrop is attached the grid must show the frame underneath:
-  // the opaque background fill is replaced by a translucent dim so the <video>
-  // behind the canvas reads through while keeping notes/grid legible.
+  // When a video backdrop is attached the grid must show the frame underneath.
+  // Rather than let the <video> element show *through* a translucent canvas —
+  // which flickers to black in WebView2 every time we seek its currentTime — we
+  // *sample* the element's current frame straight onto this canvas with
+  // drawImage (canvas sampling never triggers the element's seek-to-black), then
+  // dim it. The <video> stays behind, decoding, fully covered by the opaque
+  // canvas. `backdropVideo` is that source element (or null when unset).
   private backdrop = false;
+  private backdropVideo: HTMLVideoElement | null = null;
+
+  // Live set of MIDI pitches held on the piano, shared by reference from the
+  // screen (updated on every `midi_event`). The keyboard strip lights these keys
+  // next to the wait-mode target key, so a note can be verified against the
+  // physical piano at a glance. Empty until `setHeldNotes` is called.
+  private heldNotes: ReadonlySet<number> = new Set();
 
   // M10-C split editor: the derived segments (with keep/discard flags). When set,
   // `draw` paints a marker line at each interior boundary and dims discarded
@@ -87,6 +104,26 @@ export class EditCanvas {
    */
   setBackdrop(on: boolean): void {
     this.backdrop = on;
+  }
+
+  /**
+   * Register the `<video>` element whose current frame is composited onto the
+   * canvas while a backdrop is attached. Sampling the frame with drawImage —
+   * instead of showing the element through a translucent canvas — sidesteps the
+   * WebView2 quirk where every `currentTime` seek blacks the element out (the
+   * "backdrop flickers between visible and hidden" bug). Pass null to clear.
+   */
+  setBackdropVideo(el: HTMLVideoElement | null): void {
+    this.backdropVideo = el;
+  }
+
+  /**
+   * Register the live held-note set for the keyboard strip. Held by reference:
+   * the screen mutates the same `Set` on each `midi_event`, and the next `draw`
+   * reads it — no per-event setter churn.
+   */
+  setHeldNotes(held: ReadonlySet<number>): void {
+    this.heldNotes = held;
   }
 
   /**
@@ -139,10 +176,24 @@ export class EditCanvas {
   ): void {
     const ctx = this.ctx;
     ctx.clearRect(0, 0, this.w, this.h);
-    // With a backdrop attached, leave the fill translucent so the <video>
-    // underneath reads through (clearRect already made it transparent); the dim
-    // keeps notes/grid legible on top. Otherwise paint the opaque app bg.
-    ctx.fillStyle = this.backdrop ? BG_BACKDROP : BG;
+    // With a backdrop attached, sample the video's current frame straight onto
+    // this canvas (opaque) and dim it, rather than showing the <video> element
+    // through a translucent canvas — the latter flickers to black on every
+    // WebView2 seek. Stretch the frame to the canvas box (matches the element's
+    // object-fit:fill; the *grid* is then calibrated onto it). If the frame
+    // isn't decodable yet, fall back to the opaque app bg so the covered
+    // element never peeks through. Otherwise (no backdrop) paint the app bg.
+    const vid = this.backdropVideo;
+    if (this.backdrop && vid && vid.readyState >= 2) {
+      try {
+        ctx.drawImage(vid, 0, 0, this.w, this.h);
+        ctx.fillStyle = BG_BACKDROP; // dim for note/grid legibility
+      } catch {
+        ctx.fillStyle = BG; // frame not paintable this tick — opaque bg
+      }
+    } else {
+      ctx.fillStyle = BG;
+    }
     ctx.fillRect(0, 0, this.w, this.h);
 
     const g = gridTiming(
@@ -151,8 +202,10 @@ export class EditCanvas {
       snapshot.subdivision,
     );
     // Anchor the scroll to an explicit review head when given, else to the
-    // playhead while playing, else the cursor step.
-    const cursorUs = snapshot.cursor.step * g.stepUs;
+    // playhead while playing, else the cursor step. The cursor's µs position is
+    // phased by the grid origin (step 0 sits at the origin, not song time 0).
+    const gridOriginUs = snapshot.grid_origin_us ?? 0;
+    const cursorUs = gridOriginUs + snapshot.cursor.step * g.stepUs;
     const reviewing = scrollAnchorUs !== undefined;
     const anchorUs = reviewing
       ? scrollAnchorUs
@@ -171,7 +224,7 @@ export class EditCanvas {
 
     this.drawLanes(vp);
     this.drawLoopRegion(snapshot, vp);
-    this.drawGridlines(g, vp);
+    this.drawGridlines(g, vp, gridOriginUs);
     // Crosshair guides sit under the notes so a note on the cursor's column /
     // row stays fully legible, but over the gridlines so the selected timeslot
     // reads at a glance even on a sparse grid.
@@ -183,6 +236,91 @@ export class EditCanvas {
     this.drawCursor(snapshot, vp, cursorUs, g.stepUs);
     this.drawPlayhead(snapshot, vp, reviewing ? scrollAnchorUs : playheadUs, reviewing);
     this.drawLaneLabels(vp);
+    // The piano keyboard strip sits on top of everything at the bottom edge,
+    // aligned 1:1 with the pitch lanes so a falling note descends into its key.
+    this.drawKeyboard(snapshot, vp);
+  }
+
+  // ── keyboard strip (note-by-note verification) ──────────────────────────
+
+  /**
+   * A piano-key strip along the bottom edge, one key per visible pitch lane
+   * (aligned with the highway columns, so a note falls into its key). Keys are
+   * lit for the wait-mode target (the note the player must strike to advance),
+   * for the keys currently held on the piano, and — brightest — when a held key
+   * matches the target. Naturals read light, accidentals dark (a shorter cap),
+   * so the octave shape is legible; C keys carry a name label.
+   */
+  private drawKeyboard(snapshot: ComposerSnapshot, vp: Viewport): void {
+    const ctx = this.ctx;
+    const bandH = Math.max(30, Math.min(64, this.h * 0.16));
+    const top = this.h - bandH;
+    const awaitingArr = snapshot.awaiting ?? [];
+    const awaiting = new Set<number>(awaitingArr);
+    // A wait step (a single note OR a whole chord) is only "satisfied" once EVERY
+    // required note is held together. Until then the target keys stay amber — a
+    // held-but-still-pending target keeps its amber (with a green "registered" tick)
+    // instead of turning green early, so a chord reads as done only when complete.
+    const chordSatisfied =
+      awaitingArr.length > 0 && awaitingArr.every((p) => this.heldNotes.has(p));
+
+    ctx.save();
+    // Opaque base so the keyboard reads clearly over the note field / backdrop.
+    ctx.fillStyle = "rgba(8,9,13,0.92)";
+    ctx.fillRect(0, top, this.w, bandH);
+
+    for (let p = vp.pitchLo; p <= vp.pitchHi; p++) {
+      const x = vp.xOf(p);
+      const w = Math.max(1, vp.laneW - 1);
+      const black = isBlack(p);
+      const held = this.heldNotes.has(p);
+      const target = awaiting.has(p);
+      // A target key that is held but whose chord isn't complete yet: stays amber,
+      // gets a green tick so you can see it's registered while you find the rest.
+      const targetHeldPending = target && held && !chordSatisfied;
+
+      let fill: string;
+      let keyH = bandH;
+      if (target && chordSatisfied)
+        fill = "#7ee08a"; // all required notes held — the step is satisfied
+      else if (target)
+        fill = "#f5a742"; // play this — a note still needed for the (chord) step
+      else if (held)
+        fill = "#5b9be7"; // you're playing this (not part of the target)
+      else if (black) {
+        fill = "#23262e"; // black key — a shorter, darker cap
+        keyH = bandH * 0.62;
+      } else fill = "#c9cdd6"; // white key
+
+      ctx.fillStyle = fill;
+      ctx.fillRect(x + 0.5, top, w, keyH);
+      ctx.strokeStyle = "rgba(0,0,0,0.55)";
+      ctx.lineWidth = 1;
+      ctx.strokeRect(x + 0.5, top + 0.5, w, bandH - 1);
+
+      // Green "registered" tick along the top of a held-but-pending target key.
+      if (targetHeldPending) {
+        ctx.fillStyle = "#7ee08a";
+        ctx.fillRect(x + 0.5, top, w, Math.max(3, bandH * 0.14));
+      }
+
+      if (pitchClass(p) === 0 && vp.laneW > 10) {
+        ctx.fillStyle = "rgba(0,0,0,0.6)";
+        ctx.font = `600 9px ${FONT_MONO}`;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "bottom";
+        ctx.fillText(noteName(p), x + vp.laneW / 2, this.h - 2);
+      }
+    }
+
+    // Bright top edge so the strip reads as a deliberate keyboard.
+    ctx.strokeStyle = "rgba(255,255,255,0.2)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(0, top + 0.5);
+    ctx.lineTo(this.w, top + 0.5);
+    ctx.stroke();
+    ctx.restore();
   }
 
   // ── vertical pitch lanes ────────────────────────────────────────────────
@@ -227,17 +365,26 @@ export class EditCanvas {
   private drawGridlines(
     g: { stepUs: number; beatUs: number; barUs: number },
     vp: Viewport,
+    gridOriginUs: number,
   ): void {
     const ctx = this.ctx;
     // The top edge is the latest visible time (originUs is the bottom edge).
     const endUs = vp.originUs + this.h / vp.pxPerUs;
-    // Start at the first step at/after the bottom (earliest) edge.
-    const first = Math.floor(vp.originUs / g.stepUs) * g.stepUs;
-    for (let t = first; t <= endUs; t += g.stepUs) {
+    // Grid lines fall at `gridOriginUs + i·stepUs`. Classify bar/beat lines by the
+    // INTEGER step index `i` (steps-per-bar / -beat) rather than a float modulo of
+    // the time — `stepUs` is fractional (e.g. 60e6/172/4), so a `t % barUs` would
+    // accumulate error and miss downbeats. Start at the first index at/after the
+    // bottom (earliest) edge.
+    const stepsPerBar = Math.max(1, Math.round(g.barUs / g.stepUs));
+    const stepsPerBeat = Math.max(1, Math.round(g.beatUs / g.stepUs));
+    let i = Math.floor((vp.originUs - gridOriginUs) / g.stepUs);
+    for (; ; i++) {
+      const t = gridOriginUs + i * g.stepUs;
+      if (t > endUs) break;
       const y = vp.yOf(t);
       if (y < 0 || y > this.h) continue;
-      const onBar = t % g.barUs === 0;
-      const onBeat = t % g.beatUs === 0;
+      const onBar = mod(i, stepsPerBar) === 0;
+      const onBeat = mod(i, stepsPerBeat) === 0;
       // Heaviest per bar, heavier per beat, faint per subdivision step.
       ctx.strokeStyle = onBar
         ? "rgba(255,255,255,0.16)"

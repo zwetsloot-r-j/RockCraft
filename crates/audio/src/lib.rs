@@ -202,6 +202,13 @@ impl BackingHandle {
         // Best-effort: ignore decoders that don't support seeking.
         let _ = self.sink.try_seek(pos);
     }
+
+    /// Set the playback speed multiplier (1.0 = normal). Resamples, so the pitch
+    /// shifts with the speed — a slow-down practice mode, not time-stretch. Used
+    /// to keep the backing audio in step with a slowed transport.
+    pub fn set_speed(&self, speed: f32) {
+        self.sink.set_speed(speed);
+    }
 }
 
 /// Decode and start playing `path` on the default output device.

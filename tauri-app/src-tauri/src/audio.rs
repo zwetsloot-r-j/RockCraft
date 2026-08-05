@@ -46,6 +46,9 @@ enum BackingMsg {
     Seek(u64),
     /// Pause the current playback.
     Pause,
+    /// Set the playback speed multiplier (resamples; pitch shifts with speed).
+    /// Keeps the backing in step with a slowed/sped transport.
+    SetSpeed(f32),
     /// Query the current backing file name (reply on the one-shot channel).
     QueryFileName(Sender<Option<String>>),
 }
@@ -119,6 +122,9 @@ impl AudioState {
 
             let mut path: Option<PathBuf> = None;
             let mut handle: Option<BackingHandle> = None;
+            // Current speed multiplier, re-applied whenever a fresh sink is made
+            // (a new BackingHandle starts at 1.0×) so slow-mo survives a restart.
+            let mut speed: f32 = 1.0;
 
             for msg in backing_rx {
                 match msg {
@@ -145,7 +151,10 @@ impl AudioState {
                             // second sink) — a separate stream is silent on
                             // Windows/WASAPI.
                             match out.play_backing_at(p, pos) {
-                                Ok(h) => handle = Some(h),
+                                Ok(h) => {
+                                    h.set_speed(speed); // carry slow-mo across restarts
+                                    handle = Some(h);
+                                }
                                 Err(e) => {
                                     eprintln!("[rockcraft-tauri] backing: play failed: {e}")
                                 }
@@ -160,6 +169,12 @@ impl AudioState {
                     BackingMsg::Pause => {
                         if let Some(h) = &handle {
                             h.set_paused(true);
+                        }
+                    }
+                    BackingMsg::SetSpeed(s) => {
+                        speed = s;
+                        if let Some(h) = &handle {
+                            h.set_speed(s);
                         }
                     }
                     BackingMsg::QueryFileName(reply) => {
@@ -200,6 +215,12 @@ impl AudioState {
         if let Some(tx) = guard.as_ref() {
             let _ = tx.send(msg);
         }
+    }
+
+    /// Set the backing-audio playback speed (1.0 = normal) to match a slowed or
+    /// sped transport. Resamples, so the pitch shifts with the speed.
+    pub fn set_backing_speed(&self, speed: f32) {
+        self.send_backing(BackingMsg::SetSpeed(speed));
     }
 
     // ── Play-mode backing coupling (#168) ───────────────────────────────────

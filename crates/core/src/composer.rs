@@ -24,7 +24,7 @@
 //! This is a **port, not a redesign**: semantics match `EditScreen` 1:1 so the
 //! M4-C TUI can delegate here without behaviour drift.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -34,6 +34,7 @@ use crate::events::{MidiNote, NoteEvent, NoteEventKind, Velocity};
 use crate::grid::{Grid, Subdivision, TimeSig};
 use crate::history::History;
 use crate::timeline::{Note, NoteId, Timeline};
+use crate::wait::{GateState, WaitGate};
 
 /// Lowest MIDI note on an 88-key piano (A0).
 const LOWEST_MIDI: u8 = 21;
@@ -167,6 +168,33 @@ pub struct Composer {
     /// frontend's [`crate::backing_position_us`] seek. Pure state: the composer
     /// owns no audio, only the number frontends and `query state` read.
     backing_offset_us: u64,
+
+    // ── playback speed ──────────────────────────────────────────────────────
+    /// Transport speed multiplier (1.0 = real time). [`Composer::advance`]
+    /// scales the injected `dt_us` by this, so the playhead — and thus every
+    /// audition boundary — moves slower/faster while the *chart timing stays
+    /// untouched*. A practice/review slow-down (Rocksmith-style). Frontends read
+    /// it from the snapshot to match their backing-audio playback speed.
+    playback_rate: f64,
+
+    // ── wait mode (note-by-note play-along) ──────────────────────────────────
+    /// Whether note-by-note wait mode is armed. When armed, playback freezes on
+    /// each note (or chord) until the required pitches are held on the piano —
+    /// a precise "pause on note" review/verify mode.
+    wait_enabled: bool,
+    /// The gate driving wait mode, rebuilt from the chart at each
+    /// [`start_play`](Composer::start_play) (filtered to notes at/after the play
+    /// start). `None` before the first playback.
+    wait: Option<WaitGate>,
+    /// Whether the last [`advance`](Composer::advance) left the transport frozen
+    /// on an unsatisfied wait step. Cached so [`snapshot`](Composer::snapshot)
+    /// and the frontend see the transport as "not advancing" while frozen —
+    /// which pauses the highway, the backdrop video, and the backing audio via
+    /// the existing paused-transport path.
+    wait_frozen: bool,
+    /// Live set of MIDI pitches currently held on the piano, fed by
+    /// [`ingest`](Composer::ingest) and consumed by the wait gate.
+    held: BTreeSet<u8>,
 }
 
 impl Composer {
@@ -214,6 +242,11 @@ impl Composer {
             selection_anchor: None,
             clipboard: Vec::new(),
             backing_offset_us: 0,
+            playback_rate: 1.0,
+            wait_enabled: false,
+            wait: None,
+            wait_frozen: false,
+            held: BTreeSet::new(),
         }
     }
 
@@ -240,6 +273,63 @@ impl Composer {
     /// [`Action::NudgeBackingOffset`] instead.
     pub fn set_backing_offset_us(&mut self, us: u64) {
         self.backing_offset_us = us;
+    }
+
+    /// The transport speed multiplier (1.0 = real time). Frontends read this to
+    /// match backing-audio playback speed to the (possibly slowed) playhead.
+    pub fn playback_rate(&self) -> f64 {
+        self.playback_rate
+    }
+
+    /// Set the transport speed multiplier, clamped to a sane practice range
+    /// (0.25×–2×). Set via [`Action::SetPlaybackRate`] during playback.
+    pub fn set_playback_rate(&mut self, rate: f64) {
+        self.playback_rate = rate.clamp(0.25, 2.0);
+    }
+
+    /// Arm or disarm note-by-note wait mode ("pause on note"). When armed and a
+    /// [`WaitGate`] exists (i.e. after [`start_play`](Composer::start_play)), the
+    /// gate is (dis)armed in step so it takes effect on the next
+    /// [`advance`](Composer::advance). Disarming immediately clears the frozen
+    /// flag so playback resumes without waiting a tick.
+    pub fn set_wait_mode(&mut self, on: bool) {
+        self.wait_enabled = on;
+        if let Some(gate) = self.wait.as_mut() {
+            gate.set_armed(on);
+        }
+        if !on {
+            self.wait_frozen = false;
+        }
+    }
+
+    /// Whether note-by-note wait mode is armed.
+    pub fn is_wait_mode(&self) -> bool {
+        self.wait_enabled
+    }
+
+    /// Whether the transport is currently frozen on an unsatisfied wait step.
+    pub fn is_wait_frozen(&self) -> bool {
+        self.wait_frozen
+    }
+
+    /// Whether the transport is *actively advancing*: playing and not held by a
+    /// wait-mode freeze. Frontends and audio treat a wait freeze exactly like a
+    /// pause (highway, video, and backing all hold), so this — not
+    /// [`is_playing`](Composer::is_playing) — is the "is time moving?" signal.
+    pub fn is_advancing(&self) -> bool {
+        self.playing && !self.wait_frozen
+    }
+
+    /// The pitches the player must currently strike to un-freeze wait mode, or
+    /// `None` when not frozen. Lets a frontend highlight the awaited note(s).
+    pub fn awaiting_notes(&self) -> Option<Vec<u8>> {
+        if !self.wait_frozen {
+            return None;
+        }
+        self.wait
+            .as_ref()
+            .and_then(|g| g.awaiting())
+            .map(|step| step.notes.clone())
     }
 
     // ── core API ──────────────────────────────────────────────────────────
@@ -339,6 +429,17 @@ impl Composer {
                 self.resnap_cursor_from_us(cursor_us);
                 Vec::new()
             }
+            Action::SetGridOrigin { us } => {
+                let cursor_us = self.cursor_us();
+                self.grid.set_origin_us(us);
+                self.resnap_cursor_from_us(cursor_us);
+                Vec::new()
+            }
+            Action::QuantizeRegion {
+                start_us,
+                end_us,
+                step_us,
+            } => self.quantize_region(start_us, end_us, step_us),
 
             // ── chord selector ──────────────────────────────────────────
             Action::EnterChordMode => self.enter_chord_mode(),
@@ -359,9 +460,16 @@ impl Composer {
             }
 
             // ── wait mode ───────────────────────────────────────────────
-            // Wait mode is owned by the Play transport (M5-C), not the
-            // composer; these are inert here.
-            Action::ToggleWaitMode | Action::SetWaitMode { .. } => Vec::new(),
+            // Note-by-note "pause on note" gating for the composer/edit
+            // transport: freeze playback on each note until it is played.
+            Action::ToggleWaitMode => {
+                self.set_wait_mode(!self.wait_enabled);
+                Vec::new()
+            }
+            Action::SetWaitMode { on } => {
+                self.set_wait_mode(on);
+                Vec::new()
+            }
 
             // ── transport ───────────────────────────────────────────────
             Action::TogglePlayCursor => {
@@ -387,6 +495,14 @@ impl Composer {
                 self.backing_offset_us = (self.backing_offset_us as i64)
                     .saturating_add(delta_us)
                     .max(0) as u64;
+                Vec::new()
+            }
+
+            // ── playback speed ──────────────────────────────────────────
+            // Set the transport speed multiplier (permille: 1000 = 1×).
+            // `advance` scales dt by it; frontends match backing-audio speed.
+            Action::SetPlaybackRate { rate_permille } => {
+                self.set_playback_rate(rate_permille as f64 / 1000.0);
                 Vec::new()
             }
 
@@ -450,7 +566,31 @@ impl Composer {
         if !self.playing {
             return Vec::new();
         }
-        self.transport_us += dt_us;
+        // Wait-mode gate: if the current note/chord is due and not yet held on
+        // the piano, freeze the transport here (don't advance, fire no effects).
+        // The note-on for this step already fired on the tick that crossed its
+        // onset, so it rings under the playhead until the player matches it. The
+        // frontend sees a non-advancing transport (via `wait_frozen`) and holds
+        // the highway, video, and backing — the "pause on note" behaviour.
+        if self.wait_enabled {
+            if let Some(gate) = self.wait.as_mut() {
+                gate.set_held(self.held.clone());
+                if gate.poll(self.transport_us) == GateState::Frozen {
+                    self.wait_frozen = true;
+                    return Vec::new();
+                }
+            }
+            self.wait_frozen = false;
+        }
+        // Scale wall-clock dt by the playback-speed multiplier so a slow-down
+        // stretches song time without touching the chart. `round` keeps the
+        // per-tick truncation unbiased (net tempo error ~0 over many ticks).
+        let scaled = if self.playback_rate == 1.0 {
+            dt_us
+        } else {
+            (dt_us as f64 * self.playback_rate).round() as u64
+        };
+        self.transport_us += scaled;
         self.tick_audition()
     }
 
@@ -462,6 +602,18 @@ impl Composer {
     /// Returns effects; placement itself does not audition (the frontend echoes
     /// played keys), matching the TUI's `ingest`.
     pub fn ingest(&mut self, ev: NoteEvent) -> Vec<Effect> {
+        // Track held keys for wait-mode gating, independent of input mode: a
+        // note-on adds the pitch, a note-off (or zero-velocity on) removes it.
+        // The next `advance` polls the wait gate against this set to decide
+        // whether to un-freeze.
+        match ev.kind {
+            NoteEventKind::On { velocity } if !velocity.is_note_off() => {
+                self.held.insert(ev.note.value());
+            }
+            _ => {
+                self.held.remove(&ev.note.value());
+            }
+        }
         match self.input_mode {
             InputMode::DirectEdit => {}
             InputMode::StepRecord => self.ingest_step(ev),
@@ -480,6 +632,7 @@ impl Composer {
         self.selection_anchor = None;
         self.playing = false;
         self.counting_in = false;
+        self.wait_frozen = false;
         vec![Effect::AllOff]
     }
 
@@ -512,6 +665,7 @@ impl Composer {
             notes,
             cursor: self.cursor,
             bpm: self.grid.bpm as f64,
+            grid_origin_us: self.grid.origin_us,
             time_sig: self.grid.time_sig,
             subdivision: self.grid.subdivision,
             input_mode: self.input_mode,
@@ -525,6 +679,10 @@ impl Composer {
             chord_preview,
             clipboard_len: self.clipboard.len(),
             backing_offset_us: self.backing_offset_us,
+            playback_rate: self.playback_rate,
+            wait_mode: self.wait_enabled,
+            frozen: self.wait_frozen,
+            awaiting: self.awaiting_notes(),
         }
     }
 
@@ -782,6 +940,37 @@ impl Composer {
             pitch: end,
             velocity: vel.value(),
         }]
+    }
+
+    /// Quantise every note whose **onset** lies in `[start_us, end_us)` onto the
+    /// grid at resolution `step_us`: snap the onset to the nearest grid line
+    /// (phased from the grid origin) and the end likewise, never shrinking a note
+    /// below one `step_us`. One undo checkpoint covers the whole region. A no-op
+    /// (empty, no checkpoint) when no note starts in the range — so skipping a
+    /// bar is free. Pitch and velocity are untouched.
+    fn quantize_region(&mut self, start_us: u64, end_us: u64, step_us: u64) -> Vec<Effect> {
+        let step = step_us.max(1);
+        let ids: Vec<NoteId> = self
+            .timeline()
+            .notes()
+            .filter(|(_, n)| n.start_us >= start_us && n.start_us < end_us)
+            .map(|(id, _)| id)
+            .collect();
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        self.history.checkpoint();
+        for id in ids {
+            let Some(note) = self.timeline().get(id).copied() else {
+                continue;
+            };
+            let new_start = self.grid.snap_to_step(note.start_us, step);
+            let snapped_end = self.grid.snap_to_step(note.start_us + note.dur_us, step);
+            let new_end = snapped_end.max(new_start + step);
+            self.history.current_mut().set_start(id, new_start);
+            self.history.current_mut().resize(id, new_end - new_start);
+        }
+        Vec::new()
     }
 
     /// Delete the note under the cursor. No-op on an empty cell.
@@ -1101,6 +1290,19 @@ impl Composer {
         self.click_pending_off = None;
         self.click_count = 0;
         self.counting_in = false;
+        // Rebuild the wait gate from the notes at/after this start position so
+        // the first freeze lands on the first note we actually play (not the
+        // song's very first note when starting mid-piece / mid-loop).
+        let expected: Vec<(MidiNote, u64)> = self
+            .audition_spans
+            .iter()
+            .filter(|s| s.start_us >= from_us)
+            .filter_map(|s| MidiNote::new(s.note).map(|n| (n, s.start_us)))
+            .collect();
+        let mut gate = WaitGate::from_expected(&expected);
+        gate.set_armed(self.wait_enabled);
+        self.wait = Some(gate);
+        self.wait_frozen = false;
         vec![Effect::AllOff]
     }
 
@@ -1108,6 +1310,7 @@ impl Composer {
     fn stop_play(&mut self) -> Vec<Effect> {
         self.playing = false;
         self.counting_in = false;
+        self.wait_frozen = false;
         vec![Effect::AllOff]
     }
 
@@ -1444,6 +1647,11 @@ pub struct ComposerSnapshot {
     pub notes: Vec<NoteView>,
     pub cursor: Cursor,
     pub bpm: f64,
+    /// Grid phase origin (µs): the song time bar 1 / beat 1 / step 0 lands on.
+    /// `0` for a piece whose grid starts at song time 0. Frontends phase their
+    /// bar/beat gridlines by this so the lines match the performance.
+    #[serde(default)]
+    pub grid_origin_us: u64,
     pub time_sig: TimeSig,
     pub subdivision: Subdivision,
     pub input_mode: InputMode,
@@ -1459,6 +1667,29 @@ pub struct ComposerSnapshot {
     /// Backing-track alignment offset (`audio_start_us`): the file position that
     /// lines up with song time 0. `0` when no backing or no nudge applied.
     pub backing_offset_us: u64,
+    /// Transport speed multiplier (1.0 = real time). Frontends match their
+    /// backing-audio playback speed to this so a slow-down stays in sync.
+    #[serde(default = "default_playback_rate")]
+    pub playback_rate: f64,
+    /// Whether note-by-note wait mode ("pause on note") is armed.
+    #[serde(default)]
+    pub wait_mode: bool,
+    /// Whether the transport is currently frozen on an unsatisfied wait step.
+    /// `playing` stays `true` while frozen (so the highway anchors on the
+    /// playhead, not the cursor); frontends treat `playing && frozen` as a
+    /// pause — holding the highway, the backdrop video, and the backing audio.
+    #[serde(default)]
+    pub frozen: bool,
+    /// While frozen, the MIDI pitches the player must strike to advance (so a
+    /// frontend can highlight them); `None` when not frozen.
+    #[serde(default)]
+    pub awaiting: Option<Vec<u8>>,
+}
+
+/// Serde default for [`ComposerSnapshot::playback_rate`] so older snapshots
+/// (no field) deserialise as real-time.
+fn default_playback_rate() -> f64 {
+    1.0
 }
 
 /// Build sustained spans from a time-ordered event stream by pairing each
@@ -2259,6 +2490,217 @@ mod tests {
         let effects = c.advance(1_000_000);
         assert!(!c.is_playing());
         assert!(effects.is_empty());
+    }
+
+    // ── grid origin + region quantise ────────────────────────────────────────
+
+    #[test]
+    fn set_grid_origin_phases_snapshot_and_snapping() {
+        let mut c = Composer::new();
+        apply(&mut c, Action::SetGridOrigin { us: 5_191_846 });
+        assert_eq!(c.snapshot().grid_origin_us, 5_191_846);
+        // Snap is now phased from the origin: origin itself is a grid line.
+        assert_eq!(c.grid().snap(5_191_846), 5_191_846);
+    }
+
+    #[test]
+    fn quantize_region_snaps_onsets_and_ends_from_origin() {
+        // Grid origin at the first note; 172 BPM 1/8 ≈ 174_418 µs step.
+        let origin = 5_191_846u64;
+        let step = 174_418u64;
+        let mut tl = Timeline::new();
+        // Onset a hair past the origin, off-grid end.
+        tl.insert(note(70, origin + 4_000, 200_000));
+        // Onset ~1.4 steps past origin → snaps to the 1st step; tiny duration.
+        tl.insert(note(59, origin + step + 30_000, 20_000));
+        // Onset outside the region → untouched.
+        tl.insert(note(47, origin + 20 * step, 90_000));
+        let mut c = Composer::from_timeline(tl, Grid::default_120());
+        apply(&mut c, Action::SetGridOrigin { us: origin });
+
+        apply(
+            &mut c,
+            Action::QuantizeRegion {
+                start_us: origin,
+                end_us: origin + 5 * step,
+                step_us: step,
+            },
+        );
+
+        let snap = c.snapshot();
+        let by_pitch = |p: u8| snap.notes.iter().find(|n| n.pitch == p).copied().unwrap();
+        // Note 70: onset snaps back to the origin (grid line 0); end snaps to the
+        // nearest step, at least one step long.
+        let n70 = by_pitch(70);
+        assert_eq!(n70.start_us, origin, "onset snaps to origin grid line");
+        assert_eq!(
+            (n70.start_us - origin) % step,
+            0,
+            "onset lands on a grid line"
+        );
+        assert_eq!(
+            (n70.dur_us) % step,
+            0,
+            "duration is a whole number of steps"
+        );
+        // Note 59: never shorter than one step even though it was ~20 ms.
+        let n59 = by_pitch(59);
+        assert!(
+            n59.dur_us >= step,
+            "quantised note is at least one step long"
+        );
+        assert_eq!((n59.start_us - origin) % step, 0);
+        // Note 47 (outside region) is unchanged.
+        let n47 = by_pitch(47);
+        assert_eq!(n47.start_us, origin + 20 * step);
+        assert_eq!(n47.dur_us, 90_000);
+    }
+
+    #[test]
+    fn quantize_region_empty_is_noop_and_undoable() {
+        let mut tl = Timeline::new();
+        tl.insert(note(60, 10_000_000, 100_000));
+        let mut c = Composer::from_timeline(tl, Grid::default_120());
+        // No note starts in this range → no-op.
+        apply(
+            &mut c,
+            Action::QuantizeRegion {
+                start_us: 0,
+                end_us: 1_000_000,
+                step_us: 100_000,
+            },
+        );
+        assert_eq!(c.snapshot().notes.len(), 1);
+        assert_eq!(c.snapshot().notes[0].start_us, 10_000_000);
+    }
+
+    // ── wait mode ("pause on note") ──────────────────────────────────────────
+
+    /// Build a composer with two single notes and start it playing with wait
+    /// mode armed. Notes: C4@500ms (100ms), E4@1000ms (100ms).
+    fn wait_composer() -> Composer {
+        let mut tl = Timeline::new();
+        tl.insert(note(60, 500_000, 100_000));
+        tl.insert(note(64, 1_000_000, 100_000));
+        let mut c = Composer::from_timeline(tl, Grid::default_120());
+        apply(&mut c, Action::SetWaitMode { on: true });
+        assert!(c.is_wait_mode());
+        apply(&mut c, Action::PlayFromStart);
+        c
+    }
+
+    #[test]
+    fn wait_mode_freezes_on_due_note_until_it_is_played() {
+        let mut c = wait_composer();
+
+        // Advance up to (past) the first onset: the note fires and the transport
+        // reaches the note.
+        let effects = c.advance(520_000);
+        assert!(
+            effects.iter().any(
+                |e| matches!(e, Effect::AuditionNote { pitch: 60, velocity } if *velocity > 0)
+            ),
+            "the target note should sound as the playhead crosses its onset"
+        );
+
+        // Next tick with nothing held: frozen on the due note, playhead held.
+        let head = c.playhead_us();
+        let effects = c.advance(100_000);
+        assert!(effects.is_empty(), "frozen: no effects fire");
+        assert!(
+            c.is_wait_frozen(),
+            "should be frozen on the unsatisfied note"
+        );
+        assert!(!c.is_advancing(), "a freeze reads as not advancing");
+        assert!(c.is_playing(), "but the transport is still in play mode");
+        assert_eq!(c.playhead_us(), head, "playhead must not move while frozen");
+        assert_eq!(c.awaiting_notes(), Some(vec![60]), "awaiting the C4");
+
+        // Hold the required note: the next tick un-freezes and advances.
+        c.ingest(on_ev(60));
+        let head_before = c.playhead_us();
+        c.advance(50_000);
+        assert!(!c.is_wait_frozen(), "playing the note un-freezes");
+        assert!(c.is_advancing());
+        assert!(
+            c.playhead_us() > head_before,
+            "transport resumes after the note is played"
+        );
+        assert_eq!(c.awaiting_notes(), None);
+    }
+
+    #[test]
+    fn wait_mode_freezes_again_on_the_next_note() {
+        let mut c = wait_composer();
+        // Cross + satisfy the first note.
+        c.advance(520_000);
+        c.ingest(on_ev(60));
+        c.advance(20_000);
+        assert!(!c.is_wait_frozen());
+        // Release C, hold nothing, and run toward the second note.
+        c.ingest(NoteEvent::off(MidiNote::new(60).unwrap(), 0));
+        c.advance(500_000); // now well past E4's onset
+        c.advance(50_000);
+        assert!(c.is_wait_frozen(), "freezes again on the second note");
+        assert_eq!(c.awaiting_notes(), Some(vec![64]));
+    }
+
+    #[test]
+    fn disarmed_wait_mode_advances_freely() {
+        let mut tl = Timeline::new();
+        tl.insert(note(60, 500_000, 100_000));
+        let mut c = Composer::from_timeline(tl, Grid::default_120());
+        apply(&mut c, Action::PlayFromStart); // wait mode OFF
+        c.advance(2_000_000);
+        assert!(!c.is_wait_frozen(), "disarmed never freezes");
+        assert!(c.is_advancing());
+        assert_eq!(c.playhead_us(), 2_000_000, "playhead runs straight through");
+    }
+
+    #[test]
+    fn disarming_wait_mode_mid_freeze_resumes() {
+        let mut c = wait_composer();
+        c.advance(520_000);
+        c.advance(50_000);
+        assert!(c.is_wait_frozen());
+        // Turn wait mode off: the freeze clears immediately.
+        apply(&mut c, Action::SetWaitMode { on: false });
+        assert!(!c.is_wait_frozen());
+        assert!(c.is_advancing());
+        let head = c.playhead_us();
+        c.advance(100_000);
+        assert!(c.playhead_us() > head, "resumes freely once disarmed");
+    }
+
+    #[test]
+    fn wait_mode_snapshot_reports_frozen_and_awaiting() {
+        let mut c = wait_composer();
+        c.advance(520_000);
+        c.advance(50_000);
+        let snap = c.snapshot();
+        assert!(snap.wait_mode, "snapshot reports wait mode armed");
+        assert!(snap.frozen, "snapshot reports the freeze");
+        assert!(
+            snap.playing,
+            "playing stays true while frozen (anchor on head)"
+        );
+        assert_eq!(snap.awaiting, Some(vec![60]));
+    }
+
+    #[test]
+    fn wait_mode_starting_mid_song_freezes_on_the_first_later_note() {
+        // Start playback after the first note: the gate must freeze on the
+        // second note (E4@1s), not the already-passed first note.
+        let mut tl = Timeline::new();
+        tl.insert(note(60, 500_000, 100_000));
+        tl.insert(note(64, 1_000_000, 100_000));
+        let mut c = Composer::from_timeline(tl, Grid::default_120());
+        apply(&mut c, Action::SetWaitMode { on: true });
+        apply(&mut c, Action::Play { from_us: 700_000 });
+        c.advance(320_000); // cross E4's onset at 1.0s
+        c.advance(50_000);
+        assert!(c.is_wait_frozen());
+        assert_eq!(c.awaiting_notes(), Some(vec![64]));
     }
 
     #[test]

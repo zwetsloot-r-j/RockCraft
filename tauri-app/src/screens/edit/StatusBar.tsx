@@ -87,9 +87,12 @@ export function StatusBar(props: Props): JSX.Element {
   // even when scrolled off the grid (mirrors the TUI's "LOOP a-b" badge).
   const loopLabel = (): string => {
     const s = props.snapshot;
-    const inBar = barBeatOf(s.loop_start_us, s.bpm, s.time_sig).bar + 1;
+    // Loop bounds are absolute song time; the bar number is measured from the
+    // grid origin (the downbeat), so subtract it before deriving the bar.
+    const o = s.grid_origin_us ?? 0;
+    const inBar = barBeatOf(Math.max(0, s.loop_start_us - o), s.bpm, s.time_sig).bar + 1;
     const outBar =
-      barBeatOf(Math.max(0, s.loop_end_us - 1), s.bpm, s.time_sig).bar + 1;
+      barBeatOf(Math.max(0, s.loop_end_us - 1 - o), s.bpm, s.time_sig).bar + 1;
     return `LOOP ${inBar}-${outBar}`;
   };
 

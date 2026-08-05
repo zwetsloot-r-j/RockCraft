@@ -1661,6 +1661,7 @@ mod tests {
                 beat_unit: 4,
             },
             subdivision: Subdivision::Eighth,
+            origin_us: 0,
         };
         let key = Key {
             root_pc: 2,

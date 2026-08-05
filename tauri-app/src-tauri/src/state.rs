@@ -659,16 +659,24 @@ pub fn is_playing(state: &AppState) -> bool {
         .is_playing()
 }
 
-/// Cheap transport read — `(playing, playhead_us, backing_offset_us)` — without
-/// building the full (all-notes) snapshot. The tick thread calls this every tick
-/// for backing sync and the lightweight playhead push, so the ~900-note snapshot
-/// is only serialised when the notes actually change, not 250×/second.
-pub fn transport_fields(state: &AppState) -> (bool, u64, u64) {
+/// Cheap transport read — `(advancing, playhead_us, backing_offset_us,
+/// playback_rate)` — without building the full (all-notes) snapshot. The tick
+/// thread calls this every tick for backing sync and the lightweight playhead
+/// push, so the ~900-note snapshot is only serialised when the notes actually
+/// change, not 250×/second.
+///
+/// The first field is [`Composer::is_advancing`], not `is_playing`: a wait-mode
+/// freeze reports as **not advancing** so the backing audio pauses and the
+/// playhead push stops, exactly like a manual pause. The full snapshot still
+/// reports `playing = true` (with `frozen = true`) so the highway stays anchored
+/// on the playhead.
+pub fn transport_fields(state: &AppState) -> (bool, u64, u64, f64) {
     let composer = state.composer.lock().expect("composer mutex poisoned");
     (
-        composer.is_playing(),
+        composer.is_advancing(),
         composer.playhead_us(),
         composer.backing_offset_us(),
+        composer.playback_rate(),
     )
 }
 

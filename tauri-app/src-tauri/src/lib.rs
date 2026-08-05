@@ -334,6 +334,9 @@ fn spawn_tick_thread(app: tauri::AppHandle) {
         let mut last = Instant::now();
         // Wall-clock of the last pushed `playhead` event, to throttle it.
         let mut last_playhead_emit = Instant::now();
+        // Last playback-rate we pushed to the backing sink, to send set_speed
+        // only when it changes (not every tick).
+        let mut last_backing_rate: f64 = 1.0;
         loop {
             std::thread::sleep(TICK_PERIOD);
             let now = Instant::now();
@@ -384,7 +387,15 @@ fn spawn_tick_thread(app: tauri::AppHandle) {
             let all_effects: Vec<_> = midi_effects.into_iter().chain(effects).collect();
             // Cheap transport read (no note list); the full snapshot is built
             // only when the notes actually change (see the emit below).
-            let (playing, playhead_us, backing_offset_us) = state::transport_fields(&app_state);
+            let (playing, playhead_us, backing_offset_us, playback_rate) =
+                state::transport_fields(&app_state);
+
+            // Match backing-audio speed to the transport speed (slow-mo). Only on
+            // change — set_speed resamples, so we avoid re-issuing it every tick.
+            if playback_rate != last_backing_rate {
+                audio.set_backing_speed(playback_rate as f32);
+                last_backing_rate = playback_rate;
+            }
 
             // Route effects to the synth.
             if !all_effects.is_empty() {
@@ -392,11 +403,13 @@ fn spawn_tick_thread(app: tauri::AppHandle) {
             }
 
             // Sync backing to transport state.
+            let prev_playing;
             {
                 let mut prev = prev_transport
                     .0
                     .lock()
                     .expect("prev_transport mutex poisoned");
+                prev_playing = prev.playing;
                 audio::sync_backing(
                     &audio,
                     playing,
@@ -413,14 +426,27 @@ fn spawn_tick_thread(app: tauri::AppHandle) {
                 };
             }
 
-            // Emit strategy (the #1 performance fix): a *structural* change
-            // (edit / MIDI / effect) ships the full ~900-note snapshot at once;
-            // ordinary playback ticks ship only the lightweight `playhead` push,
-            // throttled to ~30 Hz. So the note list is serialised on edits, not
-            // 250×/second — which is what backlogged the IPC channel and dragged
-            // the highway behind real time. Idle-and-stopped ticks stay silent.
-            let changed = !all_effects.is_empty() || !midi_events.is_empty();
-            if changed {
+            // Emit strategy (the #1 performance fix): a *structural* change ships
+            // the full ~900-note snapshot at once; ordinary playback ticks ship
+            // only the lightweight `playhead` push, throttled to ~30 Hz. So the
+            // note list is serialised on edits, not 250×/second — which is what
+            // backlogged the IPC channel and dragged the highway behind real time.
+            //
+            // Crucially, *audition* effects while playing are NOT structural: the
+            // note list is static during playback, so shipping the whole snapshot
+            // on every note on/off (a dense passage = many/second) re-floods the
+            // very channel we just unflooded — and starves the WebView2 video
+            // decoder, freezing the backdrop into the "flicker once notes hit"
+            // stall. So during playback effects go to the synth only (above); the
+            // frontend already has the notes and moves them by the playhead push.
+            // A full snapshot fires only for genuine structural change: live MIDI
+            // input, an edit-time (paused) effect preview, or a play/stop
+            // transition (so `playing` flips on the frontend). Idle-and-stopped
+            // ticks stay silent.
+            let structural = !midi_events.is_empty()
+                || (!all_effects.is_empty() && !playing)
+                || (playing != prev_playing);
+            if structural {
                 let snapshot = state::query_state(&app_state);
                 let _ = app.emit(EVENT_SNAPSHOT, &snapshot);
                 last_playhead_emit = now;
