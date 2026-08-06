@@ -221,6 +221,9 @@ export class EditCanvas {
       hitLineFrac: this.gridCal.hitLineFrac,
       xScale: this.gridCal.xScale,
       xOffset: this.gridCal.xOffset,
+      // Keep the earliest notes above the keyboard strip (+margin) so notes
+      // placed near the start aren't hidden behind it.
+      bottomReservePx: this.keyboardBandH() + 12,
     });
 
     this.drawLanes(vp);
@@ -252,9 +255,15 @@ export class EditCanvas {
    * matches the target. Naturals read light, accidentals dark (a shorter cap),
    * so the octave shape is legible; C keys carry a name label.
    */
+  /** Height (px) of the bottom keyboard strip — shared by the keyboard draw and
+   * the viewport's bottom reserve so the strip never occludes the earliest notes. */
+  private keyboardBandH(): number {
+    return Math.max(30, Math.min(64, this.h * 0.16));
+  }
+
   private drawKeyboard(snapshot: ComposerSnapshot, vp: Viewport): void {
     const ctx = this.ctx;
-    const bandH = Math.max(30, Math.min(64, this.h * 0.16));
+    const bandH = this.keyboardBandH();
     const top = this.h - bandH;
     const awaitingArr = snapshot.awaiting ?? [];
     const awaiting = new Set<number>(awaitingArr);

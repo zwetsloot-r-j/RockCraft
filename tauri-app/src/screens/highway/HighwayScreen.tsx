@@ -329,6 +329,7 @@ export function HighwayScreen() {
           sd,
         );
         engine.setLive(true);
+        engine.setPractice(practice(), split());
         // Background video backdrop (M9-G): when the piece carries one, draw the
         // highway over a translucent fill so the <video> behind shows through.
         setVideo(info.video ?? null);
@@ -393,6 +394,7 @@ export function HighwayScreen() {
           : "both";
     setPractice(next);
     writeLS(PRACTICE_KEY, next);
+    eng()?.setPractice(next, split());
     void playSetPractice(practiceArg(next)).then((v) => setPractice(v as Practice));
   }
 
@@ -401,6 +403,7 @@ export function HighwayScreen() {
     const next = Math.max(21, Math.min(108, split() + delta));
     setSplit(next);
     writeLS(SPLIT_KEY, String(next));
+    eng()?.setPractice(practice(), next);
     void playSetSplit(next).then(setSplit);
   }
 

@@ -140,15 +140,25 @@ export class Viewport {
     xScale?: number;
     /** Horizontal pan in px (keyboard left-edge alignment). */
     xOffset?: number;
+    /**
+     * Pixels reserved at the bottom edge (the keyboard strip). The origin may dip
+     * below song start by up to this much so the earliest content (near time 0)
+     * renders *above* the strip instead of behind it — otherwise the hard `0`
+     * clamp pins the cursor to the bottom, hiding notes placed at the start.
+     */
+    bottomReservePx?: number;
   }) {
     this.width = Math.max(1, opts.width);
     this.height = Math.max(1, opts.height);
     this.pxPerUs = this.height / Math.max(1, opts.spanUs);
 
     // Anchor the time axis `hitLineFrac` up from the bottom so there's history
-    // below and lookahead above the cursor/playhead.
+    // below and lookahead above the cursor/playhead. The floor is normally song
+    // start (0), but may dip by the bottom reserve so the keyboard strip never
+    // occludes the earliest notes.
     const hitFrac = opts.hitLineFrac ?? 1 / 3;
-    this.originUs = Math.max(0, opts.anchorUs - opts.spanUs * hitFrac);
+    const floorUs = -((opts.bottomReservePx ?? 0) / this.pxPerUs);
+    this.originUs = Math.max(floorUs, opts.anchorUs - opts.spanUs * hitFrac);
 
     // Fit the full 88-key range across the width (lowest key left, highest
     // right, one lane per semitone), then apply the optional horizontal zoom.

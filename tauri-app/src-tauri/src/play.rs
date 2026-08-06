@@ -645,8 +645,13 @@ impl PlaySession {
         self.now_us() > self.duration_us + self.finished_pause_us
     }
 
-    /// Forward a live `NoteEvent`: update the held set and (on a real strike)
-    /// collect it for scoring with its MIDI timestamp.
+    /// Forward a `NoteEvent`: update the held set and (on a real strike) collect
+    /// it for scoring at its `timestamp_us`.
+    ///
+    /// The live path ([`tick_play`]) re-stamps incoming device events with the
+    /// current play-clock time before calling this, so strikes land in the same
+    /// frame as `expected` (see the note there). Tests call `ingest` directly with
+    /// explicit timestamps.
     pub fn ingest(&mut self, ev: NoteEvent) {
         match ev.kind {
             NoteEventKind::On { velocity } if !velocity.is_note_off() => {
@@ -1186,16 +1191,21 @@ pub fn tick_play(
     let mut guard = state.0.lock().expect("play state mutex poisoned");
     let session = guard.as_mut()?;
 
-    // Echo the notes you play on the **player** bus (M14-C), at parity with the
-    // TUI's `PlayScreen::ingest`. Its own instrument and fader, so your part can
-    // be told apart from the song's — or muted, if the piano is loud enough on
-    // its own.
-    let player_synth = audio.bus(SynthBus::Player);
+    // Re-stamp live strikes with the current play-clock time before ingesting:
+    // expected notes live in shifted play-clock time, and in wait mode the clock
+    // freezes while device time keeps running, so the raw device timestamp would
+    // never line up with an expected note (everything scored as a miss). Echoing
+    // the player's notes on the Player bus (M14-C) is the input-monitor block
+    // below, gated by `is_monitor()` — `audio.synth` is bound to that bus.
+    let now = session.now_us();
     for &ev in midi_events {
-        session.ingest(ev);
-        if let Some(synth) = &player_synth {
-            synth.apply(&ev);
-        }
+        let stamped = match ev.kind {
+            NoteEventKind::On { velocity } if !velocity.is_note_off() => {
+                NoteEvent::on(ev.note, velocity, now)
+            }
+            _ => NoteEvent::off(ev.note, now),
+        };
+        session.ingest(stamped);
     }
     // Input monitor: synthesise the player's own key presses so they hear
     // themselves. Independent of "hear the song" (the chart audition below).
@@ -1565,6 +1575,7 @@ mod tests {
     fn play_state_transforms_track_the_shifted_clock() {
         let tmp = tempfile::tempdir().unwrap();
         let mut s = load_session_from_dir(&background_bundle(&tmp)).expect("load bundle");
+        s.toggle_pause(); // loads paused (start_paused); un-pause to "press Start"
         let shift = s.shift_us();
 
         // At t=0 the song content has not begun: the layer holds its first
@@ -1625,6 +1636,7 @@ mod tests {
     #[test]
     fn toggle_hear_song_works_from_either_default() {
         let mut s = load_session_from_dir(&midi_only_fixture()).unwrap();
+        s.toggle_pause(); // loads paused (start_paused); un-pause to "press Start"
         s.advance(SHIFT);
         let (on_idx, _) = s.pending_song_triggers();
         assert_eq!(on_idx, vec![0], "MIDI-only starts auditioning");
