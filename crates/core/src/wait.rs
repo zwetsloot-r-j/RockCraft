@@ -69,6 +69,23 @@ impl WaitTracker {
         self.pos > start
     }
 
+    /// Advance past consecutive steps that are BOTH due (`time_us <= now_us`) and
+    /// satisfied by `held`. Unlike [`update`](Self::update) this never consumes a
+    /// step before its time — so a note held early (e.g. the key used to *start*
+    /// the take, still down through the lead-in) cannot pre-satisfy a not-yet-due
+    /// step and skip its wait. Returns `true` if the position moved.
+    pub fn advance_due(&mut self, held: &BTreeSet<u8>, now_us: u64) -> bool {
+        let start = self.pos;
+        while let Some(step) = self.steps.get(self.pos) {
+            if step.time_us <= now_us && step.notes.iter().all(|n| held.contains(n)) {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        self.pos > start
+    }
+
     /// Have all steps been completed?
     pub fn is_complete(&self) -> bool {
         self.pos >= self.steps.len()
@@ -146,8 +163,10 @@ impl WaitGate {
     /// current step's `time_us <= now_us` AND it is unsatisfied; otherwise
     /// [`GateState::Running`]. Always `Running` while disarmed.
     pub fn poll(&mut self, now_us: u64) -> GateState {
-        // Reuse the tracker's own advance-through-satisfied logic.
-        self.tracker.update(&self.held);
+        // Advance only through steps that are BOTH due and satisfied: a note held
+        // before its time (e.g. the key used to start the take, still down during
+        // the lead-in) must not pre-satisfy a not-yet-due step and skip its wait.
+        self.tracker.advance_due(&self.held, now_us);
 
         if !self.armed {
             self.frozen = false;
@@ -274,6 +293,26 @@ mod gate_tests {
         g.set_held(held(&[]));
         assert_eq!(g.poll(10_000), GateState::Running);
         assert!(g.awaiting().is_none());
+    }
+
+    #[test]
+    fn holding_a_note_before_it_is_due_does_not_pre_satisfy() {
+        // A note held before its step's time (e.g. the key used to START the take,
+        // still down through the lead-in) must NOT consume the step early and skip
+        // its wait — the pause on that note must still happen once it comes due.
+        let mut g = WaitGate::from_expected(&[(n(64), 1000)]);
+        g.set_armed(true);
+        g.set_held(held(&[64])); // required note held early (before it is due)
+        assert_eq!(g.poll(0), GateState::Running); // not yet due
+        assert!(
+            !g.is_complete(),
+            "step must not be consumed before its time"
+        );
+        // The player releases the start key before the note comes due.
+        g.set_held(held(&[]));
+        // Now it is due and unsatisfied → the wait DOES freeze (not skipped).
+        assert_eq!(g.poll(1000), GateState::Frozen);
+        assert_eq!(g.awaiting().unwrap().notes, vec![64]);
     }
 
     #[test]
