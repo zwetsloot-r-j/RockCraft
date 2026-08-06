@@ -358,6 +358,10 @@ export interface PlayInfo {
    */
   backgrounds: BackgroundLayerView[];
   hear_song: boolean;
+  /** Piece tempo (BPM) for the highway bar/beat grid; 120 when no grid. */
+  bpm: number;
+  /** Beats per bar (time-signature numerator); 4 when no grid. */
+  beats_per_bar: number;
 }
 
 /**

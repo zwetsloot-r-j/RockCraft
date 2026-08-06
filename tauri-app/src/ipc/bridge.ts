@@ -413,6 +413,19 @@ export function playToggleMonitor(): Promise<boolean> {
   return invoke<boolean>("play_toggle_monitor");
 }
 
+/** Set the practiced hand: `"left"`, `"right"`, or `null` = both. Only that hand
+ * is waited-on/scored; the other hand auto-plays. Returns the applied value. */
+export function playSetPractice(
+  hand: "left" | "right" | null,
+): Promise<string> {
+  return invoke<string>("play_set_practice", { hand });
+}
+
+/** Set the pitch dividing left/right hands (0..=127). Returns the applied value. */
+export function playSetSplit(pitch: number): Promise<number> {
+  return invoke<number>("play_set_split", { pitch });
+}
+
 /**
  * Finish the take: tear the session down (stop backing, silence the synth) and
  * return the end-of-take summary. Idempotent.

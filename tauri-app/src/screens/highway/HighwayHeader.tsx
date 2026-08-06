@@ -20,6 +20,8 @@ interface HighwayHeaderProps {
   hearSong?: () => boolean;
   waitMode?: () => boolean;
   monitor?: () => boolean;
+  practice?: () => "both" | "left" | "right";
+  splitName?: () => string;
 }
 
 // 12-dot pitch-class color wheel.
@@ -150,6 +152,38 @@ export function HighwayHeader(props: HighwayHeaderProps) {
           >
             🎹 n
           </span>
+          <span
+            style={{
+              "font-size": "11px",
+              "font-family": monoFont,
+              padding: "2px 8px",
+              "border-radius": "6px",
+              background:
+                (props.practice?.() ?? "both") !== "both"
+                  ? "rgba(199,146,234,0.2)"
+                  : "rgba(255,255,255,0.05)",
+              color:
+                (props.practice?.() ?? "both") !== "both" ? "#c792ea" : "#7c7f8e",
+            }}
+            title="h — practice one hand"
+          >
+            ✋ {props.practice?.() ?? "both"}
+          </span>
+          <Show when={(props.practice?.() ?? "both") !== "both"}>
+            <span
+              style={{
+                "font-size": "11px",
+                "font-family": monoFont,
+                padding: "2px 8px",
+                "border-radius": "6px",
+                background: "rgba(255,255,255,0.05)",
+                color: "#7c7f8e",
+              }}
+              title=", . — move the left/right split"
+            >
+              split {props.splitName?.()}
+            </span>
+          </Show>
         </div>
       </Show>
 

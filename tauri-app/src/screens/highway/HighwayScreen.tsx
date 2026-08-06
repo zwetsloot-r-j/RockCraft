@@ -16,6 +16,8 @@ import {
   onPlayState,
   playFinish,
   playLoad,
+  playSetPractice,
+  playSetSplit,
   playSetWait,
   playToggleHearSong,
   playToggleMonitor,
@@ -97,6 +99,58 @@ function writeWaitPref(on: boolean): void {
   }
 }
 
+/** Hand-practice mode: which hand the player practices ("both" = whole piece). */
+type Practice = "both" | "left" | "right";
+const PRACTICE_KEY = "rc.play.practice";
+const SPLIT_KEY = "rc.play.split";
+
+function readPractice(): Practice {
+  try {
+    const v = localStorage.getItem(PRACTICE_KEY);
+    return v === "left" || v === "right" ? v : "both";
+  } catch {
+    return "both";
+  }
+}
+function readSplit(): number {
+  try {
+    const v = Number(localStorage.getItem(SPLIT_KEY));
+    return Number.isInteger(v) && v >= 21 && v <= 108 ? v : 60;
+  } catch {
+    return 60;
+  }
+}
+function writeLS(key: string, value: string): void {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    /* non-fatal */
+  }
+}
+
+const NOTE_NAMES = [
+  "C",
+  "C#",
+  "D",
+  "D#",
+  "E",
+  "F",
+  "F#",
+  "G",
+  "G#",
+  "A",
+  "A#",
+  "B",
+];
+/** MIDI pitch → short name (e.g. 60 → "C4"). */
+function noteName(pitch: number): string {
+  return `${NOTE_NAMES[pitch % 12]}${Math.floor(pitch / 12) - 1}`;
+}
+/** The bridge `hand` argument for a practice mode ("both" → null). */
+function practiceArg(p: Practice): "left" | "right" | null {
+  return p === "both" ? null : p;
+}
+
 export function HighwayScreen() {
   const { screen, navigate } = useRouter();
   const scr = screen();
@@ -135,6 +189,9 @@ export function HighwayScreen() {
   const [monitor, setMonitor] = createSignal(false);
   // Wait-mode preference persists across takes/sessions (defaults on).
   const [waitMode, setWaitMode] = createSignal(readWaitPref());
+  // Hand-practice mode + the left/right split pitch, both persisted.
+  const [practice, setPractice] = createSignal<Practice>(readPractice());
+  const [split, setSplit] = createSignal(readSplit());
   // Live MIDI device status, shown on the Start overlay so the player can tell
   // whether their piano is connected (and reconnect if it was powered on late).
   const [midiInfo, setMidiInfo] = createSignal<MidiStatus | null>(null);
@@ -194,6 +251,22 @@ export function HighwayScreen() {
         // Input monitor: hear your own key presses through the synth.
         e.preventDefault();
         void playToggleMonitor().then(setMonitor);
+        break;
+      case "h":
+      case "H":
+        // Cycle hand-practice: both → right → left → both.
+        e.preventDefault();
+        cyclePractice();
+        break;
+      case ",":
+        // Move the left/right split down a semitone.
+        e.preventDefault();
+        nudgeSplit(-1);
+        break;
+      case ".":
+        // Move the left/right split up a semitone.
+        e.preventDefault();
+        nudgeSplit(1);
         break;
       default:
         break;
@@ -285,6 +358,9 @@ export function HighwayScreen() {
         // A fresh session has monitor off; re-enable it if the player had it on
         // (keeps the input-monitor setting across Replay/re-entry).
         if (monitor()) void playToggleMonitor().then(setMonitor);
+        // Apply the persisted hand-practice mode + split to the fresh session.
+        void playSetSplit(split());
+        void playSetPractice(practiceArg(practice()));
       })
       .catch((err) => setLoadErr(String(err)));
   }
@@ -305,6 +381,27 @@ export function HighwayScreen() {
     void midiRescan()
       .then(setMidiInfo)
       .finally(() => setRescanning(false));
+  }
+
+  /** Cycle the practiced hand: both → right → left → both. */
+  function cyclePractice(): void {
+    const next: Practice =
+      practice() === "both"
+        ? "right"
+        : practice() === "right"
+          ? "left"
+          : "both";
+    setPractice(next);
+    writeLS(PRACTICE_KEY, next);
+    void playSetPractice(practiceArg(next)).then((v) => setPractice(v as Practice));
+  }
+
+  /** Move the left/right split pitch by `delta` semitones (clamped to 21..108). */
+  function nudgeSplit(delta: number): void {
+    const next = Math.max(21, Math.min(108, split() + delta));
+    setSplit(next);
+    writeLS(SPLIT_KEY, String(next));
+    void playSetSplit(next).then(setSplit);
   }
 
   function replay(): void {
@@ -398,6 +495,8 @@ export function HighwayScreen() {
           hearSong={hearSong}
           waitMode={waitMode}
           monitor={monitor}
+          practice={practice}
+          splitName={() => noteName(split())}
         />
         <div style={{ flex: "1 1 auto", "min-height": 0, position: "relative" }}>
           {/* Background video backdrop (M9-G) — sits *behind* the canvas (lower

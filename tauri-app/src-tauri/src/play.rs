@@ -135,6 +135,11 @@ pub struct PlayInfo {
     pub backgrounds: Vec<BackgroundLayerView>,
     /// Whether "hear the song" starts on.
     pub hear_song: bool,
+    /// Piece tempo (BPM) so the highway draws its bar/beat grid at the right
+    /// spacing; defaults to 120 when the bundle has no grid.
+    pub bpm: u32,
+    /// Beats per bar (time-signature numerator); defaults to 4.
+    pub beats_per_bar: u8,
 }
 
 /// One span projected for the webview: pitch + ms bounds. No hand info exists in
@@ -235,6 +240,37 @@ pub struct PlaySummary {
     pub score: u64,
 }
 
+/// Which hand a note belongs to, derived from a configurable split pitch. v1 has
+/// no persisted per-note hand yet — it is inferred from pitch (see [`hand_of`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hand {
+    Left,
+    Right,
+}
+
+/// Default left/right split pitch (middle C = 60): notes below are left hand,
+/// at/above are right. Configurable per session via [`PlaySession::set_split`].
+pub const DEFAULT_SPLIT: u8 = 60;
+
+/// Infer a note's hand from its pitch relative to the split.
+fn hand_of(pitch: u8, split: u8) -> Hand {
+    if pitch < split {
+        Hand::Left
+    } else {
+        Hand::Right
+    }
+}
+
+/// Grid metadata from `meta.json`, used to bar-align the play shift and to draw
+/// the highway bar/beat grid at the piece's real tempo.
+#[derive(Debug, Clone, Copy)]
+struct GridInfo {
+    bpm: u32,
+    beats_per_bar: u8,
+    bar_us: u64,
+    origin_us: u64,
+}
+
 /// Build sustained spans from a time-ordered event stream by pairing each
 /// note-on with the next note-off (or note-on vel 0) of the same pitch. A local
 /// copy of `tui::highway::build_spans` (the tauri crate cannot depend on tui).
@@ -296,11 +332,31 @@ fn expected_steps(spans: &[NoteSpan]) -> Vec<(MidiNote, u64)> {
         .collect()
 }
 
-/// One scoring target per span (pitch at its shifted start). Held separately
-/// from the wait steps so a chord scores as N independent expected notes.
-fn expected_notes(spans: &[NoteSpan]) -> Vec<ExpectedNote> {
+/// Keep only spans belonging to the practiced hand (`None` = both hands).
+fn spans_for(
+    spans: &[NoteSpan],
+    practice: Option<Hand>,
+    split: u8,
+) -> impl Iterator<Item = &NoteSpan> {
     spans
         .iter()
+        .filter(move |s| practice.is_none_or(|h| hand_of(s.note, split) == h))
+}
+
+/// Wait-gate steps for the practiced hand only (or all hands when `None`).
+fn expected_steps_for(
+    spans: &[NoteSpan],
+    practice: Option<Hand>,
+    split: u8,
+) -> Vec<(MidiNote, u64)> {
+    spans_for(spans, practice, split)
+        .filter_map(|s| MidiNote::new(s.note).map(|n| (n, s.start_us)))
+        .collect()
+}
+
+/// Scoring targets for the practiced hand only (or all hands when `None`).
+fn expected_notes_for(spans: &[NoteSpan], practice: Option<Hand>, split: u8) -> Vec<ExpectedNote> {
+    spans_for(spans, practice, split)
         .filter_map(|s| MidiNote::new(s.note).map(|n| ExpectedNote::new(n, s.start_us)))
         .collect()
 }
@@ -338,11 +394,22 @@ pub struct PlaySession {
     /// themselves through the app synth. Independent of "hear the song" (which
     /// auditions the chart). Toggled at runtime; off by default.
     monitor: bool,
+    /// Hand-practice mode (v1): `None` = both hands; `Some(h)` = only hand `h` is
+    /// waited-on/scored while the other hand auto-plays. Hand is inferred from
+    /// pitch relative to `split_pitch`.
+    practice: Option<Hand>,
+    /// Pitch dividing left/right hands for [`practice`](Self::practice).
+    split_pitch: u8,
     /// Manual pause (`HostCommand::PlayTogglePause`). Freezes the clock + backing
     /// independently of wait-mode; while set the highway and scoring clock hold
     /// their position. The play-screen UI/keys are M12-B (#232).
     paused: bool,
     cfg: ScoreConfig,
+    /// Piece tempo + beats/bar (from `meta.grid`, else 120/4) so the play highway
+    /// draws its bar/beat grid at the real tempo. Bar-alignment of the pre-roll
+    /// shift keeps timeline bars on play bar lines.
+    bpm: u32,
+    beats_per_bar: u8,
 
     /// Live held-note set, updated by every ingested MIDI event.
     held: BTreeSet<u8>,
@@ -368,20 +435,30 @@ pub struct PlaySession {
 }
 
 impl PlaySession {
-    /// Load a song from `.mid` bytes, applying the whole-song pre-roll shift so
-    /// the highway opens empty and the first note reaches the keyboard after
-    /// `PRE_ROLL_US + LEAD_US`. Mirrors `PlayScreen::from_smf_bytes`.
-    pub fn from_smf_bytes(title: String, bytes: &[u8]) -> Result<Self, String> {
-        let events = smf_bytes_to_events(bytes).map_err(|e| e.to_string())?;
-        Ok(Self::from_events(title, &events))
+    /// Build a session directly from a note-event timeline (no grid: 120/4, raw
+    /// shift). Test-only seam; production loads go through
+    /// [`from_events_with_grid`](Self::from_events_with_grid) with the bundle grid.
+    #[cfg(test)]
+    pub fn from_events(title: String, events: &[NoteEvent]) -> Self {
+        Self::from_events_with_grid(title, events, None)
     }
 
-    /// Build a session directly from a note-event timeline (the SMF parse seam,
-    /// exposed for headless tests with `ScriptedSource`-style fixtures).
-    pub fn from_events(title: String, events: &[NoteEvent]) -> Self {
+    /// Like [`from_events`] but, when the bundle's grid is known, rounds the
+    /// pre-roll shift up to a whole bar so timeline bar lines map onto play-clock
+    /// bar lines (notes stay on the beat/bar grid, matching the editor), and
+    /// records the tempo/meter for the highway grid.
+    fn from_events_with_grid(title: String, events: &[NoteEvent], grid: Option<GridInfo>) -> Self {
         let raw = build_spans(events);
         let first_us = raw.iter().map(|s| s.start_us).min().unwrap_or(0);
-        let shift_us = song_shift_us(first_us, PRE_ROLL_US, LEAD_US);
+        let mut shift_us = song_shift_us(first_us, PRE_ROLL_US, LEAD_US);
+        if let Some(g) = grid {
+            if g.bar_us > 0 {
+                let rem = (g.origin_us + shift_us) % g.bar_us;
+                if rem != 0 {
+                    shift_us += g.bar_us - rem;
+                }
+            }
+        }
         let spans: Vec<NoteSpan> = raw
             .into_iter()
             .map(|s| NoteSpan {
@@ -406,8 +483,12 @@ impl PlaySession {
             backgrounds: Vec::new(),
             hear_song: false,
             monitor: false,
+            practice: None,
+            split_pitch: DEFAULT_SPLIT,
             paused: false,
             cfg: ScoreConfig::default(),
+            bpm: grid.map(|g| g.bpm).unwrap_or(120),
+            beats_per_bar: grid.map(|g| g.beats_per_bar).unwrap_or(4),
             held: BTreeSet::new(),
             played: Vec::new(),
             scored: HashSet::new(),
@@ -532,6 +613,8 @@ impl PlaySession {
                 })
                 .collect(),
             hear_song: self.hear_song,
+            bpm: self.bpm,
+            beats_per_bar: self.beats_per_bar,
         }
     }
 
@@ -607,7 +690,14 @@ impl PlaySession {
             .spans
             .iter()
             .enumerate()
-            .filter(|(i, s)| !self.scored.contains(i) && now >= s.start_us + self.cfg.good_us)
+            .filter(|(i, s)| {
+                !self.scored.contains(i)
+                    && now >= s.start_us + self.cfg.good_us
+                    // When practicing one hand, the other hand auto-plays — don't score it.
+                    && !self
+                        .practice
+                        .is_some_and(|h| hand_of(s.note, self.split_pitch) != h)
+            })
             .map(|(i, _)| i)
             .collect();
         if newly.is_empty() {
@@ -756,6 +846,30 @@ impl PlaySession {
         self.monitor
     }
 
+    /// Set the practiced hand (`None` = both). Rebuilds the wait gate so only that
+    /// hand's notes are waited on; the other hand auto-plays via `tick_play`.
+    pub fn set_practice(&mut self, practice: Option<Hand>) {
+        self.practice = practice;
+        self.rebuild_wait_gate();
+    }
+
+    /// Set the pitch dividing left/right hands. Reclassifies every note and
+    /// rebuilds the wait gate.
+    pub fn set_split(&mut self, split: u8) {
+        self.split_pitch = split;
+        self.rebuild_wait_gate();
+    }
+
+    /// Rebuild the wait gate from the practiced hand's steps, preserving armed
+    /// state. Practice is normally set before Start, so restarting the gate at the
+    /// first step is fine.
+    fn rebuild_wait_gate(&mut self) {
+        let armed = self.wait.is_armed();
+        let steps = expected_steps_for(&self.spans, self.practice, self.split_pitch);
+        self.wait = WaitGate::from_expected(&steps);
+        self.wait.set_armed(armed);
+    }
+
     /// The file position the backing should be at for the current clock, or
     /// `None` if it should not be playing yet / there is no backing track.
     pub fn backing_target_us(&self) -> Option<u64> {
@@ -768,13 +882,19 @@ impl PlaySession {
     /// then calls [`mark_song_fired`](Self::mark_song_fired). Empty unless
     /// `hear_song` is on.
     pub fn pending_song_triggers(&self) -> (Vec<usize>, Vec<usize>) {
-        if !self.hear_song {
-            return (Vec::new(), Vec::new());
-        }
         let now = self.now_us();
         let mut need_on = Vec::new();
         let mut need_off = Vec::new();
         for (i, span) in self.spans.iter().enumerate() {
+            // A span auto-sounds if "hear the song" is on (all notes), OR we are
+            // practicing one hand and this span is the OTHER hand (accompaniment).
+            let autoplay = self.hear_song
+                || self
+                    .practice
+                    .is_some_and(|h| hand_of(span.note, self.split_pitch) != h);
+            if !autoplay {
+                continue;
+            }
             if now >= span.start_us && !self.song_on_fired.contains(&i) {
                 need_on.push(i);
             }
@@ -832,7 +952,8 @@ impl PlaySession {
     /// and every collected strike. This is what the summary panel shows; the
     /// test asserts the derived `PlaySummary` equals `Summary::from_report`.
     pub fn report(&self) -> ScoreReport {
-        let expected = expected_notes(&self.spans);
+        // Score only the practiced hand (the other hand auto-played).
+        let expected = expected_notes_for(&self.spans, self.practice, self.split_pitch);
         score(&expected, &self.played, self.cfg)
     }
 
@@ -878,21 +999,30 @@ fn load_session_from_dir(dir: &Path) -> Result<PlaySession, String> {
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "song".into());
-    let mut session = PlaySession::from_smf_bytes(title, &bytes)?;
+    let events = smf_bytes_to_events(&bytes).map_err(|e| e.to_string())?;
+    // Read meta up front so the grid can bar-align the shift and set the tempo.
+    let meta = std::fs::read_to_string(dir.join("meta.json"))
+        .ok()
+        .and_then(|j| RecordingMeta::from_json(&j).ok());
+    let grid = meta.as_ref().and_then(|m| m.grid).map(|g| GridInfo {
+        bpm: g.bpm,
+        beats_per_bar: g.time_sig.beats_per_bar,
+        bar_us: g.bar_us(),
+        origin_us: g.origin_us,
+    });
+    let mut session = PlaySession::from_events_with_grid(title, &events, grid);
 
     let mut has_backing = false;
-    if let Ok(json) = std::fs::read_to_string(dir.join("meta.json")) {
-        if let Ok(meta) = RecordingMeta::from_json(&json) {
-            if let Some(backing) = meta.backing {
-                session = session.with_backing(dir.join(&backing.file), backing.audio_start_us);
-                has_backing = true;
-            }
-            if let Some(video) = meta.video {
-                session = session.with_video(dir.join(&video.file), video.offset_us);
-            }
-            if !meta.backgrounds.is_empty() {
-                session = session.with_backgrounds(dir, meta.backgrounds);
-            }
+    if let Some(meta) = meta {
+        if let Some(backing) = meta.backing {
+            session = session.with_backing(dir.join(&backing.file), backing.audio_start_us);
+            has_backing = true;
+        }
+        if let Some(video) = meta.video {
+            session = session.with_video(dir.join(&video.file), video.offset_us);
+        }
+        if !meta.backgrounds.is_empty() {
+            session = session.with_backgrounds(dir, meta.backgrounds);
         }
     }
     Ok(session.with_hear_song(!has_backing).start_paused())
@@ -931,6 +1061,37 @@ pub fn play_set_wait(state: tauri::State<'_, PlayState>, on: bool) -> bool {
     } else {
         false
     }
+}
+
+/// Set the practiced hand: `"left"`, `"right"`, or anything else / null = both.
+/// Returns the applied value (`"left"` / `"right"` / `"both"`).
+#[tauri::command]
+pub fn play_set_practice(state: tauri::State<'_, PlayState>, hand: Option<String>) -> String {
+    let practice = match hand.as_deref() {
+        Some("left") => Some(Hand::Left),
+        Some("right") => Some(Hand::Right),
+        _ => None,
+    };
+    let mut guard = state.0.lock().expect("play state mutex poisoned");
+    if let Some(s) = guard.as_mut() {
+        s.set_practice(practice);
+    }
+    match practice {
+        Some(Hand::Left) => "left",
+        Some(Hand::Right) => "right",
+        None => "both",
+    }
+    .to_string()
+}
+
+/// Set the left/right split pitch (0..=127). Returns the applied value.
+#[tauri::command]
+pub fn play_set_split(state: tauri::State<'_, PlayState>, pitch: u8) -> u8 {
+    let mut guard = state.0.lock().expect("play state mutex poisoned");
+    if let Some(s) = guard.as_mut() {
+        s.set_split(pitch);
+    }
+    pitch
 }
 
 /// Toggle "hear the song" (`m` key). Returns the new state; silences the synth
