@@ -176,7 +176,9 @@ export interface ActionReply {
  */
 export type SaveDest =
   | { kind: "quick_save" }
-  | { kind: "library"; name: string };
+  | { kind: "library"; name: string }
+  /** Overwrite the loaded / last-saved bundle in place (no name prompt). */
+  | { kind: "in_place" };
 
 /**
  * Result of a successful `save_bundle` — the bundle directory as a string.

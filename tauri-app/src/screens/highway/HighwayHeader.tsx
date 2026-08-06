@@ -19,6 +19,7 @@ interface HighwayHeaderProps {
   playState?: () => PlayStateEvent | null;
   hearSong?: () => boolean;
   waitMode?: () => boolean;
+  monitor?: () => boolean;
 }
 
 // 12-dot pitch-class color wheel.
@@ -133,6 +134,21 @@ export function HighwayHeader(props: HighwayHeaderProps) {
             title="w — wait mode"
           >
             ⏸ w
+          </span>
+          <span
+            style={{
+              "font-size": "11px",
+              "font-family": monoFont,
+              padding: "2px 8px",
+              "border-radius": "6px",
+              background: props.monitor?.()
+                ? "rgba(143,182,255,0.2)"
+                : "rgba(255,255,255,0.05)",
+              color: props.monitor?.() ? "#8fb6ff" : "#7c7f8e",
+            }}
+            title="n — play my notes (input monitor)"
+          >
+            🎹 n
           </span>
         </div>
       </Show>

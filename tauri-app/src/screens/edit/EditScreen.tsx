@@ -829,11 +829,12 @@ export function EditScreen(props: Props): JSX.Element {
     flashTimeout = window.setTimeout(() => setSaveFlash(null), 2500);
   }
 
-  function doQuickSave(): void {
-    // The background video (if any) is persisted into the bundle's meta.json by
-    // `save_bundle` itself now (M9-G) — the backend holds the reference, set via
-    // editSetVideo/editSetVideoOffset/editClearVideo.
-    saveBundle({ kind: "quick_save" })
+  function doSave(): void {
+    // Overwrite the loaded / last-saved bundle in place — no name prompt. A
+    // brand-new piece (never loaded or saved) falls back to a quick-save take.
+    // The background video (if any) is persisted into meta.json by `save_bundle`
+    // itself (M9-G) — the backend holds the reference.
+    saveBundle({ kind: "in_place" })
       .then((dir) => {
         setDirty(false);
         showFlash(`saved → ${dir}`);
@@ -1222,7 +1223,7 @@ export function EditScreen(props: Props): JSX.Element {
         case "s":
         case "S":
           setOverlay("none");
-          doQuickSave();
+          doSave();
           navigate({ kind: "menu" });
           break;
         case "d":
@@ -1376,11 +1377,11 @@ export function EditScreen(props: Props): JSX.Element {
       return;
     }
 
-    // `s` = quick save, `S` = save-as (only in non-chord mode).
+    // `s` = save (overwrite loaded bundle in place), `S` = save-as (new name).
     if (s.chord_preview === null) {
       if (e.key === "s") {
         e.preventDefault();
-        doQuickSave();
+        doSave();
         return;
       }
       if (e.key === "S") {

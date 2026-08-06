@@ -401,6 +401,18 @@ export function playToggleHearSong(): Promise<boolean> {
   return invoke<boolean>("play_toggle_hear_song");
 }
 
+/** Toggle manual pause of the active take (Start / play-pause). Returns the new
+ * paused state (`false` when no session is active). */
+export function playTogglePause(): Promise<boolean> {
+  return invoke<boolean>("play_toggle_pause");
+}
+
+/** Toggle input-monitor: synthesise the player's own key presses (`n`). Returns
+ * the new state. */
+export function playToggleMonitor(): Promise<boolean> {
+  return invoke<boolean>("play_toggle_monitor");
+}
+
 /**
  * Finish the take: tear the session down (stop backing, silence the synth) and
  * return the end-of-take summary. Idempotent.

@@ -18,6 +18,8 @@ import {
   playLoad,
   playSetWait,
   playToggleHearSong,
+  playToggleMonitor,
+  playTogglePause,
 } from "../../ipc/bridge";
 import type {
   BackgroundLayerView,
@@ -26,6 +28,12 @@ import type {
   PlayStateEvent,
   PlaySummary,
 } from "../../ipc/types";
+import {
+  midiRescan,
+  midiStatus,
+  onMidiEvent,
+  type MidiStatus,
+} from "../../ipc/midi";
 import { useRouter } from "../../shell/Router";
 import { IDENTITY_TRANSFORM, layerStyle } from "./backgrounds";
 import { HighwayCanvas } from "./HighwayCanvas";
@@ -67,6 +75,28 @@ const cfgFusion: HighwayConfig = {
   laneTint: "rgba(255,255,255,0.012)",
 };
 
+/** localStorage key for the persisted wait-mode preference. */
+const WAIT_PREF_KEY = "rc.play.waitMode";
+
+/** Read the saved wait-mode preference; defaults to **on** when never set. */
+function readWaitPref(): boolean {
+  try {
+    const v = localStorage.getItem(WAIT_PREF_KEY);
+    return v === null ? true : v === "1";
+  } catch {
+    return true;
+  }
+}
+
+/** Persist the wait-mode preference so it is remembered across takes/sessions. */
+function writeWaitPref(on: boolean): void {
+  try {
+    localStorage.setItem(WAIT_PREF_KEY, on ? "1" : "0");
+  } catch {
+    /* private mode / storage disabled — non-fatal, just don't persist */
+  }
+}
+
 export function HighwayScreen() {
   const { screen, navigate } = useRouter();
   const scr = screen();
@@ -101,9 +131,24 @@ export function HighwayScreen() {
   const [song, setSong] = createSignal<SongData>(EMPTY_SONG);
   const [loadErr, setLoadErr] = createSignal<string | null>(null);
   const [hearSong, setHearSong] = createSignal(false);
-  const [waitMode, setWaitMode] = createSignal(false);
+  // Input monitor: synthesise the player's own key presses (`n`), off by default.
+  const [monitor, setMonitor] = createSignal(false);
+  // Wait-mode preference persists across takes/sessions (defaults on).
+  const [waitMode, setWaitMode] = createSignal(readWaitPref());
+  // Live MIDI device status, shown on the Start overlay so the player can tell
+  // whether their piano is connected (and reconnect if it was powered on late).
+  const [midiInfo, setMidiInfo] = createSignal<MidiStatus | null>(null);
+  const [rescanning, setRescanning] = createSignal(false);
+  // The take loads paused (backend `start_paused`); it does not advance until the
+  // player hits Start. This gates auto-run before the window is focused and makes
+  // Replay re-enter the same ready-to-start state.
+  const [started, setStarted] = createSignal(false);
 
   let finished = false;
+  // Wall-clock (performance.now) when the result summary appeared, so a piano
+  // key only "continues" after a short grace — keys still held/released from the
+  // final note must not dismiss the result instantly.
+  let summaryShownAt = 0;
 
   // ── live key handling ──────────────────────────────────────────────────
   function onKeydown(e: KeyboardEvent): void {
@@ -117,7 +162,20 @@ export function HighwayScreen() {
       }
       return;
     }
+    // Before the take is started, Space/Enter begins it (the Start prompt).
+    if (!started()) {
+      if (e.key === " " || e.key === "Enter") {
+        e.preventDefault();
+        start();
+      }
+      return;
+    }
     switch (e.key) {
+      case " ":
+        // Play/pause toggle once running.
+        e.preventDefault();
+        void playTogglePause();
+        break;
       case "m":
       case "M":
         e.preventDefault();
@@ -126,7 +184,16 @@ export function HighwayScreen() {
       case "w":
       case "W":
         e.preventDefault();
-        void playSetWait(!waitMode()).then(setWaitMode);
+        void playSetWait(!waitMode()).then((on) => {
+          setWaitMode(on);
+          writeWaitPref(on);
+        });
+        break;
+      case "n":
+      case "N":
+        // Input monitor: hear your own key presses through the synth.
+        e.preventDefault();
+        void playToggleMonitor().then(setMonitor);
         break;
       default:
         break;
@@ -165,7 +232,14 @@ export function HighwayScreen() {
     }
     if (s.finished && !finished) {
       finished = true;
-      void playFinish().then(setSummary);
+      // Halt the render loop so the highway holds behind the summary panel
+      // instead of interpolating forward (which read as a "restart" under the
+      // dialog once no more play_state updates arrive).
+      eng()?.stop();
+      void playFinish().then((sm) => {
+        summaryShownAt = performance.now();
+        setSummary(sm);
+      });
     }
   }
 
@@ -203,13 +277,40 @@ export function HighwayScreen() {
         }
         engine.start();
         setEng(engine);
+        // The backend session loaded paused; wait for Start before advancing.
+        setStarted(false);
+        // A fresh session is disarmed; apply the persisted wait-mode preference
+        // so it is remembered across takes/sessions and Replay.
+        void playSetWait(waitMode()).then(setWaitMode);
+        // A fresh session has monitor off; re-enable it if the player had it on
+        // (keeps the input-monitor setting across Replay/re-entry).
+        if (monitor()) void playToggleMonitor().then(setMonitor);
       })
       .catch((err) => setLoadErr(String(err)));
+  }
+
+  /** Begin (or resume) the paused take — the Start button / Space / a piano key. */
+  function start(): void {
+    void playTogglePause().then(() => setStarted(true));
+  }
+
+  /** Refresh the shown MIDI device status. */
+  function refreshMidi(): void {
+    void midiStatus().then(setMidiInfo);
+  }
+
+  /** Re-scan for a piano powered on after launch and adopt it if found. */
+  function rescan(): void {
+    setRescanning(true);
+    void midiRescan()
+      .then(setMidiInfo)
+      .finally(() => setRescanning(false));
   }
 
   function replay(): void {
     if (dir === undefined) return;
     finished = false;
+    setStarted(false);
     setSummary(null);
     setPlayState(null);
     eng()?.stop();
@@ -223,6 +324,27 @@ export function HighwayScreen() {
 
     let unlisten: (() => void) | undefined;
     void onPlayState((s) => applyState(s)).then((u) => (unlisten = u));
+
+    // A piano key-press also clears the Start prompt (#2): while the take has not
+    // begun, any note-on starts it — the player can just start playing. (This
+    // also confirms a live device, so refresh the shown status.)
+    let unlistenMidi: (() => void) | undefined;
+    void onMidiEvent((ev) => {
+      if (!(ev.on && ev.velocity > 0)) return;
+      if (summary()) {
+        // Continue (replay) on a piano key — but only after a ~1s grace so keys
+        // still held/released from the final note don't dismiss it immediately.
+        if (performance.now() - summaryShownAt >= 1000) replay();
+        return;
+      }
+      // Before the take begins, any piano key starts it (and confirms the device).
+      if (!started()) {
+        refreshMidi();
+        start();
+      }
+    }).then((u) => (unlistenMidi = u));
+
+    refreshMidi();
     startLive(dir);
     window.addEventListener("keydown", onKeydown);
 
@@ -230,6 +352,7 @@ export function HighwayScreen() {
     onCleanup(() => {
       clearInterval(id);
       if (unlisten) unlisten();
+      if (unlistenMidi) unlistenMidi();
       window.removeEventListener("keydown", onKeydown);
       eng()?.stop();
       // Always tear the backend session down when leaving (Esc / unmount).
@@ -274,6 +397,7 @@ export function HighwayScreen() {
           playState={playState}
           hearSong={hearSong}
           waitMode={waitMode}
+          monitor={monitor}
         />
         <div style={{ flex: "1 1 auto", "min-height": 0, position: "relative" }}>
           {/* Background video backdrop (M9-G) — sits *behind* the canvas (lower
@@ -354,6 +478,83 @@ export function HighwayScreen() {
               }}
             >
               failed to load bundle: {loadErr()}
+            </div>
+          </Show>
+          <Show when={!started() && !summary() && !loadErr()}>
+            <div
+              style={{
+                position: "absolute",
+                inset: "0",
+                display: "flex",
+                "flex-direction": "column",
+                "align-items": "center",
+                "justify-content": "center",
+                gap: "16px",
+                "z-index": 2,
+                background: "rgba(15,16,22,0.55)",
+              }}
+            >
+              <button
+                onClick={() => start()}
+                style={{
+                  padding: "14px 40px",
+                  "font-size": "18px",
+                  "font-weight": "600",
+                  color: "#0f1016",
+                  background: "#8fb6ff",
+                  border: "none",
+                  "border-radius": "10px",
+                  cursor: "pointer",
+                  "font-family": "'Space Grotesk', system-ui, sans-serif",
+                }}
+              >
+                ▶ Start
+              </button>
+              <div
+                style={{
+                  color: "#9aa0b4",
+                  "font-size": "13px",
+                  "text-align": "center",
+                }}
+              >
+                Press Space — or play any key — to start
+                {waitMode() ? " · wait mode on (pauses on each note)" : ""}
+              </div>
+              {/* MIDI device status + reconnect (a piano powered on after launch
+                  is otherwise missed; rescan adopts it). */}
+              <div
+                style={{
+                  display: "flex",
+                  "align-items": "center",
+                  gap: "10px",
+                  "font-size": "12px",
+                  color: "#7c8094",
+                }}
+              >
+                <span>
+                  {midiInfo()?.kind === "live"
+                    ? `🎹 ${midiInfo()?.port ?? "connected"}`
+                    : "no piano detected"}
+                </span>
+                <Show when={midiInfo()?.kind !== "live"}>
+                  <button
+                    onClick={() => rescan()}
+                    disabled={rescanning()}
+                    style={{
+                      padding: "5px 12px",
+                      "font-size": "12px",
+                      color: "#c8cce0",
+                      background: "transparent",
+                      border: "1px solid #3a3f52",
+                      "border-radius": "6px",
+                      cursor: rescanning() ? "default" : "pointer",
+                      "font-family": "'Space Grotesk', system-ui, sans-serif",
+                    }}
+                  >
+                    {rescanning() ? "searching…" : "🔍 Reconnect piano"}
+                  </button>
+                </Show>
+              </div>
             </div>
           </Show>
           <Show when={summary()}>

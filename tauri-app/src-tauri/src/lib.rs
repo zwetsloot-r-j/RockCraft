@@ -302,6 +302,13 @@ fn midi_status(midi: State<'_, MidiState>) -> MidiStatus {
     crate::midi::midi_status(&midi)
 }
 
+/// Re-scan for a live MIDI device (e.g. the piano was powered on after launch)
+/// and switch to it if found. Returns the new status.
+#[tauri::command]
+fn midi_rescan(midi: State<'_, MidiState>) -> MidiStatus {
+    crate::midi::midi_rescan(&midi)
+}
+
 /// Simulate a computer-key press (down=true) or release (down=false) on the
 /// mock keyboard. Returns `Err` when a real device is connected (mock keys must
 /// not inject fake events into live input).
@@ -543,6 +550,7 @@ pub fn run() {
             edit_clear_backing,
             edit_query_backing,
             midi_status,
+            midi_rescan,
             mock_key,
             audio::attach_backing,
             audio::detach_backing,
@@ -557,6 +565,7 @@ pub fn run() {
             play::play_load,
             play::play_set_wait,
             play::play_toggle_hear_song,
+            play::play_toggle_monitor,
             play::play_toggle_pause,
             play::play_finish,
             import::import_url_available,

@@ -334,6 +334,10 @@ pub struct PlaySession {
     /// Background image layers resolved from the bundle's `meta.json` (M14-D).
     backgrounds: Vec<BackgroundLayerSession>,
     hear_song: bool,
+    /// Input monitor: synthesise the player's own key presses so they hear
+    /// themselves through the app synth. Independent of "hear the song" (which
+    /// auditions the chart). Toggled at runtime; off by default.
+    monitor: bool,
     /// Manual pause (`HostCommand::PlayTogglePause`). Freezes the clock + backing
     /// independently of wait-mode; while set the highway and scoring clock hold
     /// their position. The play-screen UI/keys are M12-B (#232).
@@ -401,6 +405,7 @@ impl PlaySession {
             video: None,
             backgrounds: Vec::new(),
             hear_song: false,
+            monitor: false,
             paused: false,
             cfg: ScoreConfig::default(),
             held: BTreeSet::new(),
@@ -484,6 +489,16 @@ impl PlaySession {
     /// `play_toggle_hear_song` still flips it at runtime either way.
     pub fn with_hear_song(mut self, on: bool) -> Self {
         self.hear_song = on;
+        self
+    }
+
+    /// Begin the take manually paused so the highway holds at the start until the
+    /// player hits Start (which calls `toggle_pause` to resume). This keeps the
+    /// song from running before the window is focused, and makes Replay re-enter
+    /// the same ready-to-start state. The same freeze machinery wait-mode uses
+    /// holds the clock at 0 until resumed.
+    pub fn start_paused(mut self) -> Self {
+        self.paused = true;
         self
     }
 
@@ -729,6 +744,18 @@ impl PlaySession {
         self.hear_song
     }
 
+    /// Is input-monitor on (synthesise the player's own key presses)?
+    pub fn is_monitor(&self) -> bool {
+        self.monitor
+    }
+
+    /// Toggle input-monitor, returning the new state. When turning it off the
+    /// caller silences the synth (any monitored notes still ringing).
+    pub fn toggle_monitor(&mut self) -> bool {
+        self.monitor = !self.monitor;
+        self.monitor
+    }
+
     /// The file position the backing should be at for the current clock, or
     /// `None` if it should not be playing yet / there is no backing track.
     pub fn backing_target_us(&self) -> Option<u64> {
@@ -868,7 +895,7 @@ fn load_session_from_dir(dir: &Path) -> Result<PlaySession, String> {
             }
         }
     }
-    Ok(session.with_hear_song(!has_backing))
+    Ok(session.with_hear_song(!has_backing).start_paused())
 }
 
 // ── Tauri commands ───────────────────────────────────────────────────────────
@@ -916,6 +943,27 @@ pub fn play_toggle_hear_song(
     let mut guard = state.0.lock().expect("play state mutex poisoned");
     if let Some(s) = guard.as_mut() {
         let on = s.toggle_hear_song();
+        if !on {
+            if let Some(synth) = &audio.synth {
+                synth.all_off();
+            }
+        }
+        on
+    } else {
+        false
+    }
+}
+
+/// Toggle input-monitor: synthesise the player's own key presses (`n`). Returns
+/// the new state; silences the synth when turning off.
+#[tauri::command]
+pub fn play_toggle_monitor(
+    state: tauri::State<'_, PlayState>,
+    audio: tauri::State<'_, AudioState>,
+) -> bool {
+    let mut guard = state.0.lock().expect("play state mutex poisoned");
+    if let Some(s) = guard.as_mut() {
+        let on = s.toggle_monitor();
         if !on {
             if let Some(synth) = &audio.synth {
                 synth.all_off();
@@ -986,6 +1034,20 @@ pub fn tick_play(
         session.ingest(ev);
         if let Some(synth) = &player_synth {
             synth.apply(&ev);
+        }
+    }
+    // Input monitor: synthesise the player's own key presses so they hear
+    // themselves. Independent of "hear the song" (the chart audition below).
+    if session.is_monitor() {
+        if let Some(synth) = &audio.synth {
+            for &ev in midi_events {
+                match ev.kind {
+                    NoteEventKind::On { velocity } if !velocity.is_note_off() => {
+                        synth.note_on(ev.note, velocity);
+                    }
+                    _ => synth.note_off(ev.note),
+                }
+            }
         }
     }
     let frozen = session.advance(dt_us);

@@ -28,6 +28,10 @@ pub enum SaveDest {
     QuickSave,
     /// Named save — writes to `<library_root>/<slug>/`.
     Library { name: String },
+    /// Overwrite the bundle the piece was loaded from / last saved to
+    /// ([`AppState::current_dir`]) without re-typing a name. Falls back to a
+    /// quick-save take when the piece has never been loaded or saved.
+    InPlace,
 }
 
 /// One kept part for [`split_bundle`] (M10-B): the half-open song-time range
@@ -74,6 +78,11 @@ pub struct AppState {
     /// by `core::Action`s — so this holds only what `core` may not: where the
     /// file is. Exactly the split [`AppState::backing_path`] uses.
     pub background_srcs: Mutex<Vec<AttachedBackground>>,
+    /// Directory the piece was last loaded from or saved to. Backs the no-prompt
+    /// "save in place" (`SaveDest::InPlace`) — `s` overwrites this bundle without
+    /// re-typing a name. `None` for a brand-new composition (falls back to a
+    /// quick-save take).
+    pub current_dir: Mutex<Option<std::path::PathBuf>>,
 }
 
 /// A background image attached to the live editor: the layer id it belongs to
@@ -114,6 +123,7 @@ impl AppState {
             backing_path: Mutex::new(None),
             video: Mutex::new(None),
             background_srcs: Mutex::new(Vec::new()),
+            current_dir: Mutex::new(None),
         }
     }
 }
@@ -217,14 +227,15 @@ fn timeline_fingerprint_snapshot(notes: &[NoteView]) -> u64 {
 ///
 /// Mirrors `EditScreen::save` / `save_to_library` from `crates/tui/src/edit.rs`.
 pub fn save_bundle(state: &AppState, dest: SaveDest) -> Result<String, String> {
+    let quick_save_dir = || {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        std::path::PathBuf::from("recordings").join(format!("take-{stamp}"))
+    };
     let bundle_dir = match &dest {
-        SaveDest::QuickSave => {
-            let stamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            std::path::PathBuf::from("recordings").join(format!("take-{stamp}"))
-        }
+        SaveDest::QuickSave => quick_save_dir(),
         SaveDest::Library { name } => {
             let slug = rockcraft_midi::bundle::slug(name);
             if slug.is_empty() {
@@ -232,6 +243,13 @@ pub fn save_bundle(state: &AppState, dest: SaveDest) -> Result<String, String> {
             }
             rockcraft_midi::bundle::library_root().join(slug)
         }
+        // Overwrite the loaded/last-saved bundle; new pieces fall back to a take.
+        SaveDest::InPlace => state
+            .current_dir
+            .lock()
+            .expect("current_dir mutex poisoned")
+            .clone()
+            .unwrap_or_else(quick_save_dir),
     };
     save_bundle_into(state, &bundle_dir)?;
     Ok(bundle_dir.to_string_lossy().into_owned())
@@ -278,6 +296,12 @@ fn save_bundle_into(state: &AppState, bundle_dir: &std::path::Path) -> Result<()
 
     // Clear dirty flag after a successful save.
     *state.dirty.lock().expect("dirty mutex poisoned") = false;
+    // Remember where we saved so a subsequent in-place save overwrites the same
+    // bundle without a name prompt.
+    *state
+        .current_dir
+        .lock()
+        .expect("current_dir mutex poisoned") = Some(bundle_dir.to_path_buf());
     Ok(())
 }
 
@@ -574,6 +598,11 @@ pub fn load_bundle(state: &AppState, dir: &str) -> Result<ComposerSnapshot, Stri
             id: l.id,
         })
         .collect();
+    // Remember where this piece came from so an in-place save overwrites it.
+    *state
+        .current_dir
+        .lock()
+        .expect("current_dir mutex poisoned") = Some(bundle_dir);
 
     // Return the fresh snapshot.
     let composer = state.composer.lock().expect("composer mutex poisoned");
