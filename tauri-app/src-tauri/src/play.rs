@@ -27,7 +27,7 @@ use std::sync::Mutex;
 use rockcraft_core::{
     backing_position_us, score, song_shift_us, ExpectedNote, Feedback, GateState, MidiNote,
     NoteEvent, NoteEventKind, NoteJudgment, PlayClock, RecordingMeta, ScoreConfig, ScoreReport,
-    Summary, Timing, WaitGate,
+    Summary, SynthBus, Timing, WaitGate,
 };
 use rockcraft_midi::smf_bytes_to_events;
 use serde::Serialize;
@@ -890,14 +890,22 @@ pub fn tick_play(
     let mut guard = state.0.lock().expect("play state mutex poisoned");
     let session = guard.as_mut()?;
 
+    // Echo the notes you play on the **player** bus (M14-C), at parity with the
+    // TUI's `PlayScreen::ingest`. Its own instrument and fader, so your part can
+    // be told apart from the song's — or muted, if the piano is loud enough on
+    // its own.
+    let player_synth = audio.bus(SynthBus::Player);
     for &ev in midi_events {
         session.ingest(ev);
+        if let Some(synth) = &player_synth {
+            synth.apply(&ev);
+        }
     }
     let frozen = session.advance(dt_us);
 
-    // Route "hear the song" auditions through the synth.
+    // Route "hear the song" auditions through the **song** bus.
     let (need_on, need_off) = session.pending_song_triggers();
-    if let Some(synth) = &audio.synth {
+    if let Some(synth) = audio.bus(SynthBus::Song) {
         let vel = rockcraft_core::Velocity::new(HEAR_VELOCITY);
         for &i in &need_on {
             if let (Some(p), Some(v)) = (session.span_note(i).and_then(MidiNote::new), vel) {

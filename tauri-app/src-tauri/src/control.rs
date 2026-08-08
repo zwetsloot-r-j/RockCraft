@@ -395,6 +395,23 @@ impl HostServices for TauriHost<'_> {
                 Ok(serde_json::Value::Null)
             }
 
+            // ── sound / mixer (M14-C) ───────────────────────────────────
+            HostCommand::SetInstrument { bus, instrument } => {
+                match app.state::<AudioState>().set_instrument(bus, &instrument) {
+                    Ok(report) => json_payload("set_instrument", report),
+                    Err(e) => failed("set_instrument", e),
+                }
+            }
+            HostCommand::SetBusGain { bus, gain } => {
+                match app.state::<AudioState>().set_bus_gain(bus, gain) {
+                    Ok(report) => json_payload("set_bus_gain", report),
+                    Err(e) => failed("set_bus_gain", e),
+                }
+            }
+            HostCommand::QueryMixer => {
+                json_payload("query_mixer", app.state::<AudioState>().mixer_report())
+            }
+
             // ── backing video ("the movie") ─────────────────────────────
             HostCommand::AttachVideo { path, offset_us } => {
                 let state = app.state::<AppState>();

@@ -15,7 +15,8 @@ use ratatui::{
 };
 use rockcraft_audio::{play_file_at, BackingHandle, SynthHandle};
 use rockcraft_core::{
-    backing_position_us, GateState, MidiNote, NoteEvent, PlayClock, Velocity, WaitGate,
+    backing_position_us, Gain, GateState, MidiNote, NoteEvent, PlayClock, SynthBus, Velocity,
+    WaitGate,
 };
 use rockcraft_midi::smf_bytes_to_events;
 
@@ -59,7 +60,14 @@ pub struct PlayScreen {
     wait: WaitGate,
     title: String,
     finished_pause_us: u64,
+    /// The **player** voice: the notes coming off the piano, echoed live.
     synth: Option<SynthHandle>,
+    /// The **song** voice: "hear the song". Same synth, its own MIDI channel,
+    /// so instrument and level are independent of the player's (M14-C).
+    song_synth: Option<SynthHandle>,
+    /// The backing track's level. Applied when the track arms (a fresh sink
+    /// starts at unity) and on the live handle when it changes mid-take.
+    backing_gain: Gain,
     /// Whole-song forward shift applied to the spans; the clock value at which
     /// the first note's lead-in ends and the backing track should begin.
     /// Equals `song_shift_us(first_note_us, PRE_ROLL_US, LEAD_US)`.
@@ -109,6 +117,8 @@ impl PlayScreen {
         let duration_us = song_duration_us(&spans);
         let wait = WaitGate::from_expected(&expected_steps(&spans));
 
+        let song_synth = synth.as_ref().map(|s| s.for_bus(SynthBus::Song));
+
         Ok(Self {
             spans,
             duration_us,
@@ -119,6 +129,8 @@ impl PlayScreen {
             title,
             finished_pause_us: LEAD_US,
             synth,
+            song_synth,
+            backing_gain: Gain::UNITY,
             shift_us: offset,
             backing: None,
             backing_handle: None,
@@ -202,6 +214,8 @@ impl PlayScreen {
                 if !self.clock.is_running() {
                     h.pause();
                 }
+                // A fresh sink starts at unity — carry the fader onto it.
+                h.set_gain(self.backing_gain);
                 self.backing_handle = Some(h);
             }
             // On a persistent failure (missing/undecodable file), drop the track
@@ -340,6 +354,21 @@ impl PlayScreen {
         }
     }
 
+    /// The backing track's current level (the read path for tests).
+    pub fn backing_gain(&self) -> Gain {
+        self.backing_gain
+    }
+
+    /// Set the backing track's level (M14-C). Applies to the live handle when
+    /// the track is already playing, and is carried onto the sink the next
+    /// [`tick_backing`](Self::tick_backing) creates.
+    pub fn set_backing_gain(&mut self, gain: Gain) {
+        self.backing_gain = gain;
+        if let Some(h) = &self.backing_handle {
+            h.set_gain(gain);
+        }
+    }
+
     /// Whether the "hear the song" audition is currently active (for the status
     /// line / tests).
     pub fn is_hear_song(&self) -> bool {
@@ -360,7 +389,7 @@ impl PlayScreen {
         let velocity = Velocity::new(HEAR_VELOCITY).unwrap();
         for i in need_on {
             if let Some(note) = MidiNote::new(self.spans[i].note) {
-                if let Some(s) = &self.synth {
+                if let Some(s) = &self.song_synth {
                     s.note_on(note, velocity);
                 }
             }
@@ -368,7 +397,7 @@ impl PlayScreen {
         }
         for i in need_off {
             if let Some(note) = MidiNote::new(self.spans[i].note) {
-                if let Some(s) = &self.synth {
+                if let Some(s) = &self.song_synth {
                     s.note_off(note);
                 }
             }

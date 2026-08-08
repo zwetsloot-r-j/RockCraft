@@ -16,6 +16,7 @@ pub mod composer;
 pub mod events;
 pub mod grid;
 pub mod history;
+pub mod mixer;
 pub mod play_clock;
 pub mod scoring;
 pub mod segment;
@@ -33,6 +34,10 @@ pub use composer::{Composer, ComposerSnapshot, Cursor, InputMode, NoteView, Sele
 pub use events::{MidiNote, NoteEvent, NoteEventKind, Velocity};
 pub use grid::{Grid, Subdivision, TimeSig};
 pub use history::History;
+pub use mixer::{
+    default_instrument, instrument, instruments, BusMix, Gain, Instrument, Mixer, MixerBus,
+    MixerError, MixerReport, SynthBus, DEFAULT_INSTRUMENT,
+};
 pub use play_clock::PlayClock;
 pub use scoring::{score, ExpectedNote, Feedback, NoteJudgment, ScoreConfig, ScoreReport, Timing};
 pub use segment::{segments_from_splits, slice_segment, Segment, SliceResult};

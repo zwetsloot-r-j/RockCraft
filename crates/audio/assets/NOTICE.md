@@ -36,3 +36,12 @@ budget on the piano, so it usually sounds *better* than the piano buried in a
   committing it.
 
 Target size: a few MB is plenty for an MVP.
+
+## Instrument selection needs a bank
+
+The play screen's sound picker (M14-C) switches a voice by sending a **General
+MIDI program change**. A piano-only font has one preset, so every choice sounds
+the same on it — the selection is stored and re-applied, it simply has nothing
+else to reach for. If you want the picker to actually change the timbre, point
+`ROCKCRAFT_SF2` at a full GM font (any `.sf2` carrying programs 0–127); the
+levels — your notes / the song / the backing — work either way.
