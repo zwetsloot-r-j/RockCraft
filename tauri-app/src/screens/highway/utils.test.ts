@@ -1,9 +1,18 @@
 // utils.test.ts — pure unit tests for the per-note render helpers. No canvas or
-// DOM: these are pure functions of the MIDI pitch / note length, so the rules
-// they encode can be verified headlessly. Both are shared by the highway and
-// the edit view: keyNoteStyle (M11-B) and tailGapPx (M14-A).
+// DOM: these are pure functions of the MIDI pitch / note length / judgment, so
+// the rules they encode can be verified headlessly. keyNoteStyle (M11-B) and
+// tailGapPx (M14-A) are shared by the highway and the edit view; feedbackFx
+// (M14-B) is the play screen's effect budget per judgment level.
 import { describe, expect, it } from "vitest";
-import { isBlack, keyNoteStyle, NOTE_TAIL_GAP_PX, tailGapPx } from "./utils";
+import type { FeedbackLevel } from "../../ipc/types";
+import {
+  feedbackFx,
+  feedbackLabel,
+  isBlack,
+  keyNoteStyle,
+  NOTE_TAIL_GAP_PX,
+  tailGapPx,
+} from "./utils";
 
 describe("keyNoteStyle", () => {
   it("gives a black-key pitch a distinct treatment from a white-key pitch", () => {
@@ -79,5 +88,63 @@ describe("tailGapPx", () => {
     expect(tailGapPx(0)).toBe(0);
     expect(tailGapPx(-5)).toBe(0);
     expect(tailGapPx(NaN)).toBe(0);
+  });
+});
+
+describe("feedbackFx", () => {
+  const LEVELS: FeedbackLevel[] = ["clear", "near", "subtle"];
+
+  it("makes a well-timed hit read stronger than an off-time one, and a miss weakest", () => {
+    const [clear, near, subtle] = LEVELS.map(feedbackFx);
+    // Every dimension of the effect ranks the same way, so the difference is
+    // legible however the terminal/monitor renders it.
+    expect(clear.sparks).toBeGreaterThan(near.sparks);
+    expect(near.sparks).toBeGreaterThan(subtle.sparks);
+    expect(clear.flashAlpha).toBeGreaterThan(near.flashAlpha);
+    expect(near.flashAlpha).toBeGreaterThan(subtle.flashAlpha);
+    expect(clear.flashSpread).toBeGreaterThan(near.flashSpread);
+    expect(near.flashSpread).toBeGreaterThan(subtle.flashSpread);
+    expect(clear.flashMs).toBeGreaterThan(near.flashMs);
+    expect(near.flashMs).toBeGreaterThan(subtle.flashMs);
+  });
+
+  it("throws no sparks for a miss but still acknowledges it", () => {
+    const subtle = feedbackFx("subtle");
+    expect(subtle.sparks).toBe(0);
+    // Subtle, not absent: the flash and readout still happen.
+    expect(subtle.flashAlpha).toBeGreaterThan(0);
+    expect(subtle.flashMs).toBeGreaterThan(0);
+    expect(subtle.labelMs).toBeGreaterThan(0);
+  });
+
+  it("gives every level a visible, finite effect in a distinct colour", () => {
+    const colors = new Set<string>();
+    for (const level of LEVELS) {
+      const fx = feedbackFx(level);
+      expect(fx.sparks).toBeGreaterThanOrEqual(0);
+      expect(fx.flashAlpha).toBeGreaterThan(0);
+      expect(fx.flashAlpha).toBeLessThanOrEqual(1);
+      expect(fx.flashMs).toBeGreaterThan(0);
+      expect(fx.labelMs).toBeGreaterThan(0);
+      colors.add(fx.color);
+    }
+    expect(colors.size).toBe(LEVELS.length);
+  });
+
+  it("falls back to the subtle budget for an unknown level", () => {
+    // Defensive: a backend that grows a level shouldn't crash the render loop.
+    expect(feedbackFx("bogus" as FeedbackLevel)).toEqual(feedbackFx("subtle"));
+  });
+});
+
+describe("feedbackLabel", () => {
+  it("tells an off-time hit which way it was off", () => {
+    expect(feedbackLabel("near", "early")).toBe("EARLY");
+    expect(feedbackLabel("near", "late")).toBe("LATE");
+  });
+
+  it("uses the level's own label otherwise", () => {
+    expect(feedbackLabel("clear", "perfect")).toBe("PERFECT");
+    expect(feedbackLabel("subtle", "miss")).toBe("MISS");
   });
 });

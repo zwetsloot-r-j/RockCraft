@@ -12,9 +12,12 @@
 //   - `runScoring` is demo-only; #168 replaces it with real `core::scoring`
 //     judgments (perfect 50 ms / good 150 ms) off MIDI timestamps.
 
+import type { HitFeedback } from "../../ipc/types";
 import type { HighwayConfig, KeyInfo, KeyLayout, NoteSpan, SongData } from "./types";
 import {
   clamp,
+  feedbackFx,
+  feedbackLabel,
   keyLayout,
   keyNoteStyle,
   lerp,
@@ -82,16 +85,23 @@ interface Particle {
   born: number;
   life: number;
 }
+// A one-shot lane flash at the hit line. `alpha`/`spread`/`life` are the
+// feedback budget for the judgment that spawned it (see utils::feedbackFx), so
+// a clear hit blooms wide and bright and a miss barely registers.
 interface Flash {
   cx: number;
   w: number;
   color: string;
   born: number;
+  alpha: number;
+  spread: number;
+  life: number;
 }
 interface Judge {
   text: string;
   color: string;
   born: number;
+  life: number;
 }
 
 export class HighwayCanvas {
@@ -151,6 +161,64 @@ export class HighwayCanvas {
     this.liveFrozen = frozen;
     this.liveHeld = new Set(held);
     this.liveAwaiting = new Set(awaiting);
+  }
+
+  /**
+   * Spawn the one-shot hit/near/miss effects for notes the backend judged this
+   * tick (M14-B). Each entry fires exactly once — `play_state` delivers a judged
+   * note in a single snapshot — so this just spawns and never de-duplicates.
+   *
+   * The *level* comes from `core::scoring::Feedback`, so what reads as a clear
+   * hit is decided by the engine, not here; this maps the level onto a spark
+   * count, a lane flash, and a readout via the pure `feedbackFx` table.
+   */
+  pushJudgments(items: HitFeedback[]): void {
+    for (const j of items) {
+      const fx = feedbackFx(j.level);
+      this.judge = {
+        text: feedbackLabel(j.level, j.timing),
+        color: fx.color,
+        born: performance.now(),
+        life: fx.labelMs,
+      };
+      const lane = this.kl.byNote[j.note];
+      if (!lane) continue;
+      // Spectrum mode tints the flash with the lane's own hue so the effect
+      // reads as *that* note landing; the level still sets its strength. A miss
+      // keeps the judgment red — its point is that no note landed.
+      const laneCol =
+        this.cfg.colorMode === "spectrum" && j.level !== "subtle"
+          ? `oklch(0.78 0.16 ${spectrumHue(j.note)})`
+          : fx.color;
+      this.spawnFx(lane, laneCol, fx.sparks, fx.flashAlpha, fx.flashSpread, fx.flashMs);
+    }
+  }
+
+  /** Push one lane flash plus `sparks` rising particles. Shared by the live
+   * judgments above and the demo scoring sim. */
+  private spawnFx(
+    lane: KeyInfo,
+    color: string,
+    sparks: number,
+    alpha: number,
+    spread: number,
+    life: number,
+  ): void {
+    const t = performance.now();
+    this.flashes.push({ cx: lane.cx, w: lane.w, color, born: t, alpha, spread, life });
+    for (let i = 0; i < sparks; i++) {
+      const a = -Math.PI / 2 + (Math.random() - 0.5) * 1.15;
+      const sp = 1.1 + Math.random() * 2.4;
+      this.particles.push({
+        x: lane.cx,
+        y: this.hitY,
+        vx: Math.cos(a) * sp,
+        vy: Math.sin(a) * sp * 1.7,
+        color,
+        born: t,
+        life: 460 + Math.random() * 260,
+      });
+    }
   }
 
   // scoring sim state (public reads for the header chrome)
@@ -663,24 +731,10 @@ export class HighwayCanvas {
         this.score += pts;
         const lane = this.kl.byNote[nt.note];
         // one central judgment readout (latest wins) + per-lane flash + sparks
-        this.judge = { text: res, color: col, born: performance.now() };
+        this.judge = { text: res, color: col, born: performance.now(), life: 520 };
         if (lane && res !== "MISS") {
           const fcol = c.colorMode === "spectrum" ? this.noteColor(nt, 0.45) : col;
-          this.flashes.push({ cx: lane.cx, w: lane.w, color: fcol, born: performance.now() });
-          const n = res === "PERFECT" ? 7 : 4;
-          for (let i = 0; i < n; i++) {
-            const a = -Math.PI / 2 + (Math.random() - 0.5) * 1.15;
-            const sp = 1.1 + Math.random() * 2.4;
-            this.particles.push({
-              x: lane.cx,
-              y: this.hitY,
-              vx: Math.cos(a) * sp,
-              vy: Math.sin(a) * sp * 1.7,
-              color: fcol,
-              born: performance.now(),
-              life: 460 + Math.random() * 260,
-            });
-          }
+          this.spawnFx(lane, fcol, res === "PERFECT" ? 7 : 4, 0.8, 1.6, 420);
         }
       }
     }
@@ -712,16 +766,17 @@ export class HighwayCanvas {
       ctx.fill();
     }
     ctx.restore();
-    // hit flashes at the line
-    this.flashes = this.flashes.filter((f) => t - f.born < 420);
+    // hit flashes at the line — each decays over its own lifetime, so a clear
+    // hit lingers and a miss is gone almost as soon as it appeared.
+    this.flashes = this.flashes.filter((f) => t - f.born < f.life);
     for (const f of this.flashes) {
-      const k = (t - f.born) / 420;
+      const k = (t - f.born) / f.life;
       ctx.save();
-      ctx.globalAlpha = (1 - k) * 0.8;
+      ctx.globalAlpha = (1 - k) * f.alpha;
       ctx.fillStyle = f.color;
       ctx.shadowColor = f.color;
       ctx.shadowBlur = 24;
-      const r = f.w * (0.6 + k * 1.6);
+      const r = f.w * (0.6 + k * f.spread);
       ctx.beginPath();
       ctx.ellipse(f.cx, this.hitY, r, r * 0.5, 0, 0, Math.PI * 2);
       ctx.fill();
@@ -729,7 +784,7 @@ export class HighwayCanvas {
     }
     // single central judgment readout
     if (this.judge) {
-      const k = (t - this.judge.born) / 520;
+      const k = (t - this.judge.born) / this.judge.life;
       if (k < 1) {
         const pop = k < 0.2 ? k / 0.2 : 1; // quick scale-in
         ctx.save();
