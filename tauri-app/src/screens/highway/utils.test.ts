@@ -1,8 +1,9 @@
-// utils.test.ts — pure unit tests for the per-note key treatment. No canvas or
-// DOM: keyNoteStyle is a pure function of the MIDI pitch, so the black/white
-// distinction rule can be verified headlessly (M11-B, shared with the edit view).
+// utils.test.ts — pure unit tests for the per-note render helpers. No canvas or
+// DOM: these are pure functions of the MIDI pitch / note length, so the rules
+// they encode can be verified headlessly. Both are shared by the highway and
+// the edit view: keyNoteStyle (M11-B) and tailGapPx (M14-A).
 import { describe, expect, it } from "vitest";
-import { isBlack, keyNoteStyle } from "./utils";
+import { isBlack, keyNoteStyle, NOTE_TAIL_GAP_PX, tailGapPx } from "./utils";
 
 describe("keyNoteStyle", () => {
   it("gives a black-key pitch a distinct treatment from a white-key pitch", () => {
@@ -32,5 +33,51 @@ describe("keyNoteStyle", () => {
   it("is octave-invariant (treatment tracks pitch class, not register)", () => {
     expect(keyNoteStyle(61)).toEqual(keyNoteStyle(73)); // C#4 == C#5
     expect(keyNoteStyle(60)).toEqual(keyNoteStyle(72)); // C4 == C5
+  });
+});
+
+describe("tailGapPx", () => {
+  it("gives a comfortably long note the full gap", () => {
+    expect(tailGapPx(120)).toBe(NOTE_TAIL_GAP_PX);
+    expect(tailGapPx(40)).toBe(NOTE_TAIL_GAP_PX);
+  });
+
+  it("separates two back-to-back notes of the same pitch", () => {
+    // Two 40 px notes stacked edge to edge: the earlier one ends where the
+    // later one begins. Trimming the trailing edge leaves visible space.
+    const gap = tailGapPx(40);
+    expect(gap).toBeGreaterThan(0);
+    expect(40 - gap).toBeLessThan(40); // the block really is drawn shorter
+  });
+
+  it("never eats more than a quarter of a short note", () => {
+    for (const len of [4, 6, 8, 10]) {
+      expect(tailGapPx(len)).toBeLessThanOrEqual(len * 0.25);
+    }
+  });
+
+  it("keeps the shortest blocks visible", () => {
+    for (const len of [0.5, 1, 2, 3]) {
+      const body = len - tailGapPx(len);
+      expect(body).toBeGreaterThan(0);
+      expect(body).toBeLessThanOrEqual(len);
+    }
+    expect(tailGapPx(2)).toBe(0); // already at the minimum body — no trim
+  });
+
+  it("is non-negative and monotonic in the note length", () => {
+    let prev = -1;
+    for (let len = 0; len <= 60; len += 0.5) {
+      const gap = tailGapPx(len);
+      expect(gap).toBeGreaterThanOrEqual(0);
+      expect(gap).toBeGreaterThanOrEqual(prev);
+      prev = gap;
+    }
+  });
+
+  it("treats a zero/negative length as no gap", () => {
+    expect(tailGapPx(0)).toBe(0);
+    expect(tailGapPx(-5)).toBe(0);
+    expect(tailGapPx(NaN)).toBe(0);
   });
 });

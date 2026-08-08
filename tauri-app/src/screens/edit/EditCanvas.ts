@@ -23,6 +23,7 @@ import {
   roundRect,
   shade,
   spectrumHue,
+  tailGapPx,
   withAlpha,
 } from "../highway/utils";
 import { gridTiming, Viewport } from "./viewport";
@@ -407,8 +408,13 @@ export class EditCanvas {
       if (!vp.pitchVisible(n.pitch)) continue;
       const x = vp.xOf(n.pitch);
       // The onset is the lower edge; the note grows upward by its duration.
-      const y = vp.yOf(n.start_us + n.dur_us);
-      const h = Math.max(2, vp.hOf(n.dur_us));
+      const full = Math.max(2, vp.hOf(n.dur_us));
+      // Trim the trailing (later-time) edge — the top — so back-to-back
+      // same-pitch notes read as two blocks instead of one bar. The onset edge
+      // (y + h) stays put, so a note still starts exactly where its data says.
+      const gap = tailGapPx(full);
+      const y = vp.yOf(n.start_us + n.dur_us) + gap;
+      const h = full - gap;
       if (y + h < 0 || y > this.h) continue;
       // Per-note key treatment (slim/darker/outline for accidentals). Single
       // source of truth shared with the highway; see utils.ts::keyNoteStyle. The
