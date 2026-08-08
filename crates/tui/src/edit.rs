@@ -1900,7 +1900,9 @@ impl EditScreen {
             } else {
                 NOTE_COLOR
             };
-            for row in rs.top_row..=rs.bottom_row {
+            // `body_rows` (not the raw extent) leaves the trailing edge blank so
+            // repeated notes on one pitch read as separate blocks.
+            for row in rs.body_rows() {
                 let y = area.y + row;
                 if y >= area.y + area.height {
                     break;

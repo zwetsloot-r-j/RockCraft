@@ -22,6 +22,7 @@ import {
   roundRect,
   shade,
   spectrumHue,
+  tailGapPx,
   withAlpha,
 } from "./utils";
 
@@ -371,9 +372,13 @@ export class HighwayCanvas {
   ): void {
     const ctx = this.ctx,
       c = this.cfg;
-    const yTop = clamp(this.yOf(en, now), -40, this.hitY);
+    const yEnd = clamp(this.yOf(en, now), -40, this.hitY);
     let yBot = clamp(this.yOf(st, now), -40, this.hitY);
-    if (yBot - yTop < 3) yBot = yTop + 3; // min visible height
+    if (yBot - yEnd < 3) yBot = yEnd + 3; // min visible height
+    // Trim the trailing (later-time) edge — the top, since notes fall toward the
+    // hit line at the bottom — so back-to-back same-pitch notes read as two
+    // blocks instead of one bar. The onset edge (yBot) never moves.
+    const yTop = yEnd + tailGapPx(yBot - yEnd);
     // Per-note key treatment (slim/darker/outline for accidentals). Single
     // source of truth shared with the edit view; see utils.ts::keyNoteStyle.
     const ksty = keyNoteStyle(nt.note);

@@ -124,6 +124,36 @@ export function keyNoteStyle(note: number): KeyNoteStyle {
   return isBlack(note) ? ACCIDENTAL_STYLE : NATURAL_STYLE;
 }
 
+// ── Trailing-edge gap ─────────────────────────────────────────────────────
+// Two notes of the same pitch played back-to-back share an edge: the first
+// one's end is the second one's onset, so their blocks touch and read as a
+// single long bar. To keep them apart, every note is drawn slightly short at
+// its **trailing** (later-time) edge — the end, i.e. the edge *away* from the
+// hit line, since time runs bottom → top in both the highway and the edit grid.
+// The onset edge is never moved, so the note still lands exactly on time.
+//
+// Render-only: `start_us`/`dur_us` are untouched; this trims pixels, not time.
+// Shared by the highway and the edit view so both read the same way.
+//
+//   NOTE_TAIL_GAP_PX   the gap a comfortably long note gets.
+//   TAIL_GAP_MAX_FRAC  ceiling as a fraction of the note's own length, so a
+//                      short note loses a proportional sliver, not most of it.
+//   TAIL_GAP_MIN_BODY  px of body a note always keeps, so the shortest blocks
+//                      stay visible rather than being gapped out of existence.
+export const NOTE_TAIL_GAP_PX = 3;
+const TAIL_GAP_MAX_FRAC = 0.25;
+const TAIL_GAP_MIN_BODY = 2;
+
+/** Pixels to trim from the trailing edge of a note `lengthPx` long. */
+export function tailGapPx(lengthPx: number): number {
+  if (!(lengthPx > 0)) return 0;
+  return Math.min(
+    NOTE_TAIL_GAP_PX,
+    lengthPx * TAIL_GAP_MAX_FRAC,
+    Math.max(0, lengthPx - TAIL_GAP_MIN_BODY),
+  );
+}
+
 // Shade a hex color lighter (+) or darker (-); passthrough for oklch.
 export function shade(col: string, amt: number): string {
   if (!col.startsWith("#")) {

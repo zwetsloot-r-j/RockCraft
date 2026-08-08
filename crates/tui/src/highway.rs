@@ -82,6 +82,38 @@ pub struct RowSpan {
     pub bottom_row: u16,
 }
 
+/// Rows shaved off a span's **trailing** edge so repeated notes read apart.
+///
+/// Why two and not one: a note's end and the next same-pitch note's onset are
+/// the *same* instant, so [`project`] maps them to the same row — the raw
+/// extents always overlap there. The first trimmed row only hands that shared
+/// row back to the later note; the second is the row that actually reads as a
+/// gap. The cost is a flat two rows however long the note is, so sustains
+/// barely notice it.
+const TAIL_GAP_ROWS: u16 = 2;
+
+impl RowSpan {
+    /// The rows to actually paint for this span, with the **trailing**
+    /// (later-in-time) edge shaved back — that's the top, since notes fall
+    /// toward the keyboard line at the bottom.
+    ///
+    /// Two same-pitch notes played back to back share an edge: the first one's
+    /// end is the second one's onset, so their blocks touch and read as one
+    /// unbroken bar. Blanking the trailing rows puts a gap between them. The
+    /// onset row is never given up, and a span always keeps at least one row —
+    /// a note that vanished would be worse than one that touches.
+    ///
+    /// Render-only: [`project`] still reports the true extent; this trims what
+    /// is drawn, never the timing.
+    pub fn body_rows(&self) -> std::ops::RangeInclusive<u16> {
+        let top = self
+            .top_row
+            .saturating_add(TAIL_GAP_ROWS)
+            .min(self.bottom_row);
+        top..=self.bottom_row
+    }
+}
+
 /// Project a note span onto a highway of `height` rows, given the current play
 /// time `now_us` and a `lead_us` window (how far into the future the top of the
 /// highway represents). Returns `None` if the span is not currently visible.
@@ -239,6 +271,60 @@ mod tests {
             end_us: 100,
         };
         assert!(project(&past, 1_000_000, 1_000_000, 10).is_none());
+    }
+
+    #[test]
+    fn body_rows_trims_the_trailing_edge() {
+        let rs = RowSpan {
+            note: 60,
+            top_row: 2,
+            bottom_row: 8,
+        };
+        // The two topmost (later-in-time) rows are left blank; the onset row
+        // at the bottom is untouched.
+        assert_eq!(rs.body_rows().collect::<Vec<_>>(), vec![4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn body_rows_always_keeps_the_onset_row() {
+        for (top, bottom) in [(4u16, 4u16), (4, 5), (4, 6)] {
+            let rs = RowSpan {
+                note: 60,
+                top_row: top,
+                bottom_row: bottom,
+            };
+            let rows: Vec<u16> = rs.body_rows().collect();
+            assert!(!rows.is_empty(), "{top}..={bottom} painted nothing");
+            assert_eq!(*rows.last().unwrap(), bottom, "onset row was trimmed");
+        }
+    }
+
+    #[test]
+    fn back_to_back_same_pitch_notes_are_separated() {
+        // Two adjacent notes on the same pitch: the first ends exactly where
+        // the second starts, so their projected blocks touch — the "one long
+        // bar" look this trim exists to break up.
+        let evs = vec![
+            on(60, 0),
+            off(60, 500_000),
+            on(60, 500_000),
+            off(60, 1_000_000),
+        ];
+        let spans = build_spans(&evs);
+        assert_eq!(spans.len(), 2);
+        // `a` is the lower (earlier) block, `b` the upper (later) one.
+        let a = project(&spans[0], 0, 1_000_000, 20).unwrap();
+        let b = project(&spans[1], 0, 1_000_000, 20).unwrap();
+        // Raw extents meet (they even share the boundary row) — no gap at all.
+        assert!(a.top_row <= b.bottom_row);
+        // Painted bodies leave at least one blank row between the two blocks.
+        let painted: Vec<u16> = a.body_rows().chain(b.body_rows()).collect();
+        let hi = b.body_rows().min().unwrap(); // higher up = smaller row
+        let lo = a.body_rows().max().unwrap();
+        assert!(
+            (hi..=lo).any(|r| !painted.contains(&r)),
+            "expected a blank row between the two blocks: {painted:?}"
+        );
     }
 
     #[test]
