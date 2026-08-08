@@ -34,7 +34,7 @@ pub use events::{MidiNote, NoteEvent, NoteEventKind, Velocity};
 pub use grid::{Grid, Subdivision, TimeSig};
 pub use history::History;
 pub use play_clock::PlayClock;
-pub use scoring::{score, ExpectedNote, NoteJudgment, ScoreConfig, ScoreReport, Timing};
+pub use scoring::{score, ExpectedNote, Feedback, NoteJudgment, ScoreConfig, ScoreReport, Timing};
 pub use segment::{segments_from_splits, slice_segment, Segment, SliceResult};
 pub use song::{
     backing_position_us, song_shift_us, BackgroundVideo, BackingTrack, MetaError, RecordingMeta,

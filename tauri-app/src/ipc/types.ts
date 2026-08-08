@@ -320,8 +320,36 @@ export interface PlayStateEvent {
   held: number[];
   /** Notes the player must hold to un-freeze (empty unless `frozen`). */
   awaiting: number[];
+  /**
+   * Notes judged since the previous snapshot, in song-time order (M14-B).
+   * One-shot: a judged note appears in exactly one `play_state`, so the screen
+   * spawns one decaying effect per entry without de-duplicating.
+   */
+  judgments: HitFeedback[];
   /** Set once the song (plus tail) has finished. */
   finished: boolean;
+}
+
+/**
+ * How loud a judged note should read — mirror of `core::scoring::Feedback`
+ * (`as_str`). The strength rule lives in core; the frontend only maps a level
+ * onto pixels.
+ */
+export type FeedbackLevel = "clear" | "near" | "subtle";
+
+/** Timing detail behind a judgment — mirror of `core::scoring::Timing` + miss. */
+export type FeedbackTiming = "perfect" | "early" | "late" | "miss";
+
+/** One judged note — mirror of `play::HitFeedbackView`. */
+export interface HitFeedback {
+  /** Pitch, i.e. which lane the effect belongs at. */
+  note: number;
+  level: FeedbackLevel;
+  timing: FeedbackTiming;
+  /** Signed timing error in microseconds (negative = early); 0 on a miss. */
+  error_us: number;
+  /** The (shifted) song time of the note this judges. */
+  time_us: number;
 }
 
 /** End-of-take summary returned by `play_finish` — mirror of `play::PlaySummary`. */

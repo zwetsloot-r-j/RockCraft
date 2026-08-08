@@ -42,6 +42,55 @@ pub enum NoteJudgment {
     Miss,
 }
 
+/// How strongly a play screen should react to one judged note.
+///
+/// Every frontend turns a judged note into a one-shot effect at that note's
+/// lane, and how *loud* that effect is must follow the judgment. The mapping is
+/// pure, so it lives here rather than being re-derived (and drifting) per
+/// frontend:
+///
+/// - [`Timing::Perfect`] → [`Feedback::Clear`] — a well-timed hit reads
+///   unmistakably.
+/// - [`Timing::Early`] / [`Timing::Late`] → [`Feedback::Near`] — it counted, but
+///   the effect is visibly lesser so the player feels the difference.
+/// - [`NoteJudgment::Miss`] → [`Feedback::Subtle`] — acknowledged quietly; a
+///   missed note should not shout over the notes still falling.
+///
+/// The ordering (`Subtle < Near < Clear`) is the intensity ordering, so a
+/// frontend can compare levels rather than matching every variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Feedback {
+    /// Barely-there acknowledgement (a miss).
+    Subtle,
+    /// Lesser effect — a hit that was off-time.
+    Near,
+    /// Full effect — a well-timed hit.
+    Clear,
+}
+
+impl Feedback {
+    /// The feedback level a judgment earns.
+    pub const fn from_judgment(judgment: NoteJudgment) -> Self {
+        match judgment {
+            NoteJudgment::Hit {
+                timing: Timing::Perfect,
+                ..
+            } => Self::Clear,
+            NoteJudgment::Hit { .. } => Self::Near,
+            NoteJudgment::Miss => Self::Subtle,
+        }
+    }
+
+    /// Stable wire name, for frontends that receive the level over IPC.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Subtle => "subtle",
+            Self::Near => "near",
+            Self::Clear => "clear",
+        }
+    }
+}
+
 /// Tunable timing windows (microseconds).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScoreConfig {
@@ -298,5 +347,85 @@ mod tests {
         assert_eq!(r.hits, 0);
         assert_eq!(r.misses, 0);
         assert_eq!(r.extras, 0);
+    }
+}
+
+/// Feedback-level mapping (M14-B). Kept in its own module so the seeded
+/// `tests` module above stays exactly as committed.
+#[cfg(test)]
+mod feedback_tests {
+    use super::*;
+
+    fn hit(timing: Timing, error_us: i64) -> NoteJudgment {
+        NoteJudgment::Hit { timing, error_us }
+    }
+
+    #[test]
+    fn perfect_reads_clear() {
+        assert_eq!(
+            Feedback::from_judgment(hit(Timing::Perfect, 0)),
+            Feedback::Clear
+        );
+    }
+
+    #[test]
+    fn off_time_hits_read_near_regardless_of_direction() {
+        assert_eq!(
+            Feedback::from_judgment(hit(Timing::Early, -100_000)),
+            Feedback::Near
+        );
+        assert_eq!(
+            Feedback::from_judgment(hit(Timing::Late, 100_000)),
+            Feedback::Near
+        );
+    }
+
+    #[test]
+    fn miss_reads_subtle() {
+        assert_eq!(
+            Feedback::from_judgment(NoteJudgment::Miss),
+            Feedback::Subtle
+        );
+    }
+
+    #[test]
+    fn levels_order_by_intensity() {
+        assert!(Feedback::Clear > Feedback::Near);
+        assert!(Feedback::Near > Feedback::Subtle);
+    }
+
+    #[test]
+    fn wire_names_are_distinct_and_stable() {
+        assert_eq!(Feedback::Clear.as_str(), "clear");
+        assert_eq!(Feedback::Near.as_str(), "near");
+        assert_eq!(Feedback::Subtle.as_str(), "subtle");
+    }
+
+    /// Every judgment a `score` run can produce maps to a level — the whole
+    /// point is that a frontend never has to invent one.
+    #[test]
+    fn every_scored_judgment_has_a_level() {
+        use crate::{MidiNote, Velocity};
+        let cfg = ScoreConfig::default();
+        let expected = [
+            ExpectedNote::new(MidiNote::new(60).unwrap(), 1_000_000),
+            ExpectedNote::new(MidiNote::new(62).unwrap(), 2_000_000),
+            ExpectedNote::new(MidiNote::new(64).unwrap(), 3_000_000),
+        ];
+        let v = Velocity::new(80).unwrap();
+        let played = [
+            // dead on, 100 ms late, and never played
+            NoteEvent::on(MidiNote::new(60).unwrap(), v, 1_000_000),
+            NoteEvent::on(MidiNote::new(62).unwrap(), v, 2_100_000),
+        ];
+        let levels: Vec<Feedback> = score(&expected, &played, cfg)
+            .judgments
+            .into_iter()
+            .map(Feedback::from_judgment)
+            .collect();
+        assert_eq!(
+            levels,
+            vec![Feedback::Clear, Feedback::Near, Feedback::Subtle]
+        );
     }
 }
