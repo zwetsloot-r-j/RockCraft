@@ -6,8 +6,8 @@
 use std::fs;
 
 use rockcraft_core::{
-    slice_segment, BackgroundVideo, BackingTrack, Grid, Key, MidiNote, Note, RecordingMeta, Scale,
-    Segment, Timeline, TrackOrigin, Velocity,
+    slice_segment, BackgroundImage, BackgroundVideo, BackingTrack, Easing, Grid, Key, MidiNote,
+    Note, RecordingMeta, Scale, Segment, Timeline, TrackOrigin, Transform, Velocity,
 };
 use rockcraft_import::write_part_bundle;
 
@@ -46,6 +46,7 @@ fn split_writes_kept_parts_with_copied_media_and_derived_offsets() {
     fs::write(src.join("song.mid"), b"SOURCE-MIDI").unwrap();
     fs::write(src.join("backing.wav"), b"AUDIO-BYTES").unwrap();
     fs::write(src.join("background.mp4"), b"VIDEO-BYTES").unwrap();
+    fs::write(src.join("background-0.png"), b"PNG-BYTES").unwrap();
     fs::write(src.join("meta.json"), b"{\"midi_file\":\"song.mid\"}").unwrap();
 
     let tl = four_note_timeline();
@@ -76,10 +77,22 @@ fn split_writes_kept_parts_with_copied_media_and_derived_offsets() {
         ),
     ];
 
+    // One animated background layer: a 3 s pan across the whole piece, so each
+    // part must open and close on the layout the source had at its edges.
+    let mut layer = BackgroundImage::new("bg-0", "background-0.png");
+    layer.set_keyframe(0, Transform::IDENTITY, Easing::Linear);
+    layer.set_keyframe(
+        3_000_000,
+        Transform::new(1.0, 0.0, 1.0, 0.0, 1.0),
+        Easing::Linear,
+    );
+    let backgrounds = vec![layer];
+    let background_srcs = vec![("bg-0".to_string(), src.join("background-0.png"))];
+
     let out = root.path().join("library");
     let mut dirs = Vec::new();
     for (slug, seg) in kept {
-        let sliced = slice_segment(&tl, seg, Some(&backing), Some(&video));
+        let sliced = slice_segment(&tl, seg, Some(&backing), Some(&video), &backgrounds);
         let dir = out.join(slug);
         let written = write_part_bundle(
             &dir,
@@ -88,6 +101,7 @@ fn split_writes_kept_parts_with_copied_media_and_derived_offsets() {
             test_key(),
             Some(&src.join("backing.wav")),
             Some(&src.join("background.mp4")),
+            &background_srcs,
         )
         .unwrap();
         assert_eq!(written, dir);
@@ -117,6 +131,24 @@ fn split_writes_kept_parts_with_copied_media_and_derived_offsets() {
         let v = meta.video.expect("video persisted");
         assert_eq!(v.file, "background.mp4");
         assert_eq!(v.offset_us, -100_000 + seg.start_us as i64);
+
+        // The background image is copied verbatim too, and its animation is
+        // resampled onto the part: the pan spans 0 → 1 over 3 s, so the part
+        // starting at `seg.start_us` opens at `seg.start_us / 3 s`.
+        assert_eq!(
+            fs::read(dir.join("background-0.png")).unwrap(),
+            b"PNG-BYTES"
+        );
+        let layer = meta
+            .backgrounds
+            .first()
+            .expect("background layer persisted");
+        let expected = seg.start_us as f32 / 3_000_000.0;
+        assert!(
+            (layer.transform_at(0).x - expected).abs() < 1e-5,
+            "part opens at {expected}, got {:?}",
+            layer.transform_at(0)
+        );
     }
 
     // The source bundle is left completely untouched.
@@ -145,9 +177,19 @@ fn split_midi_only_piece_writes_media_less_bundles() {
         },
         None,
         None,
+        &[],
     );
     let dir = root.path().join("part");
-    write_part_bundle(&dir, &sliced, Grid::default_120(), test_key(), None, None).unwrap();
+    write_part_bundle(
+        &dir,
+        &sliced,
+        Grid::default_120(),
+        test_key(),
+        None,
+        None,
+        &[],
+    )
+    .unwrap();
 
     assert!(dir.join("song.mid").exists());
     let meta =
@@ -157,4 +199,5 @@ fn split_midi_only_piece_writes_media_less_bundles() {
     assert_eq!(meta.origin, Some(TrackOrigin::Edited));
     assert!(!dir.join("backing.wav").exists());
     assert!(!dir.join("background.mp4").exists());
+    assert!(meta.backgrounds.is_empty());
 }

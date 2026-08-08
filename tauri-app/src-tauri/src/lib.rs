@@ -36,7 +36,9 @@ use crate::import::ImportRunning;
 use crate::midi::{MidiState, MidiStatus};
 use crate::play::PlayState;
 use crate::record::RecordState;
-use crate::state::{ActionReply, AppState, BackingRef, SaveDest, SplitSegment, VideoRef};
+use crate::state::{
+    ActionReply, AppState, BackgroundRef, BackingRef, SaveDest, SplitSegment, VideoRef,
+};
 
 /// Tick cadence for the transport-advance thread (~4 ms ≈ 250 Hz). Fine-grained
 /// so the injected `dt_us` for scoring / audition boundaries is precise.
@@ -228,6 +230,35 @@ fn edit_clear_video(state: State<'_, AppState>) {
 #[tauri::command]
 fn edit_query_video(state: State<'_, AppState>) -> Option<VideoRef> {
     state::query_video(&state)
+}
+
+/// Attach a background image as the front-most layer and select it (M14-D).
+/// `path` is the absolute file the webview picked; the layer starts still until
+/// a background action writes its first keyframe. Returns the layer list.
+#[tauri::command]
+fn edit_attach_background(state: State<'_, AppState>, path: String) -> Vec<BackgroundRef> {
+    state::attach_background(&state, path)
+}
+
+/// Detach the background image layer with this id (M14-D). Returns the
+/// remaining layers; an unknown id is an error.
+#[tauri::command]
+fn edit_detach_background(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<Vec<BackgroundRef>, String> {
+    if state::detach_background(&state, &id) {
+        Ok(state::query_backgrounds(&state))
+    } else {
+        Err(format!("no background layer `{id}`"))
+    }
+}
+
+/// Every background image layer with its transform evaluated at the playhead
+/// (M14-D).
+#[tauri::command]
+fn edit_query_backgrounds(state: State<'_, AppState>) -> Vec<BackgroundRef> {
+    state::query_backgrounds(&state)
 }
 
 /// Attach (or replace) the edit-screen backing audio track (M9-E). `path` is the
@@ -505,6 +536,9 @@ pub fn run() {
             edit_set_video_offset,
             edit_clear_video,
             edit_query_video,
+            edit_attach_background,
+            edit_detach_background,
+            edit_query_backgrounds,
             edit_set_backing,
             edit_clear_backing,
             edit_query_backing,

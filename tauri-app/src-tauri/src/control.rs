@@ -432,6 +432,24 @@ impl HostServices for TauriHost<'_> {
                 crate::state::query_video(&app.state::<AppState>()),
             ),
 
+            // ── background images (M14-D) ───────────────────────────────
+            HostCommand::AttachBackground { path } => json_payload(
+                "attach_background",
+                crate::state::attach_background(&app.state::<AppState>(), path),
+            ),
+            HostCommand::DetachBackground { id } => {
+                let state = app.state::<AppState>();
+                if crate::state::detach_background(&state, &id) {
+                    json_payload("detach_background", crate::state::query_backgrounds(&state))
+                } else {
+                    failed("detach_background", format!("no background layer `{id}`"))
+                }
+            }
+            HostCommand::QueryBackgrounds => json_payload(
+                "query_backgrounds",
+                crate::state::query_backgrounds(&app.state::<AppState>()),
+            ),
+
             // ── import ──────────────────────────────────────────────────
             HostCommand::ImportStart { url } => {
                 match crate::import::import_start(

@@ -10,6 +10,7 @@
 //! other way around.
 
 pub mod action;
+pub mod background;
 pub mod buffer;
 pub mod chord;
 pub mod composer;
@@ -27,6 +28,10 @@ pub mod wait;
 
 pub use action::{
     action_from_name, action_help, action_names, Action, ActionError, ActionInfo, Effect, ParamInfo,
+};
+pub use background::{
+    BackgroundImage, BackgroundStack, BackgroundView, Easing, Keyframe, Transform, MAX_SCALE,
+    MIN_SCALE, POS_LIMIT,
 };
 pub use buffer::EventBuffer;
 pub use chord::{ChordKind, Key, Scale};

@@ -13,9 +13,9 @@
 use std::sync::Mutex;
 
 use rockcraft_core::{
-    action_from_name, action_help, slice_segment, ActionError, BackgroundVideo, BackingTrack,
-    Composer, ComposerSnapshot, Effect, Grid, Key, NoteView, RecordingMeta, Scale, Segment,
-    Timeline, TrackOrigin,
+    action_from_name, action_help, slice_segment, ActionError, BackgroundImage, BackgroundStack,
+    BackgroundVideo, BackingTrack, Composer, ComposerSnapshot, Effect, Grid, Key, Keyframe,
+    NoteView, RecordingMeta, Scale, Segment, Timeline, TrackOrigin, Transform,
 };
 use rockcraft_midi::{events_to_smf_bytes, smf_bytes_to_events};
 use serde::{Deserialize, Serialize};
@@ -69,6 +69,22 @@ pub struct AppState {
     /// backdrop. Persisted into `meta.json` on save (M9-G); the file is copied
     /// into the bundle next to `song.mid`.
     pub video: Mutex<Option<AttachedVideo>>,
+    /// Absolute source image per background layer id (M14-D). The layout and
+    /// keyframes live on the composer's `BackgroundStack` — pure state, edited
+    /// by `core::Action`s — so this holds only what `core` may not: where the
+    /// file is. Exactly the split [`AppState::backing_path`] uses.
+    pub background_srcs: Mutex<Vec<AttachedBackground>>,
+}
+
+/// A background image attached to the live editor: the layer id it belongs to
+/// and the absolute source file, mirrored here so `save_bundle` can copy it into
+/// the bundle. Sibling of [`AttachedVideo`].
+#[derive(Debug, Clone)]
+pub struct AttachedBackground {
+    /// Matches `BackgroundImage::id` on the composer's stack.
+    pub id: String,
+    /// Absolute source path (or the resolved in-bundle path after a load).
+    pub path: std::path::PathBuf,
 }
 
 /// A background video attached to the live editor, mirrored frontend-side so
@@ -97,6 +113,7 @@ impl AppState {
             dirty: Mutex::new(false),
             backing_path: Mutex::new(None),
             video: Mutex::new(None),
+            background_srcs: Mutex::new(Vec::new()),
         }
     }
 }
@@ -200,21 +217,6 @@ fn timeline_fingerprint_snapshot(notes: &[NoteView]) -> u64 {
 ///
 /// Mirrors `EditScreen::save` / `save_to_library` from `crates/tui/src/edit.rs`.
 pub fn save_bundle(state: &AppState, dest: SaveDest) -> Result<String, String> {
-    let composer = state.composer.lock().expect("composer mutex poisoned");
-    let timeline = composer.timeline().clone();
-    let grid = composer.grid();
-    let backing_offset_us = composer.backing_offset_us();
-    drop(composer);
-
-    let key = *state.key.lock().expect("key mutex poisoned");
-    let origin = *state.origin.lock().expect("origin mutex poisoned");
-    let backing_path = state
-        .backing_path
-        .lock()
-        .expect("backing_path mutex poisoned")
-        .clone();
-    let video = state.video.lock().expect("video mutex poisoned").clone();
-
     let bundle_dir = match &dest {
         SaveDest::QuickSave => {
             let stamp = std::time::SystemTime::now()
@@ -231,9 +233,37 @@ pub fn save_bundle(state: &AppState, dest: SaveDest) -> Result<String, String> {
             rockcraft_midi::bundle::library_root().join(slug)
         }
     };
+    save_bundle_into(state, &bundle_dir)?;
+    Ok(bundle_dir.to_string_lossy().into_owned())
+}
+
+/// [`save_bundle`] with an explicit destination directory, so tests can target a
+/// temp directory without touching `$ROCKCRAFT_LIBRARY_DIR`. Gathers every piece
+/// of live state the bundle needs, writes it, and clears the dirty flag.
+fn save_bundle_into(state: &AppState, bundle_dir: &std::path::Path) -> Result<(), String> {
+    let composer = state.composer.lock().expect("composer mutex poisoned");
+    let timeline = composer.timeline().clone();
+    let grid = composer.grid();
+    let backing_offset_us = composer.backing_offset_us();
+    let backgrounds = composer.backgrounds().layers().to_vec();
+    drop(composer);
+
+    let key = *state.key.lock().expect("key mutex poisoned");
+    let origin = *state.origin.lock().expect("origin mutex poisoned");
+    let background_srcs = state
+        .background_srcs
+        .lock()
+        .expect("background_srcs mutex poisoned")
+        .clone();
+    let backing_path = state
+        .backing_path
+        .lock()
+        .expect("backing_path mutex poisoned")
+        .clone();
+    let video = state.video.lock().expect("video mutex poisoned").clone();
 
     write_bundle(
-        &bundle_dir,
+        bundle_dir,
         &timeline,
         grid,
         key,
@@ -241,14 +271,14 @@ pub fn save_bundle(state: &AppState, dest: SaveDest) -> Result<String, String> {
         backing_path.as_deref(),
         backing_offset_us,
         video.as_ref(),
+        &backgrounds,
+        &background_srcs,
     )
     .map_err(|e| e.to_string())?;
 
     // Clear dirty flag after a successful save.
-    let mut dirty = state.dirty.lock().expect("dirty mutex poisoned");
-    *dirty = false;
-
-    Ok(bundle_dir.to_string_lossy().into_owned())
+    *state.dirty.lock().expect("dirty mutex poisoned") = false;
+    Ok(())
 }
 
 /// Write `song.mid` + `meta.json` (+ optional backing/video copies) into
@@ -263,6 +293,8 @@ fn write_bundle(
     backing_path: Option<&std::path::Path>,
     backing_offset_us: u64,
     video: Option<&AttachedVideo>,
+    backgrounds: &[BackgroundImage],
+    background_srcs: &[AttachedBackground],
 ) -> std::io::Result<()> {
     std::fs::create_dir_all(bundle_dir)?;
     let bytes = events_to_smf_bytes(&timeline.to_events());
@@ -283,6 +315,19 @@ fn write_bundle(
         .map(|v| video_meta_for_bundle(bundle_dir, v))
         .transpose()?;
 
+    // Copy each background image in under the bundle-relative name its layer
+    // already carries; a layer whose source is missing keeps its keyframes so a
+    // re-save never silently drops the animation.
+    for layer in backgrounds {
+        let Some(src) = background_srcs.iter().find(|b| b.id == layer.id) else {
+            continue;
+        };
+        let dest = bundle_dir.join(&layer.file);
+        if src.path != dest {
+            std::fs::copy(&src.path, &dest)?;
+        }
+    }
+
     let meta = RecordingMeta {
         midi_file: "song.mid".into(),
         backing,
@@ -290,6 +335,7 @@ fn write_bundle(
         key: Some(key),
         origin: Some(origin),
         video,
+        backgrounds: backgrounds.to_vec(),
         version: 1,
     };
     std::fs::write(bundle_dir.join("meta.json"), meta.to_json())?;
@@ -327,6 +373,7 @@ fn split_bundle_into(
     let timeline = composer.timeline().clone();
     let grid = composer.grid();
     let backing_offset_us = composer.backing_offset_us();
+    let backgrounds = composer.backgrounds().layers().to_vec();
     drop(composer);
 
     let key = *state.key.lock().expect("key mutex poisoned");
@@ -336,6 +383,13 @@ fn split_bundle_into(
         .expect("backing_path mutex poisoned")
         .clone();
     let video = state.video.lock().expect("video mutex poisoned").clone();
+    let background_srcs: Vec<(String, std::path::PathBuf)> = state
+        .background_srcs
+        .lock()
+        .expect("background_srcs mutex poisoned")
+        .iter()
+        .map(|b| (b.id.clone(), b.path.clone()))
+        .collect();
 
     // The loaded media references the slicer shifts per segment. The file names
     // match what `write_bundle` would write, so the copied files line up.
@@ -365,6 +419,7 @@ fn split_bundle_into(
             },
             backing_meta.as_ref(),
             video_meta.as_ref(),
+            &backgrounds,
         );
         let dir = library_root.join(&slug);
         rockcraft_import::write_part_bundle(
@@ -374,6 +429,7 @@ fn split_bundle_into(
             key,
             backing_path.as_deref(),
             video.as_ref().map(|v| v.path.as_path()),
+            &background_srcs,
         )
         .map_err(|e| e.to_string())?;
         dirs.push(dir.to_string_lossy().into_owned());
@@ -441,6 +497,7 @@ pub fn load_bundle(state: &AppState, dir: &str) -> Result<ComposerSnapshot, Stri
         Option<std::path::PathBuf>,
         u64,
         Option<AttachedVideo>,
+        Vec<BackgroundImage>,
     );
     let default_meta = || -> MetaTuple {
         (
@@ -453,9 +510,10 @@ pub fn load_bundle(state: &AppState, dir: &str) -> Result<ComposerSnapshot, Stri
             None,
             0,
             None,
+            Vec::new(),
         )
     };
-    let (grid, key, origin, backing_path, backing_offset_us, video) =
+    let (grid, key, origin, backing_path, backing_offset_us, video, backgrounds) =
         match std::fs::read_to_string(bundle_dir.join("meta.json")) {
             Ok(json) => match RecordingMeta::from_json(&json) {
                 Ok(meta) => {
@@ -479,7 +537,7 @@ pub fn load_bundle(state: &AppState, dir: &str) -> Result<ComposerSnapshot, Stri
                         path: bundle_dir.join(&v.file),
                         offset_us: v.offset_us,
                     });
-                    (grid, key, origin, bpath, boffset, video)
+                    (grid, key, origin, bpath, boffset, video, meta.backgrounds)
                 }
                 Err(_) => default_meta(),
             },
@@ -492,6 +550,7 @@ pub fn load_bundle(state: &AppState, dir: &str) -> Result<ComposerSnapshot, Stri
         *composer = Composer::from_timeline(timeline, grid);
         composer.set_key(key);
         composer.set_backing_offset_us(backing_offset_us);
+        composer.set_backgrounds(BackgroundStack::from_layers(backgrounds.clone()));
     }
 
     // Update the side-channel state.
@@ -503,6 +562,18 @@ pub fn load_bundle(state: &AppState, dir: &str) -> Result<ComposerSnapshot, Stri
         .lock()
         .expect("backing_path mutex poisoned") = backing_path;
     *state.video.lock().expect("video mutex poisoned") = video;
+    // Resolve each background layer's bundle-relative file to an absolute path
+    // so the webview's asset protocol can load it (M14-D).
+    *state
+        .background_srcs
+        .lock()
+        .expect("background_srcs mutex poisoned") = backgrounds
+        .into_iter()
+        .map(|l| AttachedBackground {
+            path: bundle_dir.join(&l.file),
+            id: l.id,
+        })
+        .collect();
 
     // Return the fresh snapshot.
     let composer = state.composer.lock().expect("composer mutex poisoned");
@@ -610,6 +681,111 @@ pub fn query_video(state: &AppState) -> Option<VideoRef> {
             path: v.path.to_string_lossy().into_owned(),
             offset_us: v.offset_us,
         })
+}
+
+/// Serializable background-image reference for the edit/play screens: the
+/// absolute `path` the webview wraps with `convertFileSrc`, plus the layer's
+/// identity and its transform **already evaluated** at the playhead.
+#[derive(Debug, Clone, Serialize)]
+pub struct BackgroundRef {
+    pub index: usize,
+    pub id: String,
+    pub file: String,
+    pub path: String,
+    pub selected: bool,
+    pub transform: Transform,
+    pub keyframes: Vec<Keyframe>,
+}
+
+/// Bundle-relative filename for a background image layer, derived from the
+/// source extension (defaulting to `.png`) and the layer's ordinal.
+fn background_bundle_filename(src: &std::path::Path, ordinal: usize) -> String {
+    let ext = src
+        .extension()
+        .and_then(|e| e.to_str())
+        .filter(|e| !e.is_empty())
+        .unwrap_or("png");
+    format!("background-{ordinal}.{ext}")
+}
+
+/// Attach a background image by absolute path, appending it as the front-most
+/// layer and selecting it (M14-D). Marks the timeline dirty so a later save
+/// copies the file into the bundle and persists `meta.backgrounds`.
+///
+/// The new layer starts with **no keyframes** — a still, centred backdrop —
+/// until an edit action writes the first one.
+pub fn attach_background(state: &AppState, path: String) -> Vec<BackgroundRef> {
+    let src = std::path::PathBuf::from(path);
+    {
+        let mut composer = state.composer.lock().expect("composer mutex poisoned");
+        let stack = composer.backgrounds_mut();
+        // Lowest free ordinal, so detaching then re-attaching reuses the slot
+        // instead of growing the names forever.
+        let ordinal = (0..)
+            .find(|n| !stack.contains_id(&format!("bg-{n}")))
+            .expect("free ordinal");
+        let id = format!("bg-{ordinal}");
+        let file = background_bundle_filename(&src, ordinal);
+        stack.push(BackgroundImage::new(id.clone(), file));
+        state
+            .background_srcs
+            .lock()
+            .expect("background_srcs mutex poisoned")
+            .push(AttachedBackground { id, path: src });
+    }
+    *state.dirty.lock().expect("dirty mutex poisoned") = true;
+    query_backgrounds(state)
+}
+
+/// Detach the background layer with this id. Returns whether it existed; marks
+/// the timeline dirty when it did.
+pub fn detach_background(state: &AppState, id: &str) -> bool {
+    let removed = {
+        let mut composer = state.composer.lock().expect("composer mutex poisoned");
+        composer.backgrounds_mut().remove_by_id(id).is_some()
+    };
+    if removed {
+        state
+            .background_srcs
+            .lock()
+            .expect("background_srcs mutex poisoned")
+            .retain(|b| b.id != id);
+        *state.dirty.lock().expect("dirty mutex poisoned") = true;
+    }
+    removed
+}
+
+/// Every background layer with its absolute source path and its transform
+/// evaluated at the playhead — what the edit screen renders from.
+pub fn query_backgrounds(state: &AppState) -> Vec<BackgroundRef> {
+    let views = state
+        .composer
+        .lock()
+        .expect("composer mutex poisoned")
+        .background_views();
+    let srcs = state
+        .background_srcs
+        .lock()
+        .expect("background_srcs mutex poisoned");
+    views
+        .into_iter()
+        .map(|v| {
+            let path = srcs
+                .iter()
+                .find(|b| b.id == v.id)
+                .map(|b| b.path.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            BackgroundRef {
+                index: v.index,
+                id: v.id,
+                file: v.file,
+                path,
+                selected: v.selected,
+                transform: v.transform,
+                keyframes: v.keyframes,
+            }
+        })
+        .collect()
 }
 
 /// Current composer snapshot — mirrors `query state`.
@@ -810,6 +986,8 @@ mod tests {
                 None,
                 0,
                 None,
+                &[],
+                &[],
             )
             .expect("write_bundle should succeed");
         }
@@ -921,6 +1099,8 @@ mod tests {
                 state.backing_path.lock().unwrap().as_deref(),
                 composer.backing_offset_us(),
                 None,
+                &[],
+                &[],
             )
             .expect("write_bundle with backing should succeed");
         }
@@ -961,6 +1141,188 @@ mod tests {
         assert!(query_dirty(&state), "detach marks dirty");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── background images (M14-D) ──────────────────────────────────────────
+
+    /// A unique temp directory for a bundle round-trip test.
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rockcraft-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn attach_background_adds_a_selected_still_layer() {
+        let state = AppState::new();
+        assert!(query_backgrounds(&state).is_empty());
+
+        let layers = attach_background(&state, "/tmp/art.jpg".to_string());
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].id, "bg-0");
+        assert_eq!(layers[0].file, "background-0.jpg");
+        assert_eq!(layers[0].path, "/tmp/art.jpg");
+        assert!(layers[0].selected);
+        // A new layer starts still — no keyframes, identity transform.
+        assert!(layers[0].keyframes.is_empty());
+        assert_eq!(layers[0].transform, Transform::IDENTITY);
+        assert!(query_dirty(&state), "attaching marks the piece dirty");
+
+        // A second layer goes in front and takes the selection.
+        let layers = attach_background(&state, "/tmp/second.png".to_string());
+        assert_eq!(layers.len(), 2);
+        assert_eq!(layers[1].id, "bg-1");
+        assert_eq!(layers[1].file, "background-1.png");
+        assert!(layers[1].selected && !layers[0].selected);
+        // …and the snapshot agrees.
+        assert_eq!(query_state(&state).selected_background, Some(1));
+    }
+
+    #[test]
+    fn background_actions_animate_the_selected_layer() {
+        let state = AppState::new();
+        attach_background(&state, "/tmp/art.png".to_string());
+
+        // Keyframe the identity at t=0, then pan at a later playhead.
+        run_action(&state, "add_background_keyframe", &json!({})).expect("keyframe");
+        run_action(&state, "cursor_bar_right", &json!({})).expect("cursor");
+        run_action(
+            &state,
+            "nudge_background_pos",
+            &json!({ "dx_permille": 500, "dy_permille": 0 }),
+        )
+        .expect("pan");
+
+        let layers = query_backgrounds(&state);
+        assert_eq!(layers[0].keyframes.len(), 2);
+        // The playhead sits on the far keyframe, so the layer is fully panned.
+        assert!((layers[0].transform.x - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn detach_background_removes_the_layer_and_reuses_its_slot() {
+        let state = AppState::new();
+        attach_background(&state, "/tmp/a.png".to_string());
+        attach_background(&state, "/tmp/b.png".to_string());
+        assert!(!detach_background(&state, "bg-9"), "unknown id");
+        assert!(detach_background(&state, "bg-0"));
+
+        let layers = query_backgrounds(&state);
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].id, "bg-1");
+        // The freed ordinal is reused rather than growing forever.
+        let layers = attach_background(&state, "/tmp/c.png".to_string());
+        assert_eq!(layers[1].id, "bg-0");
+    }
+
+    #[test]
+    fn backgrounds_round_trip_through_a_saved_bundle() {
+        let dir = temp_dir("backgrounds");
+        let src = dir.join("art.png");
+        std::fs::write(&src, b"PNG").unwrap();
+
+        let state = AppState::new();
+        run_action(&state, "add_note", &json!({})).expect("add_note");
+        attach_background(&state, src.to_string_lossy().into_owned());
+        // Animate: identity at 0, panned + rotated a bar later.
+        run_action(&state, "add_background_keyframe", &json!({})).expect("keyframe");
+        run_action(&state, "cursor_bar_right", &json!({})).expect("cursor");
+        run_action(
+            &state,
+            "nudge_background_pos",
+            &json!({ "dx_permille": 250, "dy_permille": -125 }),
+        )
+        .expect("pan");
+        run_action(
+            &state,
+            "nudge_background_rotation",
+            &json!({ "delta_millideg": 15_000 }),
+        )
+        .expect("rotate");
+        let before = query_backgrounds(&state);
+
+        let bundle = dir.join("bundle");
+        save_bundle_into(&state, &bundle).expect("save");
+        assert!(
+            bundle.join("background-0.png").exists(),
+            "the image is copied into the bundle"
+        );
+        let meta =
+            RecordingMeta::from_json(&std::fs::read_to_string(bundle.join("meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(meta.backgrounds.len(), 1);
+        assert_eq!(meta.backgrounds[0].keyframes.len(), 2);
+
+        // Loading restores the animation *and* re-points the layer at the copy
+        // inside the bundle, so the webview can load it.
+        let fresh = AppState::new();
+        load_bundle(&fresh, &bundle.to_string_lossy()).expect("load");
+        let after = query_backgrounds(&fresh);
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].keyframes, before[0].keyframes);
+        assert_eq!(
+            after[0].path,
+            bundle.join("background-0.png").to_string_lossy()
+        );
+
+        // Re-saving the loaded piece is a no-op copy, not an error.
+        let bundle2 = dir.join("bundle2");
+        save_bundle_into(&fresh, &bundle2).expect("re-save");
+        assert!(bundle2.join("background-0.png").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn split_carries_backgrounds_into_each_part() {
+        let dir = temp_dir("split-backgrounds");
+        let src = dir.join("art.png");
+        std::fs::write(&src, b"PNG").unwrap();
+
+        let state = AppState::new();
+        run_action(&state, "add_note", &json!({})).expect("add_note");
+        attach_background(&state, src.to_string_lossy().into_owned());
+        // A 4 s pan across the whole piece.
+        run_action(&state, "add_background_keyframe", &json!({})).expect("keyframe at 0");
+        run_action(&state, "set_playhead", &json!({ "us": 4_000_000 })).expect("playhead");
+        run_action(&state, "play", &json!({ "from_us": 4_000_000 })).expect("play");
+        run_action(
+            &state,
+            "nudge_background_pos",
+            &json!({ "dx_permille": 1_000, "dy_permille": 0 }),
+        )
+        .expect("pan");
+        run_action(&state, "stop", &json!({})).expect("stop");
+
+        let root = dir.join("library");
+        let dirs = split_bundle_into(
+            &state,
+            &root,
+            vec![SplitSegment {
+                start_us: 1_000_000,
+                end_us: 3_000_000,
+                name: "Middle".into(),
+            }],
+        )
+        .expect("split");
+        assert_eq!(dirs.len(), 1);
+        let part = std::path::PathBuf::from(&dirs[0]);
+        assert!(part.join("background-0.png").exists(), "image copied in");
+        let meta =
+            RecordingMeta::from_json(&std::fs::read_to_string(part.join("meta.json")).unwrap())
+                .unwrap();
+        let layer = &meta.backgrounds[0];
+        // The part opens and closes on the layout the whole piece had there.
+        assert!((layer.transform_at(0).x - 0.25).abs() < 1e-5);
+        assert!((layer.transform_at(2_000_000).x - 0.75).abs() < 1e-5);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// M10-E: swapping or detaching the backing audio of a piece that carries a
@@ -1004,6 +1366,8 @@ mod tests {
                 backing_path.as_deref(),
                 offset,
                 video.as_ref(),
+                &[],
+                &[],
             )
             .expect("write_bundle should succeed");
         };

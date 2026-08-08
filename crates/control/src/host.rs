@@ -133,6 +133,15 @@ pub enum HostCommand {
     /// The currently attached background video, or null.
     QueryVideo,
 
+    // ── background images (M14-D) ───────────────────────────────────────
+    /// Attach a background image by path as the front-most layer, selecting it.
+    /// Persisted into the bundle on save. Returns the layer list.
+    AttachBackground { path: String },
+    /// Detach the background image layer with this id. Returns the layer list.
+    DetachBackground { id: String },
+    /// Every background layer with its transform evaluated at the playhead.
+    QueryBackgrounds,
+
     // ── import ──────────────────────────────────────────────────────────
     /// Start importing from a URL.
     ImportStart { url: String },
@@ -184,6 +193,9 @@ impl HostCommand {
             HostCommand::SetVideoOffset { .. } => "set_video_offset",
             HostCommand::DetachVideo => "detach_video",
             HostCommand::QueryVideo => "query_video",
+            HostCommand::AttachBackground { .. } => "attach_background",
+            HostCommand::DetachBackground { .. } => "detach_background",
+            HostCommand::QueryBackgrounds => "query_backgrounds",
             HostCommand::ImportStart { .. } => "import_start",
             HostCommand::ImportScore { .. } => "import_score",
             HostCommand::AudioStatus => "audio_status",
@@ -311,6 +323,9 @@ pub fn host_command_names() -> &'static [&'static str] {
         "set_video_offset",
         "detach_video",
         "query_video",
+        "attach_background",
+        "detach_background",
+        "query_backgrounds",
         "import_start",
         "import_score",
         "audio_status",
@@ -374,6 +389,10 @@ static HOST_HELP: &[HostCommandInfo] = {
         HostCommandInfo { name: "set_video_offset", params: &[p("offset_us", "i64")], description: "Update only the alignment offset of the already-attached background video. Returns the attached video reference." },
         HostCommandInfo { name: "detach_video", params: &[], description: "Detach the background video." },
         HostCommandInfo { name: "query_video", params: &[], description: "Return the currently attached background video, or null." },
+        // ── background images (M14-D) ───────────────────────────────────
+        HostCommandInfo { name: "attach_background", params: &[p("path", "String")], description: "Attach a background image by path as the front-most layer and select it. The layer starts still (no keyframes); animate it with the background actions (nudge_background_pos/scale/rotation, set_background_opacity, add_background_keyframe). Persisted into the bundle on save. Returns the layer list." },
+        HostCommandInfo { name: "detach_background", params: &[p("id", "String")], description: "Detach the background image layer with this id, dropping its keyframes. Returns the remaining layer list." },
+        HostCommandInfo { name: "query_backgrounds", params: &[], description: "Return every background image layer — id, bundle file, absolute path, selection, keyframes, and the transform evaluated at the playhead." },
         // ── import ──────────────────────────────────────────────────────
         HostCommandInfo { name: "import_start", params: &[p("url", "String")], description: "Start importing audio/video from a URL." },
         HostCommandInfo { name: "import_score", params: &[p("path", "String")], description: "Start importing a local score file (MusicXML/.xml/.mxl/.abc/.krn) or a scan (.pdf/.png/.jpg/.jpeg/.tif/.tiff/.bmp). A score file is a deterministic transform whose notated tempo, metre and key seed the new bundle's grid. A scan goes through an optical music recognition engine first, which is lossy: its notes carry a derived confidence, the import log reports how many were flagged, and it needs an OMR engine installed (see docs/IMPORT.md)." },
@@ -448,6 +467,11 @@ mod tests {
             HostCommand::SetVideoOffset { offset_us: 50_000 },
             HostCommand::DetachVideo,
             HostCommand::QueryVideo,
+            HostCommand::AttachBackground {
+                path: "art.png".into(),
+            },
+            HostCommand::DetachBackground { id: "bg-0".into() },
+            HostCommand::QueryBackgrounds,
             HostCommand::ImportStart {
                 url: "https://example.com/v".into(),
             },

@@ -42,10 +42,10 @@ use ratatui::{
 use rockcraft_audio::{play_file_at, BackingHandle, SynthHandle};
 use rockcraft_control::SegmentSpec;
 use rockcraft_core::{
-    backing_position_us, segments_from_splits, slice_segment, Action, BackgroundVideo,
-    BackingTrack, Composer, Cursor, Effect, Grid, InputMode, Key, MidiNote, Note, NoteEvent,
-    NoteId, RecordingMeta, Scale as MusicScale, Segment, Subdivision, Timeline, TrackOrigin,
-    Velocity,
+    backing_position_us, segments_from_splits, slice_segment, Action, BackgroundImage,
+    BackgroundStack, BackgroundVideo, BackingTrack, Composer, Cursor, Effect, Grid, InputMode, Key,
+    MidiNote, Note, NoteEvent, NoteId, RecordingMeta, Scale as MusicScale, Segment, Subdivision,
+    Timeline, TrackOrigin, Velocity,
 };
 use rockcraft_import::write_part_bundle;
 use rockcraft_midi::{events_to_smf_bytes, key_map as mock_key_map};
@@ -288,6 +288,19 @@ struct Video {
     offset_us: i64,
 }
 
+/// A background image layer's source file, carried by the editor (M14-D).
+///
+/// The layout and keyframes live in the [`Composer`]'s `BackgroundStack`; this
+/// pairs each layer's id with the absolute source image so save / split can copy
+/// the file into the new bundle. The TUI never draws it — a terminal cannot —
+/// but a piece must survive being opened and re-saved here.
+struct BackgroundSrc {
+    /// Layer id, matching `BackgroundImage::id` in the composer's stack.
+    id: String,
+    /// Absolute source path of the image file in the loaded bundle.
+    src: PathBuf,
+}
+
 /// One derived segment's editable metadata in the split panel: whether it is
 /// kept (vs. trimmed) and the name its bundle is saved under. Indexed by segment
 /// position; defaults are keep + `part-N`.
@@ -371,6 +384,9 @@ pub struct EditScreen {
     /// Backing offset at the previous `poll_backing`; a change while playing
     /// (an alignment nudge) triggers a re-seek so the shift is audible at once.
     prev_offset_us: u64,
+    /// Background image sources carried for save/split round-trip (M14-D), one
+    /// per layer in the composer's stack. The TUI renders none of them.
+    background_srcs: Vec<BackgroundSrc>,
     /// Background video reference carried for split round-trip (M10-D). `None`
     /// when the loaded piece has no backdrop; never rendered by the TUI.
     video: Option<Video>,
@@ -429,6 +445,7 @@ impl EditScreen {
             prev_playing: false,
             prev_playhead_us: 0,
             prev_offset_us: 0,
+            background_srcs: Vec::new(),
             video: None,
             split_mode: false,
             splits: Vec::new(),
@@ -473,6 +490,33 @@ impl EditScreen {
             offset_us,
         });
         self
+    }
+
+    /// Carry the loaded piece's background image layers for save/split
+    /// round-trip (M14-D). `layers` is `meta.backgrounds` (layout + keyframes,
+    /// handed to the composer) and `srcs` pairs each layer id with its absolute
+    /// source image. Builder form, mirroring [`with_video`]. The TUI never draws
+    /// them — this exists so a piece re-saved here keeps its backdrops.
+    pub fn with_backgrounds(
+        mut self,
+        layers: Vec<BackgroundImage>,
+        srcs: Vec<(String, PathBuf)>,
+    ) -> Self {
+        self.composer
+            .set_backgrounds(BackgroundStack::from_layers(layers));
+        self.background_srcs = srcs
+            .into_iter()
+            .map(|(id, src)| BackgroundSrc { id, src })
+            .collect();
+        self
+    }
+
+    /// Absolute source image per background layer id, for the bundle writers.
+    fn background_src_pairs(&self) -> Vec<(String, PathBuf)> {
+        self.background_srcs
+            .iter()
+            .map(|b| (b.id.clone(), b.src.clone()))
+            .collect()
     }
 
     /// Attach (or replace) the backing track while editing the loaded piece
@@ -588,6 +632,15 @@ impl EditScreen {
         } else {
             None
         };
+        // Carry attached background images through unchanged (M14-D), exactly
+        // like the movie above: copy each source in under its bundle-relative
+        // name and record the layer (layout + keyframes) in `meta.backgrounds`.
+        let backgrounds = self.composer.backgrounds().layers().to_vec();
+        for layer in &backgrounds {
+            if let Some(b) = self.background_srcs.iter().find(|b| b.id == layer.id) {
+                std::fs::copy(&b.src, bundle_dir.join(&layer.file))?;
+            }
+        }
         let meta = RecordingMeta {
             midi_file: "song.mid".into(),
             backing,
@@ -595,6 +648,7 @@ impl EditScreen {
             key: Some(self.key),
             origin: Some(self.origin),
             video,
+            backgrounds,
             version: 1,
         };
         std::fs::write(bundle_dir.join("meta.json"), meta.to_json())?;
@@ -802,6 +856,8 @@ impl EditScreen {
         });
         let backing_src = self.backing.as_ref().map(|b| b.path.as_path());
         let video_src = self.video.as_ref().map(|v| v.src.as_path());
+        let backgrounds = self.composer.backgrounds().layers().to_vec();
+        let background_srcs = self.background_src_pairs();
 
         let mut dirs = Vec::with_capacity(kept.len());
         for spec in &kept {
@@ -820,10 +876,19 @@ impl EditScreen {
                 },
                 backing_meta.as_ref(),
                 video_meta.as_ref(),
+                &backgrounds,
             );
             let dir = root.join(&slug);
-            write_part_bundle(&dir, &sliced, self.grid, self.key, backing_src, video_src)
-                .map_err(|e| e.to_string())?;
+            write_part_bundle(
+                &dir,
+                &sliced,
+                self.grid,
+                self.key,
+                backing_src,
+                video_src,
+                &background_srcs,
+            )
+            .map_err(|e| e.to_string())?;
             dirs.push(dir);
         }
         Ok(dirs)

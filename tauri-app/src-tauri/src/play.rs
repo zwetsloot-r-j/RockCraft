@@ -25,9 +25,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use rockcraft_core::{
-    backing_position_us, score, song_shift_us, ExpectedNote, Feedback, GateState, MidiNote,
-    NoteEvent, NoteEventKind, NoteJudgment, PlayClock, RecordingMeta, ScoreConfig, ScoreReport,
-    Summary, SynthBus, Timing, WaitGate,
+    backing_position_us, score, song_shift_us, BackgroundImage, ExpectedNote, Feedback, GateState,
+    MidiNote, NoteEvent, NoteEventKind, NoteJudgment, PlayClock, RecordingMeta, ScoreConfig,
+    ScoreReport, Summary, SynthBus, Timing, Transform, WaitGate,
 };
 use rockcraft_midi::smf_bytes_to_events;
 use serde::Serialize;
@@ -79,6 +79,31 @@ pub struct BackgroundVideoView {
     pub offset_us: i64,
 }
 
+/// One background image layer in a play session: the resolved absolute file plus
+/// the layer's keyframed animation (M14-D).
+#[derive(Debug, Clone)]
+pub struct BackgroundLayerSession {
+    pub path: PathBuf,
+    pub layer: BackgroundImage,
+}
+
+/// Serializable background-image reference for [`PlayInfo`] — the static half.
+/// `path` is the absolute file path (the webview wraps it with
+/// `convertFileSrc`); the *moving* half arrives per tick in [`PlayStateEvent`].
+#[derive(Debug, Clone, Serialize)]
+pub struct BackgroundLayerView {
+    pub id: String,
+    pub path: String,
+}
+
+/// One background layer's transform at the current song time (M14-D). Evaluated
+/// by `core` each tick, applied verbatim by the webview.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct BackgroundTransformView {
+    pub id: String,
+    pub transform: Transform,
+}
+
 /// A backing audio track attached to a bundle, plus the file position that lines
 /// up with song time 0 (`audio_start_us`).
 #[derive(Debug, Clone)]
@@ -105,6 +130,9 @@ pub struct PlayInfo {
     /// Background video to render behind the highway, or `None` when the piece
     /// has no backdrop (M9-G).
     pub video: Option<BackgroundVideoView>,
+    /// Background image layers to render behind the highway, back-to-front, or
+    /// empty when the piece has none (M14-D).
+    pub backgrounds: Vec<BackgroundLayerView>,
     /// Whether "hear the song" starts on.
     pub hear_song: bool,
 }
@@ -182,6 +210,10 @@ pub struct PlayStateEvent {
     /// One-shot: each judged note appears in exactly one `play_state`, so the
     /// webview can spawn a decaying effect per entry without de-duplicating.
     pub judgments: Vec<HitFeedbackView>,
+    /// Each background layer's transform at this instant, back-to-front and in
+    /// the same order as `PlayInfo::backgrounds` (M14-D). Empty when the piece
+    /// has no background images.
+    pub backgrounds: Vec<BackgroundTransformView>,
     /// Set once the song (plus tail) has finished.
     pub finished: bool,
 }
@@ -299,6 +331,8 @@ pub struct PlaySession {
     backing: Option<Backing>,
     /// Background video reference resolved from the bundle's `meta.json` (M9-G).
     video: Option<BackgroundVideoSession>,
+    /// Background image layers resolved from the bundle's `meta.json` (M14-D).
+    backgrounds: Vec<BackgroundLayerSession>,
     hear_song: bool,
     /// Manual pause (`HostCommand::PlayTogglePause`). Freezes the clock + backing
     /// independently of wait-mode; while set the highway and scoring clock hold
@@ -365,6 +399,7 @@ impl PlaySession {
             shift_us,
             backing: None,
             video: None,
+            backgrounds: Vec::new(),
             hear_song: false,
             paused: false,
             cfg: ScoreConfig::default(),
@@ -402,6 +437,46 @@ impl PlaySession {
         self.video.as_ref()
     }
 
+    /// Attach the background image layers resolved from the bundle's
+    /// `meta.json`, back-to-front (M14-D). `dir` resolves each layer's
+    /// bundle-relative file to the absolute path the webview loads.
+    pub fn with_backgrounds(mut self, dir: &Path, layers: Vec<BackgroundImage>) -> Self {
+        self.backgrounds = layers
+            .into_iter()
+            .map(|mut layer| {
+                layer.normalize();
+                BackgroundLayerSession {
+                    path: dir.join(&layer.file),
+                    layer,
+                }
+            })
+            .collect();
+        self
+    }
+
+    /// Song-content time for background keyframes: the clock minus the
+    /// whole-song pre-roll shift, so a keyframe authored at bar 1 of the piece
+    /// lands on bar 1 here rather than during the empty lead-in. Mirrors the
+    /// backdrop video's `(songTime - shift) + offset` mapping.
+    fn background_time_us(&self) -> u64 {
+        self.now_us().saturating_sub(self.shift_us)
+    }
+
+    /// Each layer's transform at the current song time, back-to-front (M14-D).
+    fn background_transforms(&self) -> Vec<BackgroundTransformView> {
+        if self.backgrounds.is_empty() {
+            return Vec::new();
+        }
+        let at_us = self.background_time_us();
+        self.backgrounds
+            .iter()
+            .map(|b| BackgroundTransformView {
+                id: b.layer.id.clone(),
+                transform: b.layer.transform_at(at_us),
+            })
+            .collect()
+    }
+
     /// Start with "hear the song" on or off. Bundle loading passes
     /// `meta.backing.is_none()` here (#247): a MIDI-only piece auditions itself
     /// so it isn't silent without a live piano, while a piece with a backing
@@ -433,6 +508,14 @@ impl PlaySession {
                 path: v.path.to_string_lossy().into_owned(),
                 offset_us: v.offset_us,
             }),
+            backgrounds: self
+                .backgrounds
+                .iter()
+                .map(|b| BackgroundLayerView {
+                    id: b.layer.id.clone(),
+                    path: b.path.to_string_lossy().into_owned(),
+                })
+                .collect(),
             hear_song: self.hear_song,
         }
     }
@@ -713,6 +796,7 @@ impl PlaySession {
             // Drained: each judged note reaches the webview exactly once, so the
             // effect fires on the tick the judgment became final and never again.
             judgments: std::mem::take(&mut self.pending_feedback),
+            backgrounds: self.background_transforms(),
             finished: self.is_finished(),
         }
     }
@@ -778,6 +862,9 @@ fn load_session_from_dir(dir: &Path) -> Result<PlaySession, String> {
             }
             if let Some(video) = meta.video {
                 session = session.with_video(dir.join(&video.file), video.offset_us);
+            }
+            if !meta.backgrounds.is_empty() {
+                session = session.with_backgrounds(dir, meta.backgrounds);
             }
         }
     }
@@ -1202,11 +1289,89 @@ mod tests {
             key: None,
             origin: Some(rockcraft_core::TrackOrigin::Composed),
             video: None,
+            backgrounds: Vec::new(),
             version: 1,
         };
         std::fs::write(dir.join("meta.json"), meta.to_json()).unwrap();
         std::fs::write(dir.join("backing.ogg"), b"").unwrap();
         dir
+    }
+
+    // ── background images (M14-D) ───────────────────────────────────────────
+
+    /// A bundle whose `meta.json` declares one animated background layer: a 2 s
+    /// pan from centre to half a surface-width right.
+    fn background_bundle(tmp: &tempfile::TempDir) -> PathBuf {
+        use rockcraft_core::{Easing, Transform};
+        let dir = tmp.path().to_path_buf();
+        std::fs::copy(midi_only_fixture().join("song.mid"), dir.join("song.mid")).unwrap();
+        let mut layer = BackgroundImage::new("bg-0", "background-0.png");
+        layer.set_keyframe(0, Transform::IDENTITY, Easing::Linear);
+        layer.set_keyframe(
+            2_000_000,
+            Transform::new(0.5, 0.0, 1.0, 0.0, 1.0),
+            Easing::Linear,
+        );
+        let mut meta = RecordingMeta::new_midi_only("song.mid");
+        meta.backgrounds = vec![layer];
+        std::fs::write(dir.join("meta.json"), meta.to_json()).unwrap();
+        std::fs::write(dir.join("background-0.png"), b"PNG").unwrap();
+        dir
+    }
+
+    /// `play_load` hands the webview each layer's absolute path once; the moving
+    /// part arrives per tick.
+    #[test]
+    fn play_info_lists_background_layers_with_absolute_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = background_bundle(&tmp);
+        let s = load_session_from_dir(&dir).expect("load bundle");
+        let info = s.info();
+        assert_eq!(info.backgrounds.len(), 1);
+        assert_eq!(info.backgrounds[0].id, "bg-0");
+        assert_eq!(
+            info.backgrounds[0].path,
+            dir.join("background-0.png").to_string_lossy()
+        );
+    }
+
+    /// The transform is evaluated by `core` against **song-content** time, i.e.
+    /// after the pre-roll shift — so a keyframe authored at bar 1 does not fire
+    /// during the empty lead-in.
+    #[test]
+    fn play_state_transforms_track_the_shifted_clock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = load_session_from_dir(&background_bundle(&tmp)).expect("load bundle");
+        let shift = s.shift_us();
+
+        // At t=0 the song content has not begun: the layer holds its first
+        // keyframe.
+        let st = s.live_state();
+        assert_eq!(st.backgrounds.len(), 1);
+        assert_eq!(st.backgrounds[0].id, "bg-0");
+        assert!((st.backgrounds[0].transform.x).abs() < 1e-6);
+
+        // One second of *content* in, the 2 s pan is half done.
+        s.advance(shift + 1_000_000);
+        let st = s.live_state();
+        assert!(
+            (st.backgrounds[0].transform.x - 0.25).abs() < 1e-4,
+            "{:?}",
+            st.backgrounds[0].transform
+        );
+
+        // Past the last keyframe the layer holds rather than flying off.
+        s.advance(10_000_000);
+        let st = s.live_state();
+        assert!((st.backgrounds[0].transform.x - 0.5).abs() < 1e-5);
+    }
+
+    /// A piece with no background images sends nothing per tick.
+    #[test]
+    fn play_state_backgrounds_are_empty_without_layers() {
+        let mut s = load_session_from_dir(&midi_only_fixture()).expect("load fixture bundle");
+        assert!(s.info().backgrounds.is_empty());
+        assert!(s.live_state().backgrounds.is_empty());
     }
 
     /// A MIDI-only piece would open silent without a live piano, so the synth
