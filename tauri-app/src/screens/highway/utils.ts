@@ -3,6 +3,7 @@
 // crates/core (events.rs) and crates/tui (keyboard.rs) so the screen uses the
 // exact same model the Rust engine produces.
 
+import type { FeedbackLevel, FeedbackTiming } from "../../ipc/types";
 import type { KeyInfo, KeyLayout } from "./types";
 
 export const LOWEST = 21; // A0
@@ -152,6 +153,77 @@ export function tailGapPx(lengthPx: number): number {
     lengthPx * TAIL_GAP_MAX_FRAC,
     Math.max(0, lengthPx - TAIL_GAP_MIN_BODY),
   );
+}
+
+// ── Hit / near / miss feedback (M14-B) ────────────────────────────────────
+// The backend judges each note against `core::scoring` and sends a
+// `Feedback` *level* (see `core::scoring::Feedback`): clear for a well-timed
+// hit, near for an off-time one, subtle for a miss. That's the whole judgment
+// rule — it lives in core so no frontend re-derives it. What lives *here* is
+// only the pixel budget each level gets, kept pure so the "clear reads stronger
+// than near reads stronger than subtle" ordering is unit-testable rather than
+// buried in canvas calls.
+//
+//   sparks      particles thrown up from the lane. A miss throws none — a note
+//               you didn't play shouldn't celebrate.
+//   flashAlpha  peak opacity of the lane flash at the hit line.
+//   flashSpread how far that flash grows, as a multiple of the lane width.
+//   flashMs     how long it takes to decay away.
+//   label       the central readout text, and `labelMs` its lifetime.
+export interface FeedbackFx {
+  sparks: number;
+  flashAlpha: number;
+  flashSpread: number;
+  flashMs: number;
+  label: string;
+  labelMs: number;
+  color: string;
+}
+
+/** Level → effect budget. Same palette as the design prototype's judgments. */
+const FEEDBACK_FX: Record<FeedbackLevel, FeedbackFx> = {
+  clear: {
+    sparks: 7,
+    flashAlpha: 0.8,
+    flashSpread: 1.6,
+    flashMs: 420,
+    label: "PERFECT",
+    labelMs: 520,
+    color: "#5be7c4",
+  },
+  near: {
+    sparks: 3,
+    flashAlpha: 0.42,
+    flashSpread: 1.0,
+    flashMs: 300,
+    label: "GOOD",
+    labelMs: 420,
+    color: "#ffd166",
+  },
+  subtle: {
+    sparks: 0,
+    flashAlpha: 0.18,
+    flashSpread: 0.5,
+    flashMs: 220,
+    label: "MISS",
+    labelMs: 340,
+    color: "#ff5d6c",
+  },
+};
+
+/** The effect budget for a judged note's feedback level. */
+export function feedbackFx(level: FeedbackLevel): FeedbackFx {
+  return FEEDBACK_FX[level] ?? FEEDBACK_FX.subtle;
+}
+
+/**
+ * Readout text for a judgment: the level's label, except that an off-time hit
+ * says *which* way it was off — the one thing a player can act on. Pure so the
+ * wording is testable alongside the budgets.
+ */
+export function feedbackLabel(level: FeedbackLevel, timing: FeedbackTiming): string {
+  if (level === "near") return timing === "early" ? "EARLY" : "LATE";
+  return feedbackFx(level).label;
 }
 
 // Shade a hex color lighter (+) or darker (-); passthrough for oklch.

@@ -25,9 +25,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use rockcraft_core::{
-    backing_position_us, score, song_shift_us, ExpectedNote, GateState, MidiNote, NoteEvent,
-    NoteEventKind, NoteJudgment, PlayClock, RecordingMeta, ScoreConfig, ScoreReport, Summary,
-    Timing, WaitGate,
+    backing_position_us, score, song_shift_us, ExpectedNote, Feedback, GateState, MidiNote,
+    NoteEvent, NoteEventKind, NoteJudgment, PlayClock, RecordingMeta, ScoreConfig, ScoreReport,
+    Summary, Timing, WaitGate,
 };
 use rockcraft_midi::smf_bytes_to_events;
 use serde::Serialize;
@@ -45,6 +45,11 @@ pub const PRE_ROLL_US: u64 = 1_500_000;
 
 /// Velocity used when "hear the song" synthesises chart notes. Matches the TUI.
 pub const HEAR_VELOCITY: u8 = 80;
+
+/// Ceiling on undelivered per-note judgments (M14-B). At ~60 Hz a tick closes a
+/// handful of notes at most, so this only ever trips when nothing is draining
+/// them; the oldest are dropped because a one-shot effect that late is useless.
+const MAX_PENDING_FEEDBACK: usize = 64;
 
 /// A sustained note: pitch held from `start_us` to `end_us` (microseconds,
 /// already shifted by the pre-roll). Mirrors `tui::highway::NoteSpan`.
@@ -116,6 +121,49 @@ pub struct SpanView {
     pub end: f64,
 }
 
+/// One judged note, surfaced once so the webview can fire a decaying one-shot
+/// effect at that note's lane (M14-B). The `level` is
+/// [`rockcraft_core::Feedback`]'s wire name — the frontend never re-derives how
+/// loud a judgment should read; `timing` carries the finer detail (early vs
+/// late) for the readout, and `error_us` the signed timing error.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct HitFeedbackView {
+    /// Pitch, i.e. which lane the effect belongs at.
+    pub note: u8,
+    /// `"clear"` | `"near"` | `"subtle"` — `Feedback::as_str`.
+    pub level: &'static str,
+    /// `"perfect"` | `"early"` | `"late"` | `"miss"`.
+    pub timing: &'static str,
+    /// Signed timing error in microseconds (negative = early). 0 on a miss.
+    pub error_us: i64,
+    /// The (shifted) song time of the note this judges.
+    pub time_us: u64,
+}
+
+impl HitFeedbackView {
+    /// Project one span's judgment onto the wire.
+    fn new(span: &NoteSpan, judgment: NoteJudgment) -> Self {
+        let (timing, error_us) = match judgment {
+            NoteJudgment::Hit { timing, error_us } => {
+                let name = match timing {
+                    Timing::Perfect => "perfect",
+                    Timing::Early => "early",
+                    Timing::Late => "late",
+                };
+                (name, error_us)
+            }
+            NoteJudgment::Miss => ("miss", 0),
+        };
+        Self {
+            note: span.note,
+            level: Feedback::from_judgment(judgment).as_str(),
+            timing,
+            error_us,
+            time_us: span.start_us,
+        }
+    }
+}
+
 /// A ~60 Hz live snapshot pushed to the webview while a take is running.
 #[derive(Debug, Clone, Serialize)]
 pub struct PlayStateEvent {
@@ -130,6 +178,10 @@ pub struct PlayStateEvent {
     pub held: Vec<u8>,
     /// Notes the player must hold to un-freeze (empty unless `frozen`).
     pub awaiting: Vec<u8>,
+    /// Notes judged since the previous snapshot, in song-time order (M14-B).
+    /// One-shot: each judged note appears in exactly one `play_state`, so the
+    /// webview can spawn a decaying effect per entry without de-duplicating.
+    pub judgments: Vec<HitFeedbackView>,
     /// Set once the song (plus tail) has finished.
     pub finished: bool,
 }
@@ -268,6 +320,9 @@ pub struct PlaySession {
     best_combo: u32,
     live_hits: usize,
     live_misses: usize,
+    /// Judgments queued since the last [`live_state`](PlaySession::live_state),
+    /// drained by it so each judged note fires exactly one effect (M14-B).
+    pending_feedback: Vec<HitFeedbackView>,
 
     /// "Hear the song" audition trigger bookkeeping (span indices fired).
     song_on_fired: HashSet<usize>,
@@ -321,6 +376,7 @@ impl PlaySession {
             best_combo: 0,
             live_hits: 0,
             live_misses: 0,
+            pending_feedback: Vec::new(),
             song_on_fired: HashSet::new(),
             song_off_fired: HashSet::new(),
         }
@@ -449,33 +505,58 @@ impl PlaySession {
     /// figures match the final report exactly.
     fn score_due(&mut self) {
         let now = self.now_us();
-        let mut newly = false;
-        for (i, span) in self.spans.iter().enumerate() {
-            if self.scored.contains(&i) {
-                continue;
-            }
-            if now >= span.start_us + self.cfg.good_us {
-                self.scored.insert(i);
-                newly = true;
-            }
+        let newly: Vec<usize> = self
+            .spans
+            .iter()
+            .enumerate()
+            .filter(|(i, s)| !self.scored.contains(i) && now >= s.start_us + self.cfg.good_us)
+            .map(|(i, _)| i)
+            .collect();
+        if newly.is_empty() {
+            return;
         }
-        if newly {
-            self.recompute_live();
+        self.scored.extend(newly.iter().copied());
+        let judged = self.recompute_live();
+
+        // Queue a one-shot effect for each note that just became final — in the
+        // time order `recompute_live` judged them, so the webview sees a chord's
+        // notes together and successive notes in the order they were played.
+        let fresh: Vec<HitFeedbackView> = judged
+            .into_iter()
+            .filter(|(i, _)| newly.contains(i))
+            .filter_map(|(i, j)| self.spans.get(i).map(|s| HitFeedbackView::new(s, j)))
+            .collect();
+        self.pending_feedback.extend(fresh);
+        // A webview reads this every tick; if nothing does (headless, or a
+        // stalled frontend), drop the oldest rather than grow without bound —
+        // stale effects are worthless anyway.
+        let overflow = self
+            .pending_feedback
+            .len()
+            .saturating_sub(MAX_PENDING_FEEDBACK);
+        if overflow > 0 {
+            self.pending_feedback.drain(..overflow);
         }
     }
 
     /// Recompute the live combo/score over the scored prefix (spans whose window
     /// has closed), in time order, using the authoritative `core::score`.
-    fn recompute_live(&mut self) {
-        let mut closed: Vec<ExpectedNote> = self
+    ///
+    /// Returns `(span index, judgment)` in that same time order so the caller can
+    /// attribute each judgment back to the note it belongs to (M14-B).
+    fn recompute_live(&mut self) -> Vec<(usize, NoteJudgment)> {
+        let mut closed: Vec<(usize, ExpectedNote)> = self
             .spans
             .iter()
             .enumerate()
             .filter(|(i, _)| self.scored.contains(i))
-            .filter_map(|(_, s)| MidiNote::new(s.note).map(|n| ExpectedNote::new(n, s.start_us)))
+            .filter_map(|(i, s)| {
+                MidiNote::new(s.note).map(|n| (i, ExpectedNote::new(n, s.start_us)))
+            })
             .collect();
-        closed.sort_by_key(|e| e.time_us);
-        let report = score(&closed, &self.played, self.cfg);
+        closed.sort_by_key(|(_, e)| e.time_us);
+        let expected: Vec<ExpectedNote> = closed.iter().map(|(_, e)| *e).collect();
+        let report = score(&expected, &self.played, self.cfg);
 
         self.score = 0;
         self.combo = 0;
@@ -497,6 +578,12 @@ impl PlaySession {
                 }
             }
         }
+
+        closed
+            .into_iter()
+            .map(|(i, _)| i)
+            .zip(report.judgments)
+            .collect()
     }
 
     /// Toggle a manual pause of the play session (`HostCommand::PlayTogglePause`),
@@ -623,6 +710,9 @@ impl PlaySession {
             misses: self.live_misses,
             held: self.held.iter().copied().collect(),
             awaiting,
+            // Drained: each judged note reaches the webview exactly once, so the
+            // effect fires on the tick the judgment became final and never again.
+            judgments: std::mem::take(&mut self.pending_feedback),
             finished: self.is_finished(),
         }
     }
@@ -1159,6 +1249,97 @@ mod tests {
         let mut backed = load_session_from_dir(&backed_bundle(&tmp)).unwrap();
         assert!(!backed.info().hear_song, "backed starts off");
         assert!(backed.toggle_hear_song(), "toggle lights it");
+    }
+
+    // ── per-note hit/near/miss feedback (M14-B, issue #258) ─────────────────
+
+    /// A perfect take surfaces one `clear` judgment per note, at that note's
+    /// lane, once its good-window has closed.
+    #[test]
+    fn perfect_take_surfaces_clear_feedback_per_note() {
+        let mut s = session();
+        for k in 0..4u64 {
+            s.ingest(on(PITCHES[k as usize], target_us(k)));
+        }
+        s.advance(target_us(3) + 200_000);
+        let fx = s.live_state().judgments;
+        assert_eq!(fx.len(), 4, "one judgment per note");
+        for (k, f) in fx.iter().enumerate() {
+            assert_eq!(f.note, PITCHES[k], "effect belongs at the note's lane");
+            assert_eq!(f.level, "clear");
+            assert_eq!(f.timing, "perfect");
+            assert_eq!(f.error_us, 0);
+            assert_eq!(f.time_us, target_us(k as u64));
+        }
+    }
+
+    /// An off-time (but in-window) take reads `near`, not `clear` — the lesser
+    /// effect is what tells the player their timing slipped.
+    #[test]
+    fn off_time_take_surfaces_near_feedback() {
+        let mut s = session();
+        for k in 0..4u64 {
+            s.ingest(on(PITCHES[k as usize], target_us(k) + 120_000));
+        }
+        s.advance(target_us(3) + 400_000);
+        let fx = s.live_state().judgments;
+        assert_eq!(fx.len(), 4);
+        assert!(
+            fx.iter().all(|f| f.level == "near" && f.timing == "late"),
+            "120 ms late is a hit, but not a clear one: {fx:?}"
+        );
+        assert!(fx.iter().all(|f| f.error_us == 120_000));
+    }
+
+    /// A note never struck reads `subtle`/`miss` — still acknowledged, quietly.
+    #[test]
+    fn missed_note_surfaces_subtle_feedback() {
+        let mut s = session();
+        for k in 0..3u64 {
+            s.ingest(on(PITCHES[k as usize], target_us(k)));
+        }
+        s.advance(target_us(3) + 200_000);
+        let fx = s.live_state().judgments;
+        let miss: Vec<_> = fx.iter().filter(|f| f.timing == "miss").collect();
+        assert_eq!(miss.len(), 1);
+        assert_eq!(miss[0].note, PITCHES[3], "the un-played note's lane");
+        assert_eq!(miss[0].level, "subtle");
+    }
+
+    /// Judgments are one-shot: they arrive on the tick their window closed and
+    /// never repeat, so the webview can spawn an effect per entry blindly.
+    #[test]
+    fn feedback_is_delivered_once_and_only_when_due() {
+        let mut s = session();
+        s.ingest(on(PITCHES[0], target_us(0)));
+        // Before the first note's good-window closes, nothing is final yet.
+        s.advance(target_us(0));
+        assert!(
+            s.live_state().judgments.is_empty(),
+            "no judgment before the window closes"
+        );
+        // Past the window: exactly the first note.
+        s.advance(ScoreConfig::default().good_us + 1);
+        let fx = s.live_state().judgments;
+        assert_eq!(fx.len(), 1);
+        assert_eq!(fx[0].note, PITCHES[0]);
+        // Reading again yields nothing — the queue was drained.
+        assert!(s.live_state().judgments.is_empty(), "drained, not repeated");
+    }
+
+    /// The live hit/miss counters and the queued feedback describe the same
+    /// notes: every judged note is counted exactly once in both.
+    #[test]
+    fn feedback_count_matches_live_counters() {
+        let mut s = session();
+        for k in 0..3u64 {
+            s.ingest(on(PITCHES[k as usize], target_us(k)));
+        }
+        s.advance(target_us(3) + 200_000);
+        let live = s.live_state();
+        assert_eq!(live.judgments.len(), live.hits + live.misses);
+        let clear = live.judgments.iter().filter(|f| f.level == "clear").count();
+        assert_eq!(clear, live.hits);
     }
 
     /// is_finished trips only after the song plus its tail pause.
