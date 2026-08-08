@@ -32,6 +32,7 @@ import {
   alignmentSave,
   editClearBacking,
   editClearVideo,
+  editQueryBackgrounds,
   editQueryBacking,
   editQueryVideo,
   editSetBacking,
@@ -40,7 +41,10 @@ import {
   loadBundle,
   onPlayhead,
   onSnapshot,
+  editAttachBackground,
+  editDetachBackground,
   openBackingFilePicker,
+  openImageFilePicker,
   openVideoFilePicker,
   queryDirty,
   queryState,
@@ -50,12 +54,13 @@ import {
   transcriptionLoad,
 } from "../../ipc/bridge";
 import type { AlignmentDto } from "../../ipc/bridge";
-import type { ComposerSnapshot } from "../../ipc/types";
+import type { BackgroundView, ComposerSnapshot } from "../../ipc/types";
 import { onMidiEvent } from "../../ipc/midi";
 import { EditCanvas } from "./EditCanvas";
 import { StatusBar } from "./StatusBar";
 import { RecordControls } from "./RecordControls";
-import { resolveKey } from "./keymap";
+import { resolveBackgroundKey, resolveKey } from "./keymap";
+import { IDENTITY_TRANSFORM, layerStyle } from "../highway/backgrounds";
 import { stepUs } from "./viewport";
 import {
   keptSegmentSpecs,
@@ -261,6 +266,17 @@ export function EditScreen(props: Props): JSX.Element {
   // cursor), dividing the piece into consecutive segments; each is kept (named)
   // or discarded, and "Save parts" writes the kept ones as standalone bundles
   // via the `SplitBundle` host command. All ephemeral UI state — no persistence.
+  // ── Background image layers (M14-D) ──────────────────────────────────────
+  // `B` opens a modal layout mode: the keyboard drives the *selected* layer's
+  // transform, and every nudge auto-keyframes at the playhead inside `core`.
+  // The layers themselves live on the snapshot (`snap.backgrounds`), already
+  // evaluated — this screen only paints them and routes keys.
+  const [bgMode, setBgMode] = createSignal(false);
+  // Absolute source path per layer id, for the `<img>` src. The snapshot carries
+  // the bundle-relative name only, so the paths come from `edit_attach_background`
+  // / `edit_query_backgrounds`.
+  const [bgPaths, setBgPaths] = createSignal<Record<string, string>>({});
+
   const [splitMode, setSplitMode] = createSignal(false);
   // Interior split points in song-time µs (0 < m < total), kept sorted + unique.
   const [markers, setMarkers] = createSignal<number[]>([]);
@@ -767,6 +783,7 @@ export function EditScreen(props: Props): JSX.Element {
    * grid calibration comes from the bundle's `alignment.json` sidecar when the
    * dir is known (GUI load); the socket path falls back to localStorage. */
   function reattachBackdropAndBacking(dir: string | undefined): void {
+    refreshBackgroundPaths();
     void editQueryBacking()
       .then((ref) => setBackingName(ref ? ref.name : null))
       .catch(() => {
@@ -938,6 +955,58 @@ export function EditScreen(props: Props): JSX.Element {
     void editClearBacking().catch(() => {
       /* backend down — UI state already cleared */
     });
+  }
+
+  // ── Background image layers (M14-D) ──────────────────────────────────────
+
+  /** Re-read each layer's absolute source path (the snapshot carries only the
+   * bundle-relative name). Cheap, and the list is tiny. */
+  function refreshBackgroundPaths(): void {
+    void editQueryBackgrounds()
+      .then((refs) => {
+        const next: Record<string, string> = {};
+        for (const r of refs) next[r.id] = r.path;
+        setBgPaths(next);
+      })
+      .catch(() => {
+        /* backend down — the layers simply do not paint */
+      });
+  }
+
+  /** Pick an image and attach it as the front-most layer. */
+  function attachBackground(): void {
+    void openImageFilePicker()
+      .then((path) => {
+        if (path === null) return;
+        return editAttachBackground(path).then((refs) => {
+          const next: Record<string, string> = {};
+          for (const r of refs) next[r.id] = r.path;
+          setBgPaths(next);
+          setDirty(true);
+          void queryState().then(applySnapshot);
+        });
+      })
+      .catch(() => {
+        /* cancelled or backend down — nothing attached */
+      });
+  }
+
+  /** Detach whichever layer is currently selected. */
+  function detachSelectedBackground(): void {
+    const layers = store.snap?.backgrounds ?? [];
+    const selected = layers.find((l) => l.selected);
+    if (!selected) return;
+    void editDetachBackground(selected.id)
+      .then((refs) => {
+        const next: Record<string, string> = {};
+        for (const r of refs) next[r.id] = r.path;
+        setBgPaths(next);
+        setDirty(true);
+        void queryState().then(applySnapshot);
+      })
+      .catch(() => {
+        /* already gone — nothing to do */
+      });
   }
 
   /** Nudge the alignment offset and re-sync the frame immediately. The new
@@ -1398,6 +1467,43 @@ export function EditScreen(props: Props): JSX.Element {
       }
     }
 
+    // ── Background layout mode (M14-D) ──────────────────────────────────
+    // A modal map, like chord mode: while it is open every key belongs to the
+    // selected background layer. `a`/`X` are the two I/O keys (they run host
+    // commands, not actions), so they are handled here rather than in the
+    // keymap table.
+    if (bgMode()) {
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.key === "Escape" || e.key === "B") {
+        setBgMode(false);
+        return;
+      }
+      if (e.key === "a") {
+        attachBackground();
+        return;
+      }
+      if (e.key === "X") {
+        detachSelectedBackground();
+        return;
+      }
+      const bg = resolveBackgroundKey(e.key);
+      if (bg.kind === "action-swallow") {
+        void runAction(bg.dispatch.name, bg.dispatch.params).then((reply) => {
+          setDirty(reply.dirty);
+        });
+      }
+      return;
+    }
+    if (e.key === "B" && s.chord_preview === null && !splitMode()) {
+      e.preventDefault();
+      e.stopPropagation();
+      setBgMode(true);
+      // Entering with nothing to lay out goes straight to the picker.
+      if ((s.backgrounds ?? []).length === 0) attachBackground();
+      return;
+    }
+
     // Esc in non-chord, no-selection mode → dirty exit prompt or menu nav.
     if (e.key === "Escape" && s.chord_preview === null && s.selection === null) {
       if (dirty()) {
@@ -1674,6 +1780,38 @@ export function EditScreen(props: Props): JSX.Element {
           }}
         />
 
+        {/* Background image layers (M14-D) — one <img> per layer in their own
+            z-index:0 stacking context, so they sit above the movie backdrop and
+            below the edit canvas. Each transform was evaluated by `core` at the
+            playhead, so scrubbing the cursor or playing back animates them. */}
+        <Show when={(store.snap?.backgrounds ?? []).length > 0}>
+          <div
+            style={{
+              position: "absolute",
+              inset: 0,
+              "z-index": 0,
+              "pointer-events": "none",
+              overflow: "hidden",
+            }}
+          >
+            <For each={store.snap?.backgrounds ?? []}>
+              {(layer, i) => (
+                <Show when={bgPaths()[layer.id]}>
+                  <img
+                    src={convertFileSrc(bgPaths()[layer.id])}
+                    alt=""
+                    draggable={false}
+                    style={layerStyle(
+                      layer.transform ?? IDENTITY_TRANSFORM,
+                      i(),
+                    )}
+                  />
+                </Show>
+              )}
+            </For>
+          </div>
+        </Show>
+
         <canvas
           ref={canvasEl}
           style={{
@@ -1684,6 +1822,14 @@ export function EditScreen(props: Props): JSX.Element {
             display: "block",
           }}
         />
+
+        {/* Background layout HUD — which layer, its keyframes, and the keys. */}
+        <Show when={bgMode()}>
+          <BackgroundHud
+            layers={store.snap?.backgrounds ?? []}
+            playheadUs={store.snap?.playhead_us ?? 0}
+          />
+        </Show>
 
         {/* Backdrop HUD — current alignment offset + key hints */}
         <Show when={videoPath() !== null}>
@@ -2050,6 +2196,106 @@ function BackdropHud(props: { offsetUs: number }): JSX.Element {
       </div>
       <div style={{ color: "#6a6e7e", "font-size": "11px" }}>
         ,/. ±10 ms · ;/' ±250 ms · ` align · V detach
+      </div>
+    </div>
+  );
+}
+
+// ── BackgroundHud ───────────────────────────────────────────────────────────
+
+/**
+ * Background layout HUD (M14-D): which layer the keyboard is driving, its live
+ * transform, whether a keyframe sits exactly at the playhead, and the key
+ * legend. Purely a readout — every value comes from the snapshot, already
+ * evaluated by `core`.
+ */
+function BackgroundHud(props: {
+  layers: BackgroundView[];
+  playheadUs: number;
+}): JSX.Element {
+  const selected = (): BackgroundView | undefined =>
+    props.layers.find((l) => l.selected) ?? props.layers[0];
+  const onKeyframe = (): boolean =>
+    (selected()?.keyframes ?? []).some((k) => k.time_us === props.playheadUs);
+  const num = (n: number): string => n.toFixed(2);
+
+  return (
+    <div
+      style={{
+        position: "absolute",
+        bottom: "12px",
+        right: "16px",
+        background: "rgba(26,27,36,0.85)",
+        border: "1px solid #7ec8ff",
+        "border-radius": "8px",
+        padding: "8px 12px",
+        "z-index": 100,
+        "backdrop-filter": "blur(3px)",
+        "font-family": "'Space Grotesk', system-ui, sans-serif",
+        "max-width": "min(420px, 60vw)",
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          "align-items": "center",
+          gap: "8px",
+          "margin-bottom": "4px",
+        }}
+      >
+        <span
+          style={{
+            background: "#7ec8ff",
+            color: "#0f1016",
+            padding: "2px 8px",
+            "border-radius": "4px",
+            "font-size": "11px",
+            "font-weight": 700,
+            "letter-spacing": "0.5px",
+          }}
+        >
+          BACKGROUND
+        </span>
+        <span
+          style={{
+            color: "#e7e8ef",
+            "font-size": "12px",
+            "font-family": "'IBM Plex Mono', ui-monospace, monospace",
+          }}
+        >
+          <Show when={selected()} fallback="no layers — a to add">
+            {(l) => (
+              <>
+                {l().file} ({l().index + 1}/{props.layers.length}) ·{" "}
+                {l().keyframes.length} kf
+                {onKeyframe() ? " ·" : ""}
+                <Show when={onKeyframe()}>
+                  <span style={{ color: "#7ec8ff" }}> on keyframe</span>
+                </Show>
+              </>
+            )}
+          </Show>
+        </span>
+      </div>
+      <Show when={selected()}>
+        {(l) => (
+          <div
+            style={{
+              color: "#9a9eb0",
+              "font-size": "11px",
+              "font-family": "'IBM Plex Mono', ui-monospace, monospace",
+              "margin-bottom": "4px",
+            }}
+          >
+            pos {num(l().transform.x)},{num(l().transform.y)} · scale{" "}
+            {num(l().transform.scale)} · rot {num(l().transform.rotation_deg)}° ·
+            opacity {num(l().transform.opacity)}
+          </div>
+        )}
+      </Show>
+      <div style={{ color: "#6a6e7e", "font-size": "11px" }}>
+        hjkl move · +/− zoom · [ ] rotate · 0–9 opacity · f keyframe · x delete ·
+        e/E/c ease · n layer · a add · X remove · Esc done
       </div>
     </div>
   );

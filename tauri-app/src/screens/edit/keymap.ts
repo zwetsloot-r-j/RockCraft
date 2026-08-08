@@ -22,6 +22,16 @@ const BACKING_NUDGE_COARSE_US = 250_000;
 /** Tempo nudge in BPM, bound to `(` / `)` (mirrors `edit.rs::BPM_NUDGE`). */
 const BPM_NUDGE = 5;
 
+// ── background-image layout (M14-D) ─────────────────────────────────────────
+// Pan/zoom/rotate steps for background mode, in the integer units the actions
+// take (permille of a surface width/height, permille of scale, millidegrees).
+/** Pan step: 2.5% of the surface per press. */
+const BG_PAN_PERMILLE = 25;
+/** Zoom step: 5% of the contained fit per press. */
+const BG_SCALE_PERMILLE = 50;
+/** Rotation step: 2.5° per press. */
+const BG_ROTATE_MILLIDEG = 2_500;
+
 /** A resolved action dispatch: an `ActionName` and its (optional) params. */
 export interface ActionDispatch {
   name: ActionName;
@@ -171,6 +181,107 @@ export const CHORD_BINDINGS: Binding[] = [
   // Esc → cancel_chord, handled in resolveKey.
 ];
 
+/**
+ * Background-mode keymap (M14-D) — live while the edit screen is laying out a
+ * background image layer. A modal map, like {@link CHORD_BINDINGS}, so the
+ * layout keys can be plain letters instead of modifier chords.
+ *
+ * Every binding is a `core::Action`: the frontend holds no layout logic, and
+ * each nudge auto-keyframes at the playhead in `core`.
+ */
+export const BACKGROUND_BINDINGS: Binding[] = [
+  // ── pan ───────────────────────────────────────────────────────────────
+  // Screen-natural: the arrows/hjkl move the *image*, not a cursor.
+  {
+    keys: ["h", "ArrowLeft"],
+    action: {
+      name: "nudge_background_pos",
+      params: { dx_permille: -BG_PAN_PERMILLE, dy_permille: 0 },
+    },
+  },
+  {
+    keys: ["l", "ArrowRight"],
+    action: {
+      name: "nudge_background_pos",
+      params: { dx_permille: BG_PAN_PERMILLE, dy_permille: 0 },
+    },
+  },
+  {
+    keys: ["k", "ArrowUp"],
+    action: {
+      name: "nudge_background_pos",
+      params: { dx_permille: 0, dy_permille: -BG_PAN_PERMILLE },
+    },
+  },
+  {
+    keys: ["j", "ArrowDown"],
+    action: {
+      name: "nudge_background_pos",
+      params: { dx_permille: 0, dy_permille: BG_PAN_PERMILLE },
+    },
+  },
+
+  // ── zoom / rotate ─────────────────────────────────────────────────────
+  {
+    keys: ["+", "="],
+    action: {
+      name: "nudge_background_scale",
+      params: { delta_permille: BG_SCALE_PERMILLE },
+    },
+  },
+  {
+    keys: ["-"],
+    action: {
+      name: "nudge_background_scale",
+      params: { delta_permille: -BG_SCALE_PERMILLE },
+    },
+  },
+  {
+    keys: ["]"],
+    action: {
+      name: "nudge_background_rotation",
+      params: { delta_millideg: BG_ROTATE_MILLIDEG },
+    },
+  },
+  {
+    keys: ["["],
+    action: {
+      name: "nudge_background_rotation",
+      params: { delta_millideg: -BG_ROTATE_MILLIDEG },
+    },
+  },
+
+  // ── opacity: the number row sets it directly (0 = clear, 9 = 90%) ─────
+  ...Array.from<unknown, Binding>({ length: 10 }, (_, n) => ({
+    keys: [String(n)],
+    action: {
+      name: "set_background_opacity",
+      params: { permille: n * 100 },
+    },
+  })),
+  { keys: ["o"], action: { name: "set_background_opacity", params: { permille: 1000 } } },
+
+  // ── keyframes ─────────────────────────────────────────────────────────
+  { keys: ["f"], action: { name: "add_background_keyframe" } },
+  { keys: ["x", "d"], action: { name: "delete_background_keyframe" } },
+  {
+    keys: ["e"],
+    action: { name: "set_background_easing", params: { easing: "ease_in_out" } },
+  },
+  {
+    keys: ["E"],
+    action: { name: "set_background_easing", params: { easing: "linear" } },
+  },
+  {
+    keys: ["c"],
+    action: { name: "set_background_easing", params: { easing: "hold" } },
+  },
+
+  // ── layer selection ───────────────────────────────────────────────────
+  { keys: ["n", "Tab"], action: { name: "cycle_background", params: { delta: 1 } } },
+  { keys: ["N"], action: { name: "cycle_background", params: { delta: -1 } } },
+];
+
 /** What `resolveKey` decided to do with a `KeyboardEvent`. */
 export type KeyResolution =
   | { kind: "action"; dispatch: ActionDispatch }
@@ -183,6 +294,18 @@ export type KeyResolution =
   | { kind: "swallow" }
   /** Nothing bound — let the event bubble (e.g. router's global Esc). */
   | { kind: "ignore" };
+
+/**
+ * Resolve a key while background-layout mode owns the keyboard (M14-D).
+ *
+ * Every key is swallowed so nothing leaks to the normal keymap or the router
+ * while laying a backdrop out; `Escape` leaves the mode and is reported as
+ * `{ kind: "swallow" }` so the caller can exit without dispatching an action.
+ */
+export function resolveBackgroundKey(key: string): KeyResolution {
+  const dispatch = lookup(BACKGROUND_BINDINGS, key);
+  return dispatch ? { kind: "action-swallow", dispatch } : { kind: "swallow" };
+}
 
 function lookup(bindings: Binding[], key: string): ActionDispatch | undefined {
   for (const b of bindings) {

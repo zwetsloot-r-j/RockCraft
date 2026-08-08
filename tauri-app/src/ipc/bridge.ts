@@ -16,6 +16,8 @@ import type {
   ActionName,
   ActionParams,
   ActionReply,
+  BackgroundKeyframe,
+  BackgroundTransform,
   ComposerSnapshot,
   Effect,
   LibraryEntryDto,
@@ -575,6 +577,60 @@ export function editClearVideo(): Promise<void> {
 /** Return the currently attached background video, or `null` (M9-G). */
 export function editQueryVideo(): Promise<VideoRef | null> {
   return invoke<VideoRef | null>("edit_query_video");
+}
+
+// ── Background images, persisted in the bundle (M14-D) ───────────────────────
+
+/**
+ * A background image layer on the live editor — mirror of
+ * `state::BackgroundRef`. `path` is absolute; wrap it with `convertFileSrc`
+ * before assigning to an `<img>`. `transform` is evaluated by `core` at the
+ * playhead — the webview never interpolates.
+ */
+export interface BackgroundRef {
+  index: number;
+  id: string;
+  file: string;
+  path: string;
+  selected: boolean;
+  transform: BackgroundTransform;
+  keyframes: BackgroundKeyframe[];
+}
+
+/**
+ * Open a native file-picker dialog filtered to image files.
+ * Returns the selected path, or `null` if the user cancelled.
+ */
+export async function openImageFilePicker(): Promise<string | null> {
+  const selected = await dialogOpen({
+    multiple: false,
+    filters: [
+      {
+        name: "Image files",
+        extensions: ["png", "jpg", "jpeg", "webp", "gif", "bmp", "avif"],
+      },
+    ],
+  });
+  if (selected === null || selected === undefined) return null;
+  return typeof selected === "string" ? selected : null;
+}
+
+/**
+ * Attach a background image as the front-most layer and select it (M14-D).
+ * Persisted into the bundle's `meta.json` on the next `save_bundle`.
+ */
+export function editAttachBackground(path: string): Promise<BackgroundRef[]> {
+  return invoke<BackgroundRef[]>("edit_attach_background", { path });
+}
+
+/** Detach the background image layer with this id (M14-D). */
+export function editDetachBackground(id: string): Promise<BackgroundRef[]> {
+  return invoke<BackgroundRef[]>("edit_detach_background", { id });
+}
+
+/** Every background image layer with its transform at the playhead (M14-D). */
+export function editQueryBackgrounds(): Promise<BackgroundRef[]> {
+  return invoke<BackgroundRef[]>("edit_query_backgrounds");
 }
 
 /**
