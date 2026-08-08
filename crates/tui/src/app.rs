@@ -20,7 +20,7 @@ use ratatui::{
 };
 use rockcraft_audio::SynthHandle;
 use rockcraft_control::{QueryKind, RemoteCommand, Request, Response};
-use rockcraft_core::{Grid, Key, RecordingMeta, Scale, Timeline, TrackOrigin};
+use rockcraft_core::{Grid, Key, Mixer, RecordingMeta, Scale, SynthBus, Timeline, TrackOrigin};
 use rockcraft_import::{fetch_command_configured, ImportInput};
 use rockcraft_midi::{smf_bytes_to_events, NoteSource};
 use tokio::sync::mpsc;
@@ -112,6 +112,11 @@ pub struct Shell {
     /// `true` when a URL fetch command is configured (M6-D hook).
     /// Determines whether the "Import from URL…" menu item is shown.
     has_fetch_cmd: bool,
+    /// Sound selection + levels (M14-C). Shell-wide, so a change made between
+    /// takes survives the screen the play session lives on: synth-bus settings
+    /// go straight at the synth, and the backing level is carried onto each new
+    /// play screen (and its lazily-armed backing sink).
+    mixer: Mixer,
 }
 
 impl Shell {
@@ -133,12 +138,55 @@ impl Shell {
             commands: None,
             terminal_size: (80, 24),
             has_fetch_cmd: fetch_command_configured(),
+            mixer: Mixer::new(),
         }
     }
 
     /// Override the fetch-command capability flag — used in tests.
     pub fn set_has_fetch_cmd(&mut self, v: bool) {
         self.has_fetch_cmd = v;
+    }
+
+    /// Hand a freshly loaded play screen the shell-wide mix (M14-C).
+    ///
+    /// Only the backing fader needs carrying: the two synth buses live on the
+    /// synth itself, which every screen shares, so their instrument and level
+    /// are already in force. The backing sink, by contrast, is created per take
+    /// by the screen that owns it.
+    fn tuned(&self, mut play: PlayScreen) -> PlayScreen {
+        play.set_backing_gain(self.mixer.backing_gain);
+        play
+    }
+
+    /// The shell's current mix. The TUI has no mixer UI — it is driven over the
+    /// control socket (M14-C's picker lives in the desktop app) — so this is
+    /// the read path for tests and for anything that wants to display it.
+    pub fn mixer(&self) -> &Mixer {
+        &self.mixer
+    }
+
+    /// Apply one mixer change and push it at the audio it controls (M14-C).
+    ///
+    /// Synth-bus settings go straight at the synth (shared by every screen);
+    /// the backing level goes at the live play screen, and is remembered here
+    /// for the takes that follow. Returns the resulting mix.
+    fn apply_mixer<F>(&mut self, change: F) -> Result<rockcraft_core::MixerReport, String>
+    where
+        F: FnOnce(&mut Mixer) -> Result<(), rockcraft_core::MixerError>,
+    {
+        change(&mut self.mixer).map_err(|e| e.to_string())?;
+        if let Some(synth) = &self.synth {
+            for &bus in SynthBus::all() {
+                let settings = self.mixer.bus(bus);
+                let handle = synth.for_bus(bus);
+                handle.set_instrument(settings.instrument);
+                handle.set_gain(settings.gain);
+            }
+        }
+        if let Screen::Play(play) = &mut self.screen {
+            play.set_backing_gain(self.mixer.backing_gain);
+        }
+        Ok(rockcraft_core::MixerReport::from(self.mixer))
     }
 
     /// Build the current menu item list, injecting URL import when configured.
@@ -289,7 +337,7 @@ impl Shell {
             },
             "Play last recording" => match latest_recording() {
                 Some(path) => match load_play_screen(&path, self.synth.clone()) {
-                    Ok(p) => self.screen = Screen::Play(Box::new(p)),
+                    Ok(p) => self.screen = Screen::Play(Box::new(self.tuned(p))),
                     Err(e) => self.status = e,
                 },
                 None => self.status = "no recordings yet — record one first".into(),
@@ -547,7 +595,7 @@ impl Shell {
                     LibraryOutcome::OpenPlay(dir) => {
                         let midi = dir.join("song.mid");
                         match load_play_screen(&midi, self.synth.clone()) {
-                            Ok(p) => self.screen = Screen::Play(Box::new(p)),
+                            Ok(p) => self.screen = Screen::Play(Box::new(self.tuned(p))),
                             Err(e) => {
                                 self.status = e;
                                 self.screen = Screen::Menu;
@@ -716,7 +764,7 @@ impl rockcraft_control::HostServices for Shell {
                 let midi = std::path::Path::new(&dir).join("song.mid");
                 match load_play_screen(&midi, self.synth.clone()) {
                     Ok(play) => {
-                        self.screen = Screen::Play(Box::new(play));
+                        self.screen = Screen::Play(Box::new(self.tuned(play)));
                         Ok(json!({ "loaded": dir }))
                     }
                     Err(detail) => Err(HostError::Failed {
@@ -755,6 +803,31 @@ impl rockcraft_control::HostServices for Shell {
                 Err(HostError::Unsupported("attach_backing".into()))
             }
             HostCommand::DetachBacking => Err(HostError::Unsupported("detach_backing".into())),
+            // Sound selection + levels (M14-C). Shell-wide, so these work from
+            // any screen — the synth is shared and the backing fader is carried
+            // onto the next take.
+            HostCommand::SetInstrument { bus, instrument } => self
+                .apply_mixer(|m| m.set_instrument(bus, &instrument).map(|_| ()))
+                .and_then(|report| serde_json::to_value(report).map_err(|e| e.to_string()))
+                .map_err(|detail| HostError::Failed {
+                    command: "set_instrument".into(),
+                    detail,
+                }),
+            HostCommand::SetBusGain { bus, gain } => self
+                .apply_mixer(|m| m.set_gain(bus, gain).map(|_| ()))
+                .and_then(|report| serde_json::to_value(report).map_err(|e| e.to_string()))
+                .map_err(|detail| HostError::Failed {
+                    command: "set_bus_gain".into(),
+                    detail,
+                }),
+            HostCommand::QueryMixer => {
+                serde_json::to_value(rockcraft_core::MixerReport::from(self.mixer)).map_err(|e| {
+                    HostError::Failed {
+                        command: "query_mixer".into(),
+                        detail: e.to_string(),
+                    }
+                })
+            }
             HostCommand::AttachVideo { .. } => Err(HostError::Unsupported("attach_video".into())),
             HostCommand::SetVideoOffset { .. } => {
                 Err(HostError::Unsupported("set_video_offset".into()))
@@ -1041,7 +1114,7 @@ fn apply_import_outcome(shell: &mut Shell) {
             match load_play_screen(&midi, shell.synth.clone()) {
                 Ok(play) => {
                     shell.status = format!("imported: {}", bundle.display());
-                    shell.screen = Screen::Play(Box::new(play));
+                    shell.screen = Screen::Play(Box::new(shell.tuned(play)));
                 }
                 Err(e) => {
                     shell.status = format!("import succeeded but load failed: {e}");
@@ -1137,6 +1210,15 @@ mod tests {
             HostCommand::ImportScore {
                 path: "s.musicxml".into(),
             },
+            HostCommand::SetInstrument {
+                bus: rockcraft_core::SynthBus::Song,
+                instrument: "marimba".into(),
+            },
+            HostCommand::SetBusGain {
+                bus: rockcraft_core::MixerBus::Backing,
+                gain: 0.5,
+            },
+            HostCommand::QueryMixer,
             HostCommand::AudioStatus,
             HostCommand::MidiStatus,
             HostCommand::RecordStatus,
@@ -1168,6 +1250,95 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The mixer commands work from the menu screen — the synth is shell-wide,
+    /// not owned by a session — and each answers with the whole new mix.
+    #[test]
+    fn mixer_commands_work_off_the_play_screen() {
+        use rockcraft_core::{MixerBus, SynthBus};
+
+        let mut shell = make_shell();
+        assert_eq!(shell.screen_name(), "menu");
+
+        let report = shell
+            .dispatch(HostCommand::SetInstrument {
+                bus: SynthBus::Player,
+                instrument: "vibraphone".into(),
+            })
+            .expect("set_instrument from the menu");
+        assert_eq!(report["player"]["instrument"]["id"], "vibraphone");
+        assert_eq!(report["song"]["instrument"]["id"], "grand_piano");
+
+        let report = shell
+            .dispatch(HostCommand::SetBusGain {
+                bus: MixerBus::Song,
+                gain: 0.25,
+            })
+            .expect("set_bus_gain");
+        assert_eq!(report["song"]["gain"], 0.25);
+        assert_eq!(report["player"]["gain"], 1.0, "one fader at a time");
+
+        // The catalog rides along so a client never hardcodes the list.
+        let mixer = shell
+            .dispatch(HostCommand::QueryMixer)
+            .expect("query_mixer");
+        assert_eq!(mixer["player"]["instrument"]["id"], "vibraphone");
+        assert_eq!(mixer["song"]["gain"], 0.25);
+        assert_eq!(
+            mixer["instruments"].as_array().unwrap().len(),
+            rockcraft_core::instruments().len()
+        );
+    }
+
+    /// A bad instrument id / gain is reported as a failed command and leaves
+    /// the mix as it was.
+    #[test]
+    fn mixer_commands_reject_bad_input() {
+        use rockcraft_core::{MixerBus, SynthBus};
+
+        let mut shell = make_shell();
+        let err = shell
+            .dispatch(HostCommand::SetInstrument {
+                bus: SynthBus::Player,
+                instrument: "kazoo".into(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, rockcraft_control::HostError::Failed { .. }));
+        assert!(shell
+            .dispatch(HostCommand::SetBusGain {
+                bus: MixerBus::Player,
+                gain: f32::NAN,
+            })
+            .is_err());
+        assert_eq!(
+            shell.mixer().player.instrument.id,
+            rockcraft_core::DEFAULT_INSTRUMENT
+        );
+        assert_eq!(shell.mixer().player.gain, rockcraft_core::Gain::UNITY);
+    }
+
+    /// The backing fader set between takes reaches the play screen opened
+    /// after it — the mix is shell state, not per-session state.
+    #[test]
+    fn backing_gain_carries_onto_a_new_play_screen() {
+        use rockcraft_core::{Gain, MixerBus};
+
+        let mut shell = make_shell();
+        shell
+            .dispatch(HostCommand::SetBusGain {
+                bus: MixerBus::Backing,
+                gain: 0.5,
+            })
+            .expect("set backing gain");
+        let play = load_play_screen(&midi_only_fixture().join("song.mid"), None)
+            .expect("load MIDI-only bundle");
+        shell.screen = Screen::Play(Box::new(shell.tuned(play)));
+        assert_eq!(
+            play_screen(&shell).backing_gain(),
+            Gain::new(0.5).unwrap(),
+            "the new take opens at the level the mixer is set to"
+        );
     }
 
     /// The TUI drives import through its interactive screens, not the socket,

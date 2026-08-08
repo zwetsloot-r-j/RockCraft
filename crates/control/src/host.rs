@@ -23,7 +23,7 @@
 //! `HostCommand` reuses `core`'s [`ParamInfo`] / [`ActionError`] so the wire
 //! shapes and error vocabulary stay identical to the action tier.
 
-use rockcraft_core::{ActionError, ParamInfo};
+use rockcraft_core::{ActionError, MixerBus, ParamInfo, SynthBus};
 use serde::{Deserialize, Serialize};
 
 /// Where [`HostCommand::SaveBundle`] writes the current timeline.
@@ -111,6 +111,16 @@ pub enum HostCommand {
     /// Detach the backing audio file.
     DetachBacking,
 
+    // ── sound / mixer (M14-C) ───────────────────────────────────────────
+    /// Point one synth bus (the player's notes or the song's) at a curated
+    /// instrument by id; returns the new mix.
+    SetInstrument { bus: SynthBus, instrument: String },
+    /// Set one bus's level in `0.0..=1.0` — the player's notes, the song, or
+    /// the backing track; returns the new mix.
+    SetBusGain { bus: MixerBus, gain: f32 },
+    /// The current mix plus the selectable-instrument catalog.
+    QueryMixer,
+
     // ── backing video ("the movie") ─────────────────────────────────────
     /// Attach (or replace) the background video by path, with an alignment
     /// offset (`videoTime = songTime + offset_us`). Persisted into the bundle
@@ -167,6 +177,9 @@ impl HostCommand {
             HostCommand::RecordSave => "record_save",
             HostCommand::AttachBacking { .. } => "attach_backing",
             HostCommand::DetachBacking => "detach_backing",
+            HostCommand::SetInstrument { .. } => "set_instrument",
+            HostCommand::SetBusGain { .. } => "set_bus_gain",
+            HostCommand::QueryMixer => "query_mixer",
             HostCommand::AttachVideo { .. } => "attach_video",
             HostCommand::SetVideoOffset { .. } => "set_video_offset",
             HostCommand::DetachVideo => "detach_video",
@@ -291,6 +304,9 @@ pub fn host_command_names() -> &'static [&'static str] {
         "record_save",
         "attach_backing",
         "detach_backing",
+        "set_instrument",
+        "set_bus_gain",
+        "query_mixer",
         "attach_video",
         "set_video_offset",
         "detach_video",
@@ -349,6 +365,10 @@ static HOST_HELP: &[HostCommandInfo] = {
         // ── backing / audio ─────────────────────────────────────────────
         HostCommandInfo { name: "attach_backing", params: &[p("path", "String")], description: "Attach a backing audio file by path." },
         HostCommandInfo { name: "detach_backing", params: &[], description: "Detach the backing audio file." },
+        // ── sound / mixer ───────────────────────────────────────────────
+        HostCommandInfo { name: "set_instrument", params: &[p("bus", "SynthBus"), p("instrument", "String")], description: "Point a synth bus at a curated instrument by id; bus is \"player\" (the notes you play) or \"song\" (the auto-played chart). Call query_mixer for the selectable ids. Returns the new mix." },
+        HostCommandInfo { name: "set_bus_gain", params: &[p("bus", "MixerBus"), p("gain", "f32")], description: "Set one bus's level, clamped to 0.0..=1.0; bus is \"player\", \"song\", or \"backing\". Returns the new mix." },
+        HostCommandInfo { name: "query_mixer", params: &[], description: "Return the current mix (instrument + level per synth bus, plus the backing level) and the catalog of selectable instruments." },
         // ── backing video ("the movie") ─────────────────────────────────
         HostCommandInfo { name: "attach_video", params: &[p("path", "String"), p("offset_us", "i64")], description: "Attach (or replace) the background video by path, with an alignment offset (videoTime = songTime + offset_us). Persisted into the bundle on save. Returns the attached video reference." },
         HostCommandInfo { name: "set_video_offset", params: &[p("offset_us", "i64")], description: "Update only the alignment offset of the already-attached background video. Returns the attached video reference." },
@@ -412,6 +432,15 @@ mod tests {
                 path: "song.ogg".into(),
             },
             HostCommand::DetachBacking,
+            HostCommand::SetInstrument {
+                bus: SynthBus::Song,
+                instrument: "marimba".into(),
+            },
+            HostCommand::SetBusGain {
+                bus: MixerBus::Backing,
+                gain: 0.5,
+            },
+            HostCommand::QueryMixer,
             HostCommand::AttachVideo {
                 path: "movie.mp4".into(),
                 offset_us: -100_000,
@@ -487,6 +516,8 @@ mod tests {
                 let sample = match p.ty {
                     "bool" => json!(true),
                     "i64" => json!(0),
+                    "f32" => json!(0.5),
+                    "SynthBus" | "MixerBus" => json!("player"),
                     "SaveDest" => json!({ "kind": "quick_save" }),
                     "Vec<SegmentSpec>" => {
                         json!([{ "start_us": 0, "end_us": 1, "name": "x" }])
@@ -585,6 +616,44 @@ mod tests {
                 ]
             }
         );
+    }
+
+    #[test]
+    fn mixer_commands_parse_their_typed_buses() {
+        assert_eq!(
+            host_command_from_name(
+                "set_instrument",
+                &json!({ "bus": "player", "instrument": "flute" })
+            )
+            .unwrap(),
+            HostCommand::SetInstrument {
+                bus: SynthBus::Player,
+                instrument: "flute".into()
+            }
+        );
+        assert_eq!(
+            host_command_from_name("set_bus_gain", &json!({ "bus": "backing", "gain": 0.25 }))
+                .unwrap(),
+            HostCommand::SetBusGain {
+                bus: MixerBus::Backing,
+                gain: 0.25
+            }
+        );
+    }
+
+    #[test]
+    fn set_instrument_rejects_the_backing_bus_at_the_type_level() {
+        // `backing` is an audio sink, not a synth voice: it has a level but no
+        // instrument, and `SynthBus` simply cannot name it.
+        let err = host_command_from_name(
+            "set_instrument",
+            &json!({ "bus": "backing", "instrument": "flute" }),
+        )
+        .unwrap_err();
+        match err {
+            ActionError::BadParams { action, .. } => assert_eq!(action, "set_instrument"),
+            other => panic!("expected BadParams, got {other:?}"),
+        }
     }
 
     #[test]

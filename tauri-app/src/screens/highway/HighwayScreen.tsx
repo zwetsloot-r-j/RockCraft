@@ -27,6 +27,7 @@ import type {
 import { useRouter } from "../../shell/Router";
 import { HighwayCanvas } from "./HighwayCanvas";
 import { HighwayHeader } from "./HighwayHeader";
+import { MixerPanel } from "./MixerPanel";
 import { PlaySummaryPanel } from "./PlaySummaryPanel";
 import { songFromInfo } from "./liveSong";
 import type { HighwayConfig, SongData } from "./types";
@@ -278,6 +279,10 @@ export function HighwayScreen() {
               display: "block",
             }}
           />
+          {/* Sound + levels (M14-C): instrument per voice and a fader each for
+              you / the song / the backing. Collapsed to a button until opened;
+              sits above the canvas, below the summary panel. */}
+          <MixerPanel />
           <Show when={loadErr()}>
             <div
               style={{

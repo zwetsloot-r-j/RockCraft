@@ -209,6 +209,74 @@ export function audioStatus(): Promise<AudioStatus> {
   return invoke<AudioStatus>("audio_status");
 }
 
+// ── Sound selection + mixer (M14-C) ────────────────────────────────────────
+
+/**
+ * A synth voice: the notes you play, or the notes the song plays. Each has its
+ * own instrument and level. Mirror of `core::SynthBus`.
+ */
+export type SynthBus = "player" | "song";
+
+/**
+ * Anything with a fader: the two synth voices plus the backing audio track
+ * (which has a level but no instrument). Mirror of `core::MixerBus`.
+ */
+export type MixerBus = SynthBus | "backing";
+
+/** One selectable sound. Mirror of `core::Instrument`. */
+export interface Instrument {
+  /** Stable id — what {@link setInstrument} takes and what we persist. */
+  id: string;
+  /** Display name for the dropdown. */
+  name: string;
+  /** General MIDI program number. */
+  program: number;
+}
+
+/** One synth bus's settings. Mirror of `core::BusMix`. */
+export interface BusMix {
+  instrument: Instrument;
+  /** Linear level, 0.0–1.0. */
+  gain: number;
+}
+
+/**
+ * The current mix plus the instrument catalog — the reply to every mixer call,
+ * so one round trip renders the whole panel. Mirror of `core::MixerReport`.
+ */
+export interface MixerReport {
+  player: BusMix;
+  song: BusMix;
+  /** The backing track's level, 0.0–1.0. */
+  backing_gain: number;
+  /** Every selectable instrument, in menu order — never hardcode this list. */
+  instruments: Instrument[];
+}
+
+/** Read the current mix and the selectable-instrument catalog. */
+export function mixerStatus(): Promise<MixerReport> {
+  return invoke<MixerReport>("mixer_status");
+}
+
+/**
+ * Point one synth bus at a catalog instrument by id. Rejects with an error
+ * string for an unknown id. Returns the new mix.
+ */
+export function setInstrument(
+  bus: SynthBus,
+  instrument: string,
+): Promise<MixerReport> {
+  return invoke<MixerReport>("set_instrument", { bus, instrument });
+}
+
+/**
+ * Set one bus's level. Values outside 0.0–1.0 are clamped by the backend.
+ * Returns the new mix.
+ */
+export function setBusGain(bus: MixerBus, gain: number): Promise<MixerReport> {
+  return invoke<MixerReport>("set_bus_gain", { bus, gain });
+}
+
 // ── Edit-screen backing track, persisted in the bundle (M9-E) ───────────────
 
 /**

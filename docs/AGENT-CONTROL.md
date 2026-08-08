@@ -421,6 +421,9 @@ below is an at-a-glance convenience only.
 | `record_save` | none | Save the session as a bundle. Returns the dir |
 | `attach_backing` | `{ path: String }` | Attach a backing audio file |
 | `detach_backing` | none | Detach the backing audio file |
+| `set_instrument` | `{ bus: "player"\|"song", instrument: String }` | Point a synth voice at a curated instrument by id — `player` is the notes you play, `song` the auto-played chart. Returns the new mix |
+| `set_bus_gain` | `{ bus: "player"\|"song"\|"backing", gain: f32 }` | Set one level, clamped to `0.0..=1.0`. Returns the new mix |
+| `query_mixer` | none | The current mix (instrument + level per voice, plus the backing level) and the selectable-instrument catalog |
 | `attach_video` | `{ path: String, offset_us: i64 }` | Attach a background video ("the movie"); persisted into the bundle on save. Returns the `VideoRef` |
 | `set_video_offset` | `{ offset_us: i64 }` | Re-align the attached video. Returns the `VideoRef` |
 | `detach_video` | none | Detach the background video |
@@ -433,8 +436,16 @@ below is an at-a-glance convenience only.
 
 Not every frontend supports every command: the TUI's record/import/backing
 flows are interactive screen state machines, so it returns `unsupported:` for
-those (it wires `scan_library`, `query_dirty`, `play_load`). The Tauri desktop
-host backs the full set. Always discover the live set with `query help`.
+those (it wires `scan_library`, `query_dirty`, `play_load`, the mixer trio, and
+`play_toggle_pause`). The Tauri desktop host backs the full set. Always discover
+the live set with `query help`.
+
+The mixer commands work from any screen in either frontend — the synth is
+app-wide, not owned by a play session — so a level can be set before a bundle is
+loaded and it will be in force when the take starts. Whether an instrument is
+*audible* depends on the loaded SoundFont: a full General MIDI bank has every
+program, a single-preset piano bank falls back to its one preset (see
+[`crates/audio/assets/NOTICE.md`](../crates/audio/assets/NOTICE.md)).
 
 ## Example session
 

@@ -14,10 +14,12 @@
 //! backing sender is disconnected; every operation becomes a no-op so the app
 //! is fully usable in silent environments.
 //!
-//! The three public Tauri commands are thin wrappers:
+//! The public Tauri commands are thin wrappers:
 //! - [`attach_backing`] — point at an audio file, verified to exist.
 //! - [`detach_backing`] — clear the backing-track session.
 //! - [`audio_status`] — report device / backing state to the webview.
+//! - [`set_instrument`] / [`set_bus_gain`] / [`mixer_status`] — the M14-C sound
+//!   selection + three-fader mixer (you / song / backing).
 //!
 //! [`apply_effects`] routes a batch of [`Effect`]s from `run_action` /
 //! `tick_advance` to the synth; call it on the app thread (never on the audio
@@ -29,7 +31,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use rockcraft_audio::{AudioOut, BackingHandle, SynthHandle};
-use rockcraft_core::Effect;
+use rockcraft_core::{Effect, Gain, Mixer, MixerBus, MixerReport, SynthBus};
 use serde::Serialize;
 
 // ── Backing-thread messages ──────────────────────────────────────────────────
@@ -49,6 +51,9 @@ enum BackingMsg {
     /// Set the playback speed multiplier (resamples; pitch shifts with speed).
     /// Keeps the backing in step with a slowed/sped transport.
     SetSpeed(f32),
+    /// Set the backing track's level (M14-C). Sticky: re-applied to every sink
+    /// the thread makes afterwards, exactly like the speed.
+    SetGain(Gain),
     /// Query the current backing file name (reply on the one-shot channel).
     QueryFileName(Sender<Option<String>>),
 }
@@ -62,10 +67,15 @@ enum BackingMsg {
 /// The `!Send` rodio types (`AudioOut`, `BackingHandle`) live on the
 /// dedicated backing thread.
 pub struct AudioState {
-    /// `None` when no audio device is available (CI, headless).
+    /// `None` when no audio device is available (CI, headless). Bound to
+    /// [`SynthBus::Player`]; the song voice is `synth.for_bus(SynthBus::Song)`.
     pub synth: Option<SynthHandle>,
     /// Channel to the backing-manager thread. `None` when no device.
     backing_tx: Mutex<Option<Sender<BackingMsg>>>,
+    /// The M14-C mix: instrument + level per synth bus, plus the backing level.
+    /// Pure settings (`core`); this state pushes each change at the synth /
+    /// backing thread as it is made.
+    mixer: Mutex<Mixer>,
     /// Play-mode backing coupling state (#168). Tracks the attached file and
     /// last seek target so the play tick only sends a message on a change. Kept
     /// separate from the composer/transport `sync_backing` path so the two
@@ -125,6 +135,9 @@ impl AudioState {
             // Current speed multiplier, re-applied whenever a fresh sink is made
             // (a new BackingHandle starts at 1.0×) so slow-mo survives a restart.
             let mut speed: f32 = 1.0;
+            // Current backing level, re-applied for the same reason (a fresh
+            // sink starts at unity) so the fader survives a restart.
+            let mut gain = Gain::UNITY;
 
             for msg in backing_rx {
                 match msg {
@@ -153,6 +166,7 @@ impl AudioState {
                             match out.play_backing_at(p, pos) {
                                 Ok(h) => {
                                     h.set_speed(speed); // carry slow-mo across restarts
+                                    h.set_gain(gain); // …and the fader
                                     handle = Some(h);
                                 }
                                 Err(e) => {
@@ -177,6 +191,12 @@ impl AudioState {
                             h.set_speed(s);
                         }
                     }
+                    BackingMsg::SetGain(g) => {
+                        gain = g;
+                        if let Some(h) = &handle {
+                            h.set_gain(g);
+                        }
+                    }
                     BackingMsg::QueryFileName(reply) => {
                         let name = path
                             .as_ref()
@@ -196,6 +216,7 @@ impl AudioState {
             Ok(Some(synth)) => Self {
                 synth: Some(synth),
                 backing_tx: Mutex::new(Some(backing_tx)),
+                mixer: Mutex::new(Mixer::new()),
                 play_backing: Mutex::new(PlayBacking::default()),
             },
             _ => {
@@ -203,6 +224,7 @@ impl AudioState {
                 Self {
                     synth: None,
                     backing_tx: Mutex::new(None),
+                    mixer: Mutex::new(Mixer::new()),
                     play_backing: Mutex::new(PlayBacking::default()),
                 }
             }
@@ -221,6 +243,57 @@ impl AudioState {
     /// sped transport. Resamples, so the pitch shifts with the speed.
     pub fn set_backing_speed(&self, speed: f32) {
         self.send_backing(BackingMsg::SetSpeed(speed));
+    }
+
+    // ── Sound selection + mixer (M14-C) ─────────────────────────────────────
+
+    /// A handle onto one synth bus, or `None` with no device.
+    ///
+    /// The player bus echoes the notes coming off the piano; the song bus
+    /// carries "hear the song". They have independent instruments and levels.
+    pub fn bus(&self, bus: SynthBus) -> Option<SynthHandle> {
+        self.synth.as_ref().map(|s| s.for_bus(bus))
+    }
+
+    /// The current mix plus the instrument catalog, for the webview / an agent.
+    pub fn mixer_report(&self) -> MixerReport {
+        MixerReport::from(*self.mixer.lock().expect("mixer mutex poisoned"))
+    }
+
+    /// Point a synth bus at a curated instrument by id and push the program
+    /// change at the synth. Returns the new mix, or the reason the id was
+    /// rejected.
+    pub fn set_instrument(&self, bus: SynthBus, id: &str) -> Result<MixerReport, String> {
+        let mixer = {
+            let mut guard = self.mixer.lock().expect("mixer mutex poisoned");
+            let instrument = guard.set_instrument(bus, id).map_err(|e| e.to_string())?;
+            if let Some(h) = self.bus(bus) {
+                h.set_instrument(instrument);
+            }
+            *guard
+        };
+        Ok(MixerReport::from(mixer))
+    }
+
+    /// Set one bus's level (clamped to `0.0..=1.0`) and push it at the synth
+    /// channel or the backing sink. Returns the new mix.
+    pub fn set_bus_gain(&self, bus: MixerBus, value: f32) -> Result<MixerReport, String> {
+        let mixer = {
+            let mut guard = self.mixer.lock().expect("mixer mutex poisoned");
+            let gain = guard.set_gain(bus, value).map_err(|e| e.to_string())?;
+            match bus.synth_bus() {
+                Some(synth_bus) => {
+                    if let Some(h) = self.bus(synth_bus) {
+                        h.set_gain(gain);
+                    }
+                }
+                // The backing is an audio sink: its fader lives on the thread
+                // that owns the (!Send) handle.
+                None => self.send_backing(BackingMsg::SetGain(gain)),
+            }
+            *guard
+        };
+        Ok(MixerReport::from(mixer))
     }
 
     // ── Play-mode backing coupling (#168) ───────────────────────────────────
@@ -469,6 +542,38 @@ pub fn detach_backing(state: tauri::State<'_, AudioState>) {
     state.send_backing(BackingMsg::Detach);
 }
 
+/// Point a synth bus at a curated instrument by id (M14-C).
+///
+/// `bus` is `"player"` (the notes you play) or `"song"` (the auto-played
+/// chart). Returns the new mix so the webview can re-render from one reply.
+#[tauri::command]
+pub fn set_instrument(
+    state: tauri::State<'_, AudioState>,
+    bus: SynthBus,
+    instrument: String,
+) -> Result<MixerReport, String> {
+    state.set_instrument(bus, &instrument)
+}
+
+/// Set one mixer bus's level in `0.0..=1.0` (M14-C).
+///
+/// `bus` is `"player"`, `"song"`, or `"backing"`. Out-of-range values are
+/// clamped; a non-finite one is rejected. Returns the new mix.
+#[tauri::command]
+pub fn set_bus_gain(
+    state: tauri::State<'_, AudioState>,
+    bus: MixerBus,
+    gain: f32,
+) -> Result<MixerReport, String> {
+    state.set_bus_gain(bus, gain)
+}
+
+/// Return the current mix and the catalog of selectable instruments (M14-C).
+#[tauri::command]
+pub fn mixer_status(state: tauri::State<'_, AudioState>) -> MixerReport {
+    state.mixer_report()
+}
+
 /// Return current audio status (device availability and backing file).
 #[tauri::command]
 pub fn audio_status(state: tauri::State<'_, AudioState>) -> AudioStatus {
@@ -496,14 +601,21 @@ pub fn audio_status(state: tauri::State<'_, AudioState>) -> AudioStatus {
 mod tests {
     use super::*;
 
+    /// A silent `AudioState` — no device, no backing thread. The headless CI
+    /// path, and what every test here drives.
+    fn silent_state() -> AudioState {
+        AudioState {
+            synth: None,
+            backing_tx: Mutex::new(None),
+            mixer: Mutex::new(Mixer::new()),
+            play_backing: Mutex::new(PlayBacking::default()),
+        }
+    }
+
     /// `apply_effects` with no audio device is a no-op — must not panic.
     #[test]
     fn apply_effects_no_device_is_noop() {
-        let audio = AudioState {
-            synth: None,
-            backing_tx: Mutex::new(None),
-            play_backing: Mutex::new(PlayBacking::default()),
-        };
+        let audio = silent_state();
         apply_effects(
             &audio,
             true,
@@ -548,6 +660,72 @@ mod tests {
         let nudge1 = 10_000u64;
         let nudge2 = 250_000u64;
         assert_eq!(backing_pos(base, nudge1 + nudge2), base + nudge1 + nudge2);
+    }
+
+    /// The mix survives a device-less start: settings are `core` state, so the
+    /// UI still works (silently) on a headless machine.
+    #[test]
+    fn mixer_settings_apply_without_a_device() {
+        let audio = silent_state();
+        let report = audio
+            .set_instrument(SynthBus::Song, "marimba")
+            .expect("known instrument");
+        assert_eq!(report.mixer.song.instrument.id, "marimba");
+        assert_eq!(
+            audio.mixer_report().mixer.song.instrument.id,
+            "marimba",
+            "the change is remembered, not just returned"
+        );
+        assert_eq!(
+            audio.mixer_report().mixer.player.instrument.id,
+            rockcraft_core::DEFAULT_INSTRUMENT,
+            "the other bus is untouched"
+        );
+    }
+
+    /// Each fader moves exactly one bus.
+    #[test]
+    fn bus_gains_are_independent() {
+        let audio = silent_state();
+        audio.set_bus_gain(MixerBus::Player, 0.25).unwrap();
+        audio.set_bus_gain(MixerBus::Backing, 0.5).unwrap();
+        let m = audio.mixer_report().mixer;
+        assert_eq!(m.player.gain.value(), 0.25);
+        assert_eq!(m.song.gain, Gain::UNITY);
+        assert_eq!(m.backing_gain.value(), 0.5);
+    }
+
+    /// Out-of-range clamps; non-finite is rejected and changes nothing.
+    #[test]
+    fn gain_is_clamped_and_non_finite_rejected() {
+        let audio = silent_state();
+        audio.set_bus_gain(MixerBus::Song, 9.0).unwrap();
+        assert_eq!(audio.mixer_report().mixer.song.gain, Gain::UNITY);
+        audio.set_bus_gain(MixerBus::Song, -1.0).unwrap();
+        assert_eq!(audio.mixer_report().mixer.song.gain, Gain::SILENT);
+        assert!(audio.set_bus_gain(MixerBus::Song, f32::NAN).is_err());
+        assert_eq!(audio.mixer_report().mixer.song.gain, Gain::SILENT);
+    }
+
+    /// An unknown instrument id is reported, not silently ignored.
+    #[test]
+    fn unknown_instrument_is_rejected() {
+        let audio = silent_state();
+        let err = audio.set_instrument(SynthBus::Player, "kazoo").unwrap_err();
+        assert!(err.contains("kazoo"), "error names the id: {err}");
+        assert_eq!(
+            audio.mixer_report().mixer.player.instrument.id,
+            rockcraft_core::DEFAULT_INSTRUMENT
+        );
+    }
+
+    /// With no device there is no handle to hand out — the callers all treat
+    /// `None` as "stay silent".
+    #[test]
+    fn bus_handles_are_none_without_a_device() {
+        let audio = silent_state();
+        assert!(audio.bus(SynthBus::Player).is_none());
+        assert!(audio.bus(SynthBus::Song).is_none());
     }
 
     /// `attach_backing` rejects a missing path.

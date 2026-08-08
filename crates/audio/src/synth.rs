@@ -1,4 +1,4 @@
-//! SoundFont piano synth — turns `NoteEvent`s into sound.
+//! SoundFont synth — turns `NoteEvent`s into sound, on two independent buses.
 //!
 //! Two halves, split across the real-time boundary (see `CLAUDE.md`):
 //! - [`SynthHandle`] lives on the MIDI/app thread. Its methods only **enqueue**
@@ -11,25 +11,55 @@
 //!
 //! Construct both with [`synth_from_sf2_bytes`]; the pieces are wired together
 //! by a single SPSC channel.
+//!
+//! **Buses (M14-C).** Every handle carries a [`SynthBus`] — the notes you play
+//! (`Player`) or the notes the song plays (`Song`) — and addresses that bus's
+//! MIDI channel. Each channel has its own program (instrument) and channel
+//! volume, so the two can sound different and sit at different levels. Get the
+//! other bus's handle with [`SynthHandle::for_bus`]; the handle returned by
+//! [`synth_from_sf2_bytes`] starts on [`SynthBus::Player`].
 
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rockcraft_core::{MidiNote, NoteEvent, NoteEventKind, Velocity};
+use rockcraft_core::{Gain, Instrument, MidiNote, NoteEvent, NoteEventKind, SynthBus, Velocity};
 use rodio::Source;
 use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
 
-/// We render everything on one MIDI channel — a single piano.
-const MIDI_CHANNEL: i32 = 0;
+/// MIDI status byte for a program change (instrument select) on a channel.
+const PROGRAM_CHANGE: i32 = 0xC0;
+/// MIDI status byte for a control change.
+const CONTROL_CHANGE: i32 = 0xB0;
+/// Controller 7: channel volume — how a bus's level is set on the synth.
+const CC_CHANNEL_VOLUME: i32 = 7;
 
 /// A command handed from the app thread to the audio thread. Tiny and `Copy`
-/// so enqueuing is cheap and allocation-free.
+/// so enqueuing is cheap and allocation-free. `channel` is the bus's MIDI
+/// channel ([`SynthBus::midi_channel`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SynthCommand {
-    NoteOn { note: u8, velocity: u8 },
-    NoteOff { note: u8 },
+    NoteOn {
+        channel: u8,
+        note: u8,
+        velocity: u8,
+    },
+    NoteOff {
+        channel: u8,
+        note: u8,
+    },
+    /// Release every note on every bus (panic button / screen change).
     AllOff,
+    /// Select a General MIDI program on one bus.
+    Program {
+        channel: u8,
+        program: u8,
+    },
+    /// Set one bus's channel volume (controller 7), `0..=127`.
+    Volume {
+        channel: u8,
+        value: u8,
+    },
 }
 
 /// Errors building a synth from SoundFont bytes.
@@ -55,28 +85,72 @@ impl std::error::Error for SynthError {}
 /// Cheap, cloneable handle used from the MIDI/app thread. Every method just
 /// enqueues a command; if the audio thread is gone the send is silently
 /// dropped (we're shutting down).
+///
+/// A handle is *bound to one bus*: its notes, instrument, and level all address
+/// that bus's MIDI channel. [`for_bus`](SynthHandle::for_bus) hands back a
+/// sibling on the other bus over the same channel to the audio thread.
 #[derive(Clone)]
 pub struct SynthHandle {
     tx: Sender<SynthCommand>,
+    bus: SynthBus,
 }
 
 impl SynthHandle {
-    /// Start sounding `note` at `velocity`.
+    /// The bus this handle plays on.
+    pub fn bus(&self) -> SynthBus {
+        self.bus
+    }
+
+    /// A handle onto another bus of the same synth — e.g. the song voice, from
+    /// the player voice. Cheap: it clones the command sender, nothing more.
+    pub fn for_bus(&self, bus: SynthBus) -> SynthHandle {
+        SynthHandle {
+            tx: self.tx.clone(),
+            bus,
+        }
+    }
+
+    /// Start sounding `note` at `velocity` on this handle's bus.
     pub fn note_on(&self, note: MidiNote, velocity: Velocity) {
         let _ = self.tx.send(SynthCommand::NoteOn {
+            channel: self.bus.midi_channel(),
             note: note.value(),
             velocity: velocity.value(),
         });
     }
 
-    /// Release `note`.
+    /// Release `note` on this handle's bus.
     pub fn note_off(&self, note: MidiNote) {
-        let _ = self.tx.send(SynthCommand::NoteOff { note: note.value() });
+        let _ = self.tx.send(SynthCommand::NoteOff {
+            channel: self.bus.midi_channel(),
+            note: note.value(),
+        });
     }
 
-    /// Release everything (panic button / screen change).
+    /// Release everything, on **every** bus (panic button / screen change).
     pub fn all_off(&self) {
         let _ = self.tx.send(SynthCommand::AllOff);
+    }
+
+    /// Switch this bus to `instrument` (a General MIDI program change).
+    ///
+    /// Whether it is audible depends on the loaded SoundFont: a full GM bank
+    /// has all the programs, while a single-preset piano bank falls back to its
+    /// one preset (see `crates/audio/assets/NOTICE.md`).
+    pub fn set_instrument(&self, instrument: &Instrument) {
+        let _ = self.tx.send(SynthCommand::Program {
+            channel: self.bus.midi_channel(),
+            program: instrument.program,
+        });
+    }
+
+    /// Set this bus's level (MIDI channel volume). Notes already sounding
+    /// follow the new level; the other bus is untouched.
+    pub fn set_gain(&self, gain: Gain) {
+        let _ = self.tx.send(SynthCommand::Volume {
+            channel: self.bus.midi_channel(),
+            value: gain.midi_volume(),
+        });
     }
 
     /// Route a [`NoteEvent`] straight to the synth. A note-on with velocity 0 is
@@ -113,14 +187,34 @@ impl SynthSource {
     fn refill(&mut self) {
         loop {
             match self.rx.try_recv() {
-                Ok(SynthCommand::NoteOn { note, velocity }) => {
+                Ok(SynthCommand::NoteOn {
+                    channel,
+                    note,
+                    velocity,
+                }) => {
                     self.synth
-                        .note_on(MIDI_CHANNEL, note as i32, velocity as i32);
+                        .note_on(channel as i32, note as i32, velocity as i32);
                 }
-                Ok(SynthCommand::NoteOff { note }) => {
-                    self.synth.note_off(MIDI_CHANNEL, note as i32);
+                Ok(SynthCommand::NoteOff { channel, note }) => {
+                    self.synth.note_off(channel as i32, note as i32);
                 }
                 Ok(SynthCommand::AllOff) => self.synth.note_off_all(false),
+                Ok(SynthCommand::Program { channel, program }) => {
+                    self.synth.process_midi_message(
+                        channel as i32,
+                        PROGRAM_CHANGE,
+                        program as i32,
+                        0,
+                    );
+                }
+                Ok(SynthCommand::Volume { channel, value }) => {
+                    self.synth.process_midi_message(
+                        channel as i32,
+                        CONTROL_CHANGE,
+                        CC_CHANNEL_VOLUME,
+                        value as i32,
+                    );
+                }
                 // Nothing pending, or the handle was dropped: stop draining and
                 // render whatever is currently sounding (release tails, silence).
                 Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
@@ -178,6 +272,9 @@ fn interleave(left: &[f32], right: &[f32], out: &mut Vec<f32>) {
 /// Build a synth from SoundFont bytes, returning the audio-thread [`SynthSource`]
 /// (hand to `rodio`) and the app-thread [`SynthHandle`] (call from the event
 /// loop). `sample_rate` is the output rate the source renders at.
+///
+/// The handle comes back on [`SynthBus::Player`]; reach the song voice with
+/// [`SynthHandle::for_bus`].
 pub fn synth_from_sf2_bytes(
     bytes: &[u8],
     sample_rate: u32,
@@ -192,11 +289,14 @@ pub fn synth_from_sf2_bytes(
     // MIDI program number (e.g. 12 = marimba) to make the synth's notes stand
     // out over a same-timbre backing — useful for checking a chart's alignment
     // against the source audio by ear. Unset ⇒ the SoundFont's default (piano).
+    // It seeds *both* buses; the mixer's per-bus instrument overrides it live.
     if let Some(prog) = std::env::var("ROCKCRAFT_SYNTH_PROGRAM")
         .ok()
         .and_then(|s| s.trim().parse::<i32>().ok())
     {
-        synth.process_midi_message(MIDI_CHANNEL, 0xC0, prog, 0);
+        for bus in SynthBus::all() {
+            synth.process_midi_message(bus.midi_channel() as i32, PROGRAM_CHANGE, prog, 0);
+        }
     }
     let block = synth.get_block_size();
 
@@ -210,7 +310,13 @@ pub fn synth_from_sf2_bytes(
         frame: Vec::with_capacity(block * 2),
         pos: 0, // empty `frame` forces a render on the first `next()`
     };
-    Ok((source, SynthHandle { tx }))
+    Ok((
+        source,
+        SynthHandle {
+            tx,
+            bus: SynthBus::Player,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -221,10 +327,24 @@ mod tests {
         rx.try_iter().collect()
     }
 
+    /// A player-bus handle plus the receiving end the audio thread would own.
+    fn handle() -> (SynthHandle, Receiver<SynthCommand>) {
+        let (tx, rx) = mpsc::channel();
+        (
+            SynthHandle {
+                tx,
+                bus: SynthBus::Player,
+            },
+            rx,
+        )
+    }
+
+    const PLAYER: u8 = 0;
+    const SONG: u8 = 1;
+
     #[test]
     fn handle_enqueues_in_order() {
-        let (tx, rx) = mpsc::channel();
-        let h = SynthHandle { tx };
+        let (h, rx) = handle();
         let c4 = MidiNote::new(60).unwrap();
         h.note_on(c4, Velocity::new(100).unwrap());
         h.note_off(c4);
@@ -232,18 +352,21 @@ mod tests {
             drain(&rx),
             vec![
                 SynthCommand::NoteOn {
+                    channel: PLAYER,
                     note: 60,
                     velocity: 100
                 },
-                SynthCommand::NoteOff { note: 60 },
+                SynthCommand::NoteOff {
+                    channel: PLAYER,
+                    note: 60
+                },
             ]
         );
     }
 
     #[test]
     fn apply_maps_note_events() {
-        let (tx, rx) = mpsc::channel();
-        let h = SynthHandle { tx };
+        let (h, rx) = handle();
         let c4 = MidiNote::new(60).unwrap();
         h.apply(&NoteEvent::on(c4, Velocity::new(80).unwrap(), 0));
         h.apply(&NoteEvent::off(c4, 10));
@@ -251,22 +374,98 @@ mod tests {
             drain(&rx),
             vec![
                 SynthCommand::NoteOn {
+                    channel: PLAYER,
                     note: 60,
                     velocity: 80
                 },
-                SynthCommand::NoteOff { note: 60 },
+                SynthCommand::NoteOff {
+                    channel: PLAYER,
+                    note: 60
+                },
             ]
         );
     }
 
     #[test]
     fn apply_velocity_zero_on_is_note_off() {
-        let (tx, rx) = mpsc::channel();
-        let h = SynthHandle { tx };
+        let (h, rx) = handle();
         let c4 = MidiNote::new(60).unwrap();
         // A note-on with velocity 0 is, by MIDI convention, a note-off.
         h.apply(&NoteEvent::on(c4, Velocity::new(0).unwrap(), 0));
-        assert_eq!(drain(&rx), vec![SynthCommand::NoteOff { note: 60 }]);
+        assert_eq!(
+            drain(&rx),
+            vec![SynthCommand::NoteOff {
+                channel: PLAYER,
+                note: 60
+            }]
+        );
+    }
+
+    #[test]
+    fn a_handle_starts_on_the_player_bus() {
+        let (h, _rx) = handle();
+        assert_eq!(h.bus(), SynthBus::Player);
+    }
+
+    #[test]
+    fn for_bus_addresses_the_other_channel_over_the_same_queue() {
+        let (player, rx) = handle();
+        let song = player.for_bus(SynthBus::Song);
+        assert_eq!(song.bus(), SynthBus::Song);
+        let c4 = MidiNote::new(60).unwrap();
+        player.note_on(c4, Velocity::new(80).unwrap());
+        song.note_on(c4, Velocity::new(80).unwrap());
+        // Both land on the one audio-thread queue, tagged by bus.
+        assert_eq!(
+            drain(&rx),
+            vec![
+                SynthCommand::NoteOn {
+                    channel: PLAYER,
+                    note: 60,
+                    velocity: 80
+                },
+                SynthCommand::NoteOn {
+                    channel: SONG,
+                    note: 60,
+                    velocity: 80
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn instrument_and_gain_address_the_handles_own_bus() {
+        let (player, rx) = handle();
+        let song = player.for_bus(SynthBus::Song);
+        song.set_instrument(rockcraft_core::instrument("marimba").unwrap());
+        song.set_gain(Gain::new(0.5).unwrap());
+        player.set_gain(Gain::SILENT);
+        assert_eq!(
+            drain(&rx),
+            vec![
+                SynthCommand::Program {
+                    channel: SONG,
+                    program: 12
+                },
+                SynthCommand::Volume {
+                    channel: SONG,
+                    value: 64
+                },
+                SynthCommand::Volume {
+                    channel: PLAYER,
+                    value: 0
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn all_off_is_bus_wide() {
+        // The panic button silences everything, whichever handle sends it —
+        // there is one `AllOff`, not one per channel.
+        let (player, rx) = handle();
+        player.for_bus(SynthBus::Song).all_off();
+        assert_eq!(drain(&rx), vec![SynthCommand::AllOff]);
     }
 
     #[test]

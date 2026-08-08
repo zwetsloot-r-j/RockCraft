@@ -8,6 +8,10 @@
 //! output stream, returning a [`BackingHandle`] to stop, pause, resume, or seek
 //! it; [`play_file_at`] starts it seeked to a position, for syncing a backing
 //! track to the highway.
+//!
+//! Levels are per source (M14-C): the two synth buses take theirs through
+//! [`SynthHandle::set_gain`], the backing track through
+//! [`BackingHandle::set_gain`]. The settings themselves are `core::Mixer`.
 
 pub mod synth;
 
@@ -16,6 +20,7 @@ pub use synth::{synth_from_sf2_bytes, SynthError, SynthHandle, SynthSource};
 
 use std::path::PathBuf;
 
+use rockcraft_core::Gain;
 use rodio::{OutputStream, OutputStreamHandle};
 
 /// Output sample rate the synth renders at. rodio resamples to the device rate
@@ -208,6 +213,13 @@ impl BackingHandle {
     /// to keep the backing audio in step with a slowed transport.
     pub fn set_speed(&self, speed: f32) {
         self.sink.set_speed(speed);
+    }
+
+    /// Set the backing track's level (M14-C) — the third fader next to the two
+    /// synth buses, so the recording can sit under the notes or drop out
+    /// entirely. Takes effect immediately and does not block.
+    pub fn set_gain(&self, gain: Gain) {
+        self.sink.set_volume(gain.value());
     }
 }
 
