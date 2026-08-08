@@ -13,6 +13,7 @@
 //! pure: no apply logic, no key codes, no I/O. M4-B (`Composer::apply`) gives
 //! these meaning; this module only names them.
 
+use crate::background::Easing;
 use serde::{Deserialize, Serialize};
 
 /// Every composer operation, transport-agnostic.
@@ -169,6 +170,54 @@ pub enum Action {
     PasteClipboard,
     DeleteSelection,
 
+    // ── background images (M14-D) ───────────────────────────────────────
+    // Layout + keyframing for the piece's background image layers. Every
+    // variant addresses the *selected* layer at the *edit time*
+    // (`Composer::playhead_us()` — the transport while playing, the cursor
+    // while stopped), and every one is a no-op when the piece has no layers.
+    //
+    // The transform deltas are integers (permille / millidegrees) so `Action`
+    // keeps its `Eq` derive, mirroring `SetPlaybackRate { rate_permille }`.
+    /// Address background layer `index` (back-to-front). Out of range: no-op.
+    SelectBackground {
+        index: u32,
+    },
+    /// Move the background selection by `delta`, wrapping both ways.
+    CycleBackground {
+        delta: i32,
+    },
+    /// Pan the selected layer by `(dx, dy)` in thousandths of a surface
+    /// width/height, auto-keyframing at the edit time.
+    NudgeBackgroundPos {
+        dx_permille: i32,
+        dy_permille: i32,
+    },
+    /// Zoom the selected layer by `delta_permille` thousandths, auto-keyframing
+    /// at the edit time.
+    NudgeBackgroundScale {
+        delta_permille: i32,
+    },
+    /// Rotate the selected layer by `delta_millideg` thousandths of a degree,
+    /// auto-keyframing at the edit time.
+    NudgeBackgroundRotation {
+        delta_millideg: i32,
+    },
+    /// Set the selected layer's opacity in thousandths (1000 = opaque),
+    /// auto-keyframing at the edit time.
+    SetBackgroundOpacity {
+        permille: u16,
+    },
+    /// Set the curve leaving the keyframe at the edit time. No-op when no
+    /// keyframe sits exactly there.
+    SetBackgroundEasing {
+        easing: Easing,
+    },
+    /// Pin the selected layer's currently interpolated transform as an explicit
+    /// keyframe at the edit time.
+    AddBackgroundKeyframe,
+    /// Drop the selected layer's keyframe at the edit time, if any.
+    DeleteBackgroundKeyframe,
+
     // ── history ─────────────────────────────────────────────────────────
     Undo,
     Redo,
@@ -235,6 +284,15 @@ impl Action {
             Action::YankSelection => "yank_selection",
             Action::PasteClipboard => "paste_clipboard",
             Action::DeleteSelection => "delete_selection",
+            Action::SelectBackground { .. } => "select_background",
+            Action::CycleBackground { .. } => "cycle_background",
+            Action::NudgeBackgroundPos { .. } => "nudge_background_pos",
+            Action::NudgeBackgroundScale { .. } => "nudge_background_scale",
+            Action::NudgeBackgroundRotation { .. } => "nudge_background_rotation",
+            Action::SetBackgroundOpacity { .. } => "set_background_opacity",
+            Action::SetBackgroundEasing { .. } => "set_background_easing",
+            Action::AddBackgroundKeyframe => "add_background_keyframe",
+            Action::DeleteBackgroundKeyframe => "delete_background_keyframe",
             Action::Undo => "undo",
             Action::Redo => "redo",
         }
@@ -379,6 +437,15 @@ pub fn action_names() -> &'static [&'static str] {
         "yank_selection",
         "paste_clipboard",
         "delete_selection",
+        "select_background",
+        "cycle_background",
+        "nudge_background_pos",
+        "nudge_background_scale",
+        "nudge_background_rotation",
+        "set_background_opacity",
+        "set_background_easing",
+        "add_background_keyframe",
+        "delete_background_keyframe",
         "undo",
         "redo",
     ]
@@ -487,6 +554,16 @@ static ACTION_HELP: &[ActionInfo] = {
         ActionInfo { name: "yank_selection", params: &[], description: "Copy the selected notes to the clipboard." },
         ActionInfo { name: "paste_clipboard", params: &[], description: "Paste the clipboard at the cursor." },
         ActionInfo { name: "delete_selection", params: &[], description: "Delete the notes inside the selection." },
+        // ── background images (M14-D) ───────────────────────────────────
+        ActionInfo { name: "select_background", params: &[p("index", "u32")], description: "Address background image layer `index` (0 = furthest back). Out of range: no-op." },
+        ActionInfo { name: "cycle_background", params: &[p("delta", "i32")], description: "Move the background-layer selection by delta, wrapping in both directions." },
+        ActionInfo { name: "nudge_background_pos", params: &[p("dx_permille", "i32"), p("dy_permille", "i32")], description: "Pan the selected background layer by (dx, dy) thousandths of a surface width/height, writing (and creating if needed) the keyframe at the edit time." },
+        ActionInfo { name: "nudge_background_scale", params: &[p("delta_permille", "i32")], description: "Zoom the selected background layer by delta_permille thousandths (1000 = 1x), writing the keyframe at the edit time. Clamped to 0.05x-10x." },
+        ActionInfo { name: "nudge_background_rotation", params: &[p("delta_millideg", "i32")], description: "Rotate the selected background layer by delta_millideg thousandths of a degree, writing the keyframe at the edit time." },
+        ActionInfo { name: "set_background_opacity", params: &[p("permille", "u16")], description: "Set the selected background layer's opacity in thousandths (1000 = fully opaque), writing the keyframe at the edit time." },
+        ActionInfo { name: "set_background_easing", params: &[p("easing", "Easing")], description: "Set the curve leaving the selected layer's keyframe at the edit time: \"linear\", \"ease_in\", \"ease_out\", \"ease_in_out\" or \"hold\" (a cut). No-op when no keyframe sits exactly there." },
+        ActionInfo { name: "add_background_keyframe", params: &[], description: "Pin the selected background layer's currently interpolated transform as an explicit keyframe at the edit time." },
+        ActionInfo { name: "delete_background_keyframe", params: &[], description: "Delete the selected background layer's keyframe at the edit time, if one sits exactly there." },
         // ── history ─────────────────────────────────────────────────────
         ActionInfo { name: "undo", params: &[], description: "Undo the last edit." },
         ActionInfo { name: "redo", params: &[], description: "Redo the last undone edit." },
@@ -567,6 +644,22 @@ mod tests {
             Action::YankSelection,
             Action::PasteClipboard,
             Action::DeleteSelection,
+            Action::SelectBackground { index: 0 },
+            Action::CycleBackground { delta: 1 },
+            Action::NudgeBackgroundPos {
+                dx_permille: 25,
+                dy_permille: -25,
+            },
+            Action::NudgeBackgroundScale { delta_permille: 50 },
+            Action::NudgeBackgroundRotation {
+                delta_millideg: 1_500,
+            },
+            Action::SetBackgroundOpacity { permille: 600 },
+            Action::SetBackgroundEasing {
+                easing: Easing::EaseInOut,
+            },
+            Action::AddBackgroundKeyframe,
+            Action::DeleteBackgroundKeyframe,
             Action::Undo,
             Action::Redo,
         ]
@@ -632,6 +725,7 @@ mod tests {
                 // A type-appropriate sample value per documented scalar type.
                 let sample = match p.ty {
                     "bool" => json!(true),
+                    "Easing" => json!("linear"),
                     _ => json!(1), // small in-range value for every numeric type
                 };
                 params.insert(p.name.to_string(), sample);

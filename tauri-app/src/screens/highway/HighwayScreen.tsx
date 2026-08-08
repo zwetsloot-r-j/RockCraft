@@ -10,7 +10,7 @@
 // Opening Play without a `dir` is just a guard (reaching it requires a bundle):
 // it shows a centered empty state instead of any canned fixture.
 
-import { createSignal, onCleanup, onMount, Show } from "solid-js";
+import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import {
   onPlayState,
@@ -20,11 +20,14 @@ import {
   playToggleHearSong,
 } from "../../ipc/bridge";
 import type {
+  BackgroundLayerView,
+  BackgroundTransform,
   BackgroundVideoView,
   PlayStateEvent,
   PlaySummary,
 } from "../../ipc/types";
 import { useRouter } from "../../shell/Router";
+import { IDENTITY_TRANSFORM, layerStyle } from "./backgrounds";
 import { HighwayCanvas } from "./HighwayCanvas";
 import { HighwayHeader } from "./HighwayHeader";
 import { MixerPanel } from "./MixerPanel";
@@ -81,6 +84,15 @@ export function HighwayScreen() {
   // Whole-song shift in µs; the video aligns to song *content*, which begins
   // after the pre-roll shift. videoTime = (songTime - shift) + offset.
   let shiftUs = 0;
+  // ── Background image layers (M14-D) ────────────────────────────────────────
+  // The piece's keyframed backdrops, back-to-front behind the highway canvas.
+  // `layers` is the static half (id + file) from `play_load`; `transforms` is
+  // the moving half, re-evaluated by `core` on every `play_state` tick — the
+  // webview never interpolates, it only applies what it is handed.
+  const [bgLayers, setBgLayers] = createSignal<BackgroundLayerView[]>([]);
+  const [bgTransforms, setBgTransforms] = createSignal<
+    Record<string, BackgroundTransform>
+  >({});
   const [eng, setEng] = createSignal<HighwayCanvas | null>(null);
   // ~9 fps throttle so the header re-reads without a per-frame render.
   const [frame, setFrame] = createSignal(0);
@@ -146,6 +158,11 @@ export function HighwayScreen() {
       if (s.judgments.length > 0) e.pushJudgments(s.judgments);
     }
     syncVideo(s.time_us);
+    if (s.backgrounds.length > 0) {
+      const next: Record<string, BackgroundTransform> = {};
+      for (const b of s.backgrounds) next[b.id] = b.transform;
+      setBgTransforms(next);
+    }
     if (s.finished && !finished) {
       finished = true;
       void playFinish().then(setSummary);
@@ -168,7 +185,12 @@ export function HighwayScreen() {
         // Background video backdrop (M9-G): when the piece carries one, draw the
         // highway over a translucent fill so the <video> behind shows through.
         setVideo(info.video ?? null);
-        engine.setBackdrop(info.video != null);
+        // Background images (M14-D) count as a backdrop too: the highway draws
+        // over a translucent fill so whatever sits behind it shows through.
+        const layers = info.backgrounds ?? [];
+        setBgLayers(layers);
+        setBgTransforms({});
+        engine.setBackdrop(info.video != null || layers.length > 0);
         if (videoEl) {
           if (info.video) {
             videoEl.src = convertFileSrc(info.video.path);
@@ -274,6 +296,37 @@ export function HighwayScreen() {
               background: "#000",
             }}
           />
+          {/* Background image layers (M14-D) — one <img> per layer, stacked
+              back-to-front inside their own z-index:0 stacking context. That
+              places them above the movie backdrop (so a translucent layer can
+              sit over it) and below the highway canvas. Each transform was
+              evaluated by `core` against the play clock; here we only turn it
+              into CSS. */}
+          <Show when={bgLayers().length > 0}>
+            <div
+              style={{
+                position: "absolute",
+                inset: 0,
+                "z-index": 0,
+                "pointer-events": "none",
+                overflow: "hidden",
+              }}
+            >
+              <For each={bgLayers()}>
+                {(layer, i) => (
+                  <img
+                    src={convertFileSrc(layer.path)}
+                    alt=""
+                    draggable={false}
+                    style={layerStyle(
+                      bgTransforms()[layer.id] ?? IDENTITY_TRANSFORM,
+                      i(),
+                    )}
+                  />
+                )}
+              </For>
+            </div>
+          </Show>
           <canvas
             ref={canvasEl}
             style={{

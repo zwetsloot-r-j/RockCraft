@@ -834,6 +834,18 @@ impl rockcraft_control::HostServices for Shell {
             }
             HostCommand::DetachVideo => Err(HostError::Unsupported("detach_video".into())),
             HostCommand::QueryVideo => Err(HostError::Unsupported("query_video".into())),
+            // A terminal cannot draw an image: background layers ride through
+            // the TUI's save/split paths untouched but are not editable here
+            // (M14-D), exactly like the movie backdrop above.
+            HostCommand::AttachBackground { .. } => {
+                Err(HostError::Unsupported("attach_background".into()))
+            }
+            HostCommand::DetachBackground { .. } => {
+                Err(HostError::Unsupported("detach_background".into()))
+            }
+            HostCommand::QueryBackgrounds => {
+                Err(HostError::Unsupported("query_backgrounds".into()))
+            }
             HostCommand::ImportStart { .. } => Err(HostError::Unsupported("import_start".into())),
             HostCommand::ImportScore { .. } => Err(HostError::Unsupported("import_score".into())),
             HostCommand::AudioStatus => Err(HostError::Unsupported("audio_status".into())),
@@ -2416,6 +2428,7 @@ mod tests {
             key: None,
             origin: Some(TrackOrigin::Composed),
             video: None,
+            backgrounds: Vec::new(),
             version: 1,
         };
         std::fs::write(dir.join("meta.json"), meta.to_json()).unwrap();

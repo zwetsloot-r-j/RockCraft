@@ -186,11 +186,14 @@ fn alignment_from_source(source: &SourceMeta) -> Option<AlignmentSidecar> {
 /// `sliced` is the [`SliceResult`] from `core::segment::slice_segment` for this
 /// part: a sub-timeline already shifted to t=0, plus the **derived**
 /// `backing`/`video` references whose offsets have been shifted by the segment
-/// start (file names unchanged). `backing_src` / `video_src` are the absolute
-/// source paths of the media in the loaded bundle; each is copied **unchanged**
-/// (no re-encode, no trim) into the new bundle under the bundle-relative name
-/// carried by `sliced.backing.file` / `sliced.video.file`. `grid`/`key` are
-/// copied from the source piece; the new bundle's `origin` is recorded as
+/// start (file names unchanged) and the background image layers whose keyframes
+/// have been resampled onto the segment. `backing_src` / `video_src` are the
+/// absolute source paths of the media in the loaded bundle; each is copied
+/// **unchanged** (no re-encode, no trim) into the new bundle under the
+/// bundle-relative name carried by `sliced.backing.file` / `sliced.video.file`.
+/// `background_srcs` pairs each background layer id with its absolute source
+/// image, copied the same way under `sliced.backgrounds[..].file`. `grid`/`key`
+/// are copied from the source piece; the new bundle's `origin` is recorded as
 /// [`TrackOrigin::Edited`].
 ///
 /// Writes `<dir>/song.mid`, the copied media file(s) (when present), and
@@ -210,6 +213,7 @@ pub fn write_part_bundle(
     key: Key,
     backing_src: Option<&Path>,
     video_src: Option<&Path>,
+    background_srcs: &[(String, PathBuf)],
 ) -> Result<PathBuf, ImportError> {
     std::fs::create_dir_all(dir)?;
 
@@ -224,6 +228,11 @@ pub fn write_part_bundle(
     if let (Some(src), Some(video)) = (video_src, sliced.video.as_ref()) {
         std::fs::copy(src, dir.join(&video.file))?;
     }
+    for layer in &sliced.backgrounds {
+        if let Some((_, src)) = background_srcs.iter().find(|(id, _)| *id == layer.id) {
+            std::fs::copy(src, dir.join(&layer.file))?;
+        }
+    }
 
     let meta = RecordingMeta {
         midi_file: "song.mid".into(),
@@ -232,6 +241,7 @@ pub fn write_part_bundle(
         key: Some(key),
         origin: Some(TrackOrigin::Edited),
         video: sliced.video.clone(),
+        backgrounds: sliced.backgrounds.clone(),
         version: 1,
     };
     std::fs::write(dir.join("meta.json"), meta.to_json())?;

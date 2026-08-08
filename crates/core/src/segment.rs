@@ -13,7 +13,7 @@
 //! decoding — data and math only, headless-testable.
 
 use crate::timeline::Note;
-use crate::{BackgroundVideo, BackingTrack, Timeline};
+use crate::{BackgroundImage, BackgroundVideo, BackingTrack, Timeline};
 
 /// A consecutive slice of a piece's timeline, in song-time microseconds.
 /// Half-open: `start_us` inclusive, `end_us` exclusive.
@@ -25,11 +25,17 @@ pub struct Segment {
 
 /// The sliced piece for one part: a sub-timeline shifted to t=0 plus the media
 /// references derived for the new bundle (file names unchanged; offsets shifted).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Not `Eq`: `backgrounds` carries float transforms (M14-D).
+#[derive(Debug, Clone, PartialEq)]
 pub struct SliceResult {
     pub timeline: Timeline,
     pub backing: Option<BackingTrack>,
     pub video: Option<BackgroundVideo>,
+    /// Background image layers rebased onto the new zero, their animation
+    /// resampled so each part opens and closes on the layout the whole piece
+    /// had there.
+    pub backgrounds: Vec<BackgroundImage>,
 }
 
 /// Slice `src` to `seg`, returning a sub-timeline shifted so `seg.start_us`
@@ -44,11 +50,14 @@ pub struct SliceResult {
 ///   stays `None`.
 /// - `video`   => `offset_us += seg.start_us as i64` (file unchanged); `None`
 ///   stays `None`.
+/// - `backgrounds` => each layer's keyframes are resampled onto the segment
+///   (see [`BackgroundImage::sliced`]); an empty list stays empty.
 pub fn slice_segment(
     src: &Timeline,
     seg: Segment,
     backing: Option<&BackingTrack>,
     video: Option<&BackgroundVideo>,
+    backgrounds: &[BackgroundImage],
 ) -> SliceResult {
     let seg_len = seg.end_us.saturating_sub(seg.start_us);
 
@@ -79,10 +88,16 @@ pub fn slice_segment(
         offset_us: v.offset_us + seg.start_us as i64,
     });
 
+    let backgrounds = backgrounds
+        .iter()
+        .map(|b| b.sliced(seg.start_us, seg.end_us))
+        .collect();
+
     SliceResult {
         timeline,
         backing,
         video,
+        backgrounds,
     }
 }
 
@@ -155,6 +170,7 @@ mod tests {
             },
             None,
             None,
+            &[],
         );
 
         // Only the 1 s and 2 s notes survive, shifted to 0 and 1 s. The note at
@@ -179,6 +195,7 @@ mod tests {
             },
             None,
             None,
+            &[],
         );
 
         // Clipped to end at 3 s → 0.5 s duration at start 2.5 s.
@@ -199,6 +216,7 @@ mod tests {
             },
             None,
             None,
+            &[],
         );
         assert_eq!(rows(&out.timeline), vec![(60, 2_999_999, 1)]);
     }
@@ -217,6 +235,7 @@ mod tests {
             },
             Some(&backing),
             None,
+            &[],
         );
         let derived = out.backing.unwrap();
         assert_eq!(derived.audio_start_us, 1_250_000);
@@ -233,6 +252,7 @@ mod tests {
             },
             None,
             None,
+            &[],
         );
         assert!(out.backing.is_none());
     }
@@ -251,6 +271,7 @@ mod tests {
             },
             None,
             Some(&video),
+            &[],
         );
         let derived = out.video.unwrap();
         assert_eq!(derived.offset_us, 800_000);
@@ -267,6 +288,7 @@ mod tests {
             },
             None,
             None,
+            &[],
         );
         assert!(out.video.is_none());
     }
@@ -355,7 +377,7 @@ mod tests {
         // segment start. The union must equal the originals, no dupes.
         let mut reassembled: Vec<(u8, u64, u64)> = Vec::new();
         for seg in &segs {
-            let out = slice_segment(&tl, *seg, None, None);
+            let out = slice_segment(&tl, *seg, None, None, &[]);
             for (_, n) in out.timeline.notes() {
                 reassembled.push((n.pitch.value(), n.start_us + seg.start_us, n.dur_us));
             }

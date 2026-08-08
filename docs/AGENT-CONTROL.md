@@ -393,6 +393,12 @@ authoritative, exhaustive source:
 | `resize_note` | `{ delta_steps: i64 }` | Resize the note under cursor |
 | `adjust_velocity` | `{ delta: i16 }` | Adjust note velocity |
 | `undo` / `redo` | none | History navigation |
+| `select_background` / `cycle_background` | `{ index: u32 }` / `{ delta: i32 }` | Choose which background image layer the layout actions address |
+| `nudge_background_pos` | `{ dx_permille: i32, dy_permille: i32 }` | Pan the selected layer, auto-keyframing at the playhead |
+| `nudge_background_scale` / `nudge_background_rotation` | `{ delta_permille: i32 }` / `{ delta_millideg: i32 }` | Zoom / rotate the selected layer, auto-keyframing |
+| `set_background_opacity` | `{ permille: u16 }` | Fade the selected layer (1000 = opaque), auto-keyframing |
+| `add_background_keyframe` / `delete_background_keyframe` | none | Pin / drop the selected layer's keyframe at the playhead |
+| `set_background_easing` | `{ easing: "linear"\|"ease_in"\|"ease_out"\|"ease_in_out"\|"hold" }` | Curve leaving the keyframe at the playhead |
 
 For the exhaustive list, call `query { what: "actions" }` or consult `core::action_names()`.
 
@@ -428,6 +434,9 @@ below is an at-a-glance convenience only.
 | `set_video_offset` | `{ offset_us: i64 }` | Re-align the attached video. Returns the `VideoRef` |
 | `detach_video` | none | Detach the background video |
 | `query_video` | none | The attached background video, or `null` |
+| `attach_background` | `{ path: String }` | Attach a background image as the front-most layer and select it; persisted into the bundle on save. Returns the layer list |
+| `detach_background` | `{ id: String }` | Detach that background layer. Returns the remaining layers |
+| `query_backgrounds` | none | Every background layer — id, bundle file, absolute path, selection, keyframes, and the transform at the playhead |
 | `import_start` | `{ url: String }` | Start importing from a URL |
 | `import_score` | `{ path: String }` | Start importing a local score file (MusicXML/`.xml`/`.mxl`/`.abc`/`.krn`). The notated tempo, metre and key seed the new bundle's grid |
 | `import_score` (scan) | `{ path: String }` | The same command with a `.pdf`/`.png`/`.jpg`/`.jpeg`/`.tif`/`.tiff`/`.bmp` path runs optical music recognition first. Lossy: notes carry a derived `confidence`, and the import log emits `omr: imported N notes, M flagged …`. Needs an OMR engine installed — see [`IMPORT.md`](IMPORT.md#scanned-sheet-music-omr-m13-b) |
@@ -437,7 +446,11 @@ below is an at-a-glance convenience only.
 Not every frontend supports every command: the TUI's record/import/backing
 flows are interactive screen state machines, so it returns `unsupported:` for
 those (it wires `scan_library`, `query_dirty`, `play_load`, the mixer trio, and
-`play_toggle_pause`). The Tauri desktop host backs the full set. Always discover
+`play_toggle_pause`). A terminal also cannot draw a picture, so the video and
+background-image commands are `unsupported:` there too — though the TUI still
+carries a loaded piece's movie and background layers through save/split
+untouched, so editing a chart there never destroys its backdrops. The Tauri
+desktop host backs the full set. Always discover
 the live set with `query help`.
 
 The mixer commands work from any screen in either frontend — the synth is
@@ -482,8 +495,29 @@ The `state` field in responses is a `ComposerSnapshot` from `rockcraft_core`. It
 - `loop_bounds`: Loop start/end in microseconds
 - `metronome_enabled`: Whether metronome is on
 - `input_mode`: Current input mode
+- `backgrounds`: Background image layers, back-to-front, each with its
+  `transform` **already evaluated** at the playhead plus its `keyframes`
+- `selected_background`: Index of the layer the background actions address
 
 See `rockcraft_core::ComposerSnapshot` for the full schema.
+
+### Animating a background
+
+`core` owns the interpolation, so the loop is: attach the image, put the
+playhead where a pose belongs, nudge it into place (which writes the keyframe),
+move on. Nothing has to compute a curve client-side.
+
+```json
+{"type":"run_host_command","name":"attach_background","params":{"path":"/abs/art.png"}}
+{"type":"run_action","name":"add_background_keyframe"}
+{"type":"run_action","name":"set_playhead","params":{"us":8000000}}
+{"type":"run_action","name":"nudge_background_scale","params":{"delta_permille":600}}
+{"type":"run_action","name":"set_background_easing","params":{"easing":"ease_in_out"}}
+```
+
+That is an 8-second ease-in-out zoom from the untouched frame to 1.6×. Reading
+`state.backgrounds[0].transform` after any `set_playhead` shows the pose at that
+instant — the same number the renderer draws.
 
 ## Error handling
 

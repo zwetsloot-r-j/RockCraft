@@ -95,6 +95,57 @@ export interface ComposerSnapshot {
   frozen?: boolean;
   /** While frozen, the MIDI pitches to strike to advance; null otherwise. */
   awaiting?: number[] | null;
+  /**
+   * Background image layers, back-to-front, each transform **already evaluated**
+   * at the playhead by `core` (M14-D). Absent/empty for pieces without any.
+   */
+  backgrounds?: BackgroundView[];
+  /** Index of the layer background actions address; null when there are none. */
+  selected_background?: number | null;
+}
+
+/**
+ * Where a background image sits on the play surface — mirror of
+ * `background::Transform`. Normalised, resolution-independent surface units:
+ * `x`/`y` offset the image centre by that fraction of the surface
+ * width/height, `scale` multiplies an `object-fit: contain` fit, and
+ * `rotation_deg` turns it clockwise. `core` computes these; the webview only
+ * renders them (see {@link cssTransform}).
+ */
+export interface BackgroundTransform {
+  x: number;
+  y: number;
+  scale: number;
+  rotation_deg: number;
+  opacity: number;
+}
+
+/** The curve leaving a keyframe — mirror of `background::Easing`. */
+export type BackgroundEasing =
+  | "linear"
+  | "ease_in"
+  | "ease_out"
+  | "ease_in_out"
+  | "hold";
+
+/** One pinned (song time, transform) pair — mirror of `background::Keyframe`. */
+export interface BackgroundKeyframe {
+  time_us: number;
+  transform: BackgroundTransform;
+  easing: BackgroundEasing;
+}
+
+/**
+ * One background image layer in a {@link ComposerSnapshot} — mirror of
+ * `background::BackgroundView`. `transform` is evaluated at the playhead.
+ */
+export interface BackgroundView {
+  index: number;
+  id: string;
+  file: string;
+  selected: boolean;
+  transform: BackgroundTransform;
+  keyframes: BackgroundKeyframe[];
 }
 
 /**
@@ -225,6 +276,16 @@ export type ActionName =
   | "yank_selection"
   | "paste_clipboard"
   | "delete_selection"
+  // ── background images (M14-D) ───────────────────────────────────────
+  | "select_background"
+  | "cycle_background"
+  | "nudge_background_pos"
+  | "nudge_background_scale"
+  | "nudge_background_rotation"
+  | "set_background_opacity"
+  | "set_background_easing"
+  | "add_background_keyframe"
+  | "delete_background_keyframe"
   // ── history ─────────────────────────────────────────────────────────
   | "undo"
   | "redo";
@@ -288,7 +349,32 @@ export interface PlayInfo {
    * no backdrop (M9-G). Mirror of `play::BackgroundVideoView`.
    */
   video: BackgroundVideoView | null;
+  /**
+   * Background image layers to render behind the highway, back-to-front (M14-D).
+   * The *static* half — the moving transforms arrive per tick in
+   * {@link PlayStateEvent}. Mirror of `play::BackgroundLayerView`.
+   */
+  backgrounds: BackgroundLayerView[];
   hear_song: boolean;
+}
+
+/**
+ * A background image layer returned with {@link PlayInfo} — mirror of
+ * `play::BackgroundLayerView`.
+ */
+export interface BackgroundLayerView {
+  id: string;
+  /** Absolute file path (wrap with `convertFileSrc` before assigning to an `<img>`). */
+  path: string;
+}
+
+/**
+ * One layer's transform at the current song time — mirror of
+ * `play::BackgroundTransformView`. Evaluated by `core` each tick.
+ */
+export interface BackgroundTransformView {
+  id: string;
+  transform: BackgroundTransform;
 }
 
 /**
@@ -326,6 +412,11 @@ export interface PlayStateEvent {
    * spawns one decaying effect per entry without de-duplicating.
    */
   judgments: HitFeedback[];
+  /**
+   * Each background layer's transform at this instant, in the same order as
+   * `PlayInfo.backgrounds` (M14-D). Empty when the piece has none.
+   */
+  backgrounds: BackgroundTransformView[];
   /** Set once the song (plus tail) has finished. */
   finished: boolean;
 }

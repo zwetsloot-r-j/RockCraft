@@ -29,6 +29,7 @@ use std::collections::{BTreeSet, HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::action::{Action, ActionError, Effect};
+use crate::background::{BackgroundStack, BackgroundView, Easing, Transform};
 use crate::chord::{ChordKind, Key, Scale};
 use crate::events::{MidiNote, NoteEvent, NoteEventKind, Velocity};
 use crate::grid::{Grid, Subdivision, TimeSig};
@@ -169,6 +170,13 @@ pub struct Composer {
     /// owns no audio, only the number frontends and `query state` read.
     backing_offset_us: u64,
 
+    // ── background images (M14-D) ───────────────────────────────────────────
+    /// The piece's background image layers plus the one edit actions address.
+    /// Pure editor state exactly like [`Composer::backing_offset_us`]: the
+    /// composer owns the layout and the keyframes, never the image files —
+    /// attaching one is I/O and therefore a `control::HostCommand`.
+    backgrounds: BackgroundStack,
+
     // ── playback speed ──────────────────────────────────────────────────────
     /// Transport speed multiplier (1.0 = real time). [`Composer::advance`]
     /// scales the injected `dt_us` by this, so the playhead — and thus every
@@ -242,6 +250,7 @@ impl Composer {
             selection_anchor: None,
             clipboard: Vec::new(),
             backing_offset_us: 0,
+            backgrounds: BackgroundStack::new(),
             playback_rate: 1.0,
             wait_enabled: false,
             wait: None,
@@ -273,6 +282,54 @@ impl Composer {
     /// [`Action::NudgeBackingOffset`] instead.
     pub fn set_backing_offset_us(&mut self, us: u64) {
         self.backing_offset_us = us;
+    }
+
+    // ── background images (M14-D) ──────────────────────────────────────────
+
+    /// The piece's background image layers and the selected one.
+    pub fn backgrounds(&self) -> &BackgroundStack {
+        &self.backgrounds
+    }
+
+    /// Mutable access to the background layers, for the host tier: attaching or
+    /// detaching an image file is I/O, so it arrives as a `HostCommand` rather
+    /// than an [`Action`]. Layout and keyframing stay pure and go through
+    /// [`apply`](Composer::apply).
+    pub fn backgrounds_mut(&mut self) -> &mut BackgroundStack {
+        &mut self.backgrounds
+    }
+
+    /// Replace the background layers, e.g. when loading a bundle whose
+    /// `meta.json` declared some.
+    pub fn set_backgrounds(&mut self, backgrounds: BackgroundStack) {
+        self.backgrounds = backgrounds;
+    }
+
+    /// Every background layer with its transform evaluated at the edit time —
+    /// what a frontend renders straight from.
+    pub fn background_views(&self) -> Vec<BackgroundView> {
+        self.backgrounds.views_at(self.playhead_us())
+    }
+
+    /// Write the selected layer's keyframe at the edit time, seeding a new one
+    /// from the currently interpolated transform (auto-keyframing).
+    ///
+    /// `edit` receives the transform to modify. A no-op when the piece has no
+    /// background layers, so a frontend may bind the keys unconditionally.
+    fn edit_background(&mut self, edit: impl FnOnce(&mut Transform)) -> Vec<Effect> {
+        let at_us = self.playhead_us();
+        if let Some(layer) = self.backgrounds.selected_mut() {
+            let mut transform = layer.transform_at(at_us);
+            edit(&mut transform);
+            // An existing keyframe keeps its departing curve; a fresh one is
+            // linear.
+            let easing = layer
+                .keyframe_at(at_us)
+                .map(|k| k.easing)
+                .unwrap_or(Easing::Linear);
+            layer.set_keyframe(at_us, transform, easing);
+        }
+        Vec::new()
     }
 
     /// The transport speed multiplier (1.0 = real time). Frontends read this to
@@ -498,6 +555,54 @@ impl Composer {
                 Vec::new()
             }
 
+            // ── background images (M14-D) ───────────────────────────────
+            // Layout + keyframing for the selected layer at the edit time.
+            // Every arm is a no-op on a piece with no background images, so a
+            // frontend can bind the keys unconditionally.
+            Action::SelectBackground { index } => {
+                self.backgrounds.select(index as usize);
+                Vec::new()
+            }
+            Action::CycleBackground { delta } => {
+                self.backgrounds.cycle(delta);
+                Vec::new()
+            }
+            Action::NudgeBackgroundPos {
+                dx_permille,
+                dy_permille,
+            } => self.edit_background(|t| {
+                t.x += dx_permille as f32 / 1000.0;
+                t.y += dy_permille as f32 / 1000.0;
+            }),
+            Action::NudgeBackgroundScale { delta_permille } => self.edit_background(|t| {
+                t.scale += delta_permille as f32 / 1000.0;
+            }),
+            Action::NudgeBackgroundRotation { delta_millideg } => self.edit_background(|t| {
+                t.rotation_deg += delta_millideg as f32 / 1000.0;
+            }),
+            Action::SetBackgroundOpacity { permille } => self.edit_background(|t| {
+                t.opacity = permille as f32 / 1000.0;
+            }),
+            // Easing describes an *existing* keyframe's departure, so unlike the
+            // nudges this one never creates a keyframe.
+            Action::SetBackgroundEasing { easing } => {
+                let at_us = self.playhead_us();
+                if let Some(layer) = self.backgrounds.selected_mut() {
+                    layer.set_easing_at(at_us, easing);
+                }
+                Vec::new()
+            }
+            // Pin the interpolated transform as-is: a hold, or the anchor a
+            // later nudge animates away from.
+            Action::AddBackgroundKeyframe => self.edit_background(|_| {}),
+            Action::DeleteBackgroundKeyframe => {
+                let at_us = self.playhead_us();
+                if let Some(layer) = self.backgrounds.selected_mut() {
+                    layer.remove_keyframe_at(at_us);
+                }
+                Vec::new()
+            }
+
             // ── playback speed ──────────────────────────────────────────
             // Set the transport speed multiplier (permille: 1000 = 1×).
             // `advance` scales dt by it; frontends match backing-audio speed.
@@ -679,6 +784,8 @@ impl Composer {
             chord_preview,
             clipboard_len: self.clipboard.len(),
             backing_offset_us: self.backing_offset_us,
+            backgrounds: self.background_views(),
+            selected_background: self.backgrounds.selected_index(),
             playback_rate: self.playback_rate,
             wait_mode: self.wait_enabled,
             frozen: self.wait_frozen,
@@ -1667,6 +1774,15 @@ pub struct ComposerSnapshot {
     /// Backing-track alignment offset (`audio_start_us`): the file position that
     /// lines up with song time 0. `0` when no backing or no nudge applied.
     pub backing_offset_us: u64,
+    /// Background image layers with each transform **already evaluated** at the
+    /// playhead, back-to-front. Empty for pieces without any. Frontends render
+    /// these verbatim — the interpolation math lives in `core`.
+    #[serde(default)]
+    pub backgrounds: Vec<BackgroundView>,
+    /// Index of the layer background actions address; `None` when the piece has
+    /// no background images.
+    #[serde(default)]
+    pub selected_background: Option<usize>,
     /// Transport speed multiplier (1.0 = real time). Frontends match their
     /// backing-audio playback speed to this so a slow-down stays in sync.
     #[serde(default = "default_playback_rate")]
@@ -3037,6 +3153,284 @@ mod tests {
             crate::backing_position_us(1_000_000, 0, offset),
             Some(1_250_000)
         );
+    }
+
+    // ── background images (M14-D) ──────────────────────────────────────────
+
+    /// A composer carrying two background layers, the first one selected.
+    fn composer_with_backgrounds() -> Composer {
+        use crate::background::BackgroundImage;
+        let mut c = Composer::new();
+        let stack = c.backgrounds_mut();
+        stack.push(BackgroundImage::new("bg0", "bg0.png"));
+        stack.push(BackgroundImage::new("bg1", "bg1.png"));
+        stack.select(0);
+        c
+    }
+
+    #[test]
+    fn background_actions_are_no_ops_without_layers() {
+        // Every background action on a piece with no images must be a harmless
+        // no-op, so a frontend can bind the keys unconditionally.
+        let mut c = Composer::new();
+        for action in [
+            Action::SelectBackground { index: 3 },
+            Action::CycleBackground { delta: 1 },
+            Action::NudgeBackgroundPos {
+                dx_permille: 100,
+                dy_permille: -100,
+            },
+            Action::NudgeBackgroundScale {
+                delta_permille: 250,
+            },
+            Action::NudgeBackgroundRotation {
+                delta_millideg: 5_000,
+            },
+            Action::SetBackgroundOpacity { permille: 500 },
+            Action::SetBackgroundEasing {
+                easing: Easing::Hold,
+            },
+            Action::AddBackgroundKeyframe,
+            Action::DeleteBackgroundKeyframe,
+        ] {
+            assert!(apply(&mut c, action.clone()).is_empty(), "{action:?}");
+        }
+        assert!(c.backgrounds().is_empty());
+        assert_eq!(c.snapshot().selected_background, None);
+        assert!(c.snapshot().backgrounds.is_empty());
+    }
+
+    #[test]
+    fn selection_actions_address_a_layer() {
+        let mut c = composer_with_backgrounds();
+        assert_eq!(c.backgrounds().selected_index(), Some(0));
+        apply(&mut c, Action::SelectBackground { index: 1 });
+        assert_eq!(c.backgrounds().selected_index(), Some(1));
+        // Out of range leaves the selection alone.
+        apply(&mut c, Action::SelectBackground { index: 9 });
+        assert_eq!(c.backgrounds().selected_index(), Some(1));
+        // Cycling wraps.
+        apply(&mut c, Action::CycleBackground { delta: 1 });
+        assert_eq!(c.backgrounds().selected_index(), Some(0));
+        apply(&mut c, Action::CycleBackground { delta: -1 });
+        assert_eq!(c.snapshot().selected_background, Some(1));
+    }
+
+    #[test]
+    fn a_nudge_auto_keyframes_at_the_edit_time() {
+        let mut c = composer_with_backgrounds();
+        // Stopped, so the edit time is the cursor: move it off zero first.
+        apply(&mut c, Action::CursorRight);
+        let at_us = c.playhead_us();
+        assert!(at_us > 0);
+
+        apply(
+            &mut c,
+            Action::NudgeBackgroundPos {
+                dx_permille: 250,
+                dy_permille: -125,
+            },
+        );
+        let layer = &c.backgrounds().layers()[0];
+        assert_eq!(layer.keyframes.len(), 1, "the nudge created the keyframe");
+        assert_eq!(layer.keyframes[0].time_us, at_us);
+        assert!((layer.keyframes[0].transform.x - 0.25).abs() < 1e-5);
+        assert!((layer.keyframes[0].transform.y + 0.125).abs() < 1e-5);
+
+        // A second nudge at the same time edits that keyframe rather than
+        // stacking another one.
+        apply(
+            &mut c,
+            Action::NudgeBackgroundPos {
+                dx_permille: 250,
+                dy_permille: 0,
+            },
+        );
+        let layer = &c.backgrounds().layers()[0];
+        assert_eq!(layer.keyframes.len(), 1);
+        assert!((layer.keyframes[0].transform.x - 0.5).abs() < 1e-5);
+
+        // Only the selected layer moved.
+        assert!(c.backgrounds().layers()[1].keyframes.is_empty());
+    }
+
+    #[test]
+    fn scale_rotation_and_opacity_nudges_write_the_same_keyframe() {
+        let mut c = composer_with_backgrounds();
+        apply(
+            &mut c,
+            Action::NudgeBackgroundScale {
+                delta_permille: 500,
+            },
+        );
+        apply(
+            &mut c,
+            Action::NudgeBackgroundRotation {
+                delta_millideg: 30_000,
+            },
+        );
+        apply(&mut c, Action::SetBackgroundOpacity { permille: 400 });
+        let layer = &c.backgrounds().layers()[0];
+        assert_eq!(layer.keyframes.len(), 1);
+        let t = layer.keyframes[0].transform;
+        assert!((t.scale - 1.5).abs() < 1e-5);
+        assert!((t.rotation_deg - 30.0).abs() < 1e-5);
+        assert!((t.opacity - 0.4).abs() < 1e-5);
+    }
+
+    #[test]
+    fn a_later_nudge_seeds_from_the_interpolated_transform() {
+        let mut c = composer_with_backgrounds();
+        // Keyframe at t=0 …
+        apply(&mut c, Action::NudgeBackgroundScale { delta_permille: 0 });
+        // … and one a bar later at 2×.
+        apply(&mut c, Action::CursorBarRight);
+        let end_us = c.playhead_us();
+        apply(
+            &mut c,
+            Action::NudgeBackgroundScale {
+                delta_permille: 1_000,
+            },
+        );
+        assert_eq!(c.backgrounds().layers()[0].keyframes.len(), 2);
+
+        // Halfway between them the layer is interpolated to 1.5×; nudging there
+        // must start from 1.5, not from the identity.
+        c.apply(Action::SetCursor { pitch: 60, step: 0 }).unwrap();
+        c.start_play(end_us / 2);
+        assert_eq!(c.playhead_us(), end_us / 2);
+        apply(
+            &mut c,
+            Action::NudgeBackgroundScale {
+                delta_permille: 100,
+            },
+        );
+        let mid = c
+            .backgrounds()
+            .layers()
+            .first()
+            .and_then(|l| l.keyframe_at(end_us / 2))
+            .expect("keyframe at the playhead");
+        assert!(
+            (mid.transform.scale - 1.6).abs() < 1e-4,
+            "{:?}",
+            mid.transform
+        );
+    }
+
+    #[test]
+    fn add_keyframe_pins_the_interpolated_transform_without_moving_it() {
+        let mut c = composer_with_backgrounds();
+        apply(&mut c, Action::AddBackgroundKeyframe);
+        let layer = &c.backgrounds().layers()[0];
+        assert_eq!(layer.keyframes.len(), 1);
+        assert_eq!(layer.keyframes[0].transform, Transform::IDENTITY);
+    }
+
+    #[test]
+    fn delete_keyframe_only_removes_the_one_at_the_edit_time() {
+        let mut c = composer_with_backgrounds();
+        apply(&mut c, Action::AddBackgroundKeyframe); // at 0
+        apply(&mut c, Action::CursorRight);
+        let second_us = c.playhead_us();
+        apply(&mut c, Action::AddBackgroundKeyframe);
+        assert_eq!(c.backgrounds().layers()[0].keyframes.len(), 2);
+
+        apply(&mut c, Action::DeleteBackgroundKeyframe);
+        let layer = &c.backgrounds().layers()[0];
+        assert_eq!(layer.keyframes.len(), 1);
+        assert!(layer.keyframe_at(second_us).is_none());
+        assert!(layer.keyframe_at(0).is_some());
+
+        // Deleting where there is nothing is a no-op.
+        apply(&mut c, Action::DeleteBackgroundKeyframe);
+        assert_eq!(c.backgrounds().layers()[0].keyframes.len(), 1);
+    }
+
+    #[test]
+    fn set_easing_targets_an_existing_keyframe_and_survives_further_nudges() {
+        let mut c = composer_with_backgrounds();
+        // No keyframe here yet: setting the easing must not create one.
+        apply(
+            &mut c,
+            Action::SetBackgroundEasing {
+                easing: Easing::Hold,
+            },
+        );
+        assert!(c.backgrounds().layers()[0].keyframes.is_empty());
+
+        apply(&mut c, Action::AddBackgroundKeyframe);
+        apply(
+            &mut c,
+            Action::SetBackgroundEasing {
+                easing: Easing::EaseInOut,
+            },
+        );
+        assert_eq!(
+            c.backgrounds().layers()[0].keyframes[0].easing,
+            Easing::EaseInOut
+        );
+        // A later nudge at the same time keeps the chosen curve.
+        apply(
+            &mut c,
+            Action::NudgeBackgroundScale {
+                delta_permille: 100,
+            },
+        );
+        assert_eq!(
+            c.backgrounds().layers()[0].keyframes[0].easing,
+            Easing::EaseInOut
+        );
+    }
+
+    #[test]
+    fn snapshot_backgrounds_track_the_playhead() {
+        let mut c = composer_with_backgrounds();
+        apply(&mut c, Action::AddBackgroundKeyframe); // identity at 0
+        apply(&mut c, Action::CursorBarRight);
+        let end_us = c.playhead_us();
+        apply(
+            &mut c,
+            Action::NudgeBackgroundPos {
+                dx_permille: 1_000,
+                dy_permille: 0,
+            },
+        );
+
+        // Stopped at the far keyframe: fully panned.
+        let snap = c.snapshot();
+        assert_eq!(snap.backgrounds.len(), 2);
+        assert!(snap.backgrounds[0].selected);
+        assert!((snap.backgrounds[0].transform.x - 1.0).abs() < 1e-5);
+        assert_eq!(snap.backgrounds[0].keyframes.len(), 2);
+        // The unkeyframed sibling stays put.
+        assert_eq!(snap.backgrounds[1].transform, Transform::IDENTITY);
+
+        // Scrub the transport to the midpoint: half panned, no edit involved.
+        c.start_play(end_us / 2);
+        let snap = c.snapshot();
+        assert!(
+            (snap.backgrounds[0].transform.x - 0.5).abs() < 1e-3,
+            "{:?}",
+            snap.backgrounds[0].transform
+        );
+    }
+
+    #[test]
+    fn snapshot_with_backgrounds_round_trips_json() {
+        let mut c = composer_with_backgrounds();
+        apply(
+            &mut c,
+            Action::NudgeBackgroundScale {
+                delta_permille: 500,
+            },
+        );
+        let json = serde_json::to_string(&c.snapshot()).unwrap();
+        let back: ComposerSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.selected_background, Some(0));
+        assert_eq!(back.backgrounds.len(), 2);
+        assert_eq!(back.backgrounds[0].file, "bg0.png");
+        assert!((back.backgrounds[0].transform.scale - 1.5).abs() < 1e-5);
     }
 
     // ── snapshot ──────────────────────────────────────────────────────────

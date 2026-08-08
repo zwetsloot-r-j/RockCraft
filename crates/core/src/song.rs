@@ -4,7 +4,7 @@
 //! `RecordingMeta` struct mirrors the `meta.json` inside a bundle directory;
 //! serialization is in-memory only (callers in `tui`/`audio` do the fs work).
 
-use crate::{Grid, Key};
+use crate::{BackgroundImage, Grid, Key};
 use serde::{Deserialize, Serialize};
 
 /// Describes the backing audio track inside a recording bundle.
@@ -65,7 +65,9 @@ impl TrackOrigin {
 }
 
 /// The manifest serialised as `meta.json` inside a recording bundle.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Not `Eq`: `backgrounds` carries float transforms (M14-D).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RecordingMeta {
     /// Bundle-relative MIDI filename, e.g. `"song.mid"`.
     pub midi_file: String,
@@ -87,6 +89,11 @@ pub struct RecordingMeta {
     /// bundles written before this field existed.
     #[serde(default)]
     pub video: Option<BackgroundVideo>,
+    /// Custom background image layers with their keyframed transforms (M14-D),
+    /// rendered back-to-front behind the highway/edit grid. Empty for pieces
+    /// without any, including every bundle written before this field existed.
+    #[serde(default)]
+    pub backgrounds: Vec<BackgroundImage>,
     /// Schema version; always written as `1`. Kept for forward-compat.
     #[serde(default = "default_version")]
     pub version: u32,
@@ -118,6 +125,7 @@ impl RecordingMeta {
             key: None,
             origin: None,
             video: None,
+            backgrounds: Vec::new(),
             version: 1,
         }
     }
@@ -179,6 +187,7 @@ mod tests {
             key: None,
             origin: None,
             video: None,
+            backgrounds: Vec::new(),
             version: 1,
         };
         let json = meta.to_json();
@@ -199,6 +208,7 @@ mod tests {
             }),
             origin: None,
             video: None,
+            backgrounds: Vec::new(),
             version: 1,
         };
         let json = meta.to_json();
@@ -219,6 +229,7 @@ mod tests {
             key: None,
             origin: None,
             video: None,
+            backgrounds: Vec::new(),
             version: 1,
         };
         let back = RecordingMeta::from_json(&meta.to_json()).unwrap();
@@ -233,6 +244,7 @@ mod tests {
             grid: None,
             key: None,
             origin: Some(TrackOrigin::Imported),
+            backgrounds: Vec::new(),
             video: Some(BackgroundVideo {
                 file: "source.mp4".into(),
                 offset_us: -250_000,
@@ -265,6 +277,7 @@ mod tests {
             key: None,
             origin: Some(TrackOrigin::Imported),
             video: Some(video.clone()),
+            backgrounds: Vec::new(),
             version: 1,
         };
 
@@ -302,6 +315,42 @@ mod tests {
         let back = RecordingMeta::from_json(&meta.to_json()).unwrap();
         assert!(back.video.is_none());
         assert_eq!(meta, back);
+    }
+
+    #[test]
+    fn with_backgrounds_roundtrip() {
+        use crate::{BackgroundImage, Easing, Transform};
+        let mut layer = BackgroundImage::new("bg0", "background-0.png");
+        layer.set_keyframe(0, Transform::IDENTITY, Easing::EaseInOut);
+        layer.set_keyframe(
+            4_000_000,
+            Transform::new(0.5, -0.25, 1.8, 30.0, 0.6),
+            Easing::Hold,
+        );
+        let mut meta = RecordingMeta::new_midi_only("song.mid");
+        meta.backgrounds = vec![layer, BackgroundImage::new("bg1", "background-1.png")];
+
+        let back = RecordingMeta::from_json(&meta.to_json()).unwrap();
+        assert_eq!(meta, back);
+        assert_eq!(back.backgrounds.len(), 2);
+        assert_eq!(back.backgrounds[0].keyframes.len(), 2);
+        // The animation survives byte-for-byte, so a reloaded piece replays the
+        // same motion.
+        assert_eq!(
+            back.backgrounds[0].transform_at(2_000_000),
+            meta.backgrounds[0].transform_at(2_000_000)
+        );
+        // …and coexists with the movie backdrop rather than replacing it.
+        assert!(back.video.is_none());
+    }
+
+    #[test]
+    fn pre_backgrounds_bundle_parses_with_no_layers() {
+        // Every bundle written before M14-D: no `backgrounds` key at all.
+        let pre = r#"{"midi_file":"song.mid","video":{"file":"m.mp4","offset_us":0},"version":1}"#;
+        let meta = RecordingMeta::from_json(pre).unwrap();
+        assert!(meta.backgrounds.is_empty());
+        assert!(meta.video.is_some());
     }
 
     #[test]
