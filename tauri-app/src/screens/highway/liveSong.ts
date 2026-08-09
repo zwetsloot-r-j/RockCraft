@@ -11,10 +11,6 @@ import type { NoteSpan, SongData } from "./types";
 /** Middle C — the pitch split used to derive a nominal hand for coloring. */
 const SPLIT = 60;
 
-/** A reasonable default grid for a bundle without tempo metadata: 120 BPM 4/4. */
-const BEAT = 500; // ms
-const BAR = BEAT * 4;
-
 /**
  * Build the engine `SongData` from a loaded bundle.
  *
@@ -30,6 +26,13 @@ export function songFromInfo(info: PlayInfo): SongData {
     hand: n.note < SPLIT ? "L" : "R",
   }));
 
+  // Bar/beat grid at the piece's real tempo (the backend bar-aligns the pre-roll
+  // shift, so timeline bars land on these play-clock bar lines).
+  const bpm = info.bpm > 0 ? info.bpm : 120;
+  const beatsPerBar = info.beats_per_bar > 0 ? info.beats_per_bar : 4;
+  const BEAT = 60000 / bpm; // ms per beat
+  const BAR = BEAT * beatsPerBar;
+
   const leadMs = info.lead_us / 1000;
   const durMs = info.duration_us / 1000;
   // One-shot: keep LOOP comfortably beyond the last note + lead so wraps stay
@@ -40,8 +43,8 @@ export function songFromInfo(info: PlayInfo): SongData {
     title: info.title,
     artist: "",
     key: "",
-    timeSig: "4/4",
-    tempoBpm: 120,
+    timeSig: `${beatsPerBar}/4`,
+    tempoBpm: bpm,
     notes,
     chords: [],
     LOOP: loop,

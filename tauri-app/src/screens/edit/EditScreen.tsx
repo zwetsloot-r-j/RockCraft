@@ -81,6 +81,16 @@ const BACKDROP_NUDGE_FINE_US = 10_000;
 const BACKDROP_NUDGE_COARSE_US = 250_000;
 /** Opacity the backdrop `<video>` renders at (dimmed under the grid). */
 const BACKDROP_OPACITY = 0.5;
+/**
+ * How long the edit cursor must rest before the backdrop scrubs to it (ms).
+ *
+ * A backdrop seek costs a full WebView2 decode, so issuing one per keystroke
+ * makes the frame lag the whole time you are editing. Long enough that a held
+ * arrow key collapses into one seek, short enough that single moves still feel
+ * like they track the cursor — a key repeat is ~30 ms, so this coalesces a
+ * repeat without making a deliberate step wait.
+ */
+const SCRUB_DEBOUNCE_MS = 60;
 
 // ── Backdrop calibration (M-align) ─────────────────────────────────────────
 // The edit grid is the authoritative note-space (fixed: 88 keys across the
@@ -334,6 +344,10 @@ export function EditScreen(props: Props): JSX.Element {
   // Previous video target time (s), to detect a backward jump — a loop wrap or a
   // scrub-back — which must SEEK the backdrop to the new spot, not slow it down.
   let prevVideoWant = -1;
+  // Pending debounced backdrop scrub (see driveVideo's stopped branch), and the
+  // was-playing latch that exempts the playback→stop re-seat from the debounce.
+  let scrubTimer: number | undefined;
+  let videoWasPlaying = false;
 
   function interpolatedPlayheadUs(s: ComposerSnapshot): number {
     // Frozen on a wait-mode note (or stopped): pin exactly to the backend
@@ -411,22 +425,64 @@ export function EditScreen(props: Props): JSX.Element {
    * `playbackRate` (phase-lock, no seek) rather than seeking — only a large
    * desync hard-seeks. Paused, we pause the element and seek exactly.
    */
+  /**
+   * The clip time (s) the backdrop should be showing for snapshot `s`, or null
+   * when there is no usable backdrop yet. Shared by `driveVideo` (which seeks to
+   * it) and `render` (which tells the canvas to reject any frame that isn't it),
+   * so the two can never disagree about the target.
+   */
+  function backdropWantS(s: ComposerSnapshot): number | null {
+    const v = videoEl;
+    if (!v || videoPath() === null) return null;
+    const dur = v.duration;
+    if (!Number.isFinite(dur) || dur <= 0) return null;
+    return Math.min(Math.max((anchorUsOf(s) + offsetUs()) / 1e6, 0), dur);
+  }
+
   function driveVideo(s: ComposerSnapshot): void {
     const v = videoEl;
     if (!v || videoPath() === null) return;
-    const dur = v.duration;
-    if (!Number.isFinite(dur) || dur <= 0) return;
-    const want = Math.min(Math.max((anchorUsOf(s) + offsetUs()) / 1e6, 0), dur);
-    // Stopped editor: pause the element and seek exactly to the frame under the
-    // playhead (scrub / cursor move). Safe here because the element is idle.
+    const want = backdropWantS(s);
+    if (want === null) return;
+    // Stopped editor: pause the element and seek to the frame under the playhead
+    // (scrub / cursor move).
+    //
+    // The seek is DEBOUNCED. A `currentTime` set costs a full WebView2 decode —
+    // ~1 s on a large clip — and `draw` composites whatever frame is decoded
+    // *now*, before this function runs, so every keystroke otherwise painted a
+    // stale (or, once readyState drops, blank) frame for the whole seek. Seeking
+    // per keystroke also queues seeks faster than they can land, so the backdrop
+    // never settles while editing quickly. Waiting for the cursor to come to rest
+    // means a burst of edits issues ONE seek: the last good frame is held
+    // throughout (see EditCanvas's frozen-frame fallback) and snaps to the right
+    // one when you stop.
+    //
+    // Exception: the playback→stop re-seat fires immediately. It is a one-shot
+    // transition, not a burst, and delaying it would leave the frame visibly
+    // adrift from the playhead you just parked on.
     if (!s.playing) {
       if (!v.paused) v.pause();
       if (v.playbackRate !== 1) v.playbackRate = 1; // clear any servo residue
       lastVideoSeekMs = 0;
       prevVideoWant = -1; // next play re-seats without a false back-jump
-      v.currentTime = want; // paused: seek exactly (scrub / cursor move)
+      const justStopped = videoWasPlaying;
+      videoWasPlaying = false;
+      if (scrubTimer !== undefined) clearTimeout(scrubTimer);
+      if (justStopped) {
+        scrubTimer = undefined;
+        v.currentTime = want;
+        return;
+      }
+      scrubTimer = window.setTimeout(() => {
+        scrubTimer = undefined;
+        // Re-check: playback may have started while the scrub was pending, in
+        // which case the playback path owns the element and must not be seeked.
+        if (store.snap?.playing) return;
+        v.currentTime = want;
+      }, SCRUB_DEBOUNCE_MS);
       return;
     }
+    videoWasPlaying = true;
     // Wait-mode freeze: pause and hold the note's frame. A note reached by
     // playing through is already parked on-frame (native playback was phase-locked
     // to the playhead), so we hold it as-is — NO seek, no flash. Only a LARGE gap
@@ -522,11 +578,30 @@ export function EditScreen(props: Props): JSX.Element {
     // video scrub so the overlay and movie advance together at `reviewRate`.
     const head = reviewUs();
     if (head !== null) {
+      // Review scrubs the element by seeking too, so the same intro-frame
+      // substitution applies — gate on the head we are scrubbing to.
+      const dur = videoEl?.duration;
+      engine.setBackdropWant(
+        videoPath() !== null && Number.isFinite(dur) && (dur ?? 0) > 0
+          ? Math.min(Math.max((head + offsetUs()) / 1e6, 0), dur as number)
+          : null,
+      );
       engine.draw(s, head, head);
       syncVideo(head);
       return;
     }
     const playhead = interpolatedPlayheadUs(s);
+    // Tell the canvas which frame counts as correct BEFORE it draws. While
+    // playing the element runs natively and drifts from any single target by
+    // design, so accept whatever it presents (null).
+    // Accept any frame only during *native* playback, where the element runs on
+    // its own clock and drifts from a single target by design. A wait-mode
+    // freeze reports `playing: true` but is seek-driven like a paused editor
+    // (see driveVideo's frozen branch), so it must be gated on the target too —
+    // otherwise the intro frame leaks in while its retry seeks land.
+    engine.setBackdropWant(
+      s.playing && !s.frozen ? null : backdropWantS(s),
+    );
     engine.draw(s, playhead);
     driveVideo(s);
   }
@@ -829,11 +904,12 @@ export function EditScreen(props: Props): JSX.Element {
     flashTimeout = window.setTimeout(() => setSaveFlash(null), 2500);
   }
 
-  function doQuickSave(): void {
-    // The background video (if any) is persisted into the bundle's meta.json by
-    // `save_bundle` itself now (M9-G) — the backend holds the reference, set via
-    // editSetVideo/editSetVideoOffset/editClearVideo.
-    saveBundle({ kind: "quick_save" })
+  function doSave(): void {
+    // Overwrite the loaded / last-saved bundle in place — no name prompt. A
+    // brand-new piece (never loaded or saved) falls back to a quick-save take.
+    // The background video (if any) is persisted into meta.json by `save_bundle`
+    // itself (M9-G) — the backend holds the reference.
+    saveBundle({ kind: "in_place" })
       .then((dir) => {
         setDirty(false);
         showFlash(`saved → ${dir}`);
@@ -1222,7 +1298,7 @@ export function EditScreen(props: Props): JSX.Element {
         case "s":
         case "S":
           setOverlay("none");
-          doQuickSave();
+          doSave();
           navigate({ kind: "menu" });
           break;
         case "d":
@@ -1376,11 +1452,11 @@ export function EditScreen(props: Props): JSX.Element {
       return;
     }
 
-    // `s` = quick save, `S` = save-as (only in non-chord mode).
+    // `s` = save (overwrite loaded bundle in place), `S` = save-as (new name).
     if (s.chord_preview === null) {
       if (e.key === "s") {
         e.preventDefault();
-        doQuickSave();
+        doSave();
         return;
       }
       if (e.key === "S") {
@@ -1674,6 +1750,7 @@ export function EditScreen(props: Props): JSX.Element {
       window.removeEventListener("keydown", onKeydown);
       cancelAnimationFrame(raf);
       clearTimeout(flashTimeout);
+      if (scrubTimer !== undefined) clearTimeout(scrubTimer);
       unlisten?.();
       unlistenPlayhead?.();
       unlistenMidi?.();

@@ -779,6 +779,8 @@ impl rockcraft_control::HostServices for Shell {
             HostCommand::LoadBundle { .. } => Err(HostError::Unsupported("load_bundle".into())),
             HostCommand::SplitBundle { .. } => Err(HostError::Unsupported("split_bundle".into())),
             HostCommand::PlaySetWait { .. } => Err(HostError::Unsupported("play_set_wait".into())),
+            HostCommand::PlaySetRate { .. } => Err(HostError::Unsupported("play_set_rate".into())),
+            HostCommand::PlayStatus => Err(HostError::Unsupported("play_status".into())),
             HostCommand::PlayToggleHearSong => {
                 Err(HostError::Unsupported("play_toggle_hear_song".into()))
             }

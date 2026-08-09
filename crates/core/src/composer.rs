@@ -486,6 +486,18 @@ impl Composer {
                 self.resnap_cursor_from_us(cursor_us);
                 Vec::new()
             }
+            Action::SetTimeSig {
+                beats_per_bar,
+                beat_unit,
+            } => {
+                // Metre moves bar lines only — the step grid and note times are
+                // unchanged — but resnap anyway so the cursor keeps its song
+                // time, exactly as SetBpm does.
+                let cursor_us = self.cursor_us();
+                self.grid.set_time_sig(beats_per_bar, beat_unit);
+                self.resnap_cursor_from_us(cursor_us);
+                Vec::new()
+            }
             Action::SetGridOrigin { us } => {
                 let cursor_us = self.cursor_us();
                 self.grid.set_origin_us(us);
@@ -2223,6 +2235,37 @@ mod tests {
         assert_eq!(c.grid().bpm, Grid::MIN_BPM);
         apply(&mut c, Action::SetBpm { bpm: 100_000 });
         assert_eq!(c.grid().bpm, Grid::MAX_BPM);
+    }
+
+    #[test]
+    fn set_time_sig_changes_metre_and_bar_numbering() {
+        let mut c = Composer::new();
+        assert_eq!(c.grid().time_sig.beats_per_bar, 4);
+
+        apply(
+            &mut c,
+            Action::SetTimeSig {
+                beats_per_bar: 3,
+                beat_unit: 4,
+            },
+        );
+        assert_eq!(c.grid().time_sig.beats_per_bar, 3);
+        assert_eq!(c.grid().time_sig.beat_unit, 4);
+
+        // At 120 BPM a 3/4 bar is 1.5 s, so 4.5 s in is bar 3 (0-indexed) beat 0
+        // — under 4/4 the same instant would still be bar 2.
+        assert_eq!(c.grid().bar_beat_of(4_500_000), (3, 0));
+
+        // Illegal values are snapped, not rejected.
+        apply(
+            &mut c,
+            Action::SetTimeSig {
+                beats_per_bar: 0,
+                beat_unit: 0,
+            },
+        );
+        assert_eq!(c.grid().time_sig.beats_per_bar, Grid::MIN_BEATS_PER_BAR);
+        assert!(c.grid().bar_us() > 0);
     }
 
     #[test]

@@ -401,6 +401,38 @@ export function playToggleHearSong(): Promise<boolean> {
   return invoke<boolean>("play_toggle_hear_song");
 }
 
+/** Toggle manual pause of the active take (Start / play-pause). Returns the new
+ * paused state (`false` when no session is active). */
+export function playTogglePause(): Promise<boolean> {
+  return invoke<boolean>("play_toggle_pause");
+}
+
+/** Toggle input-monitor: synthesise the player's own key presses (`n`). Returns
+ * the new state. */
+export function playToggleMonitor(): Promise<boolean> {
+  return invoke<boolean>("play_toggle_monitor");
+}
+
+/** Set the practiced hand: `"left"`, `"right"`, or `null` = both. Only that hand
+ * is waited-on/scored; the other hand auto-plays. Returns the applied value. */
+export function playSetPractice(
+  hand: "left" | "right" | null,
+): Promise<string> {
+  return invoke<string>("play_set_practice", { hand });
+}
+
+/** Set the play-session practice speed in permille (1000 = 1x), clamped
+ * 0.25x..=2x. The highway, wait gate and scoring stretch together; the backing
+ * recording mutes off-tempo. Returns the applied value. */
+export function playSetRate(ratePermille: number): Promise<number> {
+  return invoke<number>("play_set_rate", { ratePermille });
+}
+
+/** Set the pitch dividing left/right hands (0..=127). Returns the applied value. */
+export function playSetSplit(pitch: number): Promise<number> {
+  return invoke<number>("play_set_split", { pitch });
+}
+
 /**
  * Finish the take: tear the session down (stop backing, silence the synth) and
  * return the end-of-take summary. Idempotent.

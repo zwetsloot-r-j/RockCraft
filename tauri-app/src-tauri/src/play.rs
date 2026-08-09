@@ -135,6 +135,11 @@ pub struct PlayInfo {
     pub backgrounds: Vec<BackgroundLayerView>,
     /// Whether "hear the song" starts on.
     pub hear_song: bool,
+    /// Piece tempo (BPM) so the highway draws its bar/beat grid at the right
+    /// spacing; defaults to 120 when the bundle has no grid.
+    pub bpm: u32,
+    /// Beats per bar (time-signature numerator); defaults to 4.
+    pub beats_per_bar: u8,
 }
 
 /// One span projected for the webview: pitch + ms bounds. No hand info exists in
@@ -218,6 +223,55 @@ pub struct PlayStateEvent {
     pub finished: bool,
 }
 
+/// A complete read-only picture of the live take, for the agent-control socket.
+///
+/// `play_state` events reach the webview only, so an agent driving the app over
+/// the socket previously had **no way to see a running take** — not the clock,
+/// not what the wait gate wanted, not even whether a session existed. Diagnosing
+/// "wait mode won't advance" then came down to guesswork. This carries the live
+/// snapshot *and* the session's configuration (the half the event never had), so
+/// the state is directly readable.
+///
+/// Deliberately non-mutating: unlike [`PlaySession::live_state`] it neither
+/// polls the gate nor drains `pending_feedback`, so an agent reading status can
+/// never steal a judgment effect from the webview or perturb the take it is
+/// observing.
+#[derive(Debug, Clone, Serialize)]
+pub struct PlayStatusView {
+    /// False when no bundle is loaded — every other field is then meaningless.
+    pub loaded: bool,
+    pub title: String,
+    pub time_us: u64,
+    pub duration_us: u64,
+    /// Manual pause (`play_toggle_pause`).
+    pub paused: bool,
+    /// Clock held — by the manual pause or an unsatisfied wait step.
+    pub frozen: bool,
+    pub finished: bool,
+    /// Wait mode armed.
+    pub wait_armed: bool,
+    /// Pitches the gate is waiting for; empty unless frozen by the gate. The
+    /// pairing of this with `held` is what makes a stuck take diagnosable.
+    pub awaiting: Vec<u8>,
+    /// Pitches currently held by the player.
+    pub held: Vec<u8>,
+    /// `"both"`, `"left"` or `"right"`.
+    pub practice: String,
+    pub split_pitch: u8,
+    pub rate_permille: u16,
+    pub hear_song: bool,
+    pub monitor: bool,
+    pub score: u64,
+    pub combo: u32,
+    pub best_combo: u32,
+    pub hits: usize,
+    pub misses: usize,
+    pub bpm: u32,
+    pub beats_per_bar: u8,
+    /// Total notes in the loaded chart, to sanity-check against the bundle.
+    pub note_count: usize,
+}
+
 /// The end-of-take summary returned by `play_finish`.
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub struct PlaySummary {
@@ -233,6 +287,45 @@ pub struct PlaySummary {
     pub accuracy_bp: u32,
     pub best_combo: u32,
     pub score: u64,
+}
+
+/// Which hand a note belongs to, derived from a configurable split pitch. v1 has
+/// no persisted per-note hand yet — it is inferred from pitch (see [`hand_of`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hand {
+    Left,
+    Right,
+}
+
+/// Default left/right split pitch (middle C = 60): notes below are left hand,
+/// at/above are right. Configurable per session via [`PlaySession::set_split`].
+pub const DEFAULT_SPLIT: u8 = 60;
+
+/// Practice speed meaning "normal", in permille.
+pub const PLAY_RATE_UNITY: u16 = 1000;
+/// Slowest practice speed (0.25x) — matches `core::Action::SetPlaybackRate`'s
+/// range so the two transports feel the same.
+pub const PLAY_RATE_MIN: u16 = 250;
+/// Fastest practice speed (2x).
+pub const PLAY_RATE_MAX: u16 = 2000;
+
+/// Infer a note's hand from its pitch relative to the split.
+fn hand_of(pitch: u8, split: u8) -> Hand {
+    if pitch < split {
+        Hand::Left
+    } else {
+        Hand::Right
+    }
+}
+
+/// Grid metadata from `meta.json`, used to bar-align the play shift and to draw
+/// the highway bar/beat grid at the piece's real tempo.
+#[derive(Debug, Clone, Copy)]
+struct GridInfo {
+    bpm: u32,
+    beats_per_bar: u8,
+    bar_us: u64,
+    origin_us: u64,
 }
 
 /// Build sustained spans from a time-ordered event stream by pairing each
@@ -296,11 +389,31 @@ fn expected_steps(spans: &[NoteSpan]) -> Vec<(MidiNote, u64)> {
         .collect()
 }
 
-/// One scoring target per span (pitch at its shifted start). Held separately
-/// from the wait steps so a chord scores as N independent expected notes.
-fn expected_notes(spans: &[NoteSpan]) -> Vec<ExpectedNote> {
+/// Keep only spans belonging to the practiced hand (`None` = both hands).
+fn spans_for(
+    spans: &[NoteSpan],
+    practice: Option<Hand>,
+    split: u8,
+) -> impl Iterator<Item = &NoteSpan> {
     spans
         .iter()
+        .filter(move |s| practice.is_none_or(|h| hand_of(s.note, split) == h))
+}
+
+/// Wait-gate steps for the practiced hand only (or all hands when `None`).
+fn expected_steps_for(
+    spans: &[NoteSpan],
+    practice: Option<Hand>,
+    split: u8,
+) -> Vec<(MidiNote, u64)> {
+    spans_for(spans, practice, split)
+        .filter_map(|s| MidiNote::new(s.note).map(|n| (n, s.start_us)))
+        .collect()
+}
+
+/// Scoring targets for the practiced hand only (or all hands when `None`).
+fn expected_notes_for(spans: &[NoteSpan], practice: Option<Hand>, split: u8) -> Vec<ExpectedNote> {
+    spans_for(spans, practice, split)
         .filter_map(|s| MidiNote::new(s.note).map(|n| ExpectedNote::new(n, s.start_us)))
         .collect()
 }
@@ -334,11 +447,30 @@ pub struct PlaySession {
     /// Background image layers resolved from the bundle's `meta.json` (M14-D).
     backgrounds: Vec<BackgroundLayerSession>,
     hear_song: bool,
+    /// Input monitor: synthesise the player's own key presses so they hear
+    /// themselves through the app synth. Independent of "hear the song" (which
+    /// auditions the chart). Toggled at runtime; off by default.
+    monitor: bool,
+    /// Hand-practice mode (v1): `None` = both hands; `Some(h)` = only hand `h` is
+    /// waited-on/scored while the other hand auto-plays. Hand is inferred from
+    /// pitch relative to `split_pitch`.
+    practice: Option<Hand>,
+    /// Pitch dividing left/right hands for [`practice`](Self::practice).
+    split_pitch: u8,
+    /// Practice speed in permille (1000 = 1x). Scales the time injected into
+    /// [`advance`](Self::advance), so the clock, wait gate and scoring windows
+    /// all stretch together and the chart itself is never rewritten.
+    rate_permille: u16,
     /// Manual pause (`HostCommand::PlayTogglePause`). Freezes the clock + backing
     /// independently of wait-mode; while set the highway and scoring clock hold
     /// their position. The play-screen UI/keys are M12-B (#232).
     paused: bool,
     cfg: ScoreConfig,
+    /// Piece tempo + beats/bar (from `meta.grid`, else 120/4) so the play highway
+    /// draws its bar/beat grid at the real tempo. Bar-alignment of the pre-roll
+    /// shift keeps timeline bars on play bar lines.
+    bpm: u32,
+    beats_per_bar: u8,
 
     /// Live held-note set, updated by every ingested MIDI event.
     held: BTreeSet<u8>,
@@ -364,20 +496,30 @@ pub struct PlaySession {
 }
 
 impl PlaySession {
-    /// Load a song from `.mid` bytes, applying the whole-song pre-roll shift so
-    /// the highway opens empty and the first note reaches the keyboard after
-    /// `PRE_ROLL_US + LEAD_US`. Mirrors `PlayScreen::from_smf_bytes`.
-    pub fn from_smf_bytes(title: String, bytes: &[u8]) -> Result<Self, String> {
-        let events = smf_bytes_to_events(bytes).map_err(|e| e.to_string())?;
-        Ok(Self::from_events(title, &events))
+    /// Build a session directly from a note-event timeline (no grid: 120/4, raw
+    /// shift). Test-only seam; production loads go through
+    /// [`from_events_with_grid`](Self::from_events_with_grid) with the bundle grid.
+    #[cfg(test)]
+    pub fn from_events(title: String, events: &[NoteEvent]) -> Self {
+        Self::from_events_with_grid(title, events, None)
     }
 
-    /// Build a session directly from a note-event timeline (the SMF parse seam,
-    /// exposed for headless tests with `ScriptedSource`-style fixtures).
-    pub fn from_events(title: String, events: &[NoteEvent]) -> Self {
+    /// Like [`from_events`] but, when the bundle's grid is known, rounds the
+    /// pre-roll shift up to a whole bar so timeline bar lines map onto play-clock
+    /// bar lines (notes stay on the beat/bar grid, matching the editor), and
+    /// records the tempo/meter for the highway grid.
+    fn from_events_with_grid(title: String, events: &[NoteEvent], grid: Option<GridInfo>) -> Self {
         let raw = build_spans(events);
         let first_us = raw.iter().map(|s| s.start_us).min().unwrap_or(0);
-        let shift_us = song_shift_us(first_us, PRE_ROLL_US, LEAD_US);
+        let mut shift_us = song_shift_us(first_us, PRE_ROLL_US, LEAD_US);
+        if let Some(g) = grid {
+            if g.bar_us > 0 {
+                let rem = (g.origin_us + shift_us) % g.bar_us;
+                if rem != 0 {
+                    shift_us += g.bar_us - rem;
+                }
+            }
+        }
         let spans: Vec<NoteSpan> = raw
             .into_iter()
             .map(|s| NoteSpan {
@@ -396,13 +538,19 @@ impl PlaySession {
             finished_pause_us: LEAD_US,
             clock: PlayClock::new(),
             wait,
+            rate_permille: PLAY_RATE_UNITY,
             shift_us,
             backing: None,
             video: None,
             backgrounds: Vec::new(),
             hear_song: false,
+            monitor: false,
+            practice: None,
+            split_pitch: DEFAULT_SPLIT,
             paused: false,
             cfg: ScoreConfig::default(),
+            bpm: grid.map(|g| g.bpm).unwrap_or(120),
+            beats_per_bar: grid.map(|g| g.beats_per_bar).unwrap_or(4),
             held: BTreeSet::new(),
             played: Vec::new(),
             scored: HashSet::new(),
@@ -487,6 +635,16 @@ impl PlaySession {
         self
     }
 
+    /// Begin the take manually paused so the highway holds at the start until the
+    /// player hits Start (which calls `toggle_pause` to resume). This keeps the
+    /// song from running before the window is focused, and makes Replay re-enter
+    /// the same ready-to-start state. The same freeze machinery wait-mode uses
+    /// holds the clock at 0 until resumed.
+    pub fn start_paused(mut self) -> Self {
+        self.paused = true;
+        self
+    }
+
     /// The static info payload for `play_load`.
     pub fn info(&self) -> PlayInfo {
         PlayInfo {
@@ -517,6 +675,8 @@ impl PlaySession {
                 })
                 .collect(),
             hear_song: self.hear_song,
+            bpm: self.bpm,
+            beats_per_bar: self.beats_per_bar,
         }
     }
 
@@ -547,8 +707,13 @@ impl PlaySession {
         self.now_us() > self.duration_us + self.finished_pause_us
     }
 
-    /// Forward a live `NoteEvent`: update the held set and (on a real strike)
-    /// collect it for scoring with its MIDI timestamp.
+    /// Forward a `NoteEvent`: update the held set and (on a real strike) collect
+    /// it for scoring at its `timestamp_us`.
+    ///
+    /// The live path ([`tick_play`]) re-stamps incoming device events with the
+    /// current play-clock time before calling this, so strikes land in the same
+    /// frame as `expected` (see the note there). Tests call `ingest` directly with
+    /// explicit timestamps.
     pub fn ingest(&mut self, ev: NoteEvent) {
         match ev.kind {
             NoteEventKind::On { velocity } if !velocity.is_note_off() => {
@@ -567,6 +732,14 @@ impl PlaySession {
     /// good-window has now closed into the live score. Returns whether the clock
     /// is frozen after this step (so the caller can pause the backing).
     pub fn advance(&mut self, dt_us: u64) -> bool {
+        // Practice speed scales the time entering the session, not the chart:
+        // the clock, wait gate and scoring windows all stretch by the same
+        // factor, so judgements stay identical relative to the music.
+        let dt_us = if self.rate_permille == PLAY_RATE_UNITY {
+            dt_us
+        } else {
+            dt_us * self.rate_permille as u64 / PLAY_RATE_UNITY as u64
+        };
         self.wait.set_held(self.held.clone());
         let wait_frozen = self.wait.poll(self.clock.now_us()) == GateState::Frozen;
         // A manual pause freezes the transport just like an unsatisfied wait step.
@@ -592,7 +765,14 @@ impl PlaySession {
             .spans
             .iter()
             .enumerate()
-            .filter(|(i, s)| !self.scored.contains(i) && now >= s.start_us + self.cfg.good_us)
+            .filter(|(i, s)| {
+                !self.scored.contains(i)
+                    && now >= s.start_us + self.cfg.good_us
+                    // When practicing one hand, the other hand auto-plays — don't score it.
+                    && !self
+                        .practice
+                        .is_some_and(|h| hand_of(s.note, self.split_pitch) != h)
+            })
             .map(|(i, _)| i)
             .collect();
         if newly.is_empty() {
@@ -729,6 +909,49 @@ impl PlaySession {
         self.hear_song
     }
 
+    /// Is input-monitor on (synthesise the player's own key presses)?
+    pub fn is_monitor(&self) -> bool {
+        self.monitor
+    }
+
+    /// Toggle input-monitor, returning the new state. When turning it off the
+    /// caller silences the synth (any monitored notes still ringing).
+    pub fn toggle_monitor(&mut self) -> bool {
+        self.monitor = !self.monitor;
+        self.monitor
+    }
+
+    /// Set the practiced hand (`None` = both). Rebuilds the wait gate so only that
+    /// hand's notes are waited on; the other hand auto-plays via `tick_play`.
+    pub fn set_practice(&mut self, practice: Option<Hand>) {
+        self.practice = practice;
+        self.rebuild_wait_gate();
+    }
+
+    /// Set the practice speed in permille, clamped to
+    /// [`PLAY_RATE_MIN`]..=[`PLAY_RATE_MAX`]. Returns the applied value.
+    pub fn set_rate(&mut self, rate_permille: u16) -> u16 {
+        self.rate_permille = rate_permille.clamp(PLAY_RATE_MIN, PLAY_RATE_MAX);
+        self.rate_permille
+    }
+
+    /// Set the pitch dividing left/right hands. Reclassifies every note and
+    /// rebuilds the wait gate.
+    pub fn set_split(&mut self, split: u8) {
+        self.split_pitch = split;
+        self.rebuild_wait_gate();
+    }
+
+    /// Rebuild the wait gate from the practiced hand's steps, preserving armed
+    /// state. Practice is normally set before Start, so restarting the gate at the
+    /// first step is fine.
+    fn rebuild_wait_gate(&mut self) {
+        let armed = self.wait.is_armed();
+        let steps = expected_steps_for(&self.spans, self.practice, self.split_pitch);
+        self.wait = WaitGate::from_expected(&steps);
+        self.wait.set_armed(armed);
+    }
+
     /// The file position the backing should be at for the current clock, or
     /// `None` if it should not be playing yet / there is no backing track.
     pub fn backing_target_us(&self) -> Option<u64> {
@@ -741,13 +964,19 @@ impl PlaySession {
     /// then calls [`mark_song_fired`](Self::mark_song_fired). Empty unless
     /// `hear_song` is on.
     pub fn pending_song_triggers(&self) -> (Vec<usize>, Vec<usize>) {
-        if !self.hear_song {
-            return (Vec::new(), Vec::new());
-        }
         let now = self.now_us();
         let mut need_on = Vec::new();
         let mut need_off = Vec::new();
         for (i, span) in self.spans.iter().enumerate() {
+            // A span auto-sounds if "hear the song" is on (all notes), OR we are
+            // practicing one hand and this span is the OTHER hand (accompaniment).
+            let autoplay = self.hear_song
+                || self
+                    .practice
+                    .is_some_and(|h| hand_of(span.note, self.split_pitch) != h);
+            if !autoplay {
+                continue;
+            }
             if now >= span.start_us && !self.song_on_fired.contains(&i) {
                 need_on.push(i);
             }
@@ -774,6 +1003,47 @@ impl PlaySession {
     }
 
     /// A live snapshot for the `play_state` event.
+    /// A read-only status picture of this take (see [`PlayStatusView`]).
+    ///
+    /// Reads the gate's *last* poll rather than re-polling: the tick loop polls
+    /// at ~60 Hz, so this is current, and observing stays free of side effects.
+    pub fn status(&self) -> PlayStatusView {
+        let awaiting = self
+            .wait
+            .awaiting()
+            .map(|s| s.notes.clone())
+            .unwrap_or_default();
+        PlayStatusView {
+            loaded: true,
+            title: self.title.clone(),
+            time_us: self.now_us(),
+            duration_us: self.duration_us,
+            paused: self.paused,
+            frozen: self.paused || !awaiting.is_empty(),
+            finished: self.is_finished(),
+            wait_armed: self.wait.is_armed(),
+            awaiting,
+            held: self.held.iter().copied().collect(),
+            practice: match self.practice {
+                None => "both".to_string(),
+                Some(Hand::Left) => "left".to_string(),
+                Some(Hand::Right) => "right".to_string(),
+            },
+            split_pitch: self.split_pitch,
+            rate_permille: self.rate_permille,
+            hear_song: self.hear_song,
+            monitor: self.monitor,
+            score: self.score,
+            combo: self.combo,
+            best_combo: self.best_combo,
+            hits: self.live_hits,
+            misses: self.live_misses,
+            bpm: self.bpm,
+            beats_per_bar: self.beats_per_bar,
+            note_count: self.spans.len(),
+        }
+    }
+
     pub fn live_state(&mut self) -> PlayStateEvent {
         // Re-poll the gate to surface the awaited notes (idempotent read). A
         // manual pause also reads as frozen so the webview sees the clock held.
@@ -805,7 +1075,8 @@ impl PlaySession {
     /// and every collected strike. This is what the summary panel shows; the
     /// test asserts the derived `PlaySummary` equals `Summary::from_report`.
     pub fn report(&self) -> ScoreReport {
-        let expected = expected_notes(&self.spans);
+        // Score only the practiced hand (the other hand auto-played).
+        let expected = expected_notes_for(&self.spans, self.practice, self.split_pitch);
         score(&expected, &self.played, self.cfg)
     }
 
@@ -851,24 +1122,33 @@ fn load_session_from_dir(dir: &Path) -> Result<PlaySession, String> {
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "song".into());
-    let mut session = PlaySession::from_smf_bytes(title, &bytes)?;
+    let events = smf_bytes_to_events(&bytes).map_err(|e| e.to_string())?;
+    // Read meta up front so the grid can bar-align the shift and set the tempo.
+    let meta = std::fs::read_to_string(dir.join("meta.json"))
+        .ok()
+        .and_then(|j| RecordingMeta::from_json(&j).ok());
+    let grid = meta.as_ref().and_then(|m| m.grid).map(|g| GridInfo {
+        bpm: g.bpm,
+        beats_per_bar: g.time_sig.beats_per_bar,
+        bar_us: g.bar_us(),
+        origin_us: g.origin_us,
+    });
+    let mut session = PlaySession::from_events_with_grid(title, &events, grid);
 
     let mut has_backing = false;
-    if let Ok(json) = std::fs::read_to_string(dir.join("meta.json")) {
-        if let Ok(meta) = RecordingMeta::from_json(&json) {
-            if let Some(backing) = meta.backing {
-                session = session.with_backing(dir.join(&backing.file), backing.audio_start_us);
-                has_backing = true;
-            }
-            if let Some(video) = meta.video {
-                session = session.with_video(dir.join(&video.file), video.offset_us);
-            }
-            if !meta.backgrounds.is_empty() {
-                session = session.with_backgrounds(dir, meta.backgrounds);
-            }
+    if let Some(meta) = meta {
+        if let Some(backing) = meta.backing {
+            session = session.with_backing(dir.join(&backing.file), backing.audio_start_us);
+            has_backing = true;
+        }
+        if let Some(video) = meta.video {
+            session = session.with_video(dir.join(&video.file), video.offset_us);
+        }
+        if !meta.backgrounds.is_empty() {
+            session = session.with_backgrounds(dir, meta.backgrounds);
         }
     }
-    Ok(session.with_hear_song(!has_backing))
+    Ok(session.with_hear_song(!has_backing).start_paused())
 }
 
 // ── Tauri commands ───────────────────────────────────────────────────────────
@@ -906,6 +1186,94 @@ pub fn play_set_wait(state: tauri::State<'_, PlayState>, on: bool) -> bool {
     }
 }
 
+/// The live take's full state, or `loaded: false` when none is running.
+/// See [`PlayStatusView`] — this is the socket's window onto a running game.
+#[tauri::command]
+pub fn play_status(state: tauri::State<'_, PlayState>) -> PlayStatusView {
+    let guard = state.0.lock().expect("play state mutex poisoned");
+    guard
+        .as_ref()
+        .map(|s| s.status())
+        .unwrap_or(PlayStatusView {
+            loaded: false,
+            title: String::new(),
+            time_us: 0,
+            duration_us: 0,
+            paused: false,
+            frozen: false,
+            finished: false,
+            wait_armed: false,
+            awaiting: Vec::new(),
+            held: Vec::new(),
+            practice: "both".to_string(),
+            split_pitch: DEFAULT_SPLIT,
+            rate_permille: PLAY_RATE_UNITY,
+            hear_song: false,
+            monitor: false,
+            score: 0,
+            combo: 0,
+            best_combo: 0,
+            hits: 0,
+            misses: 0,
+            bpm: 0,
+            beats_per_bar: 0,
+            note_count: 0,
+        })
+}
+
+/// Set play-session speed in permille (1000 = 1x), clamped to 0.25x..=2x.
+/// Returns the applied value.
+///
+/// Slowing scales the time injected into the session, so the highway, wait gate
+/// and scoring windows all stretch together — the chart is untouched, only the
+/// wall-clock pace changes. The backing *recording* cannot follow without
+/// resampling, so it is muted off-tempo and restored at 1x.
+#[tauri::command]
+pub fn play_set_rate(
+    state: tauri::State<'_, PlayState>,
+    audio: tauri::State<'_, AudioState>,
+    rate_permille: u16,
+) -> u16 {
+    let mut guard = state.0.lock().expect("play state mutex poisoned");
+    let Some(s) = guard.as_mut() else {
+        return PLAY_RATE_UNITY;
+    };
+    let applied = s.set_rate(rate_permille);
+    audio.set_backing_muted(applied != PLAY_RATE_UNITY);
+    applied
+}
+
+/// Set the practiced hand: `"left"`, `"right"`, or anything else / null = both.
+/// Returns the applied value (`"left"` / `"right"` / `"both"`).
+#[tauri::command]
+pub fn play_set_practice(state: tauri::State<'_, PlayState>, hand: Option<String>) -> String {
+    let practice = match hand.as_deref() {
+        Some("left") => Some(Hand::Left),
+        Some("right") => Some(Hand::Right),
+        _ => None,
+    };
+    let mut guard = state.0.lock().expect("play state mutex poisoned");
+    if let Some(s) = guard.as_mut() {
+        s.set_practice(practice);
+    }
+    match practice {
+        Some(Hand::Left) => "left",
+        Some(Hand::Right) => "right",
+        None => "both",
+    }
+    .to_string()
+}
+
+/// Set the left/right split pitch (0..=127). Returns the applied value.
+#[tauri::command]
+pub fn play_set_split(state: tauri::State<'_, PlayState>, pitch: u8) -> u8 {
+    let mut guard = state.0.lock().expect("play state mutex poisoned");
+    if let Some(s) = guard.as_mut() {
+        s.set_split(pitch);
+    }
+    pitch
+}
+
 /// Toggle "hear the song" (`m` key). Returns the new state; silences the synth
 /// when turning off.
 #[tauri::command]
@@ -916,6 +1284,27 @@ pub fn play_toggle_hear_song(
     let mut guard = state.0.lock().expect("play state mutex poisoned");
     if let Some(s) = guard.as_mut() {
         let on = s.toggle_hear_song();
+        if !on {
+            if let Some(synth) = &audio.synth {
+                synth.all_off();
+            }
+        }
+        on
+    } else {
+        false
+    }
+}
+
+/// Toggle input-monitor: synthesise the player's own key presses (`n`). Returns
+/// the new state; silences the synth when turning off.
+#[tauri::command]
+pub fn play_toggle_monitor(
+    state: tauri::State<'_, PlayState>,
+    audio: tauri::State<'_, AudioState>,
+) -> bool {
+    let mut guard = state.0.lock().expect("play state mutex poisoned");
+    if let Some(s) = guard.as_mut() {
+        let on = s.toggle_monitor();
         if !on {
             if let Some(synth) = &audio.synth {
                 synth.all_off();
@@ -977,15 +1366,34 @@ pub fn tick_play(
     let mut guard = state.0.lock().expect("play state mutex poisoned");
     let session = guard.as_mut()?;
 
-    // Echo the notes you play on the **player** bus (M14-C), at parity with the
-    // TUI's `PlayScreen::ingest`. Its own instrument and fader, so your part can
-    // be told apart from the song's — or muted, if the piano is loud enough on
-    // its own.
-    let player_synth = audio.bus(SynthBus::Player);
+    // Re-stamp live strikes with the current play-clock time before ingesting:
+    // expected notes live in shifted play-clock time, and in wait mode the clock
+    // freezes while device time keeps running, so the raw device timestamp would
+    // never line up with an expected note (everything scored as a miss). Echoing
+    // the player's notes on the Player bus (M14-C) is the input-monitor block
+    // below, gated by `is_monitor()` — `audio.synth` is bound to that bus.
+    let now = session.now_us();
     for &ev in midi_events {
-        session.ingest(ev);
-        if let Some(synth) = &player_synth {
-            synth.apply(&ev);
+        let stamped = match ev.kind {
+            NoteEventKind::On { velocity } if !velocity.is_note_off() => {
+                NoteEvent::on(ev.note, velocity, now)
+            }
+            _ => NoteEvent::off(ev.note, now),
+        };
+        session.ingest(stamped);
+    }
+    // Input monitor: synthesise the player's own key presses so they hear
+    // themselves. Independent of "hear the song" (the chart audition below).
+    if session.is_monitor() {
+        if let Some(synth) = &audio.synth {
+            for &ev in midi_events {
+                match ev.kind {
+                    NoteEventKind::On { velocity } if !velocity.is_note_off() => {
+                        synth.note_on(ev.note, velocity);
+                    }
+                    _ => synth.note_off(ev.note),
+                }
+            }
         }
     }
     let frozen = session.advance(dt_us);
@@ -1051,6 +1459,78 @@ mod tests {
     /// Targets, after the pre-roll shift, fall at SHIFT + k·250ms.
     fn target_us(k: u64) -> u64 {
         SHIFT + k * 250_000
+    }
+
+    /// `status` reports the wait gate's demand alongside what is actually held —
+    /// the pairing that makes a stuck take diagnosable over the socket.
+    #[test]
+    fn status_reports_awaiting_against_held() {
+        let mut s = session();
+        s.set_wait_mode(true);
+        // `advance` polls the gate at the clock's *current* time and only then
+        // advances it, so the freeze lands on the tick after the target passes.
+        s.advance(target_us(0) + 1);
+        s.advance(16_000);
+        let st = s.status();
+        assert!(st.loaded);
+        assert!(st.wait_armed);
+        assert!(st.frozen, "gate holds the clock at an unsatisfied step");
+        assert_eq!(st.awaiting, vec![60], "the note the take is waiting for");
+        assert!(st.held.is_empty(), "nothing pressed yet");
+        assert_eq!(st.note_count, 4);
+        assert_eq!(st.practice, "both");
+        assert_eq!(st.rate_permille, PLAY_RATE_UNITY);
+
+        // Press it: the gate is satisfied and the take moves on.
+        s.ingest(on(60, s.now_us()));
+        s.advance(16_000);
+        let st = s.status();
+        assert_eq!(st.held, vec![60], "status shows what is held");
+        assert!(!st.frozen, "satisfied step releases the clock");
+    }
+
+    /// Reading status must not perturb the take it observes — in particular it
+    /// must not drain the judgment queue `live_state` owns, or an agent polling
+    /// status would silently eat the webview's hit effects.
+    #[test]
+    fn status_is_free_of_side_effects() {
+        let mut s = session();
+        s.set_wait_mode(true);
+        s.advance(target_us(0) + 1);
+        s.advance(16_000);
+
+        let before = s.status();
+        for _ in 0..5 {
+            let again = s.status();
+            assert_eq!(
+                again.time_us, before.time_us,
+                "status must not advance time"
+            );
+            assert_eq!(again.awaiting, before.awaiting, "nor move the gate");
+        }
+        // The judgment queue survives repeated status reads.
+        s.ingest(on(60, s.now_us()));
+        s.advance(500_000);
+        let _ = s.status();
+        let ev = s.live_state();
+        assert!(
+            !ev.judgments.is_empty(),
+            "status reads must leave judgments for the webview"
+        );
+    }
+
+    /// A slowed take advances proportionally less per tick, leaving the chart
+    /// untouched — the clock is what stretches.
+    #[test]
+    fn set_rate_scales_advance() {
+        let mut s = session();
+        assert_eq!(s.set_rate(500), 500);
+        s.advance(1_000_000);
+        assert_eq!(s.status().time_us, 500_000, "half speed, half the clock");
+
+        // Out-of-range values clamp rather than erroring.
+        assert_eq!(s.set_rate(1), PLAY_RATE_MIN);
+        assert_eq!(s.set_rate(60_000), PLAY_RATE_MAX);
     }
 
     const PITCHES: [u8; 4] = [60, 62, 64, 65];
@@ -1342,6 +1822,7 @@ mod tests {
     fn play_state_transforms_track_the_shifted_clock() {
         let tmp = tempfile::tempdir().unwrap();
         let mut s = load_session_from_dir(&background_bundle(&tmp)).expect("load bundle");
+        s.toggle_pause(); // loads paused (start_paused); un-pause to "press Start"
         let shift = s.shift_us();
 
         // At t=0 the song content has not begun: the layer holds its first
@@ -1402,6 +1883,7 @@ mod tests {
     #[test]
     fn toggle_hear_song_works_from_either_default() {
         let mut s = load_session_from_dir(&midi_only_fixture()).unwrap();
+        s.toggle_pause(); // loads paused (start_paused); un-pause to "press Start"
         s.advance(SHIFT);
         let (on_idx, _) = s.pending_song_triggers();
         assert_eq!(on_idx, vec![0], "MIDI-only starts auditioning");

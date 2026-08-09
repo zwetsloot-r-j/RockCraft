@@ -28,6 +28,10 @@ pub enum SaveDest {
     QuickSave,
     /// Named save — writes to `<library_root>/<slug>/`.
     Library { name: String },
+    /// Overwrite the bundle the piece was loaded from / last saved to
+    /// ([`AppState::current_dir`]) without re-typing a name. Falls back to a
+    /// quick-save take when the piece has never been loaded or saved.
+    InPlace,
 }
 
 /// One kept part for [`split_bundle`] (M10-B): the half-open song-time range
@@ -74,6 +78,11 @@ pub struct AppState {
     /// by `core::Action`s — so this holds only what `core` may not: where the
     /// file is. Exactly the split [`AppState::backing_path`] uses.
     pub background_srcs: Mutex<Vec<AttachedBackground>>,
+    /// Directory the piece was last loaded from or saved to. Backs the no-prompt
+    /// "save in place" (`SaveDest::InPlace`) — `s` overwrites this bundle without
+    /// re-typing a name. `None` for a brand-new composition (falls back to a
+    /// quick-save take).
+    pub current_dir: Mutex<Option<std::path::PathBuf>>,
 }
 
 /// A background image attached to the live editor: the layer id it belongs to
@@ -114,6 +123,7 @@ impl AppState {
             backing_path: Mutex::new(None),
             video: Mutex::new(None),
             background_srcs: Mutex::new(Vec::new()),
+            current_dir: Mutex::new(None),
         }
     }
 }
@@ -217,14 +227,15 @@ fn timeline_fingerprint_snapshot(notes: &[NoteView]) -> u64 {
 ///
 /// Mirrors `EditScreen::save` / `save_to_library` from `crates/tui/src/edit.rs`.
 pub fn save_bundle(state: &AppState, dest: SaveDest) -> Result<String, String> {
+    let quick_save_dir = || {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        std::path::PathBuf::from("recordings").join(format!("take-{stamp}"))
+    };
     let bundle_dir = match &dest {
-        SaveDest::QuickSave => {
-            let stamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            std::path::PathBuf::from("recordings").join(format!("take-{stamp}"))
-        }
+        SaveDest::QuickSave => quick_save_dir(),
         SaveDest::Library { name } => {
             let slug = rockcraft_midi::bundle::slug(name);
             if slug.is_empty() {
@@ -232,6 +243,13 @@ pub fn save_bundle(state: &AppState, dest: SaveDest) -> Result<String, String> {
             }
             rockcraft_midi::bundle::library_root().join(slug)
         }
+        // Overwrite the loaded/last-saved bundle; new pieces fall back to a take.
+        SaveDest::InPlace => state
+            .current_dir
+            .lock()
+            .expect("current_dir mutex poisoned")
+            .clone()
+            .unwrap_or_else(quick_save_dir),
     };
     save_bundle_into(state, &bundle_dir)?;
     Ok(bundle_dir.to_string_lossy().into_owned())
@@ -278,7 +296,29 @@ fn save_bundle_into(state: &AppState, bundle_dir: &std::path::Path) -> Result<()
 
     // Clear dirty flag after a successful save.
     *state.dirty.lock().expect("dirty mutex poisoned") = false;
+    // Remember where we saved so a subsequent in-place save overwrites the same
+    // bundle without a name prompt.
+    *state
+        .current_dir
+        .lock()
+        .expect("current_dir mutex poisoned") = Some(bundle_dir.to_path_buf());
     Ok(())
+}
+
+/// Whether two paths name the same file on disk.
+///
+/// A plain `a == b` is not enough: a bundle's media is tracked by *absolute*
+/// path while the bundle dir itself is often *relative* (`library/<slug>`, from
+/// `library_root()`), so the same file compares unequal and gets copied onto
+/// itself — which Windows rejects with a sharing violation. Resolving both
+/// sides catches that. Falls back to a textual compare when either side cannot
+/// be resolved (e.g. the destination does not exist yet, which already means
+/// they are different files).
+fn is_same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
 }
 
 /// Write `song.mid` + `meta.json` (+ optional backing/video copies) into
@@ -302,7 +342,16 @@ fn write_bundle(
 
     let backing = if let Some(bpath) = backing_path {
         let filename = crate::record_bundle_backing_filename(bpath);
-        std::fs::copy(bpath, bundle_dir.join(&filename))?;
+        let dest = bundle_dir.join(&filename);
+        // Saving a bundle back over itself — the common case for an imported
+        // piece, whose backing already lives in the bundle dir — makes source
+        // and destination the same file. Windows fails that copy outright (a
+        // sharing violation), which aborted the save *after* song.mid was
+        // written but before meta.json, leaving the bundle half-updated and the
+        // dirty flag set.
+        if !is_same_file(bpath, &dest) {
+            std::fs::copy(bpath, &dest)?;
+        }
         Some(BackingTrack {
             file: filename,
             audio_start_us: backing_offset_us,
@@ -323,7 +372,7 @@ fn write_bundle(
             continue;
         };
         let dest = bundle_dir.join(&layer.file);
-        if src.path != dest {
+        if !is_same_file(&src.path, &dest) {
             std::fs::copy(&src.path, &dest)?;
         }
     }
@@ -457,7 +506,14 @@ fn video_meta_for_bundle(
     bundle_dir: &std::path::Path,
     v: &AttachedVideo,
 ) -> std::io::Result<BackgroundVideo> {
-    let already_in_bundle = v.path.parent() == Some(bundle_dir);
+    // Resolve rather than compare textually: the attached path is absolute while
+    // `bundle_dir` is usually relative, so a plain parent comparison misses the
+    // already-in-bundle case and copies the file onto itself.
+    let already_in_bundle = v
+        .path
+        .parent()
+        .map(|p| is_same_file(p, bundle_dir))
+        .unwrap_or(false);
     let filename = if already_in_bundle {
         v.path
             .file_name()
@@ -574,6 +630,11 @@ pub fn load_bundle(state: &AppState, dir: &str) -> Result<ComposerSnapshot, Stri
             id: l.id,
         })
         .collect();
+    // Remember where this piece came from so an in-place save overwrites it.
+    *state
+        .current_dir
+        .lock()
+        .expect("current_dir mutex poisoned") = Some(bundle_dir);
 
     // Return the fresh snapshot.
     let composer = state.composer.lock().expect("composer mutex poisoned");
@@ -871,6 +932,98 @@ mod tests {
         assert_eq!(reply.snapshot.notes.len(), 1);
         // The note sits at the cursor's pitch.
         assert_eq!(reply.snapshot.notes[0].pitch, before.cursor.pitch);
+    }
+
+    /// Saving a bundle back over itself must succeed even though its backing
+    /// track already lives in the destination — the normal case for an imported
+    /// piece. Regression: the copy was source==destination, which Windows
+    /// rejects, aborting the save after song.mid was written but before
+    /// meta.json and leaving the piece dirty on disk.
+    #[test]
+    fn write_bundle_in_place_with_backing_already_in_bundle() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bundle = tmp.path().join("piece");
+        std::fs::create_dir_all(&bundle).unwrap();
+        let backing = bundle.join("backing.wav");
+        std::fs::write(&backing, b"audio-bytes").unwrap();
+
+        write_bundle(
+            &bundle,
+            &Timeline::default(),
+            Grid::default_120(),
+            Key {
+                root_pc: 0,
+                scale: rockcraft_core::Scale::Major,
+            },
+            TrackOrigin::Imported,
+            Some(backing.as_path()), // already inside `bundle`
+            0,
+            None,
+            &[],
+            &[],
+        )
+        .expect("in-place save must not fail on a self-copy");
+
+        // meta.json is written (the step that used to be skipped) and still
+        // references the untouched backing file.
+        let meta =
+            RecordingMeta::from_json(&std::fs::read_to_string(bundle.join("meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(meta.backing.map(|b| b.file).as_deref(), Some("backing.wav"));
+        assert_eq!(std::fs::read(&backing).unwrap(), b"audio-bytes");
+        assert!(bundle.join("song.mid").exists());
+    }
+
+    /// The same in-place save, but with the bundle addressed by a *relative*
+    /// path while the backing is tracked absolutely — exactly how a library save
+    /// arrives, since `library_root()` is relative and attached media is not.
+    /// A textual path comparison misses this and self-copies; only resolving
+    /// both sides catches it.
+    #[test]
+    fn write_bundle_in_place_survives_relative_bundle_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bundle_abs = tmp.path().join("piece");
+        std::fs::create_dir_all(&bundle_abs).unwrap();
+        let backing_abs = bundle_abs.join("backing.wav");
+        std::fs::write(&backing_abs, b"audio-bytes").unwrap();
+
+        // Address the bundle relatively, from inside the tempdir.
+        let prev_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+        let result = write_bundle(
+            std::path::Path::new("piece"), // relative
+            &Timeline::default(),
+            Grid::default_120(),
+            Key {
+                root_pc: 0,
+                scale: rockcraft_core::Scale::Major,
+            },
+            TrackOrigin::Imported,
+            Some(backing_abs.as_path()), // absolute, same file
+            0,
+            None,
+            &[],
+            &[],
+        );
+        std::env::set_current_dir(prev_cwd).unwrap();
+
+        result.expect("relative bundle dir must not defeat the self-copy guard");
+        assert_eq!(std::fs::read(&backing_abs).unwrap(), b"audio-bytes");
+        assert!(bundle_abs.join("meta.json").exists());
+    }
+
+    #[test]
+    fn is_same_file_resolves_relative_and_absolute() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let f = tmp.path().join("a.bin");
+        std::fs::write(&f, b"x").unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+        let same = is_same_file(&f, std::path::Path::new("a.bin"));
+        let differs = is_same_file(&f, std::path::Path::new("b.bin"));
+        std::env::set_current_dir(prev).unwrap();
+        assert!(same, "same file via absolute and relative paths");
+        assert!(!differs, "a missing sibling is not the same file");
     }
 
     #[test]

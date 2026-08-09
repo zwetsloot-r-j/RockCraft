@@ -134,6 +134,26 @@ export class HighwayCanvas {
     this.live = on;
   }
 
+  // ── hand practice (#3) ────────────────────────────────────────────────────
+  // When practicing one hand, the OTHER hand auto-plays; render its notes greyed
+  // so it's clear which notes the player is responsible for. Hand is derived by
+  // the configurable split pitch (matches the backend).
+  private practiceMode: "both" | "left" | "right" = "both";
+  private practiceSplit = 60;
+
+  /** Set the practiced hand + split so auto-played (other-hand) notes grey out. */
+  setPractice(mode: "both" | "left" | "right", split: number): void {
+    this.practiceMode = mode;
+    this.practiceSplit = split;
+  }
+
+  /** True when a note belongs to the auto-played (non-practiced) hand. */
+  private isAutoPlayed(note: number): boolean {
+    if (this.practiceMode === "both") return false;
+    const hand = note < this.practiceSplit ? "left" : "right";
+    return hand !== this.practiceMode;
+  }
+
   // ── Background video backdrop (M9-G) ──────────────────────────────────────
   // When a piece carries a background video, the highway draws over it: the
   // opaque background fill is swapped for a translucent dim so the <video>
@@ -461,7 +481,13 @@ export class HighwayCanvas {
     // Darken accidentals the same way in every colour mode (replaces the old
     // ad-hoc black-key alpha tweak) so the dimmer read is mode-independent.
     const baseCol = this.noteColor(nt, light);
-    const col = ksty.shadeMul ? shade(baseCol, ksty.shadeMul) : baseCol;
+    // Auto-played (other-hand) notes render greyed so the player can see at a
+    // glance which notes are theirs to play (#3).
+    const col = this.isAutoPlayed(nt.note)
+      ? `oklch(${0.5 + light * 0.12} 0.015 260)`
+      : ksty.shadeMul
+        ? shade(baseCol, ksty.shadeMul)
+        : baseCol;
     // Diagonal rear (top) cutoff: a highway-only motion cue for accidentals when
     // perspective is flat. Not part of the shared keyNoteStyle (the edit view
     // omits it); proportional to height so short notes stay legible.

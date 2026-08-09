@@ -19,6 +19,13 @@ interface HighwayHeaderProps {
   playState?: () => PlayStateEvent | null;
   hearSong?: () => boolean;
   waitMode?: () => boolean;
+  monitor?: () => boolean;
+  practice?: () => "both" | "left" | "right";
+  /** Backdrop-movie visibility, cycled with `v`. */
+  backdrop?: () => "on" | "dim" | "off";
+  /** Practice speed in permille (1000 = 1x), stepped with `-` / `=`. */
+  rate?: () => number;
+  splitName?: () => string;
 }
 
 // 12-dot pitch-class color wheel.
@@ -134,6 +141,85 @@ export function HighwayHeader(props: HighwayHeaderProps) {
           >
             ⏸ w
           </span>
+          <span
+            style={{
+              "font-size": "11px",
+              "font-family": monoFont,
+              padding: "2px 8px",
+              "border-radius": "6px",
+              background: props.monitor?.()
+                ? "rgba(143,182,255,0.2)"
+                : "rgba(255,255,255,0.05)",
+              color: props.monitor?.() ? "#8fb6ff" : "#7c7f8e",
+            }}
+            title="n — play my notes (input monitor)"
+          >
+            🎹 n
+          </span>
+          <span
+            style={{
+              "font-size": "11px",
+              "font-family": monoFont,
+              padding: "2px 8px",
+              "border-radius": "6px",
+              background:
+                (props.practice?.() ?? "both") !== "both"
+                  ? "rgba(199,146,234,0.2)"
+                  : "rgba(255,255,255,0.05)",
+              color:
+                (props.practice?.() ?? "both") !== "both" ? "#c792ea" : "#7c7f8e",
+            }}
+            title="h — practice one hand"
+          >
+            ✋ {props.practice?.() ?? "both"}
+          </span>
+          <span
+            style={{
+              "font-size": "11px",
+              "font-family": monoFont,
+              padding: "2px 8px",
+              "border-radius": "6px",
+              background:
+                (props.backdrop?.() ?? "on") !== "on"
+                  ? "rgba(199,146,234,0.2)"
+                  : "rgba(255,255,255,0.05)",
+              color:
+                (props.backdrop?.() ?? "on") !== "on" ? "#c792ea" : "#7c7f8e",
+            }}
+            title="v — backdrop movie: on / dim / off"
+          >
+            🎬 {props.backdrop?.() ?? "on"}
+          </span>
+          <Show when={(props.rate?.() ?? 1000) !== 1000}>
+            <span
+              style={{
+                "font-size": "11px",
+                "font-family": monoFont,
+                padding: "2px 8px",
+                "border-radius": "6px",
+                background: "rgba(199,146,234,0.2)",
+                color: "#c792ea",
+              }}
+              title="- / = — practice speed (backing mutes below 1x)"
+            >
+              🐢 {((props.rate?.() ?? 1000) / 1000).toFixed(2)}×
+            </span>
+          </Show>
+          <Show when={(props.practice?.() ?? "both") !== "both"}>
+            <span
+              style={{
+                "font-size": "11px",
+                "font-family": monoFont,
+                padding: "2px 8px",
+                "border-radius": "6px",
+                background: "rgba(255,255,255,0.05)",
+                color: "#7c7f8e",
+              }}
+              title=", . — move the left/right split"
+            >
+              split {props.splitName?.()}
+            </span>
+          </Show>
         </div>
       </Show>
 

@@ -97,6 +97,16 @@ export function midiStatus(): Promise<MidiStatus> {
 }
 
 /**
+ * Re-scan for a live MIDI device and switch to it if one is now present.
+ *
+ * Use when a piano is powered on *after* the app launched (it is opened once at
+ * startup, so a late device is otherwise missed). Returns the resulting status.
+ */
+export function midiRescan(): Promise<MidiStatus> {
+  return invoke<MidiStatus>("midi_rescan");
+}
+
+/**
  * Simulate a computer-key press or release on the mock keyboard.
  *
  * `down=true` triggers a note-on; the backend auto-enqueues a note-off

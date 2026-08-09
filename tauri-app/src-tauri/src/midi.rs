@@ -132,6 +132,25 @@ pub fn midi_status(state: &MidiState) -> MidiStatus {
     }
 }
 
+/// Re-scan for a live USB-MIDI device and switch to it if one is now present.
+///
+/// The device is opened once at startup ([`MidiState::new`]); a piano powered on
+/// *after* launch is therefore never picked up. This re-runs
+/// [`LiveInput::connect`] and, on success, replaces the active source with the
+/// live device (dropping any previous connection or the mock). When no device is
+/// found the current source is left untouched. Returns the resulting status so
+/// the UI can reflect whether a piano is now connected.
+pub fn midi_rescan(state: &MidiState) -> MidiStatus {
+    let mut source = state.source.lock().expect("midi source mutex poisoned");
+    if let Ok(live) = LiveInput::connect("") {
+        *source = InputSource::Live(live);
+    }
+    MidiStatus {
+        kind: source.kind_str().to_string(),
+        port: source.port_name(),
+    }
+}
+
 /// Simulate a computer-key press/release on the mock keyboard.
 ///
 /// Returns `Err` when the active source is live (we must not inject fake events

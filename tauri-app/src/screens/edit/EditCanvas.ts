@@ -37,6 +37,23 @@ function mod(a: number, b: number): number {
 const BG = "#0f1016";
 /** Translucent dim used over a video backdrop (lets the frame read through). */
 const BG_BACKDROP = "rgba(15,16,22,0.45)";
+/**
+ * How far (s) the backdrop element's `currentTime` may sit from the frame we
+ * asked for and still count as showing it. Comfortably wider than a frame at
+ * any sane rate, and far narrower than the gap to the intro frame a decoding
+ * WebView2 substitutes — which is what this distinguishes.
+ */
+const FRAME_TOL_S = 0.2;
+/**
+ * How long (ms) the cached frame may be held while the element refuses to reach
+ * its target before we give up and show whatever it has.
+ *
+ * The on-target test suppresses the intro frame WebView2 substitutes mid-decode,
+ * but a seek that never lands — the element was not primed, the clip is still
+ * loading — would otherwise freeze the backdrop permanently. Showing a slightly
+ * wrong frame beats showing a stale one forever.
+ */
+const MAX_HOLD_MS = 700;
 const FONT_MONO = "'IBM Plex Mono', ui-monospace, monospace";
 
 /** µs spanned across the canvas height (~8 bars at 120 4/4): the vertical zoom. */
@@ -60,6 +77,28 @@ export class EditCanvas {
   // canvas. `backdropVideo` is that source element (or null when unset).
   private backdrop = false;
   private backdropVideo: HTMLVideoElement | null = null;
+
+  // Last frame successfully sampled from `backdropVideo`, kept at the video's
+  // native resolution so it can be re-stretched to any canvas size. Painted
+  // whenever the element has no trustworthy frame of its own — chiefly while a
+  // seek is in flight, which is most of the time when scrubbing the cursor.
+  // Null until the first frame decodes.
+  private lastFrame: HTMLCanvasElement | null = null;
+
+  // Song time (s) the backdrop frame is *supposed* to show, or null to accept
+  // whatever the element presents (during playback, where the element runs on
+  // its own clock and drifts from the target by design).
+  //
+  // `seeking` alone is not a usable signal: WebView2 presents the clip's INTRO
+  // frame while it decodes a seek, with `seeking` already back to false — so a
+  // frame can look live, be wrong, and poison the cache. Comparing currentTime
+  // against the target catches that, because the intro frame is seconds away
+  // from where we asked to be.
+  private backdropWantS: number | null = null;
+
+  // When the cached frame started being held in place of a live-but-off-target
+  // one, so the hold can time out (see MAX_HOLD_MS). 0 = not currently holding.
+  private holdSinceMs = 0;
 
   // Live set of MIDI pitches held on the piano, shared by reference from the
   // screen (updated on every `midi_event`). The keyboard strip lights these keys
@@ -115,7 +154,48 @@ export class EditCanvas {
    * "backdrop flickers between visible and hidden" bug). Pass null to clear.
    */
   setBackdropVideo(el: HTMLVideoElement | null): void {
+    if (el !== this.backdropVideo) this.lastFrame = null; // stale for a new clip
     this.backdropVideo = el;
+  }
+
+  /**
+   * Declare the song time (s) the backdrop frame should show, so `draw` can tell
+   * a real frame from the intro frame WebView2 substitutes while decoding a
+   * seek. Pass null while playing — the element then runs on its own clock and
+   * is *expected* to differ from any single target.
+   */
+  setBackdropWant(seconds: number | null): void {
+    this.backdropWantS = seconds;
+  }
+
+  /**
+   * Copy `vid`'s current frame into the offscreen cache, returning whether it
+   * is now safe to paint from the element this tick.
+   *
+   * `drawImage` from a media element throws if the frame isn't paintable, so a
+   * successful copy here is also the proof that drawing the element will
+   * succeed. On failure the previous cached frame is left intact — a bad tick
+   * must never blank a backdrop we already had.
+   */
+  private cacheFrame(vid: HTMLVideoElement): boolean {
+    const vw = vid.videoWidth;
+    const vh = vid.videoHeight;
+    if (vw <= 0 || vh <= 0) return false;
+    let cache = this.lastFrame;
+    if (!cache || cache.width !== vw || cache.height !== vh) {
+      cache = document.createElement("canvas");
+      cache.width = vw;
+      cache.height = vh;
+    }
+    const cctx = cache.getContext("2d");
+    if (!cctx) return false;
+    try {
+      cctx.drawImage(vid, 0, 0, vw, vh);
+    } catch {
+      return false; // frame not paintable — keep whatever we cached before
+    }
+    this.lastFrame = cache;
+    return true;
   }
 
   /**
@@ -185,12 +265,37 @@ export class EditCanvas {
     // isn't decodable yet, fall back to the opaque app bg so the covered
     // element never peeks through. Otherwise (no backdrop) paint the app bg.
     const vid = this.backdropVideo;
-    if (this.backdrop && vid && vid.readyState >= 2) {
-      try {
+    if (this.backdrop && vid) {
+      // A frame is only trustworthy when the element is decoded AND not mid-seek:
+      // while `seeking` is true WebView2 may present an unrelated frame (or drop
+      // readyState and present none), which is what made every cursor move flash
+      // a wrong backdrop for the length of the seek. So cache each good frame and
+      // re-show the cached one for the duration of the seek — the backdrop then
+      // holds steady on the last real frame and cuts straight to the new one when
+      // the seek lands.
+      const want = this.backdropWantS;
+      const onTarget =
+        want === null || Math.abs(vid.currentTime - want) <= FRAME_TOL_S;
+      // Hold the cache while the element is off-target — but only for so long,
+      // so a seek that never lands can't freeze the backdrop for good.
+      const now = performance.now();
+      if (onTarget) {
+        this.holdSinceMs = 0;
+      } else if (this.holdSinceMs === 0) {
+        this.holdSinceMs = now;
+      }
+      const heldTooLong =
+        this.holdSinceMs !== 0 && now - this.holdSinceMs >= MAX_HOLD_MS;
+      const decoded = vid.readyState >= 2 && !vid.seeking;
+      const live = decoded && (onTarget || heldTooLong || !this.lastFrame);
+      if (live && this.cacheFrame(vid)) {
         ctx.drawImage(vid, 0, 0, this.w, this.h);
         ctx.fillStyle = BG_BACKDROP; // dim for note/grid legibility
-      } catch {
-        ctx.fillStyle = BG; // frame not paintable this tick — opaque bg
+      } else if (this.lastFrame) {
+        ctx.drawImage(this.lastFrame, 0, 0, this.w, this.h);
+        ctx.fillStyle = BG_BACKDROP;
+      } else {
+        ctx.fillStyle = BG; // nothing decoded yet — opaque bg
       }
     } else {
       ctx.fillStyle = BG;
@@ -221,6 +326,9 @@ export class EditCanvas {
       hitLineFrac: this.gridCal.hitLineFrac,
       xScale: this.gridCal.xScale,
       xOffset: this.gridCal.xOffset,
+      // Keep the earliest notes above the keyboard strip (+margin) so notes
+      // placed near the start aren't hidden behind it.
+      bottomReservePx: this.keyboardBandH() + 12,
     });
 
     this.drawLanes(vp);
@@ -252,9 +360,15 @@ export class EditCanvas {
    * matches the target. Naturals read light, accidentals dark (a shorter cap),
    * so the octave shape is legible; C keys carry a name label.
    */
+  /** Height (px) of the bottom keyboard strip — shared by the keyboard draw and
+   * the viewport's bottom reserve so the strip never occludes the earliest notes. */
+  private keyboardBandH(): number {
+    return Math.max(30, Math.min(64, this.h * 0.16));
+  }
+
   private drawKeyboard(snapshot: ComposerSnapshot, vp: Viewport): void {
     const ctx = this.ctx;
-    const bandH = Math.max(30, Math.min(64, this.h * 0.16));
+    const bandH = this.keyboardBandH();
     const top = this.h - bandH;
     const awaitingArr = snapshot.awaiting ?? [];
     const awaiting = new Set<number>(awaitingArr);

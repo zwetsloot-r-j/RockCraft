@@ -176,7 +176,9 @@ export interface ActionReply {
  */
 export type SaveDest =
   | { kind: "quick_save" }
-  | { kind: "library"; name: string };
+  | { kind: "library"; name: string }
+  /** Overwrite the loaded / last-saved bundle in place (no name prompt). */
+  | { kind: "in_place" };
 
 /**
  * Result of a successful `save_bundle` — the bundle directory as a string.
@@ -356,6 +358,10 @@ export interface PlayInfo {
    */
   backgrounds: BackgroundLayerView[];
   hear_song: boolean;
+  /** Piece tempo (BPM) for the highway bar/beat grid; 120 when no grid. */
+  bpm: number;
+  /** Beats per bar (time-signature numerator); 4 when no grid. */
+  beats_per_bar: number;
 }
 
 /**

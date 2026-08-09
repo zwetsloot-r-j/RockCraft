@@ -38,6 +38,12 @@ pub enum SaveDest {
     QuickSave,
     /// A named library bundle (`<library_root>/<slug>/`).
     Library { name: String },
+    /// Overwrite the bundle the piece was loaded from (falling back to a
+    /// quick-save take for a piece that has no home yet). The frontends have
+    /// always had this — it is what the editor's plain "save" does — but it was
+    /// missing from the protocol, so an agent could only re-save by *naming* the
+    /// bundle and relying on the slug matching.
+    InPlace,
 }
 
 /// One kept part to write as its own standalone bundle by
@@ -90,12 +96,21 @@ pub enum HostCommand {
     PlayLoad { dir: String },
     /// Arm/disarm note-by-note wait mode for the play session.
     PlaySetWait { on: bool },
+    /// Set play-session speed in permille (1000 = 1x), for practising slowly.
+    /// Mirrors `core::Action::SetPlaybackRate`, which drives the *editor*
+    /// transport; the play session is a separate engine and needs its own.
+    PlaySetRate { rate_permille: u16 },
     /// Toggle "hear the song" (audible song synth) for the play session.
     PlayToggleHearSong,
     /// Toggle pause on the active play session (freeze/thaw clock + backing).
     PlayTogglePause,
     /// Finish the play session; returns the score summary.
     PlayFinish,
+    /// The live take's full state — clock, wait gate (what it awaits vs what is
+    /// held), practice hand, speed, score — or `loaded: false` when none runs.
+    /// Read-only: observing never perturbs the take. `play_state` events reach
+    /// the webview only, so this is the socket's sole window onto a running game.
+    PlayStatus,
 
     // ── record ──────────────────────────────────────────────────────────
     /// Start a record session, optionally over a backing audio file.
@@ -178,9 +193,11 @@ impl HostCommand {
             HostCommand::SplitBundle { .. } => "split_bundle",
             HostCommand::PlayLoad { .. } => "play_load",
             HostCommand::PlaySetWait { .. } => "play_set_wait",
+            HostCommand::PlaySetRate { .. } => "play_set_rate",
             HostCommand::PlayToggleHearSong => "play_toggle_hear_song",
             HostCommand::PlayTogglePause => "play_toggle_pause",
             HostCommand::PlayFinish => "play_finish",
+            HostCommand::PlayStatus => "play_status",
             HostCommand::RecordStart { .. } => "record_start",
             HostCommand::RecordStop => "record_stop",
             HostCommand::RecordSave => "record_save",
@@ -308,9 +325,11 @@ pub fn host_command_names() -> &'static [&'static str] {
         "split_bundle",
         "play_load",
         "play_set_wait",
+        "play_set_rate",
         "play_toggle_hear_song",
         "play_toggle_pause",
         "play_finish",
+        "play_status",
         "record_start",
         "record_stop",
         "record_save",
@@ -370,9 +389,11 @@ static HOST_HELP: &[HostCommandInfo] = {
         // ── play ──────────────────────────────────────────────────────────
         HostCommandInfo { name: "play_load", params: &[p("dir", "String")], description: "Load a bundle directory as a play session. Returns play info." },
         HostCommandInfo { name: "play_set_wait", params: &[p("on", "bool")], description: "Arm (true) or disarm (false) note-by-note wait mode for the play session." },
+        HostCommandInfo { name: "play_set_rate", params: &[p("rate_permille", "u16")], description: "Set play-session speed in permille (1000 = 1x, 500 = half speed), clamped 0.25x-2x. Slows the highway, wait gate and scoring together; the backing recording mutes below 1x." },
         HostCommandInfo { name: "play_toggle_hear_song", params: &[], description: "Toggle the audible song synth for the play session." },
         HostCommandInfo { name: "play_toggle_pause", params: &[], description: "Toggle pause on the active play session, freezing/thawing the clock and backing at the current position. No-op when no session is active." },
         HostCommandInfo { name: "play_finish", params: &[], description: "Finish the play session and return the score summary." },
+        HostCommandInfo { name: "play_status", params: &[], description: "The live take's full state: clock, paused/frozen, wait gate (awaiting vs held pitches), practice hand + split, speed, score, and the chart's note count. Returns loaded:false when no take is running. Read-only — observing never perturbs the take." },
         // ── record ────────────────────────────────────────────────────────
         HostCommandInfo { name: "record_start", params: &[p("backing", "String?")], description: "Start a record session, optionally over a backing audio file path." },
         HostCommandInfo { name: "record_stop", params: &[], description: "Stop the record session without saving." },
@@ -441,9 +462,11 @@ mod tests {
                 dir: "some/dir".into(),
             },
             HostCommand::PlaySetWait { on: true },
+            HostCommand::PlaySetRate { rate_permille: 500 },
             HostCommand::PlayToggleHearSong,
             HostCommand::PlayTogglePause,
             HostCommand::PlayFinish,
+            HostCommand::PlayStatus,
             HostCommand::RecordStart { backing: None },
             HostCommand::RecordStop,
             HostCommand::RecordSave,
@@ -540,6 +563,7 @@ mod tests {
                 let sample = match p.ty {
                     "bool" => json!(true),
                     "i64" => json!(0),
+                    "u16" => json!(1000),
                     "f32" => json!(0.5),
                     "SynthBus" | "MixerBus" => json!("player"),
                     "SaveDest" => json!({ "kind": "quick_save" }),
