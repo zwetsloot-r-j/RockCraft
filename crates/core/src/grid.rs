@@ -67,6 +67,14 @@ impl Grid {
     pub const MIN_BPM: u32 = 20;
     /// Highest editable tempo, in BPM.
     pub const MAX_BPM: u32 = 300;
+    /// Fewest beats a bar may hold. One is degenerate but legal (every beat a
+    /// downbeat); zero would make [`bar_us`](Grid::bar_us) zero and divide by it.
+    pub const MIN_BEATS_PER_BAR: u8 = 1;
+    /// Most beats a bar may hold.
+    pub const MAX_BEATS_PER_BAR: u8 = 32;
+    /// Legal beat units (note values). Powers of two only, as a time signature's
+    /// lower numeral always is.
+    pub const BEAT_UNITS: [u8; 6] = [1, 2, 4, 8, 16, 32];
 
     /// Set the tempo to `bpm`, clamped to [`MIN_BPM`](Grid::MIN_BPM)..=[`MAX_BPM`](Grid::MAX_BPM).
     pub fn set_bpm(&mut self, bpm: u32) {
@@ -96,6 +104,31 @@ impl Grid {
     /// Set the grid phase origin: the song time bar 1 / beat 1 / step 0 lands on.
     pub fn set_origin_us(&mut self, origin_us: u64) {
         self.origin_us = origin_us;
+    }
+
+    /// Set the metre, e.g. `(3, 4)` for 3/4.
+    ///
+    /// `beats_per_bar` is clamped to
+    /// [`MIN_BEATS_PER_BAR`](Grid::MIN_BEATS_PER_BAR)..=[`MAX_BEATS_PER_BAR`](Grid::MAX_BEATS_PER_BAR).
+    /// `beat_unit` is a note value, so it must be a power of two in
+    /// [`BEAT_UNITS`](Grid::BEAT_UNITS); anything else — including `0`, which
+    /// would divide by zero in [`bar_us`](Grid::bar_us) — snaps to the nearest
+    /// legal unit. Out of range is not an error, matching
+    /// [`set_bpm`](Grid::set_bpm).
+    pub fn set_time_sig(&mut self, beats_per_bar: u8, beat_unit: u8) {
+        self.time_sig = TimeSig {
+            beats_per_bar: beats_per_bar.clamp(Self::MIN_BEATS_PER_BAR, Self::MAX_BEATS_PER_BAR),
+            beat_unit: Self::nearest_beat_unit(beat_unit),
+        };
+    }
+
+    /// Snap `unit` to the nearest legal [`BEAT_UNITS`](Grid::BEAT_UNITS) entry
+    /// (ties round down, to the longer note value).
+    fn nearest_beat_unit(unit: u8) -> u8 {
+        *Self::BEAT_UNITS
+            .iter()
+            .min_by_key(|u| (**u as i32 - unit as i32).abs())
+            .expect("BEAT_UNITS is non-empty")
     }
 
     /// Snap `us` to the nearest multiple of `step` from the grid origin — the
@@ -310,5 +343,50 @@ mod tests {
         assert_eq!(g.time_sig.beats_per_bar, 4);
         assert_eq!(g.time_sig.beat_unit, 4);
         assert_eq!(g.subdivision, Subdivision::Sixteenth);
+    }
+
+    #[test]
+    fn set_time_sig_sets_metre_and_shortens_the_bar() {
+        let mut g = Grid::default_120();
+        let four_four_bar = g.bar_us();
+        g.set_time_sig(3, 4);
+        assert_eq!(g.time_sig.beats_per_bar, 3);
+        assert_eq!(g.time_sig.beat_unit, 4);
+        // 3/4 at 120 BPM is a 1.5 s bar — three quarters of the 4/4 bar.
+        assert_eq!(g.bar_us(), 1_500_000);
+        assert_eq!(g.bar_us(), four_four_bar / 4 * 3);
+        // The beat itself is untouched by the metre.
+        assert_eq!(g.beat_us(), 500_000);
+    }
+
+    #[test]
+    fn set_time_sig_clamps_beats_and_snaps_beat_unit() {
+        let mut g = Grid::default_120();
+
+        g.set_time_sig(0, 4);
+        assert_eq!(g.time_sig.beats_per_bar, Grid::MIN_BEATS_PER_BAR);
+        g.set_time_sig(200, 4);
+        assert_eq!(g.time_sig.beats_per_bar, Grid::MAX_BEATS_PER_BAR);
+
+        // A zero beat_unit would divide by zero in bar_us — it must not survive.
+        g.set_time_sig(4, 0);
+        assert_eq!(g.time_sig.beat_unit, 1);
+        assert!(g.bar_us() > 0);
+
+        // Non-powers of two snap to the nearest legal note value.
+        g.set_time_sig(6, 7);
+        assert_eq!(g.time_sig.beat_unit, 8);
+        g.set_time_sig(6, 5);
+        assert_eq!(g.time_sig.beat_unit, 4);
+        g.set_time_sig(6, 200);
+        assert_eq!(g.time_sig.beat_unit, 32);
+    }
+
+    #[test]
+    fn compound_metre_bar_length() {
+        let mut g = Grid::default_120();
+        g.set_time_sig(6, 8);
+        // 6/8 at 120 BPM: six eighths = three quarters = 1.5 s.
+        assert_eq!(g.bar_us(), 1_500_000);
     }
 }
