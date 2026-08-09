@@ -15,6 +15,16 @@ const BACKING_FILENAME: &str = "backing.wav";
 /// Bundle-relative base name (without extension) for the retained source video.
 const VIDEO_BASENAME: &str = "source";
 
+/// Frame rate every retained backdrop is normalised to (see
+/// [`transcode_backdrop`]). A backdrop is scrubbed and watched, never scored
+/// against — 30 fps halves the decode work of a 60 fps source for no loss that
+/// matters here.
+const BACKDROP_FPS: &str = "30";
+/// Keyframe interval, in frames, for a retained backdrop — 0.5 s at
+/// [`BACKDROP_FPS`]. This is the number that governs seek cost: it bounds how
+/// many frames a `currentTime` seek must decode before it can present.
+const BACKDROP_KEYINT: &str = "15";
+
 /// How many trailing fetch-hook output lines to retain for failure messages.
 const FETCH_TAIL_LINES: usize = 20;
 
@@ -133,7 +143,7 @@ fn run_pipeline(
     // Retain the original source video inside the bundle so the imported piece
     // comes with its background backdrop already attached (M9-G). Best-effort:
     // a copy failure leaves `video: null` and the import still succeeds.
-    let video = retain_source_video(&video_path, &out_dir);
+    let video = retain_source_video(&video_path, &out_dir, &ctx.ffmpeg_cmd);
     let bundle = write_chart_bundle_full(&chart, &out_dir, backing, video)?;
     on_progress(Progress::Done(bundle.clone()));
     Ok(bundle)
@@ -208,15 +218,92 @@ fn extract_backing(video_path: &Path, out_dir: &Path, ffmpeg_cmd: &Path) -> Opti
     }
 }
 
-/// Copy the source video into `out_dir/source.<ext>` and return the
-/// [`BackgroundVideo`] reference to record in `meta.json` (offset 0 — 1:1
-/// real-time alignment, like M7-tauri-N).
+/// Retain the source video in `out_dir` and return the [`BackgroundVideo`]
+/// reference to record in `meta.json` (offset 0 — 1:1 real-time alignment, like
+/// M7-tauri-N).
 ///
-/// Best-effort: returns `None` (leaving the bundle without a backdrop) when the
-/// source has no usable extension or the copy fails, so import degrades
-/// gracefully. The bundle-relative filename preserves the source extension so
-/// the webview's `<video>` can pick the right decoder.
-fn retain_source_video(video_path: &Path, out_dir: &Path) -> Option<BackgroundVideo> {
+/// Prefers a **normalising transcode** (see [`transcode_backdrop`]) so every
+/// imported bundle carries a backdrop with the same scrubbing characteristics,
+/// falling back to a straight copy when ffmpeg is unavailable or fails.
+///
+/// Best-effort throughout: returns `None` (leaving the bundle without a
+/// backdrop) only when both paths fail, so import degrades gracefully.
+fn retain_source_video(
+    video_path: &Path,
+    out_dir: &Path,
+    ffmpeg_cmd: &Path,
+) -> Option<BackgroundVideo> {
+    if let Some(video) = transcode_backdrop(video_path, out_dir, ffmpeg_cmd) {
+        return Some(video);
+    }
+    copy_source_video(video_path, out_dir)
+}
+
+/// Re-encode the source into `out_dir/source.mp4` as a *scrub-friendly* backdrop.
+///
+/// The editor scrubs the backdrop by setting `currentTime`, and a seek must
+/// decode every frame from the preceding keyframe to the target. Whatever a
+/// download hands us is tuned for linear playback — typically 60 fps with a ~6 s
+/// keyframe interval, i.e. up to ~390 frames of decode *per cursor move*, which
+/// in WebView2 leaves the backdrop showing the clip's intro frame for about a
+/// second at a time. Normalising to [`BACKDROP_FPS`] with a
+/// [`BACKDROP_KEYINT`]-frame GOP cuts that to ~15 frames, and — just as
+/// importantly — makes every imported piece behave the same way regardless of
+/// what the source happened to be encoded as.
+///
+/// `-sc_threshold 0` pins the GOP to a fixed cadence rather than letting scene
+/// detection place keyframes, so the worst-case seek distance is bounded.
+///
+/// Returns `None` if ffmpeg is missing or the encode fails/writes nothing; the
+/// caller then falls back to copying the original.
+fn transcode_backdrop(
+    video_path: &Path,
+    out_dir: &Path,
+    ffmpeg_cmd: &Path,
+) -> Option<BackgroundVideo> {
+    let filename = format!("{VIDEO_BASENAME}.mp4");
+    let dest = out_dir.join(&filename);
+    let status = Command::new(ffmpeg_cmd)
+        .arg("-y") // overwrite without prompting
+        .arg("-i")
+        .arg(video_path)
+        .args(["-c:v", "libx264"])
+        .args(["-preset", "veryfast"])
+        .args(["-crf", "23"])
+        .args(["-r", BACKDROP_FPS])
+        .args(["-g", BACKDROP_KEYINT])
+        .args(["-keyint_min", BACKDROP_KEYINT])
+        .args(["-sc_threshold", "0"])
+        .args(["-pix_fmt", "yuv420p"]) // widest decoder support
+        .arg("-an") // audio rides in backing.wav, not the backdrop
+        .arg(&dest)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .ok()?;
+
+    // ffmpeg can exit 0 having written nothing usable; require real bytes.
+    let wrote = status.success()
+        && std::fs::metadata(&dest)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false);
+    if wrote {
+        Some(BackgroundVideo {
+            file: filename,
+            offset_us: 0,
+        })
+    } else {
+        let _ = std::fs::remove_file(&dest); // never leave a partial encode
+        None
+    }
+}
+
+/// Copy the source video into `out_dir/source.<ext>` verbatim — the fallback
+/// when [`transcode_backdrop`] cannot run. The bundle-relative filename
+/// preserves the source extension so the webview's `<video>` can pick the right
+/// decoder.
+fn copy_source_video(video_path: &Path, out_dir: &Path) -> Option<BackgroundVideo> {
     let ext = video_path
         .extension()
         .and_then(|e| e.to_str())
@@ -810,8 +897,69 @@ mod tests {
         let out_dir = tmp.path().join("out");
         std::fs::create_dir_all(&out_dir).unwrap();
         let missing = tmp.path().join("does-not-exist.mp4");
-        assert!(retain_source_video(&missing, &out_dir).is_none());
+        let no_ffmpeg = Path::new("rockcraft-no-such-ffmpeg");
+        assert!(retain_source_video(&missing, &out_dir, no_ffmpeg).is_none());
         assert!(!out_dir.join("source.mp4").exists());
+    }
+
+    /// Without ffmpeg the backdrop falls back to a verbatim copy — the bundle
+    /// still gets its movie, just un-normalised. Guards the degradation path:
+    /// the normalising transcode must never be load-bearing for having a
+    /// backdrop at all.
+    #[test]
+    fn retain_source_video_falls_back_to_copy_without_ffmpeg() {
+        let tmp = TempDir::new().unwrap();
+        let out_dir = tmp.path().join("out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let src = tmp.path().join("clip.webm");
+        std::fs::write(&src, b"not-really-a-video").unwrap();
+
+        let video =
+            retain_source_video(&src, &out_dir, Path::new("rockcraft-no-such-ffmpeg")).unwrap();
+
+        // Copied verbatim, so the source extension (and bytes) survive.
+        assert_eq!(video.file, "source.webm");
+        assert_eq!(video.offset_us, 0);
+        assert_eq!(
+            std::fs::read(out_dir.join("source.webm")).unwrap(),
+            b"not-really-a-video"
+        );
+        // The failed transcode must not leave a stray .mp4 behind.
+        assert!(!out_dir.join("source.mp4").exists());
+    }
+
+    /// A *successful* transcode normalises the backdrop to `source.mp4` whatever
+    /// the source container was, and the copy fallback does not also run.
+    #[cfg(unix)]
+    #[test]
+    fn retain_source_video_transcodes_to_normalised_mp4() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let out_dir = tmp.path().join("out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let src = tmp.path().join("clip.webm");
+        std::fs::write(&src, b"stub").unwrap();
+
+        // Stub ffmpeg: writes bytes to the last argument (the destination).
+        let fake = tmp.path().join("fake-ffmpeg");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nfor a in \"$@\"; do d=\"$a\"; done\nprintf transcoded > \"$d\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let video = retain_source_video(&src, &out_dir, &fake).unwrap();
+
+        assert_eq!(video.file, "source.mp4", "normalised regardless of source");
+        assert_eq!(
+            std::fs::read(out_dir.join("source.mp4")).unwrap(),
+            b"transcoded"
+        );
+        assert!(
+            !out_dir.join("source.webm").exists(),
+            "copy fallback must not run once the transcode succeeded"
+        );
     }
 
     /// With no usable ffmpeg, a File import still produces a valid bundle whose
