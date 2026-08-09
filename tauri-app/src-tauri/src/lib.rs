@@ -565,6 +565,8 @@ pub fn run() {
             play::play_load,
             play::play_set_wait,
             play::play_set_practice,
+            play::play_set_rate,
+            play::play_status,
             play::play_set_split,
             play::play_toggle_hear_song,
             play::play_toggle_monitor,

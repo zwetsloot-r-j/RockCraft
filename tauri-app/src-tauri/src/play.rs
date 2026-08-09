@@ -223,6 +223,55 @@ pub struct PlayStateEvent {
     pub finished: bool,
 }
 
+/// A complete read-only picture of the live take, for the agent-control socket.
+///
+/// `play_state` events reach the webview only, so an agent driving the app over
+/// the socket previously had **no way to see a running take** — not the clock,
+/// not what the wait gate wanted, not even whether a session existed. Diagnosing
+/// "wait mode won't advance" then came down to guesswork. This carries the live
+/// snapshot *and* the session's configuration (the half the event never had), so
+/// the state is directly readable.
+///
+/// Deliberately non-mutating: unlike [`PlaySession::live_state`] it neither
+/// polls the gate nor drains `pending_feedback`, so an agent reading status can
+/// never steal a judgment effect from the webview or perturb the take it is
+/// observing.
+#[derive(Debug, Clone, Serialize)]
+pub struct PlayStatusView {
+    /// False when no bundle is loaded — every other field is then meaningless.
+    pub loaded: bool,
+    pub title: String,
+    pub time_us: u64,
+    pub duration_us: u64,
+    /// Manual pause (`play_toggle_pause`).
+    pub paused: bool,
+    /// Clock held — by the manual pause or an unsatisfied wait step.
+    pub frozen: bool,
+    pub finished: bool,
+    /// Wait mode armed.
+    pub wait_armed: bool,
+    /// Pitches the gate is waiting for; empty unless frozen by the gate. The
+    /// pairing of this with `held` is what makes a stuck take diagnosable.
+    pub awaiting: Vec<u8>,
+    /// Pitches currently held by the player.
+    pub held: Vec<u8>,
+    /// `"both"`, `"left"` or `"right"`.
+    pub practice: String,
+    pub split_pitch: u8,
+    pub rate_permille: u16,
+    pub hear_song: bool,
+    pub monitor: bool,
+    pub score: u64,
+    pub combo: u32,
+    pub best_combo: u32,
+    pub hits: usize,
+    pub misses: usize,
+    pub bpm: u32,
+    pub beats_per_bar: u8,
+    /// Total notes in the loaded chart, to sanity-check against the bundle.
+    pub note_count: usize,
+}
+
 /// The end-of-take summary returned by `play_finish`.
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub struct PlaySummary {
@@ -251,6 +300,14 @@ pub enum Hand {
 /// Default left/right split pitch (middle C = 60): notes below are left hand,
 /// at/above are right. Configurable per session via [`PlaySession::set_split`].
 pub const DEFAULT_SPLIT: u8 = 60;
+
+/// Practice speed meaning "normal", in permille.
+pub const PLAY_RATE_UNITY: u16 = 1000;
+/// Slowest practice speed (0.25x) — matches `core::Action::SetPlaybackRate`'s
+/// range so the two transports feel the same.
+pub const PLAY_RATE_MIN: u16 = 250;
+/// Fastest practice speed (2x).
+pub const PLAY_RATE_MAX: u16 = 2000;
 
 /// Infer a note's hand from its pitch relative to the split.
 fn hand_of(pitch: u8, split: u8) -> Hand {
@@ -400,6 +457,10 @@ pub struct PlaySession {
     practice: Option<Hand>,
     /// Pitch dividing left/right hands for [`practice`](Self::practice).
     split_pitch: u8,
+    /// Practice speed in permille (1000 = 1x). Scales the time injected into
+    /// [`advance`](Self::advance), so the clock, wait gate and scoring windows
+    /// all stretch together and the chart itself is never rewritten.
+    rate_permille: u16,
     /// Manual pause (`HostCommand::PlayTogglePause`). Freezes the clock + backing
     /// independently of wait-mode; while set the highway and scoring clock hold
     /// their position. The play-screen UI/keys are M12-B (#232).
@@ -477,6 +538,7 @@ impl PlaySession {
             finished_pause_us: LEAD_US,
             clock: PlayClock::new(),
             wait,
+            rate_permille: PLAY_RATE_UNITY,
             shift_us,
             backing: None,
             video: None,
@@ -670,6 +732,14 @@ impl PlaySession {
     /// good-window has now closed into the live score. Returns whether the clock
     /// is frozen after this step (so the caller can pause the backing).
     pub fn advance(&mut self, dt_us: u64) -> bool {
+        // Practice speed scales the time entering the session, not the chart:
+        // the clock, wait gate and scoring windows all stretch by the same
+        // factor, so judgements stay identical relative to the music.
+        let dt_us = if self.rate_permille == PLAY_RATE_UNITY {
+            dt_us
+        } else {
+            dt_us * self.rate_permille as u64 / PLAY_RATE_UNITY as u64
+        };
         self.wait.set_held(self.held.clone());
         let wait_frozen = self.wait.poll(self.clock.now_us()) == GateState::Frozen;
         // A manual pause freezes the transport just like an unsatisfied wait step.
@@ -858,6 +928,13 @@ impl PlaySession {
         self.rebuild_wait_gate();
     }
 
+    /// Set the practice speed in permille, clamped to
+    /// [`PLAY_RATE_MIN`]..=[`PLAY_RATE_MAX`]. Returns the applied value.
+    pub fn set_rate(&mut self, rate_permille: u16) -> u16 {
+        self.rate_permille = rate_permille.clamp(PLAY_RATE_MIN, PLAY_RATE_MAX);
+        self.rate_permille
+    }
+
     /// Set the pitch dividing left/right hands. Reclassifies every note and
     /// rebuilds the wait gate.
     pub fn set_split(&mut self, split: u8) {
@@ -926,6 +1003,47 @@ impl PlaySession {
     }
 
     /// A live snapshot for the `play_state` event.
+    /// A read-only status picture of this take (see [`PlayStatusView`]).
+    ///
+    /// Reads the gate's *last* poll rather than re-polling: the tick loop polls
+    /// at ~60 Hz, so this is current, and observing stays free of side effects.
+    pub fn status(&self) -> PlayStatusView {
+        let awaiting = self
+            .wait
+            .awaiting()
+            .map(|s| s.notes.clone())
+            .unwrap_or_default();
+        PlayStatusView {
+            loaded: true,
+            title: self.title.clone(),
+            time_us: self.now_us(),
+            duration_us: self.duration_us,
+            paused: self.paused,
+            frozen: self.paused || !awaiting.is_empty(),
+            finished: self.is_finished(),
+            wait_armed: self.wait.is_armed(),
+            awaiting,
+            held: self.held.iter().copied().collect(),
+            practice: match self.practice {
+                None => "both".to_string(),
+                Some(Hand::Left) => "left".to_string(),
+                Some(Hand::Right) => "right".to_string(),
+            },
+            split_pitch: self.split_pitch,
+            rate_permille: self.rate_permille,
+            hear_song: self.hear_song,
+            monitor: self.monitor,
+            score: self.score,
+            combo: self.combo,
+            best_combo: self.best_combo,
+            hits: self.live_hits,
+            misses: self.live_misses,
+            bpm: self.bpm,
+            beats_per_bar: self.beats_per_bar,
+            note_count: self.spans.len(),
+        }
+    }
+
     pub fn live_state(&mut self) -> PlayStateEvent {
         // Re-poll the gate to surface the awaited notes (idempotent read). A
         // manual pause also reads as frozen so the webview sees the clock held.
@@ -1066,6 +1184,63 @@ pub fn play_set_wait(state: tauri::State<'_, PlayState>, on: bool) -> bool {
     } else {
         false
     }
+}
+
+/// The live take's full state, or `loaded: false` when none is running.
+/// See [`PlayStatusView`] — this is the socket's window onto a running game.
+#[tauri::command]
+pub fn play_status(state: tauri::State<'_, PlayState>) -> PlayStatusView {
+    let guard = state.0.lock().expect("play state mutex poisoned");
+    guard
+        .as_ref()
+        .map(|s| s.status())
+        .unwrap_or(PlayStatusView {
+            loaded: false,
+            title: String::new(),
+            time_us: 0,
+            duration_us: 0,
+            paused: false,
+            frozen: false,
+            finished: false,
+            wait_armed: false,
+            awaiting: Vec::new(),
+            held: Vec::new(),
+            practice: "both".to_string(),
+            split_pitch: DEFAULT_SPLIT,
+            rate_permille: PLAY_RATE_UNITY,
+            hear_song: false,
+            monitor: false,
+            score: 0,
+            combo: 0,
+            best_combo: 0,
+            hits: 0,
+            misses: 0,
+            bpm: 0,
+            beats_per_bar: 0,
+            note_count: 0,
+        })
+}
+
+/// Set play-session speed in permille (1000 = 1x), clamped to 0.25x..=2x.
+/// Returns the applied value.
+///
+/// Slowing scales the time injected into the session, so the highway, wait gate
+/// and scoring windows all stretch together — the chart is untouched, only the
+/// wall-clock pace changes. The backing *recording* cannot follow without
+/// resampling, so it is muted off-tempo and restored at 1x.
+#[tauri::command]
+pub fn play_set_rate(
+    state: tauri::State<'_, PlayState>,
+    audio: tauri::State<'_, AudioState>,
+    rate_permille: u16,
+) -> u16 {
+    let mut guard = state.0.lock().expect("play state mutex poisoned");
+    let Some(s) = guard.as_mut() else {
+        return PLAY_RATE_UNITY;
+    };
+    let applied = s.set_rate(rate_permille);
+    audio.set_backing_muted(applied != PLAY_RATE_UNITY);
+    applied
 }
 
 /// Set the practiced hand: `"left"`, `"right"`, or anything else / null = both.
@@ -1284,6 +1459,78 @@ mod tests {
     /// Targets, after the pre-roll shift, fall at SHIFT + k·250ms.
     fn target_us(k: u64) -> u64 {
         SHIFT + k * 250_000
+    }
+
+    /// `status` reports the wait gate's demand alongside what is actually held —
+    /// the pairing that makes a stuck take diagnosable over the socket.
+    #[test]
+    fn status_reports_awaiting_against_held() {
+        let mut s = session();
+        s.set_wait_mode(true);
+        // `advance` polls the gate at the clock's *current* time and only then
+        // advances it, so the freeze lands on the tick after the target passes.
+        s.advance(target_us(0) + 1);
+        s.advance(16_000);
+        let st = s.status();
+        assert!(st.loaded);
+        assert!(st.wait_armed);
+        assert!(st.frozen, "gate holds the clock at an unsatisfied step");
+        assert_eq!(st.awaiting, vec![60], "the note the take is waiting for");
+        assert!(st.held.is_empty(), "nothing pressed yet");
+        assert_eq!(st.note_count, 4);
+        assert_eq!(st.practice, "both");
+        assert_eq!(st.rate_permille, PLAY_RATE_UNITY);
+
+        // Press it: the gate is satisfied and the take moves on.
+        s.ingest(on(60, s.now_us()));
+        s.advance(16_000);
+        let st = s.status();
+        assert_eq!(st.held, vec![60], "status shows what is held");
+        assert!(!st.frozen, "satisfied step releases the clock");
+    }
+
+    /// Reading status must not perturb the take it observes — in particular it
+    /// must not drain the judgment queue `live_state` owns, or an agent polling
+    /// status would silently eat the webview's hit effects.
+    #[test]
+    fn status_is_free_of_side_effects() {
+        let mut s = session();
+        s.set_wait_mode(true);
+        s.advance(target_us(0) + 1);
+        s.advance(16_000);
+
+        let before = s.status();
+        for _ in 0..5 {
+            let again = s.status();
+            assert_eq!(
+                again.time_us, before.time_us,
+                "status must not advance time"
+            );
+            assert_eq!(again.awaiting, before.awaiting, "nor move the gate");
+        }
+        // The judgment queue survives repeated status reads.
+        s.ingest(on(60, s.now_us()));
+        s.advance(500_000);
+        let _ = s.status();
+        let ev = s.live_state();
+        assert!(
+            !ev.judgments.is_empty(),
+            "status reads must leave judgments for the webview"
+        );
+    }
+
+    /// A slowed take advances proportionally less per tick, leaving the chart
+    /// untouched — the clock is what stretches.
+    #[test]
+    fn set_rate_scales_advance() {
+        let mut s = session();
+        assert_eq!(s.set_rate(500), 500);
+        s.advance(1_000_000);
+        assert_eq!(s.status().time_us, 500_000, "half speed, half the clock");
+
+        // Out-of-range values clamp rather than erroring.
+        assert_eq!(s.set_rate(1), PLAY_RATE_MIN);
+        assert_eq!(s.set_rate(60_000), PLAY_RATE_MAX);
     }
 
     const PITCHES: [u8; 4] = [60, 62, 64, 65];

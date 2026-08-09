@@ -17,6 +17,7 @@ import {
   playFinish,
   playLoad,
   playSetPractice,
+  playSetRate,
   playSetSplit,
   playSetWait,
   playToggleHearSong,
@@ -112,6 +113,41 @@ function readPractice(): Practice {
     return "both";
   }
 }
+/**
+ * How much of the backdrop movie to show behind the highway.
+ *
+ * An imported piece's movie is a note tutorial, so its own falling notes sit
+ * right where ours do and compete with them. `dim` keeps the scene readable
+ * (artwork, the performer) while pushing its notes back; `off` removes it.
+ */
+type Backdrop = "on" | "dim" | "off";
+const BACKDROP_KEY = "rc.play.backdrop";
+/** Opacity the backdrop `<video>` renders at in each mode. */
+const BACKDROP_OPACITY: Record<Backdrop, number> = {
+  on: 1,
+  dim: 0.22,
+  off: 0,
+};
+
+function readBackdrop(): Backdrop {
+  try {
+    const v = localStorage.getItem(BACKDROP_KEY);
+    return v === "dim" || v === "off" ? v : "on";
+  } catch {
+    return "on";
+  }
+}
+/** Practice speed presets in permille, cycled with `-` / `=`. */
+const RATE_STEPS = [500, 625, 750, 875, 1000] as const;
+const RATE_KEY = "rc.play.rate";
+function readRate(): number {
+  try {
+    const v = Number(localStorage.getItem(RATE_KEY));
+    return RATE_STEPS.includes(v as (typeof RATE_STEPS)[number]) ? v : 1000;
+  } catch {
+    return 1000;
+  }
+}
 function readSplit(): number {
   try {
     const v = Number(localStorage.getItem(SPLIT_KEY));
@@ -192,6 +228,10 @@ export function HighwayScreen() {
   // Hand-practice mode + the left/right split pitch, both persisted.
   const [practice, setPractice] = createSignal<Practice>(readPractice());
   const [split, setSplit] = createSignal(readSplit());
+  // How much of the backdrop movie to show, persisted across takes/sessions.
+  const [backdrop, setBackdrop] = createSignal<Backdrop>(readBackdrop());
+  // Practice speed (permille), persisted across takes/sessions.
+  const [rate, setRate] = createSignal(readRate());
   // Live MIDI device status, shown on the Start overlay so the player can tell
   // whether their piano is connected (and reconnect if it was powered on late).
   const [midiInfo, setMidiInfo] = createSignal<MidiStatus | null>(null);
@@ -257,6 +297,24 @@ export function HighwayScreen() {
         // Cycle hand-practice: both → right → left → both.
         e.preventDefault();
         cyclePractice();
+        break;
+      case "-":
+      case "_":
+        // Slow the take down one step.
+        e.preventDefault();
+        nudgeRate(-1);
+        break;
+      case "=":
+      case "+":
+        // Speed the take back up one step (never past 1x).
+        e.preventDefault();
+        nudgeRate(1);
+        break;
+      case "v":
+      case "V":
+        // Cycle the backdrop movie: on → dim → off.
+        e.preventDefault();
+        cycleBackdrop();
         break;
       case ",":
         // Move the left/right split down a semitone.
@@ -338,7 +396,9 @@ export function HighwayScreen() {
         const layers = info.backgrounds ?? [];
         setBgLayers(layers);
         setBgTransforms({});
-        engine.setBackdrop(info.video != null || layers.length > 0);
+        engine.setBackdrop(
+          (info.video != null && backdrop() !== "off") || layers.length > 0,
+        );
         if (videoEl) {
           if (info.video) {
             videoEl.src = convertFileSrc(info.video.path);
@@ -362,6 +422,8 @@ export function HighwayScreen() {
         // Apply the persisted hand-practice mode + split to the fresh session.
         void playSetSplit(split());
         void playSetPractice(practiceArg(practice()));
+        // Re-apply the persisted practice speed to the fresh session.
+        if (rate() !== 1000) void playSetRate(rate());
       })
       .catch((err) => setLoadErr(String(err)));
   }
@@ -382,6 +444,36 @@ export function HighwayScreen() {
     void midiRescan()
       .then(setMidiInfo)
       .finally(() => setRescanning(false));
+  }
+
+  /** Step the practice speed through RATE_STEPS. Slowing mutes the backing
+   * recording (it cannot follow without resampling); the synth carries on. */
+  function nudgeRate(delta: number): void {
+    const i = RATE_STEPS.indexOf(rate() as (typeof RATE_STEPS)[number]);
+    const at = i === -1 ? RATE_STEPS.length - 1 : i;
+    const next = RATE_STEPS[Math.max(0, Math.min(RATE_STEPS.length - 1, at + delta))];
+    if (next === rate()) return;
+    setRate(next);
+    writeLS(RATE_KEY, String(next));
+    void playSetRate(next).then((v) => setRate(v));
+  }
+
+  /** Cycle the backdrop movie: on → dim → off. View-only — the play session is
+   * untouched, so this never affects timing, scoring or the wait gate. */
+  function cycleBackdrop(): void {
+    const next: Backdrop =
+      backdrop() === "on" ? "dim" : backdrop() === "dim" ? "off" : "on";
+    setBackdrop(next);
+    writeLS(BACKDROP_KEY, next);
+    // The highway paints an opaque bg when nothing shows behind it, so a hidden
+    // movie must not leave the canvas translucent over black.
+    eng()?.setBackdrop(hasVisibleBackdrop(next));
+  }
+
+  /** Whether anything is actually visible behind the highway canvas. */
+  function hasVisibleBackdrop(mode: Backdrop = backdrop()): boolean {
+    const movieShows = video() !== null && mode !== "off";
+    return movieShows || bgLayers().length > 0;
   }
 
   /** Cycle the practiced hand: both → right → left → both. */
@@ -499,6 +591,8 @@ export function HighwayScreen() {
           waitMode={waitMode}
           monitor={monitor}
           practice={practice}
+          backdrop={backdrop}
+          rate={rate}
           splitName={() => noteName(split())}
         />
         <div style={{ flex: "1 1 auto", "min-height": 0, position: "relative" }}>
@@ -518,7 +612,12 @@ export function HighwayScreen() {
               "object-fit": "contain",
               "z-index": 0,
               "pointer-events": "none",
-              display: video() === null ? "none" : "block",
+              // `off` is display:none rather than opacity:0 so the element stops
+              // compositing entirely — the movie's notes must not merely fade,
+              // they must cost nothing.
+              display:
+                video() === null || backdrop() === "off" ? "none" : "block",
+              opacity: BACKDROP_OPACITY[backdrop()],
               background: "#000",
             }}
           />

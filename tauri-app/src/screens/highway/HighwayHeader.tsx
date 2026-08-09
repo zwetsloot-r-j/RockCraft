@@ -21,6 +21,10 @@ interface HighwayHeaderProps {
   waitMode?: () => boolean;
   monitor?: () => boolean;
   practice?: () => "both" | "left" | "right";
+  /** Backdrop-movie visibility, cycled with `v`. */
+  backdrop?: () => "on" | "dim" | "off";
+  /** Practice speed in permille (1000 = 1x), stepped with `-` / `=`. */
+  rate?: () => number;
   splitName?: () => string;
 }
 
@@ -169,6 +173,38 @@ export function HighwayHeader(props: HighwayHeaderProps) {
           >
             ✋ {props.practice?.() ?? "both"}
           </span>
+          <span
+            style={{
+              "font-size": "11px",
+              "font-family": monoFont,
+              padding: "2px 8px",
+              "border-radius": "6px",
+              background:
+                (props.backdrop?.() ?? "on") !== "on"
+                  ? "rgba(199,146,234,0.2)"
+                  : "rgba(255,255,255,0.05)",
+              color:
+                (props.backdrop?.() ?? "on") !== "on" ? "#c792ea" : "#7c7f8e",
+            }}
+            title="v — backdrop movie: on / dim / off"
+          >
+            🎬 {props.backdrop?.() ?? "on"}
+          </span>
+          <Show when={(props.rate?.() ?? 1000) !== 1000}>
+            <span
+              style={{
+                "font-size": "11px",
+                "font-family": monoFont,
+                padding: "2px 8px",
+                "border-radius": "6px",
+                background: "rgba(199,146,234,0.2)",
+                color: "#c792ea",
+              }}
+              title="- / = — practice speed (backing mutes below 1x)"
+            >
+              🐢 {((props.rate?.() ?? 1000) / 1000).toFixed(2)}×
+            </span>
+          </Show>
           <Show when={(props.practice?.() ?? "both") !== "both"}>
             <span
               style={{

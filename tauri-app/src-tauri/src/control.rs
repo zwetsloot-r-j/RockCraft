@@ -344,6 +344,18 @@ impl HostServices for TauriHost<'_> {
                 let armed = crate::play::play_set_wait(app.state::<PlayState>(), on);
                 Ok(serde_json::json!({ "wait": armed }))
             }
+            HostCommand::PlaySetRate { rate_permille } => {
+                let rate = crate::play::play_set_rate(
+                    app.state::<PlayState>(),
+                    app.state::<AudioState>(),
+                    rate_permille,
+                );
+                Ok(serde_json::json!({ "rate_permille": rate }))
+            }
+            HostCommand::PlayStatus => {
+                let status = crate::play::play_status(app.state::<PlayState>());
+                json_payload("play_status", status)
+            }
             HostCommand::PlayToggleHearSong => {
                 let on = crate::play::play_toggle_hear_song(
                     app.state::<PlayState>(),
@@ -512,6 +524,7 @@ fn map_save_dest(dest: SaveDest) -> crate::state::SaveDest {
     match dest {
         SaveDest::QuickSave => crate::state::SaveDest::QuickSave,
         SaveDest::Library { name } => crate::state::SaveDest::Library { name },
+        SaveDest::InPlace => crate::state::SaveDest::InPlace,
     }
 }
 

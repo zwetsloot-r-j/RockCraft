@@ -36,6 +36,17 @@ use serde::Serialize;
 
 // ── Backing-thread messages ──────────────────────────────────────────────────
 
+/// The level actually applied to the backing sink: its fader, or silence while
+/// muted. Keeping the two separate means un-muting restores the player's level
+/// rather than resetting it to unity.
+fn effective_gain(gain: Gain, muted: bool) -> Gain {
+    if muted {
+        Gain::SILENT
+    } else {
+        gain
+    }
+}
+
 /// Commands sent from the app thread to the backing-manager thread.
 enum BackingMsg {
     /// Attach a backing file (replaces any previous one; does not play yet).
@@ -54,6 +65,10 @@ enum BackingMsg {
     /// Set the backing track's level (M14-C). Sticky: re-applied to every sink
     /// the thread makes afterwards, exactly like the speed.
     SetGain(Gain),
+    /// Silence (or restore) the backing without touching its fader — used when
+    /// the transport runs off-tempo, where a recording cannot follow. Kept
+    /// separate from `SetGain` so the player's chosen level survives the mute.
+    SetMuted(bool),
     /// Query the current backing file name (reply on the one-shot channel).
     QueryFileName(Sender<Option<String>>),
 }
@@ -138,6 +153,8 @@ impl AudioState {
             // Current backing level, re-applied for the same reason (a fresh
             // sink starts at unity) so the fader survives a restart.
             let mut gain = Gain::UNITY;
+            // Off-tempo mute, orthogonal to the fader above (see SetMuted).
+            let mut muted = false;
 
             for msg in backing_rx {
                 match msg {
@@ -166,7 +183,7 @@ impl AudioState {
                             match out.play_backing_at(p, pos) {
                                 Ok(h) => {
                                     h.set_speed(speed); // carry slow-mo across restarts
-                                    h.set_gain(gain); // …and the fader
+                                    h.set_gain(effective_gain(gain, muted)); // …fader + mute
                                     handle = Some(h);
                                 }
                                 Err(e) => {
@@ -194,7 +211,13 @@ impl AudioState {
                     BackingMsg::SetGain(g) => {
                         gain = g;
                         if let Some(h) = &handle {
-                            h.set_gain(g);
+                            h.set_gain(effective_gain(gain, muted));
+                        }
+                    }
+                    BackingMsg::SetMuted(m) => {
+                        muted = m;
+                        if let Some(h) = &handle {
+                            h.set_gain(effective_gain(gain, muted));
                         }
                     }
                     BackingMsg::QueryFileName(reply) => {
@@ -243,6 +266,13 @@ impl AudioState {
     /// sped transport. Resamples, so the pitch shifts with the speed.
     pub fn set_backing_speed(&self, speed: f32) {
         self.send_backing(BackingMsg::SetSpeed(speed));
+    }
+
+    /// Silence (or restore) the backing recording without disturbing its fader.
+    /// Used by play-mode slow practice, where the recording cannot follow the
+    /// transport and the synth carries the piece instead.
+    pub fn set_backing_muted(&self, muted: bool) {
+        self.send_backing(BackingMsg::SetMuted(muted));
     }
 
     // ── Sound selection + mixer (M14-C) ─────────────────────────────────────

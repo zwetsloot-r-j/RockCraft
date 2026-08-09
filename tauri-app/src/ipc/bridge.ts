@@ -421,6 +421,13 @@ export function playSetPractice(
   return invoke<string>("play_set_practice", { hand });
 }
 
+/** Set the play-session practice speed in permille (1000 = 1x), clamped
+ * 0.25x..=2x. The highway, wait gate and scoring stretch together; the backing
+ * recording mutes off-tempo. Returns the applied value. */
+export function playSetRate(ratePermille: number): Promise<number> {
+  return invoke<number>("play_set_rate", { ratePermille });
+}
+
 /** Set the pitch dividing left/right hands (0..=127). Returns the applied value. */
 export function playSetSplit(pitch: number): Promise<number> {
   return invoke<number>("play_set_split", { pitch });
