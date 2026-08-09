@@ -26,6 +26,7 @@ import {
   tailGapPx,
   withAlpha,
 } from "../highway/utils";
+import { DEFAULT_SPLIT, handTint } from "./hand";
 import { gridTiming, Viewport } from "./viewport";
 
 /** Euclidean modulo (non-negative result), for classifying step indices that
@@ -338,6 +339,7 @@ export class EditCanvas {
     // row stays fully legible, but over the gridlines so the selected timeslot
     // reads at a glance even on a sparse grid.
     this.drawCrosshair(snapshot, vp, cursorUs, g.stepUs);
+    this.drawHandSplit(snapshot, vp);
     this.drawNotes(snapshot, vp);
     this.drawSelection(snapshot, vp);
     this.drawSplits(vp);
@@ -518,6 +520,7 @@ export class EditCanvas {
 
   private drawNotes(snapshot: ComposerSnapshot, vp: Viewport): void {
     const ctx = this.ctx;
+    const split = snapshot.hand_split ?? DEFAULT_SPLIT;
     for (const n of snapshot.notes) {
       if (!vp.pitchVisible(n.pitch)) continue;
       const x = vp.xOf(n.pitch);
@@ -538,10 +541,12 @@ export class EditCanvas {
       // base pad, so accidentals read as a thinner pill.
       const pad = Math.min(2, vp.laneW * 0.15) + (ksty.inset * vp.laneW) / 2;
       const w = vp.laneW - pad * 2;
-      const hue = spectrumHue(n.pitch);
+      // Tint by the note's EFFECTIVE hand (M14-E): its authored override when
+      // it has one, else the piece's split line. Same palette as the highway.
+      const tint = handTint(n.pitch, n.hand, split);
       // Velocity → alpha (0..127 mapped onto 0.4..1.0).
       const alpha = 0.4 + (n.velocity / 127) * 0.6;
-      const base = `oklch(0.72 0.16 ${hue})`;
+      const base = tint.color;
       // Darken accidentals the same way the highway does (helper's shadeMul).
       const fill = ksty.shadeMul ? shade(base, ksty.shadeMul) : base;
       ctx.save();
@@ -566,8 +571,54 @@ export class EditCanvas {
       ctx.moveTo(x + pad, y + h - 0.75);
       ctx.lineTo(x + pad + w, y + h - 0.75);
       ctx.stroke();
+      // A note whose hand was set BY HAND gets a white outline plus a dot at
+      // the onset, so exceptions to the split line are visible at a glance —
+      // the tint alone can't distinguish "left because of the split" from
+      // "left because the author said so".
+      if (tint.overridden) {
+        ctx.globalAlpha = 1;
+        ctx.strokeStyle = withAlpha("#ffffff", 0.85);
+        ctx.lineWidth = 1;
+        roundRect(ctx, x + pad + 0.5, y + 0.5, w - 1, h - 1, 3);
+        ctx.stroke();
+        const r = Math.min(2.5, Math.max(1.25, w * 0.16));
+        ctx.fillStyle = "#ffffff";
+        ctx.beginPath();
+        ctx.arc(x + pad + w / 2, y + h - r - 1.5, r, 0, Math.PI * 2);
+        ctx.fill();
+      }
       ctx.restore();
     }
+  }
+
+  // ── hand split line ─────────────────────────────────────────────────────
+
+  /**
+   * The piece's left/right split line, drawn down the pitch axis at the lane
+   * boundary below `snapshot.hand_split`: notes left of it default to the left
+   * hand, right of it to the right. Dashed and dim so it reads as a guide, not
+   * a gridline; labelled at the top edge with the split pitch.
+   */
+  private drawHandSplit(snapshot: ComposerSnapshot, vp: Viewport): void {
+    const split = snapshot.hand_split ?? DEFAULT_SPLIT;
+    if (!vp.pitchVisible(split)) return;
+    const ctx = this.ctx;
+    const x = vp.xOf(split);
+    ctx.save();
+    ctx.setLineDash([5, 4]);
+    ctx.strokeStyle = withAlpha("#ffffff", 0.32);
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(x + 0.5, 0);
+    ctx.lineTo(x + 0.5, this.h - this.keyboardBandH());
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.font = `10px ${FONT_MONO}`;
+    ctx.textAlign = "left";
+    ctx.textBaseline = "top";
+    ctx.fillStyle = withAlpha("#ffffff", 0.45);
+    ctx.fillText(`split ${noteName(split)}`, x + 3, 3);
+    ctx.restore();
   }
 
   // ── selection rectangle ─────────────────────────────────────────────────

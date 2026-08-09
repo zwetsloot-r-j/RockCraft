@@ -59,9 +59,10 @@ import { onMidiEvent } from "../../ipc/midi";
 import { EditCanvas } from "./EditCanvas";
 import { StatusBar } from "./StatusBar";
 import { RecordControls } from "./RecordControls";
+import { DEFAULT_SPLIT } from "./hand";
 import { resolveBackgroundKey, resolveKey } from "./keymap";
 import { IDENTITY_TRANSFORM, layerStyle } from "../highway/backgrounds";
-import { stepUs } from "./viewport";
+import { HIGHEST_MIDI, LOWEST_MIDI, stepUs } from "./viewport";
 import {
   keptSegmentSpecs,
   pieceLengthUs,
@@ -1580,6 +1581,29 @@ export function EditScreen(props: Props): JSX.Element {
       return;
     }
 
+    // ── Hand split line (M14-E), non-chord mode only ────────────────────
+    // Shift+Left/Right walk the split down/up a semitone. The pitch axis runs
+    // left→right here, so the arrows move the line the way it looks. The
+    // action takes an absolute pitch, so the current split comes from the
+    // snapshot — which is why this can't live in the static keymap table.
+    if (
+      s.chord_preview === null &&
+      !splitMode() &&
+      e.shiftKey &&
+      (e.key === "ArrowLeft" || e.key === "ArrowRight")
+    ) {
+      e.preventDefault();
+      const delta = e.key === "ArrowRight" ? 1 : -1;
+      const pitch = Math.min(
+        HIGHEST_MIDI,
+        Math.max(LOWEST_MIDI, (s.hand_split ?? DEFAULT_SPLIT) + delta),
+      );
+      void runAction("set_hand_split", { pitch }).then((reply) => {
+        setDirty(reply.dirty);
+      });
+      return;
+    }
+
     // Esc in non-chord, no-selection mode → dirty exit prompt or menu nav.
     if (e.key === "Escape" && s.chord_preview === null && s.selection === null) {
       if (dirty()) {
@@ -2689,6 +2713,16 @@ function HelpOverlay(props: { onClose: () => void }): JSX.Element {
         "( / )         Tempo −/+ 5 BPM",
         "T             Set BPM (type a value, Enter to apply)",
         "m             Toggle grab (move note with h/j/k/l)",
+      ],
+    },
+    {
+      title: "Hands",
+      rows: [
+        "n             Cycle the hand of the cursor note / selection",
+        "              (auto → left → right → auto)",
+        "Shift+← / →   Move the split line down / up a semitone",
+        "              Notes left of the dashed split line default to the left",
+        "              hand; a note set by hand is outlined with a dot",
       ],
     },
     {

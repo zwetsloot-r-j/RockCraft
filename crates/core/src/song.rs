@@ -4,8 +4,13 @@
 //! `RecordingMeta` struct mirrors the `meta.json` inside a bundle directory;
 //! serialization is in-memory only (callers in `tui`/`audio` do the fs work).
 
+use crate::hand::DEFAULT_SPLIT;
 use crate::{BackgroundImage, Grid, Key};
 use serde::{Deserialize, Serialize};
+
+/// One persisted per-note hand exception. Defined in [`crate::hand`] and
+/// re-exported here because `meta.json` is what carries it.
+pub use crate::hand::HandOverride;
 
 /// Describes the backing audio track inside a recording bundle.
 ///
@@ -94,6 +99,18 @@ pub struct RecordingMeta {
     /// without any, including every bundle written before this field existed.
     #[serde(default)]
     pub backgrounds: Vec<BackgroundImage>,
+    /// The piece's left/right hand split pitch (M14-E): notes below it are the
+    /// left hand, at/above it the right. `None` — every bundle written before
+    /// this field existed — means [`DEFAULT_SPLIT`]; read it through
+    /// [`RecordingMeta::split_or_default`].
+    #[serde(default)]
+    pub hand_split: Option<u8>,
+    /// Per-note exceptions to the split line (M14-E), keyed by `(pitch,
+    /// start_us)` — the only note identity that survives a reload, since
+    /// `song.mid` carries no per-note metadata and `NoteId`s are reassigned.
+    /// Empty for pieces with no exceptions, including every legacy bundle.
+    #[serde(default)]
+    pub hand_overrides: Vec<HandOverride>,
     /// Schema version; always written as `1`. Kept for forward-compat.
     #[serde(default = "default_version")]
     pub version: u32,
@@ -126,8 +143,16 @@ impl RecordingMeta {
             origin: None,
             video: None,
             backgrounds: Vec::new(),
+            hand_split: None,
+            hand_overrides: Vec::new(),
             version: 1,
         }
+    }
+
+    /// The piece's hand split pitch, falling back to [`DEFAULT_SPLIT`] for
+    /// bundles that never declared one.
+    pub fn split_or_default(&self) -> u8 {
+        self.hand_split.unwrap_or(DEFAULT_SPLIT)
     }
 
     /// Serialize to a JSON string. Infallible for well-formed types.
@@ -188,6 +213,8 @@ mod tests {
             origin: None,
             video: None,
             backgrounds: Vec::new(),
+            hand_split: None,
+            hand_overrides: Vec::new(),
             version: 1,
         };
         let json = meta.to_json();
@@ -209,6 +236,8 @@ mod tests {
             origin: None,
             video: None,
             backgrounds: Vec::new(),
+            hand_split: None,
+            hand_overrides: Vec::new(),
             version: 1,
         };
         let json = meta.to_json();
@@ -230,6 +259,8 @@ mod tests {
             origin: None,
             video: None,
             backgrounds: Vec::new(),
+            hand_split: None,
+            hand_overrides: Vec::new(),
             version: 1,
         };
         let back = RecordingMeta::from_json(&meta.to_json()).unwrap();
@@ -249,6 +280,8 @@ mod tests {
                 file: "source.mp4".into(),
                 offset_us: -250_000,
             }),
+            hand_split: None,
+            hand_overrides: Vec::new(),
             version: 1,
         };
         let json = meta.to_json();
@@ -278,6 +311,8 @@ mod tests {
             origin: Some(TrackOrigin::Imported),
             video: Some(video.clone()),
             backgrounds: Vec::new(),
+            hand_split: None,
+            hand_overrides: Vec::new(),
             version: 1,
         };
 
@@ -351,6 +386,52 @@ mod tests {
         let meta = RecordingMeta::from_json(pre).unwrap();
         assert!(meta.backgrounds.is_empty());
         assert!(meta.video.is_some());
+    }
+
+    // ── hand split + per-note overrides (M14-E) ─────────────────────────────
+
+    #[test]
+    fn with_hand_overrides_roundtrip() {
+        use crate::Hand;
+        let mut meta = RecordingMeta::new_midi_only("song.mid");
+        meta.hand_split = Some(55);
+        meta.hand_overrides = vec![
+            HandOverride {
+                pitch: 48,
+                start_us: 1_000_000,
+                hand: Hand::Right,
+            },
+            HandOverride {
+                pitch: 72,
+                start_us: 2_000_000,
+                hand: Hand::Left,
+            },
+        ];
+
+        let back = RecordingMeta::from_json(&meta.to_json()).unwrap();
+        assert_eq!(meta, back);
+        assert_eq!(back.split_or_default(), 55);
+        assert_eq!(back.hand_overrides.len(), 2);
+        assert_eq!(back.hand_overrides[0].hand, Hand::Right);
+    }
+
+    #[test]
+    fn pre_hand_bundle_parses_with_default_split_and_no_overrides() {
+        // Every bundle written before M14-E: no `hand_split`, no
+        // `hand_overrides` — it must play, score and colour exactly as before.
+        let pre = r#"{"midi_file":"song.mid","backgrounds":[],"version":1}"#;
+        let meta = RecordingMeta::from_json(pre).unwrap();
+        assert_eq!(meta.hand_split, None);
+        assert!(meta.hand_overrides.is_empty());
+        assert_eq!(meta.split_or_default(), crate::hand::DEFAULT_SPLIT);
+    }
+
+    #[test]
+    fn hand_fields_default_on_a_fresh_meta() {
+        let meta = RecordingMeta::new_midi_only("song.mid");
+        assert_eq!(meta.hand_split, None);
+        assert!(meta.hand_overrides.is_empty());
+        assert_eq!(meta.split_or_default(), crate::hand::DEFAULT_SPLIT);
     }
 
     #[test]

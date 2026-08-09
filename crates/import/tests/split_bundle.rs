@@ -7,7 +7,7 @@ use std::fs;
 
 use rockcraft_core::{
     slice_segment, BackgroundImage, BackgroundVideo, BackingTrack, Easing, Grid, Key, MidiNote,
-    Note, RecordingMeta, Scale, Segment, Timeline, TrackOrigin, Transform, Velocity,
+    Note, RecordingMeta, Scale, Segment, Timeline, TrackOrigin, Transform, Velocity, DEFAULT_SPLIT,
 };
 use rockcraft_import::write_part_bundle;
 
@@ -17,6 +17,7 @@ fn note(pitch: u8, start_us: u64, dur_us: u64) -> Note {
         start_us,
         dur_us,
         velocity: Velocity::new(80).unwrap(),
+        hand: None,
     }
 }
 
@@ -102,6 +103,7 @@ fn split_writes_kept_parts_with_copied_media_and_derived_offsets() {
             Some(&src.join("backing.wav")),
             Some(&src.join("background.mp4")),
             &background_srcs,
+            DEFAULT_SPLIT,
         )
         .unwrap();
         assert_eq!(written, dir);
@@ -188,6 +190,7 @@ fn split_midi_only_piece_writes_media_less_bundles() {
         None,
         None,
         &[],
+        DEFAULT_SPLIT,
     )
     .unwrap();
 

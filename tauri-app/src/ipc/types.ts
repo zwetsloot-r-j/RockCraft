@@ -38,6 +38,17 @@ export type Subdivision =
  */
 export type InputMode = "DirectEdit" | "StepRecord" | "LiveRecord";
 
+/**
+ * Which hand plays a note — mirror of `core::hand::Hand` (serde snake_case).
+ */
+export type Hand = "left" | "right";
+
+/**
+ * What an edit action sets on a note — mirror of `core::hand::HandSetting`.
+ * `"auto"` clears the override so the note follows the piece's split line.
+ */
+export type HandSetting = "auto" | "left" | "right";
+
 /** One note in a snapshot — mirror of `composer::NoteView`. */
 export interface NoteView {
   /** Stable note id (raw `NoteId` value). */
@@ -46,6 +57,12 @@ export interface NoteView {
   start_us: number;
   dur_us: number;
   velocity: number;
+  /**
+   * The note's **raw** hand override (M14-E); `null`/absent means it follows
+   * the piece's split line. Derive the effective hand from this plus
+   * {@link ComposerSnapshot.hand_split} — see `screens/edit/hand.ts`.
+   */
+  hand?: Hand | null;
 }
 
 /** The active selection rectangle — mirror of `composer::SelectionView`. */
@@ -102,6 +119,12 @@ export interface ComposerSnapshot {
   backgrounds?: BackgroundView[];
   /** Index of the layer background actions address; null when there are none. */
   selected_background?: number | null;
+  /**
+   * The piece's left/right hand split pitch (M14-E): notes below it default to
+   * the left hand, at/above it to the right. Absent on pre-M14-E snapshots,
+   * where middle C (60) is the implied value.
+   */
+  hand_split?: number;
 }
 
 /**
@@ -288,6 +311,10 @@ export type ActionName =
   | "set_background_easing"
   | "add_background_keyframe"
   | "delete_background_keyframe"
+  // ── hand assignment (M14-E) ─────────────────────────────────────────
+  | "set_hand_split"
+  | "set_note_hand"
+  | "cycle_note_hand"
   // ── history ─────────────────────────────────────────────────────────
   | "undo"
   | "redo";
@@ -322,7 +349,7 @@ export interface LibraryEntryDto {
 /**
  * One projected note span for the highway — mirror of `play::SpanView`.
  * Bounds are in MILLISECONDS (the webview engine is ms-based), already shifted
- * by the pre-roll. No hand info exists in a bundle.
+ * by the pre-roll.
  */
 export interface PlaySpan {
   note: number;
@@ -330,6 +357,12 @@ export interface PlaySpan {
   start: number;
   /** End in milliseconds. */
   end: number;
+  /**
+   * The **effective** hand that plays this note (M14-E): the piece's per-note
+   * override when it has one, else its split line. `core` resolves it, so the
+   * highway never re-derives the rule.
+   */
+  hand: Hand;
 }
 
 /**

@@ -76,6 +76,8 @@ pub fn slice_segment(
             start_us: new_start_us,
             dur_us,
             velocity: note.velocity,
+            // A part keeps the exceptions the author marked on its notes.
+            hand: note.hand,
         });
     }
 
@@ -141,6 +143,7 @@ mod tests {
             start_us,
             dur_us,
             velocity: Velocity::new(80).unwrap(),
+            hand: None,
         }
     }
 

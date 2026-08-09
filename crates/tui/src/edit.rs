@@ -237,6 +237,12 @@ fn key_to_action(code: KeyCode) -> Option<Action> {
         KeyCode::Char('D') => Action::DeleteSelection,
         KeyCode::Esc => Action::ClearSelection,
 
+        // ── hand assignment (M14-E) ─────────────────────────────────────
+        // Cycle the hand of the cursor note (or the whole selection) through
+        // auto -> left -> right -> auto. The split line itself is a piece
+        // property; set it over the control socket with `set_hand_split`.
+        KeyCode::Char('n') => Action::CycleNoteHand,
+
         // ── history ─────────────────────────────────────────────────────
         KeyCode::Char('u') => Action::Undo,
         KeyCode::Char('U') => Action::Redo,
@@ -461,6 +467,12 @@ impl EditScreen {
         self.composer.set_key(key);
     }
 
+    /// Set the piece's left/right hand split pitch, e.g. from a loaded bundle's
+    /// `meta.json` (M14-E). Live editing goes through `Action::SetHandSplit`.
+    pub fn set_hand_split(&mut self, pitch: u8) {
+        self.composer.set_hand_split(pitch);
+    }
+
     /// Attach a synth handle so edits are auditioned. Called by the shell after
     /// construction so the existing no-arg `new()` stays usable in tests.
     pub fn attach_synth(&mut self, synth: SynthHandle) {
@@ -649,6 +661,9 @@ impl EditScreen {
             origin: Some(self.origin),
             video,
             backgrounds,
+            // The piece's authored hand assignment (M14-E).
+            hand_split: Some(self.composer.hand_split()),
+            hand_overrides: self.composer.timeline().hand_overrides(),
             version: 1,
         };
         std::fs::write(bundle_dir.join("meta.json"), meta.to_json())?;
@@ -887,6 +902,7 @@ impl EditScreen {
                 backing_src,
                 video_src,
                 &background_srcs,
+                self.composer.hand_split(),
             )
             .map_err(|e| e.to_string())?;
             dirs.push(dir);
@@ -1859,7 +1875,7 @@ impl EditScreen {
             ),
             vel_span,
             Span::styled(
-                "[a/x] add/del  []/[] size  [+/-] vel  [(/)] tempo  [T] set BPM  [m] grab  [c] chord  [v] select  [y/p/D] yank/paste/del  [u/U] undo/redo  [R] rec  [t] step/live  [C] count-in  [Space] play/stop  [P] play-start  [o] loop  [{/}] loop in/out  [M] metro  [>/<] subdiv  [hjkl] pitch/time  [H/L] bar  [w/b] oct  [g/G] timeline ends  [0/$] pitch ends  [s] save  [S] save to library  [X] split  [Tab] menu",
+                "[a/x] add/del  []/[] size  [+/-] vel  [(/)] tempo  [T] set BPM  [m] grab  [n] hand  [c] chord  [v] select  [y/p/D] yank/paste/del  [u/U] undo/redo  [R] rec  [t] step/live  [C] count-in  [Space] play/stop  [P] play-start  [o] loop  [{/}] loop in/out  [M] metro  [>/<] subdiv  [hjkl] pitch/time  [H/L] bar  [w/b] oct  [g/G] timeline ends  [0/$] pitch ends  [s] save  [S] save to library  [X] split  [Tab] menu",
                 Style::default().fg(Color::DarkGray),
             ),
         ]);
@@ -2625,6 +2641,7 @@ mod tests {
             start_us,
             dur_us,
             velocity: Velocity::new(80).unwrap(),
+            hand: None,
         }
     }
 

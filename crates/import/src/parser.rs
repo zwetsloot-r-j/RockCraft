@@ -36,6 +36,8 @@ pub fn chart_to_timeline(chart: &ExtractedChart) -> Result<Timeline, ImportError
             start_us: note.start_us,
             dur_us: note.dur_us.max(1),
             velocity,
+            // Hand is authored in the composer (M14-E), not sniffed on import.
+            hand: None,
         });
     }
     Ok(timeline)

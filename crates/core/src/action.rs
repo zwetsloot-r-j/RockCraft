@@ -14,6 +14,7 @@
 //! these meaning; this module only names them.
 
 use crate::background::Easing;
+use crate::hand::HandSetting;
 use serde::{Deserialize, Serialize};
 
 /// Every composer operation, transport-agnostic.
@@ -224,6 +225,23 @@ pub enum Action {
     /// Drop the selected layer's keyframe at the edit time, if any.
     DeleteBackgroundKeyframe,
 
+    // ── hand assignment (M14-E) ─────────────────────────────────────────
+    /// Set the piece's left/right split line: notes below `pitch` default to
+    /// the left hand, at/above it to the right. Per-note overrides win over it.
+    SetHandSplit {
+        pitch: u8,
+    },
+    /// Pin the target notes to a hand (or back to `Auto` = follow the split).
+    /// The target is the **selection** when one is active, else the note under
+    /// the cursor; with neither it is a no-op, never an error.
+    SetNoteHand {
+        hand: HandSetting,
+    },
+    /// Cycle the same target's setting `Auto → Left → Right → Auto` — the
+    /// one-key convenience. Reads the target's current setting (the cursor
+    /// note's, or the first selected note's) to decide the next one.
+    CycleNoteHand,
+
     // ── history ─────────────────────────────────────────────────────────
     Undo,
     Redo,
@@ -300,6 +318,9 @@ impl Action {
             Action::SetBackgroundEasing { .. } => "set_background_easing",
             Action::AddBackgroundKeyframe => "add_background_keyframe",
             Action::DeleteBackgroundKeyframe => "delete_background_keyframe",
+            Action::SetHandSplit { .. } => "set_hand_split",
+            Action::SetNoteHand { .. } => "set_note_hand",
+            Action::CycleNoteHand => "cycle_note_hand",
             Action::Undo => "undo",
             Action::Redo => "redo",
         }
@@ -454,6 +475,9 @@ pub fn action_names() -> &'static [&'static str] {
         "set_background_easing",
         "add_background_keyframe",
         "delete_background_keyframe",
+        "set_hand_split",
+        "set_note_hand",
+        "cycle_note_hand",
         "undo",
         "redo",
     ]
@@ -573,6 +597,10 @@ static ACTION_HELP: &[ActionInfo] = {
         ActionInfo { name: "set_background_easing", params: &[p("easing", "Easing")], description: "Set the curve leaving the selected layer's keyframe at the edit time: \"linear\", \"ease_in\", \"ease_out\", \"ease_in_out\" or \"hold\" (a cut). No-op when no keyframe sits exactly there." },
         ActionInfo { name: "add_background_keyframe", params: &[], description: "Pin the selected background layer's currently interpolated transform as an explicit keyframe at the edit time." },
         ActionInfo { name: "delete_background_keyframe", params: &[], description: "Delete the selected background layer's keyframe at the edit time, if one sits exactly there." },
+        // ── hand assignment (M14-E) ─────────────────────────────────────
+        ActionInfo { name: "set_hand_split", params: &[p("pitch", "u8")], description: "Set the piece's left/right hand split line: notes below `pitch` default to the left hand, at/above it to the right. Per-note overrides win over it." },
+        ActionInfo { name: "set_note_hand", params: &[p("hand", "HandSetting")], description: "Pin the target notes to a hand: \"left\", \"right\", or \"auto\" to follow the split line. Targets the selection when one is active, else the note under the cursor; a no-op with neither." },
+        ActionInfo { name: "cycle_note_hand", params: &[], description: "Cycle the target notes' hand setting auto -> left -> right -> auto. Same target as set_note_hand (selection, else the cursor note)." },
         // ── history ─────────────────────────────────────────────────────
         ActionInfo { name: "undo", params: &[], description: "Undo the last edit." },
         ActionInfo { name: "redo", params: &[], description: "Redo the last undone edit." },
@@ -673,6 +701,11 @@ mod tests {
             },
             Action::AddBackgroundKeyframe,
             Action::DeleteBackgroundKeyframe,
+            Action::SetHandSplit { pitch: 55 },
+            Action::SetNoteHand {
+                hand: HandSetting::Left,
+            },
+            Action::CycleNoteHand,
             Action::Undo,
             Action::Redo,
         ]
@@ -739,6 +772,7 @@ mod tests {
                 let sample = match p.ty {
                     "bool" => json!(true),
                     "Easing" => json!("linear"),
+                    "HandSetting" => json!("auto"),
                     _ => json!(1), // small in-range value for every numeric type
                 };
                 params.insert(p.name.to_string(), sample);
@@ -909,6 +943,37 @@ mod tests {
         ));
         assert!(matches!(
             action_from_name("set_bpm", &json!({})).unwrap_err(),
+            ActionError::BadParams { .. }
+        ));
+    }
+
+    #[test]
+    fn hand_actions_round_trip_via_name() {
+        assert_eq!(
+            action_from_name("set_hand_split", &json!({ "pitch": 55 })).unwrap(),
+            Action::SetHandSplit { pitch: 55 }
+        );
+        for (wire, setting) in [
+            ("auto", HandSetting::Auto),
+            ("left", HandSetting::Left),
+            ("right", HandSetting::Right),
+        ] {
+            assert_eq!(
+                action_from_name("set_note_hand", &json!({ "hand": wire })).unwrap(),
+                Action::SetNoteHand { hand: setting }
+            );
+        }
+        assert_eq!(
+            action_from_name("cycle_note_hand", &json!({})).unwrap(),
+            Action::CycleNoteHand
+        );
+        // Missing / unknown params are rejected rather than silently defaulted.
+        assert!(matches!(
+            action_from_name("set_hand_split", &json!({})).unwrap_err(),
+            ActionError::BadParams { .. }
+        ));
+        assert!(matches!(
+            action_from_name("set_note_hand", &json!({ "hand": "both" })).unwrap_err(),
             ActionError::BadParams { .. }
         ));
     }
