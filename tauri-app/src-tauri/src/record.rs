@@ -133,6 +133,8 @@ impl RecordSession {
             origin: Some(TrackOrigin::Recorded),
             video: None,
             backgrounds: Vec::new(),
+            hand_split: None,
+            hand_overrides: Vec::new(),
             version: 1,
         };
         std::fs::write(bundle_dir.join("meta.json"), meta.to_json())?;
@@ -512,6 +514,8 @@ mod tests {
             origin: Some(TrackOrigin::Recorded),
             video: None,
             backgrounds: Vec::new(),
+            hand_split: None,
+            hand_overrides: Vec::new(),
             version: 1,
         };
         std::fs::write(bundle_dir.join("meta.json"), meta.to_json()).unwrap();

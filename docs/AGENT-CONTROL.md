@@ -399,6 +399,9 @@ authoritative, exhaustive source:
 | `set_background_opacity` | `{ permille: u16 }` | Fade the selected layer (1000 = opaque), auto-keyframing |
 | `add_background_keyframe` / `delete_background_keyframe` | none | Pin / drop the selected layer's keyframe at the playhead |
 | `set_background_easing` | `{ easing: "linear"\|"ease_in"\|"ease_out"\|"ease_in_out"\|"hold" }` | Curve leaving the keyframe at the playhead |
+| `set_hand_split` | `{ pitch: u8 }` | Set the piece's left/right split line (notes below `pitch` default to the left hand) |
+| `set_note_hand` | `{ hand: "auto"\|"left"\|"right" }` | Pin the selection — or the cursor note — to a hand; `auto` clears the override |
+| `cycle_note_hand` | none | Cycle that same target `auto → left → right → auto` |
 
 For the exhaustive list, call `query { what: "actions" }` or consult `core::action_names()`.
 
@@ -498,6 +501,10 @@ The `state` field in responses is a `ComposerSnapshot` from `rockcraft_core`. It
 - `backgrounds`: Background image layers, back-to-front, each with its
   `transform` **already evaluated** at the playhead plus its `keyframes`
 - `selected_background`: Index of the layer the background actions address
+- `hand_split`: The piece's left/right split pitch (60 = middle C by default).
+  Each note's `hand` is its **raw** override — `null` for the usual case of
+  following the split line — so a note's effective hand is
+  `hand ?? (pitch < hand_split ? "left" : "right")`
 
 See `rockcraft_core::ComposerSnapshot` for the full schema.
 

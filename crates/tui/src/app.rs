@@ -20,7 +20,10 @@ use ratatui::{
 };
 use rockcraft_audio::SynthHandle;
 use rockcraft_control::{QueryKind, RemoteCommand, Request, Response};
-use rockcraft_core::{Grid, Key, Mixer, RecordingMeta, Scale, SynthBus, Timeline, TrackOrigin};
+use rockcraft_core::{
+    Grid, HandOverride, Key, Mixer, RecordingMeta, Scale, SynthBus, Timeline, TrackOrigin,
+    DEFAULT_SPLIT,
+};
 use rockcraft_import::{fetch_command_configured, ImportInput};
 use rockcraft_midi::{smf_bytes_to_events, NoteSource};
 use tokio::sync::mpsc;
@@ -279,11 +282,17 @@ impl Shell {
                 return;
             }
         };
-        let timeline = Timeline::from_events(&events);
+        let mut timeline = Timeline::from_events(&events);
         let bundle_dir = midi_path.parent().unwrap_or(midi_path);
         let (grid, key) = load_meta_grid_key(bundle_dir);
+        // Re-attach the piece's hand assignment (M14-E): `song.mid` carries no
+        // hand, so the exceptions come back from `meta.json` keyed by
+        // `(pitch, start_us)`, and the split line with them.
+        let (hand_split, hand_overrides) = load_meta_hands(bundle_dir);
+        timeline.apply_hand_overrides(&hand_overrides);
         let mut edit = EditScreen::from_timeline(timeline, grid);
         edit.set_key(key);
+        edit.set_hand_split(hand_split);
         // Preserve the bundle's own provenance; a bundle with no origin recorded
         // becomes `Edited` once reopened in the composer.
         edit.set_origin(load_meta_origin(bundle_dir).unwrap_or(TrackOrigin::Edited));
@@ -1047,6 +1056,20 @@ fn load_meta_backing(bundle_dir: &std::path::Path) -> Option<(PathBuf, u64)> {
     Some((bundle_dir.join(&backing.file), backing.audio_start_us))
 }
 
+/// Read a bundle's hand assignment from its `meta.json` (M14-E): the split
+/// pitch and the per-note exceptions. A missing/unparsable manifest — or one
+/// written before the fields existed — yields `(DEFAULT_SPLIT, [])`, which is
+/// exactly the pitch-only behaviour those bundles had.
+fn load_meta_hands(bundle_dir: &std::path::Path) -> (u8, Vec<HandOverride>) {
+    let Ok(json) = std::fs::read_to_string(bundle_dir.join("meta.json")) else {
+        return (DEFAULT_SPLIT, Vec::new());
+    };
+    match RecordingMeta::from_json(&json) {
+        Ok(meta) => (meta.split_or_default(), meta.hand_overrides),
+        Err(_) => (DEFAULT_SPLIT, Vec::new()),
+    }
+}
+
 /// Read a bundle's recorded provenance from its `meta.json`; `None` when there
 /// is no manifest, it fails to parse, or it predates the `origin` field.
 fn load_meta_origin(bundle_dir: &std::path::Path) -> Option<TrackOrigin> {
@@ -1391,6 +1414,7 @@ mod tests {
             start_us: start,
             dur_us: dur,
             velocity: Velocity::new(80).unwrap(),
+            hand: None,
         }
     }
 
@@ -2431,6 +2455,8 @@ mod tests {
             origin: Some(TrackOrigin::Composed),
             video: None,
             backgrounds: Vec::new(),
+            hand_split: None,
+            hand_overrides: Vec::new(),
             version: 1,
         };
         std::fs::write(dir.join("meta.json"), meta.to_json()).unwrap();

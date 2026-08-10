@@ -177,6 +177,7 @@ mod tests {
             start_us: 0,
             dur_us: 500_000,
             velocity: Velocity::new(80).unwrap(),
+            hand: None,
         });
         let edit = EditScreen::from_timeline(tl, Grid::default_120());
         let dir = edit.save_to_library(&root, name).expect("save");

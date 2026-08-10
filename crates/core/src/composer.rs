@@ -33,6 +33,7 @@ use crate::background::{BackgroundStack, BackgroundView, Easing, Transform};
 use crate::chord::{ChordKind, Key, Scale};
 use crate::events::{MidiNote, NoteEvent, NoteEventKind, Velocity};
 use crate::grid::{Grid, Subdivision, TimeSig};
+use crate::hand::{Hand, HandSetting, DEFAULT_SPLIT};
 use crate::history::History;
 use crate::timeline::{Note, NoteId, Timeline};
 use crate::wait::{GateState, WaitGate};
@@ -203,6 +204,13 @@ pub struct Composer {
     /// Live set of MIDI pitches currently held on the piano, fed by
     /// [`ingest`](Composer::ingest) and consumed by the wait gate.
     held: BTreeSet<u8>,
+
+    // ── hand assignment (M14-E) ─────────────────────────────────────────────
+    /// The piece's left/right split line: notes below it default to the left
+    /// hand, at/above it to the right. An authored, persisted property
+    /// (`meta.json`'s `hand_split`); per-note overrides live on the notes
+    /// themselves and win over it.
+    hand_split: u8,
 }
 
 impl Composer {
@@ -256,7 +264,45 @@ impl Composer {
             wait: None,
             wait_frozen: false,
             held: BTreeSet::new(),
+            hand_split: DEFAULT_SPLIT,
         }
+    }
+
+    // ── hand assignment (M14-E) ────────────────────────────────────────────
+
+    /// The piece's left/right split pitch.
+    pub fn hand_split(&self) -> u8 {
+        self.hand_split
+    }
+
+    /// Set the split pitch, e.g. when loading a bundle whose `meta.json`
+    /// declared one. Live editing goes through [`Action::SetHandSplit`].
+    pub fn set_hand_split(&mut self, pitch: u8) {
+        self.hand_split = pitch;
+    }
+
+    /// The notes [`Action::SetNoteHand`] / [`Action::CycleNoteHand`] act on:
+    /// the selection when one is active, else the note under the cursor, else
+    /// nothing (the actions are no-ops, never errors).
+    fn hand_target_ids(&self) -> Vec<NoteId> {
+        let selected = self.selection_ids();
+        if !selected.is_empty() {
+            return selected;
+        }
+        self.note_under_cursor().into_iter().collect()
+    }
+
+    /// Pin every target note to `hand` (`None` = follow the split line).
+    fn set_note_hand(&mut self, hand: Option<Hand>) -> Vec<Effect> {
+        let ids = self.hand_target_ids();
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        self.history.checkpoint();
+        for id in ids {
+            self.history.current_mut().set_hand(id, hand);
+        }
+        Vec::new()
     }
 
     /// Set the key used to voice diatonic chords.
@@ -464,6 +510,26 @@ impl Composer {
             Action::DeleteNote => self.delete_note(),
             Action::ResizeNote { delta_steps } => self.resize_note(delta_steps),
             Action::AdjustVelocity { delta } => self.adjust_velocity(delta),
+
+            // ── hand assignment (M14-E) ──────────────────────────────────
+            Action::SetHandSplit { pitch } => {
+                self.hand_split = pitch;
+                Vec::new()
+            }
+            Action::SetNoteHand { hand } => self.set_note_hand(hand.override_value()),
+            // Read the target's *current* setting so the cycle is predictable;
+            // with a multi-note selection the first note leads and the whole
+            // selection lands on the same setting.
+            Action::CycleNoteHand => {
+                let current = self
+                    .hand_target_ids()
+                    .first()
+                    .and_then(|&id| self.get_note(id))
+                    .map(|n| HandSetting::from_override(n.hand))
+                    .unwrap_or(HandSetting::Auto);
+                self.set_note_hand(current.next().override_value())
+            }
+
             Action::ToggleGrab => self.toggle_grab(),
             Action::InsertRun {
                 end_pitch,
@@ -764,6 +830,7 @@ impl Composer {
                 start_us: n.start_us,
                 dur_us: n.dur_us,
                 velocity: n.velocity.value(),
+                hand: n.hand,
             })
             .collect();
         let selection = self
@@ -802,6 +869,7 @@ impl Composer {
             wait_mode: self.wait_enabled,
             frozen: self.wait_frozen,
             awaiting: self.awaiting_notes(),
+            hand_split: self.hand_split,
         }
     }
 
@@ -1005,6 +1073,7 @@ impl Composer {
             start_us,
             dur_us,
             velocity,
+            hand: None,
         });
         vec![Effect::AuditionNote {
             pitch: pitch.value(),
@@ -1053,6 +1122,7 @@ impl Composer {
                 start_us,
                 dur_us,
                 velocity: vel,
+                hand: None,
             });
         }
         vec![Effect::AuditionNote {
@@ -1265,6 +1335,7 @@ impl Composer {
                     start_us: start,
                     dur_us: dur,
                     velocity,
+                    hand: None,
                 })
             })
             .collect();
@@ -1345,6 +1416,7 @@ impl Composer {
             start_us,
             dur_us,
             velocity,
+            hand: None,
         });
         self.cursor.step += 1;
     }
@@ -1372,6 +1444,7 @@ impl Composer {
                         start_us: start,
                         dur_us: end - start,
                         velocity,
+                        hand: None,
                     });
                 }
             }
@@ -1748,6 +1821,11 @@ pub struct NoteView {
     pub start_us: u64,
     pub dur_us: u64,
     pub velocity: u8,
+    /// The note's **raw** hand override (M14-E): `None` = follows the piece's
+    /// split line. Frontends derive the *effective* hand from this plus
+    /// [`ComposerSnapshot::hand_split`], and mark the overridden ones.
+    #[serde(default)]
+    pub hand: Option<Hand>,
 }
 
 /// The active selection rectangle in a [`ComposerSnapshot`].
@@ -1812,6 +1890,17 @@ pub struct ComposerSnapshot {
     /// frontend can highlight them); `None` when not frozen.
     #[serde(default)]
     pub awaiting: Option<Vec<u8>>,
+    /// The piece's left/right hand split pitch (M14-E): notes below it default
+    /// to the left hand, at/above it to the right. Combine with
+    /// [`NoteView::hand`] for a note's effective hand.
+    #[serde(default = "default_hand_split")]
+    pub hand_split: u8,
+}
+
+/// Serde default for [`ComposerSnapshot::hand_split`] so older snapshots (no
+/// field) deserialise at middle C.
+fn default_hand_split() -> u8 {
+    DEFAULT_SPLIT
 }
 
 /// Serde default for [`ComposerSnapshot::playback_rate`] so older snapshots
@@ -1892,6 +1981,7 @@ fn audition_pending_triggers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hand::HandOverride;
 
     fn note(pitch: u8, start_us: u64, dur_us: u64) -> Note {
         Note {
@@ -1899,6 +1989,7 @@ mod tests {
             start_us,
             dur_us,
             velocity: Velocity::new(80).unwrap(),
+            hand: None,
         }
     }
 
@@ -3530,5 +3621,204 @@ mod tests {
         assert_eq!(c.note_count(), 0);
         assert!(!c.is_playing());
         assert_eq!(effects, vec![Effect::AllOff]);
+    }
+
+    // ── hand assignment (M14-E) ────────────────────────────────────────────
+
+    /// The raw override of the note under the cursor.
+    fn cursor_hand(c: &Composer) -> Option<Hand> {
+        c.note_under_cursor()
+            .and_then(|id| c.get_note(id))
+            .and_then(|n| n.hand)
+    }
+
+    #[test]
+    fn split_defaults_to_middle_c_and_is_settable() {
+        let mut c = Composer::new();
+        assert_eq!(c.hand_split(), DEFAULT_SPLIT);
+        assert_eq!(c.snapshot().hand_split, DEFAULT_SPLIT);
+
+        apply(&mut c, Action::SetHandSplit { pitch: 55 });
+        assert_eq!(c.hand_split(), 55);
+        assert_eq!(c.snapshot().hand_split, 55);
+    }
+
+    #[test]
+    fn set_note_hand_with_no_target_is_a_noop_not_an_error() {
+        let mut c = Composer::new();
+        // Empty cell, no selection.
+        assert!(c.note_under_cursor().is_none());
+        assert_eq!(
+            c.apply(Action::SetNoteHand {
+                hand: HandSetting::Left
+            }),
+            Ok(Vec::new())
+        );
+        assert_eq!(c.apply(Action::CycleNoteHand), Ok(Vec::new()));
+        assert_eq!(c.note_count(), 0, "no note is conjured");
+    }
+
+    #[test]
+    fn set_note_hand_pins_the_cursor_note() {
+        let mut c = Composer::new();
+        apply(&mut c, Action::AddNote); // middle C, right hand by default
+        assert_eq!(cursor_hand(&c), None);
+
+        apply(
+            &mut c,
+            Action::SetNoteHand {
+                hand: HandSetting::Left,
+            },
+        );
+        assert_eq!(cursor_hand(&c), Some(Hand::Left));
+        let id = c.note_under_cursor().unwrap();
+        assert_eq!(
+            c.get_note(id).unwrap().effective_hand(c.hand_split()),
+            Hand::Left,
+            "the override beats the split line"
+        );
+
+        // Back to Auto clears the override entirely.
+        apply(
+            &mut c,
+            Action::SetNoteHand {
+                hand: HandSetting::Auto,
+            },
+        );
+        assert_eq!(cursor_hand(&c), None);
+    }
+
+    #[test]
+    fn set_note_hand_applies_to_the_whole_selection() {
+        let mut c = Composer::new();
+        apply(&mut c, Action::AddNote);
+        apply(&mut c, Action::CursorRight);
+        apply(&mut c, Action::AddNote);
+        apply(&mut c, Action::SetCursor { pitch: 60, step: 0 });
+        apply(&mut c, Action::StartSelection);
+        apply(&mut c, Action::CursorRight);
+        apply(
+            &mut c,
+            Action::SetNoteHand {
+                hand: HandSetting::Left,
+            },
+        );
+
+        let hands: Vec<Option<Hand>> = c.snapshot().notes.iter().map(|n| n.hand).collect();
+        assert_eq!(hands, vec![Some(Hand::Left), Some(Hand::Left)]);
+    }
+
+    #[test]
+    fn cycle_note_hand_walks_auto_left_right_auto() {
+        let mut c = Composer::new();
+        apply(&mut c, Action::AddNote);
+        assert_eq!(cursor_hand(&c), None);
+        apply(&mut c, Action::CycleNoteHand);
+        assert_eq!(cursor_hand(&c), Some(Hand::Left));
+        apply(&mut c, Action::CycleNoteHand);
+        assert_eq!(cursor_hand(&c), Some(Hand::Right));
+        apply(&mut c, Action::CycleNoteHand);
+        assert_eq!(cursor_hand(&c), None);
+    }
+
+    #[test]
+    fn hand_edits_undo_as_one_step() {
+        let mut c = Composer::new();
+        apply(&mut c, Action::AddNote);
+        apply(&mut c, Action::CycleNoteHand);
+        assert_eq!(cursor_hand(&c), Some(Hand::Left));
+        apply(&mut c, Action::Undo);
+        assert_eq!(
+            cursor_hand(&c),
+            None,
+            "undo restores the un-overridden note"
+        );
+    }
+
+    #[test]
+    fn snapshot_exposes_raw_override_and_split() {
+        let mut c = Composer::new();
+        apply(&mut c, Action::SetHandSplit { pitch: 64 });
+        apply(&mut c, Action::AddNote); // middle C (60) — left of a 64 split
+        apply(
+            &mut c,
+            Action::SetNoteHand {
+                hand: HandSetting::Right,
+            },
+        );
+        let snap = c.snapshot();
+        assert_eq!(snap.hand_split, 64);
+        assert_eq!(snap.notes.len(), 1);
+        assert_eq!(snap.notes[0].hand, Some(Hand::Right));
+        // The snapshot round-trips over the wire with both fields intact.
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: ComposerSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.hand_split, 64);
+        assert_eq!(back.notes[0].hand, Some(Hand::Right));
+    }
+
+    #[test]
+    fn override_rides_the_note_id_across_a_move() {
+        // Grabbing and dragging a note keeps its exception in-session; the
+        // saved `(pitch, start_us)` key just moves with it.
+        let mut c = Composer::new();
+        apply(&mut c, Action::AddNote);
+        apply(
+            &mut c,
+            Action::SetNoteHand {
+                hand: HandSetting::Left,
+            },
+        );
+        let id = c.note_under_cursor().unwrap();
+        apply(&mut c, Action::ToggleGrab);
+        apply(&mut c, Action::CursorRight); // drag one step later
+        apply(&mut c, Action::CursorUp); // and one semitone up
+        apply(&mut c, Action::ToggleGrab);
+
+        let moved = c.get_note(id).expect("same id after the drag");
+        assert_eq!(moved.hand, Some(Hand::Left));
+        assert_eq!(moved.pitch.value(), 61);
+        // ...and the persisted key follows the note to its new position.
+        assert_eq!(
+            c.timeline().hand_overrides(),
+            vec![HandOverride {
+                pitch: 61,
+                start_us: moved.start_us,
+                hand: Hand::Left,
+            }]
+        );
+    }
+
+    #[test]
+    fn hand_overrides_survive_a_save_load_round_trip() {
+        // Save = MIDI events + meta overrides; load = from_events +
+        // apply_hand_overrides. The exception and the split both come back.
+        let mut c = Composer::new();
+        apply(&mut c, Action::SetHandSplit { pitch: 55 });
+        apply(&mut c, Action::AddNote);
+        apply(
+            &mut c,
+            Action::SetNoteHand {
+                hand: HandSetting::Left,
+            },
+        );
+        apply(&mut c, Action::CursorRight);
+        apply(&mut c, Action::AddNote); // no override
+
+        let events = c.timeline().to_events();
+        let saved = c.timeline().hand_overrides();
+        let split = c.hand_split();
+        assert_eq!(saved.len(), 1);
+
+        let mut reloaded = Timeline::from_events(&events);
+        reloaded.apply_hand_overrides(&saved);
+        let mut c2 = Composer::from_timeline(reloaded, c.grid());
+        c2.set_hand_split(split);
+
+        assert_eq!(c2.hand_split(), 55);
+        let snap = c2.snapshot();
+        assert_eq!(snap.notes.len(), 2);
+        assert_eq!(snap.notes[0].hand, Some(Hand::Left));
+        assert_eq!(snap.notes[1].hand, None);
     }
 }

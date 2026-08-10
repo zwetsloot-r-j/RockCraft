@@ -1,15 +1,14 @@
 // liveSong.ts — convert a backend `PlayInfo` bundle into the engine's `SongData`
-// (#168). The highway engine is ms-based with hand info; a core bundle is
-// pitch+us with no hand, so we map at this boundary (the engine stays the
-// prototype's exact projection — see types.ts). Hand is derived by a simple
-// pitch split (middle C) purely for coloring in "hands" mode; the active config
-// colors by pitch (spectrum), so the value is cosmetic.
+// (#168). The highway engine is ms-based; a core bundle is µs, so we map at this
+// boundary (the engine stays the prototype's exact projection — see types.ts).
+//
+// Hand comes straight from the backend now (M14-E): `core` resolves each note's
+// *effective* hand — the piece's per-note override when it has one, else its
+// split line — so a crossover colours on the hand its author marked and this
+// layer never re-derives the rule.
 
 import type { PlayInfo } from "../../ipc/types";
 import type { NoteSpan, SongData } from "./types";
-
-/** Middle C — the pitch split used to derive a nominal hand for coloring. */
-const SPLIT = 60;
 
 /**
  * Build the engine `SongData` from a loaded bundle.
@@ -23,7 +22,7 @@ export function songFromInfo(info: PlayInfo): SongData {
     note: n.note,
     start: n.start,
     end: n.end,
-    hand: n.note < SPLIT ? "L" : "R",
+    hand: n.hand === "left" ? "L" : "R",
   }));
 
   // Bar/beat grid at the piece's real tempo (the backend bar-aligns the pre-roll

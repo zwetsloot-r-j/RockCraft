@@ -25,9 +25,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use rockcraft_core::{
-    backing_position_us, score, song_shift_us, BackgroundImage, ExpectedNote, Feedback, GateState,
-    MidiNote, NoteEvent, NoteEventKind, NoteJudgment, PlayClock, RecordingMeta, ScoreConfig,
-    ScoreReport, Summary, SynthBus, Timing, Transform, WaitGate,
+    backing_position_us, hand::hand_of_pitch_value, score, song_shift_us, BackgroundImage,
+    ExpectedNote, Feedback, GateState, Hand, HandOverride, MidiNote, NoteEvent, NoteEventKind,
+    NoteJudgment, PlayClock, RecordingMeta, ScoreConfig, ScoreReport, Summary, SynthBus, Timing,
+    Transform, WaitGate, DEFAULT_SPLIT,
 };
 use rockcraft_midi::smf_bytes_to_events;
 use serde::Serialize;
@@ -58,6 +59,19 @@ pub struct NoteSpan {
     pub note: u8,
     pub start_us: u64,
     pub end_us: u64,
+    /// The piece's per-note hand exception (M14-E), read from `meta.json` at
+    /// load. `None` — the common case — means the note follows the split line.
+    pub hand: Option<Hand>,
+}
+
+impl NoteSpan {
+    /// Which hand plays this note: the authored override when set, else the
+    /// split rule. Every hand-aware consumer here reads this, so a crossover is
+    /// practised and scored on the hand the author marked.
+    pub fn effective_hand(&self, split: u8) -> Hand {
+        self.hand
+            .unwrap_or_else(|| hand_of_pitch_value(self.note, split))
+    }
 }
 
 /// A background video attached to a bundle, surfaced to the play screen so the
@@ -142,9 +156,10 @@ pub struct PlayInfo {
     pub beats_per_bar: u8,
 }
 
-/// One span projected for the webview: pitch + ms bounds. No hand info exists in
-/// a bundle, so — like the TUI — every note shares one color mode (the webview's
-/// spectrum-by-pitch handles coloring); `hand` is the frontend default.
+/// One span projected for the webview: pitch + ms bounds + the hand that plays
+/// it. `hand` is the **effective** hand (the piece's per-note override, else its
+/// split line), so the highway colours in "hands" mode without re-deriving the
+/// rule — and a crossover note reads on the hand the author marked (M14-E).
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct SpanView {
     pub note: u8,
@@ -152,6 +167,8 @@ pub struct SpanView {
     pub start: f64,
     /// End in milliseconds.
     pub end: f64,
+    /// `"left"` | `"right"` — `Hand`'s wire name.
+    pub hand: Hand,
 }
 
 /// One judged note, surfaced once so the webview can fire a decaying one-shot
@@ -289,18 +306,6 @@ pub struct PlaySummary {
     pub score: u64,
 }
 
-/// Which hand a note belongs to, derived from a configurable split pitch. v1 has
-/// no persisted per-note hand yet — it is inferred from pitch (see [`hand_of`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Hand {
-    Left,
-    Right,
-}
-
-/// Default left/right split pitch (middle C = 60): notes below are left hand,
-/// at/above are right. Configurable per session via [`PlaySession::set_split`].
-pub const DEFAULT_SPLIT: u8 = 60;
-
 /// Practice speed meaning "normal", in permille.
 pub const PLAY_RATE_UNITY: u16 = 1000;
 /// Slowest practice speed (0.25x) — matches `core::Action::SetPlaybackRate`'s
@@ -308,15 +313,6 @@ pub const PLAY_RATE_UNITY: u16 = 1000;
 pub const PLAY_RATE_MIN: u16 = 250;
 /// Fastest practice speed (2x).
 pub const PLAY_RATE_MAX: u16 = 2000;
-
-/// Infer a note's hand from its pitch relative to the split.
-fn hand_of(pitch: u8, split: u8) -> Hand {
-    if pitch < split {
-        Hand::Left
-    } else {
-        Hand::Right
-    }
-}
 
 /// Grid metadata from `meta.json`, used to bar-align the play shift and to draw
 /// the highway bar/beat grid at the piece's real tempo.
@@ -346,6 +342,7 @@ fn build_spans(events: &[NoteEvent]) -> Vec<NoteSpan> {
                         note: pitch,
                         start_us: start,
                         end_us: ev.timestamp_us,
+                        hand: None,
                     });
                 }
                 open.insert(pitch, ev.timestamp_us);
@@ -356,6 +353,7 @@ fn build_spans(events: &[NoteEvent]) -> Vec<NoteSpan> {
                         note: pitch,
                         start_us: start,
                         end_us: ev.timestamp_us,
+                        hand: None,
                     });
                 }
             }
@@ -367,6 +365,7 @@ fn build_spans(events: &[NoteEvent]) -> Vec<NoteSpan> {
             note: pitch,
             start_us: start,
             end_us: last_us.max(start + 1),
+            hand: None,
         });
     }
 
@@ -397,7 +396,7 @@ fn spans_for(
 ) -> impl Iterator<Item = &NoteSpan> {
     spans
         .iter()
-        .filter(move |s| practice.is_none_or(|h| hand_of(s.note, split) == h))
+        .filter(move |s| practice.is_none_or(|h| s.effective_hand(split) == h))
 }
 
 /// Wait-gate steps for the practiced hand only (or all hands when `None`).
@@ -451,11 +450,13 @@ pub struct PlaySession {
     /// themselves through the app synth. Independent of "hear the song" (which
     /// auditions the chart). Toggled at runtime; off by default.
     monitor: bool,
-    /// Hand-practice mode (v1): `None` = both hands; `Some(h)` = only hand `h` is
-    /// waited-on/scored while the other hand auto-plays. Hand is inferred from
-    /// pitch relative to `split_pitch`.
+    /// Hand-practice mode: `None` = both hands; `Some(h)` = only hand `h` is
+    /// waited-on/scored while the other hand auto-plays. A note's hand is its
+    /// authored override (M14-E) when it has one, else its pitch relative to
+    /// `split_pitch` — see [`NoteSpan::effective_hand`].
     practice: Option<Hand>,
-    /// Pitch dividing left/right hands for [`practice`](Self::practice).
+    /// Pitch dividing left/right hands for [`practice`](Self::practice), from
+    /// the piece's `meta.json` (or [`DEFAULT_SPLIT`]). Per-note overrides win.
     split_pitch: u8,
     /// Practice speed in permille (1000 = 1x). Scales the time injected into
     /// [`advance`](Self::advance), so the clock, wait gate and scoring windows
@@ -523,9 +524,9 @@ impl PlaySession {
         let spans: Vec<NoteSpan> = raw
             .into_iter()
             .map(|s| NoteSpan {
-                note: s.note,
                 start_us: s.start_us + shift_us,
                 end_us: s.end_us + shift_us,
+                ..s
             })
             .collect();
         let duration_us = song_duration_us(&spans);
@@ -571,6 +572,26 @@ impl PlaySession {
             path,
             audio_start_us,
         });
+        self
+    }
+
+    /// Apply the piece's authored hand assignment from its `meta.json` (M14-E):
+    /// the split line plus the per-note exceptions.
+    ///
+    /// Overrides are keyed by the note's **original** `(pitch, start_us)` — the
+    /// position the editor saved — so they are matched here against
+    /// `start_us - shift_us`, before the whole-song pre-roll shift this session
+    /// already applied.
+    pub fn with_hands(mut self, overrides: &[HandOverride], split: u8) -> Self {
+        self.split_pitch = split;
+        let shift_us = self.shift_us;
+        for span in &mut self.spans {
+            let original_start = span.start_us.saturating_sub(shift_us);
+            span.hand = overrides
+                .iter()
+                .find(|o| o.pitch == span.note && o.start_us == original_start)
+                .map(|o| o.hand);
+        }
         self
     }
 
@@ -656,6 +677,7 @@ impl PlaySession {
                     note: s.note,
                     start: s.start_us as f64 / 1000.0,
                     end: s.end_us as f64 / 1000.0,
+                    hand: s.effective_hand(self.split_pitch),
                 })
                 .collect(),
             shift_us: self.shift_us,
@@ -771,7 +793,7 @@ impl PlaySession {
                     // When practicing one hand, the other hand auto-plays — don't score it.
                     && !self
                         .practice
-                        .is_some_and(|h| hand_of(s.note, self.split_pitch) != h)
+                        .is_some_and(|h| s.effective_hand(self.split_pitch) != h)
             })
             .map(|(i, _)| i)
             .collect();
@@ -935,8 +957,9 @@ impl PlaySession {
         self.rate_permille
     }
 
-    /// Set the pitch dividing left/right hands. Reclassifies every note and
-    /// rebuilds the wait gate.
+    /// Set the pitch dividing left/right hands. Re-classifies every note that
+    /// follows the split line — notes carrying an authored override keep their
+    /// hand — and rebuilds the wait gate.
     pub fn set_split(&mut self, split: u8) {
         self.split_pitch = split;
         self.rebuild_wait_gate();
@@ -973,7 +996,7 @@ impl PlaySession {
             let autoplay = self.hear_song
                 || self
                     .practice
-                    .is_some_and(|h| hand_of(span.note, self.split_pitch) != h);
+                    .is_some_and(|h| span.effective_hand(self.split_pitch) != h);
             if !autoplay {
                 continue;
             }
@@ -1137,6 +1160,9 @@ fn load_session_from_dir(dir: &Path) -> Result<PlaySession, String> {
 
     let mut has_backing = false;
     if let Some(meta) = meta {
+        // Hand assignment first: it sets `split_pitch`, and every later
+        // hand-aware read (practice gate, scoring, colouring) goes through it.
+        session = session.with_hands(&meta.hand_overrides, meta.split_or_default());
         if let Some(backing) = meta.backing {
             session = session.with_backing(dir.join(&backing.file), backing.audio_start_us);
             has_backing = true;
@@ -1770,6 +1796,8 @@ mod tests {
             origin: Some(rockcraft_core::TrackOrigin::Composed),
             video: None,
             backgrounds: Vec::new(),
+            hand_split: None,
+            hand_overrides: Vec::new(),
             version: 1,
         };
         std::fs::write(dir.join("meta.json"), meta.to_json()).unwrap();
@@ -2006,5 +2034,140 @@ mod tests {
         assert!(!s.is_finished(), "still within the tail pause");
         s.advance(LEAD_US + 1);
         assert!(s.is_finished());
+    }
+
+    // ── per-note hand assignment (M14-E) ─────────────────────────────────────
+
+    /// Mark the fixture's first note (C4 = 60, right hand under the default
+    /// split) as a **left**-hand crossover.
+    fn crossover_session() -> PlaySession {
+        let overrides = [HandOverride {
+            pitch: 60,
+            // The pre-shift position — what the editor saved.
+            start_us: 0,
+            hand: Hand::Left,
+        }];
+        PlaySession::from_events("test".into(), &four_note_events())
+            .with_hands(&overrides, DEFAULT_SPLIT)
+    }
+
+    #[test]
+    fn with_hands_matches_the_pre_shift_position() {
+        let s = crossover_session();
+        let first = s.spans.first().expect("fixture has notes");
+        assert_eq!(first.note, 60);
+        assert_eq!(first.start_us, SHIFT, "span is shifted by the pre-roll");
+        assert_eq!(
+            first.hand,
+            Some(Hand::Left),
+            "the override is keyed by the ORIGINAL start, not the shifted one"
+        );
+        // Every other note keeps the split default.
+        assert!(s.spans[1..].iter().all(|s| s.hand.is_none()));
+        assert_eq!(first.effective_hand(DEFAULT_SPLIT), Hand::Left);
+        assert_eq!(s.spans[1].effective_hand(DEFAULT_SPLIT), Hand::Right);
+    }
+
+    #[test]
+    fn overridden_note_is_practised_and_scored_on_its_marked_hand() {
+        let mut s = crossover_session();
+        s.set_practice(Some(Hand::Left));
+        s.set_wait_mode(true);
+
+        // The left hand owns exactly the overridden note — the gate waits for it
+        // even though its pitch sits on the right side of the split.
+        assert_eq!(
+            expected_notes_for(&s.spans, s.practice, s.split_pitch).len(),
+            1,
+            "only the crossover is scored while practising the left hand"
+        );
+        s.advance(target_us(0) + 1);
+        s.advance(16_000);
+        assert_eq!(s.status().awaiting, vec![60]);
+
+        // Playing it lands as a hit.
+        s.ingest(on(60, s.now_us()));
+        s.advance(16_000);
+        assert!(!s.status().frozen);
+        s.advance(target_us(3) + 200_000);
+        assert_eq!(s.live_state().hits, 1);
+    }
+
+    #[test]
+    fn the_other_hand_auto_plays_the_overridden_note() {
+        let mut s = crossover_session();
+        s.set_practice(Some(Hand::Right));
+
+        // Practising the right hand, the crossover is accompaniment: it is not
+        // scored, and it auto-sounds.
+        let expected = expected_notes_for(&s.spans, s.practice, s.split_pitch);
+        assert_eq!(expected.len(), 3, "the crossover is not the right hand's");
+        s.advance(target_us(0) + 1);
+        let (need_on, _) = s.pending_song_triggers();
+        assert_eq!(
+            need_on
+                .iter()
+                .filter_map(|&i| s.span_note(i))
+                .collect::<Vec<_>>(),
+            vec![60],
+            "the left-hand crossover auto-plays under right-hand practice"
+        );
+        // ...and never counts as a miss.
+        s.advance(target_us(3) + 200_000);
+        assert_eq!(s.live_state().misses, 3, "only the three right-hand notes");
+    }
+
+    #[test]
+    fn a_bundle_with_no_overrides_behaves_exactly_as_before() {
+        let mut plain = PlaySession::from_events("test".into(), &four_note_events())
+            .with_hands(&[], DEFAULT_SPLIT);
+        let mut untouched = session();
+        for s in [&mut plain, &mut untouched] {
+            s.set_practice(Some(Hand::Right));
+        }
+        assert_eq!(
+            expected_notes_for(&plain.spans, plain.practice, plain.split_pitch).len(),
+            expected_notes_for(&untouched.spans, untouched.practice, untouched.split_pitch).len(),
+        );
+        // All four are the right hand at the default split — the pitch-only rule.
+        assert_eq!(
+            expected_notes_for(&plain.spans, plain.practice, plain.split_pitch).len(),
+            4
+        );
+        assert!(plain.spans.iter().all(|s| s.hand.is_none()));
+    }
+
+    #[test]
+    fn a_low_split_is_honoured_without_any_overrides() {
+        // A piece that declares its own split line: at 66, 60/62/64/65 all read
+        // as the left hand even though nothing is overridden.
+        let mut s =
+            PlaySession::from_events("test".into(), &four_note_events()).with_hands(&[], 66);
+        s.set_practice(Some(Hand::Left));
+        assert_eq!(
+            expected_notes_for(&s.spans, s.practice, s.split_pitch).len(),
+            4
+        );
+        assert_eq!(s.status().split_pitch, 66);
+    }
+
+    #[test]
+    fn play_info_carries_the_effective_hand() {
+        let s = crossover_session();
+        let info = s.info();
+        assert_eq!(info.notes[0].hand, Hand::Left, "override wins");
+        assert_eq!(info.notes[1].hand, Hand::Right, "split rule for the rest");
+    }
+
+    #[test]
+    fn retuning_the_split_live_leaves_overrides_alone() {
+        // `play_set_split` re-classifies the un-overridden notes only.
+        let mut s = crossover_session();
+        s.set_split(70); // everything below 70 is now the left hand
+        assert_eq!(s.spans[0].effective_hand(70), Hand::Left, "still pinned");
+        assert_eq!(s.spans[1].effective_hand(70), Hand::Left, "re-classified");
+        s.set_split(21); // ...and now everything reads right — except the pin
+        assert_eq!(s.spans[0].effective_hand(21), Hand::Left);
+        assert_eq!(s.spans[1].effective_hand(21), Hand::Right);
     }
 }

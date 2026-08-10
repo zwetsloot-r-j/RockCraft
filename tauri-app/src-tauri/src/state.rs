@@ -14,8 +14,9 @@ use std::sync::Mutex;
 
 use rockcraft_core::{
     action_from_name, action_help, slice_segment, ActionError, BackgroundImage, BackgroundStack,
-    BackgroundVideo, BackingTrack, Composer, ComposerSnapshot, Effect, Grid, Key, Keyframe,
-    NoteView, RecordingMeta, Scale, Segment, Timeline, TrackOrigin, Transform,
+    BackgroundVideo, BackingTrack, Composer, ComposerSnapshot, Effect, Grid, HandOverride, Key,
+    Keyframe, NoteView, RecordingMeta, Scale, Segment, Timeline, TrackOrigin, Transform,
+    DEFAULT_SPLIT,
 };
 use rockcraft_midi::{events_to_smf_bytes, smf_bytes_to_events};
 use serde::{Deserialize, Serialize};
@@ -264,6 +265,8 @@ fn save_bundle_into(state: &AppState, bundle_dir: &std::path::Path) -> Result<()
     let grid = composer.grid();
     let backing_offset_us = composer.backing_offset_us();
     let backgrounds = composer.backgrounds().layers().to_vec();
+    let hand_split = composer.hand_split();
+    let hand_overrides = composer.timeline().hand_overrides();
     drop(composer);
 
     let key = *state.key.lock().expect("key mutex poisoned");
@@ -291,6 +294,8 @@ fn save_bundle_into(state: &AppState, bundle_dir: &std::path::Path) -> Result<()
         video.as_ref(),
         &backgrounds,
         &background_srcs,
+        hand_split,
+        hand_overrides,
     )
     .map_err(|e| e.to_string())?;
 
@@ -335,6 +340,8 @@ fn write_bundle(
     video: Option<&AttachedVideo>,
     backgrounds: &[BackgroundImage],
     background_srcs: &[AttachedBackground],
+    hand_split: u8,
+    hand_overrides: Vec<HandOverride>,
 ) -> std::io::Result<()> {
     std::fs::create_dir_all(bundle_dir)?;
     let bytes = events_to_smf_bytes(&timeline.to_events());
@@ -385,6 +392,10 @@ fn write_bundle(
         origin: Some(origin),
         video,
         backgrounds: backgrounds.to_vec(),
+        // The piece's authored hand assignment (M14-E): the split line plus the
+        // per-note exceptions, keyed by `(pitch, start_us)`.
+        hand_split: Some(hand_split),
+        hand_overrides,
         version: 1,
     };
     std::fs::write(bundle_dir.join("meta.json"), meta.to_json())?;
@@ -423,6 +434,7 @@ fn split_bundle_into(
     let grid = composer.grid();
     let backing_offset_us = composer.backing_offset_us();
     let backgrounds = composer.backgrounds().layers().to_vec();
+    let hand_split = composer.hand_split();
     drop(composer);
 
     let key = *state.key.lock().expect("key mutex poisoned");
@@ -479,6 +491,7 @@ fn split_bundle_into(
             backing_path.as_deref(),
             video.as_ref().map(|v| v.path.as_path()),
             &background_srcs,
+            hand_split,
         )
         .map_err(|e| e.to_string())?;
         dirs.push(dir.to_string_lossy().into_owned());
@@ -543,7 +556,7 @@ pub fn load_bundle(state: &AppState, dir: &str) -> Result<ComposerSnapshot, Stri
     let midi_path = bundle_dir.join("song.mid");
     let bytes = std::fs::read(&midi_path).map_err(|e| format!("read song.mid: {e}"))?;
     let events = smf_bytes_to_events(&bytes).map_err(|e| format!("parse song.mid: {e}"))?;
-    let timeline = Timeline::from_events(&events);
+    let mut timeline = Timeline::from_events(&events);
 
     // Load the meta (optional — legacy bundles have no meta.json).
     type MetaTuple = (
@@ -554,6 +567,8 @@ pub fn load_bundle(state: &AppState, dir: &str) -> Result<ComposerSnapshot, Stri
         u64,
         Option<AttachedVideo>,
         Vec<BackgroundImage>,
+        u8,
+        Vec<HandOverride>,
     );
     let default_meta = || -> MetaTuple {
         (
@@ -567,38 +582,65 @@ pub fn load_bundle(state: &AppState, dir: &str) -> Result<ComposerSnapshot, Stri
             0,
             None,
             Vec::new(),
+            DEFAULT_SPLIT,
+            Vec::new(),
         )
     };
-    let (grid, key, origin, backing_path, backing_offset_us, video, backgrounds) =
-        match std::fs::read_to_string(bundle_dir.join("meta.json")) {
-            Ok(json) => match RecordingMeta::from_json(&json) {
-                Ok(meta) => {
-                    let grid = meta.grid.unwrap_or_else(Grid::default_120);
-                    let key = meta.key.unwrap_or(Key {
-                        root_pc: 0,
-                        scale: Scale::Major,
-                    });
-                    let origin = meta.origin.unwrap_or(TrackOrigin::Edited);
-                    let (bpath, boffset) = meta
-                        .backing
-                        .map(|b| {
-                            // Resolve the bundle-relative filename to an absolute path.
-                            let abs = bundle_dir.join(&b.file);
-                            (Some(abs), b.audio_start_us)
-                        })
-                        .unwrap_or((None, 0));
-                    // Resolve the bundle-relative video to an absolute path so the
-                    // webview's asset protocol can load it (M9-G).
-                    let video = meta.video.map(|v| AttachedVideo {
-                        path: bundle_dir.join(&v.file),
-                        offset_us: v.offset_us,
-                    });
-                    (grid, key, origin, bpath, boffset, video, meta.backgrounds)
-                }
-                Err(_) => default_meta(),
-            },
+    let (
+        grid,
+        key,
+        origin,
+        backing_path,
+        backing_offset_us,
+        video,
+        backgrounds,
+        hand_split,
+        hand_overrides,
+    ) = match std::fs::read_to_string(bundle_dir.join("meta.json")) {
+        Ok(json) => match RecordingMeta::from_json(&json) {
+            Ok(meta) => {
+                let grid = meta.grid.unwrap_or_else(Grid::default_120);
+                let key = meta.key.unwrap_or(Key {
+                    root_pc: 0,
+                    scale: Scale::Major,
+                });
+                let origin = meta.origin.unwrap_or(TrackOrigin::Edited);
+                let hand_split = meta.split_or_default();
+                let (bpath, boffset) = meta
+                    .backing
+                    .map(|b| {
+                        // Resolve the bundle-relative filename to an absolute path.
+                        let abs = bundle_dir.join(&b.file);
+                        (Some(abs), b.audio_start_us)
+                    })
+                    .unwrap_or((None, 0));
+                // Resolve the bundle-relative video to an absolute path so the
+                // webview's asset protocol can load it (M9-G).
+                let video = meta.video.map(|v| AttachedVideo {
+                    path: bundle_dir.join(&v.file),
+                    offset_us: v.offset_us,
+                });
+                (
+                    grid,
+                    key,
+                    origin,
+                    bpath,
+                    boffset,
+                    video,
+                    meta.backgrounds,
+                    hand_split,
+                    meta.hand_overrides,
+                )
+            }
             Err(_) => default_meta(),
-        };
+        },
+        Err(_) => default_meta(),
+    };
+
+    // Re-attach the per-note hand exceptions (M14-E): `song.mid` carries no
+    // hand, so they are matched back onto the freshly built notes by their
+    // `(pitch, start_us)` key.
+    timeline.apply_hand_overrides(&hand_overrides);
 
     // Replace the composer.
     {
@@ -607,6 +649,7 @@ pub fn load_bundle(state: &AppState, dir: &str) -> Result<ComposerSnapshot, Stri
         composer.set_key(key);
         composer.set_backing_offset_us(backing_offset_us);
         composer.set_backgrounds(BackgroundStack::from_layers(backgrounds.clone()));
+        composer.set_hand_split(hand_split);
     }
 
     // Update the side-channel state.
@@ -961,6 +1004,8 @@ mod tests {
             None,
             &[],
             &[],
+            DEFAULT_SPLIT,
+            Vec::new(),
         )
         .expect("in-place save must not fail on a self-copy");
 
@@ -1004,6 +1049,8 @@ mod tests {
             None,
             &[],
             &[],
+            DEFAULT_SPLIT,
+            Vec::new(),
         );
         std::env::set_current_dir(prev_cwd).unwrap();
 
@@ -1141,6 +1188,8 @@ mod tests {
                 None,
                 &[],
                 &[],
+                DEFAULT_SPLIT,
+                Vec::new(),
             )
             .expect("write_bundle should succeed");
         }
@@ -1254,6 +1303,8 @@ mod tests {
                 None,
                 &[],
                 &[],
+                DEFAULT_SPLIT,
+                Vec::new(),
             )
             .expect("write_bundle with backing should succeed");
         }
@@ -1433,6 +1484,94 @@ mod tests {
     }
 
     #[test]
+    fn hand_split_and_overrides_round_trip_through_a_saved_bundle() {
+        let dir = temp_dir("hands");
+        let state = AppState::new();
+
+        // Two notes; the first (middle C) is marked as a left-hand crossover
+        // even though it sits at/above the piece's split line.
+        run_action(&state, "set_hand_split", &json!({ "pitch": 55 })).expect("split");
+        run_action(&state, "add_note", &json!({})).expect("add_note");
+        run_action(&state, "set_note_hand", &json!({ "hand": "left" })).expect("set hand");
+        run_action(&state, "cursor_right", &json!({})).expect("cursor");
+        run_action(&state, "add_note", &json!({})).expect("add_note 2");
+
+        let bundle = dir.join("bundle");
+        save_bundle_into(&state, &bundle).expect("save");
+        let meta =
+            RecordingMeta::from_json(&std::fs::read_to_string(bundle.join("meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(meta.hand_split, Some(55));
+        assert_eq!(meta.hand_overrides.len(), 1, "only the marked note");
+        assert_eq!(meta.hand_overrides[0].pitch, 60);
+        assert_eq!(meta.hand_overrides[0].hand, rockcraft_core::Hand::Left);
+
+        // Reloading re-attaches the override by (pitch, start_us) and restores
+        // the split line.
+        let fresh = AppState::new();
+        let snap = load_bundle(&fresh, &bundle.to_string_lossy()).expect("load");
+        assert_eq!(snap.hand_split, 55);
+        assert_eq!(snap.notes.len(), 2);
+        assert_eq!(snap.notes[0].hand, Some(rockcraft_core::Hand::Left));
+        assert_eq!(snap.notes[1].hand, None, "the un-marked note stays auto");
+
+        // A note moved after being overridden keeps it in-session (it rides the
+        // NoteId) and is re-matched at its NEW position on the next reload.
+        run_action(&fresh, "set_cursor", &json!({ "pitch": 60, "step": 0 })).expect("cursor");
+        run_action(&fresh, "toggle_grab", &json!({})).expect("grab");
+        run_action(&fresh, "cursor_right", &json!({})).expect("drag later");
+        run_action(&fresh, "cursor_up", &json!({})).expect("drag up");
+        run_action(&fresh, "toggle_grab", &json!({})).expect("drop");
+        let moved = {
+            let c = fresh.composer.lock().unwrap();
+            let n = c
+                .timeline()
+                .notes()
+                .find(|(_, n)| n.pitch.value() == 61)
+                .expect("the dragged note")
+                .1;
+            (n.hand, n.start_us)
+        };
+        assert_eq!(moved.0, Some(rockcraft_core::Hand::Left), "rides the id");
+
+        let bundle2 = dir.join("bundle2");
+        save_bundle_into(&fresh, &bundle2).expect("re-save");
+        let again = AppState::new();
+        let snap2 = load_bundle(&again, &bundle2.to_string_lossy()).expect("reload");
+        let dragged = snap2
+            .notes
+            .iter()
+            .find(|n| n.pitch == 61)
+            .expect("dragged note reloaded");
+        assert_eq!(dragged.start_us, moved.1);
+        assert_eq!(dragged.hand, Some(rockcraft_core::Hand::Left));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_legacy_bundle_loads_with_the_default_split_and_no_overrides() {
+        let dir = temp_dir("hands-legacy");
+        let state = AppState::new();
+        run_action(&state, "add_note", &json!({})).expect("add_note");
+        let bundle = dir.join("bundle");
+        save_bundle_into(&state, &bundle).expect("save");
+        // Rewrite meta.json as a pre-M14-E manifest (no hand fields at all).
+        std::fs::write(
+            bundle.join("meta.json"),
+            r#"{"midi_file":"song.mid","version":1}"#,
+        )
+        .unwrap();
+
+        let fresh = AppState::new();
+        let snap = load_bundle(&fresh, &bundle.to_string_lossy()).expect("load");
+        assert_eq!(snap.hand_split, rockcraft_core::DEFAULT_SPLIT);
+        assert!(snap.notes.iter().all(|n| n.hand.is_none()));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn split_carries_backgrounds_into_each_part() {
         let dir = temp_dir("split-backgrounds");
         let src = dir.join("art.png");
@@ -1521,6 +1660,8 @@ mod tests {
                 video.as_ref(),
                 &[],
                 &[],
+                DEFAULT_SPLIT,
+                Vec::new(),
             )
             .expect("write_bundle should succeed");
         };

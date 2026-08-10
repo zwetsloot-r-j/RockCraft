@@ -156,6 +156,13 @@ export const NORMAL_BINDINGS: Binding[] = [
   // Esc → clear_selection is handled specially (see resolveKey) so the router's
   // global Esc still fires when there's nothing to clear.
 
+  // ── hand assignment (M14-E) ───────────────────────────────────────────
+  // `n` cycles the hand of the cursor note (or the whole selection) through
+  // auto → left → right → auto. The split line itself is nudged with
+  // Shift+Left/Right, handled in EditScreen (it needs the current split from
+  // the snapshot to compute the absolute target pitch).
+  { keys: ["n"], action: { name: "cycle_note_hand" } },
+
   // ── history ───────────────────────────────────────────────────────────
   { keys: ["u"], action: { name: "undo" } },
   { keys: ["U"], action: { name: "redo" } },

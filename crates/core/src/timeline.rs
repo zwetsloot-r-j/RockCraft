@@ -16,6 +16,7 @@
 use std::collections::BTreeMap;
 
 use crate::events::{MidiNote, NoteEvent, NoteEventKind, Velocity};
+use crate::hand::{hand_of, Hand, HandOverride};
 
 /// Opaque, stable handle to a note inside a [`Timeline`].
 ///
@@ -39,6 +40,20 @@ pub struct Note {
     pub start_us: u64,
     pub dur_us: u64,
     pub velocity: Velocity,
+    /// Per-note hand exception (M14-E). `None` — the default — means the note
+    /// follows the piece's split line; `Some(h)` pins it to that hand no matter
+    /// where the split sits. Never written to `song.mid`: it round-trips
+    /// through `meta.json` (see [`crate::HandOverride`]).
+    pub hand: Option<Hand>,
+}
+
+impl Note {
+    /// The hand that actually plays this note: the override when set, else the
+    /// split rule. Every hand-aware consumer (practice grey-out, one-hand
+    /// scoring, colouring) reads this rather than re-deriving from pitch.
+    pub fn effective_hand(&self, split: u8) -> Hand {
+        self.hand.unwrap_or_else(|| hand_of(self.pitch, split))
+    }
 }
 
 /// A pure, editable timeline of notes with stable ids.
@@ -131,6 +146,61 @@ impl Timeline {
                     && note.start_us <= us
                     && us < note.start_us + note.dur_us
             })
+            .map(|(&id, _)| NoteId(id))
+    }
+
+    /// Set (or clear, with `None`) a note's hand override. Returns false if
+    /// `id` is unknown.
+    pub fn set_hand(&mut self, id: NoteId, hand: Option<Hand>) -> bool {
+        match self.notes.get_mut(&id.0) {
+            Some(note) => {
+                note.hand = hand;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Every overridden note as a persistable [`HandOverride`], sorted by
+    /// `(start_us, pitch)` so a saved `meta.json` is stable across re-saves.
+    /// Notes following the split line are omitted.
+    pub fn hand_overrides(&self) -> Vec<HandOverride> {
+        let mut out: Vec<HandOverride> = self
+            .notes
+            .values()
+            .filter_map(|note| {
+                note.hand.map(|hand| HandOverride {
+                    pitch: note.pitch.value(),
+                    start_us: note.start_us,
+                    hand,
+                })
+            })
+            .collect();
+        out.sort_by_key(|o| (o.start_us, o.pitch));
+        out
+    }
+
+    /// Re-apply persisted overrides after a reload: for each entry, pin the note
+    /// sitting at exactly `(pitch, start_us)`.
+    ///
+    /// Entries with no matching note (the note was deleted since the save) are
+    /// silently ignored — a stale override must never resurrect a note or fail
+    /// a load.
+    pub fn apply_hand_overrides(&mut self, overrides: &[HandOverride]) {
+        for o in overrides {
+            if let Some(id) = self.find_starting_at(o.pitch, o.start_us) {
+                self.set_hand(id, Some(o.hand));
+            }
+        }
+    }
+
+    /// The note *starting* exactly at `(pitch, start_us)`, if any — the key
+    /// persisted overrides are matched on. On overlap the highest-id (most
+    /// recently inserted) note wins, mirroring [`Timeline::find_at`].
+    fn find_starting_at(&self, pitch: u8, start_us: u64) -> Option<NoteId> {
+        self.notes
+            .iter()
+            .rfind(|(_, note)| note.pitch.value() == pitch && note.start_us == start_us)
             .map(|(&id, _)| NoteId(id))
     }
 
@@ -244,6 +314,9 @@ impl Timeline {
                 start_us: start,
                 dur_us: (end.saturating_sub(start)).max(1),
                 velocity: vel,
+                // `song.mid` carries no per-note hand; overrides are re-applied
+                // from `meta.json` via `apply_hand_overrides`.
+                hand: None,
             });
         };
 
@@ -284,6 +357,7 @@ impl Timeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hand::DEFAULT_SPLIT;
 
     fn note(pitch: u8, start_us: u64, dur_us: u64, vel: u8) -> Note {
         Note {
@@ -291,6 +365,7 @@ mod tests {
             start_us,
             dur_us,
             velocity: Velocity::new(vel).unwrap(),
+            hand: None,
         }
     }
 
@@ -483,6 +558,7 @@ mod tests {
             start_us,
             dur_us: 100,
             velocity: v,
+            hand: None,
         };
         // Inside region [60..=64] × [1000..5000)
         let a = tl.insert(mk(60, 1_000)); // pitch_lo, us_lo — inclusive
@@ -511,18 +587,21 @@ mod tests {
                 start_us: 0,
                 dur_us: 100,
                 velocity: v,
+                hand: None,
             },
             Note {
                 pitch: MidiNote::new(60).unwrap(),
                 start_us: 100,
                 dur_us: 100,
                 velocity: v,
+                hand: None,
             },
             Note {
                 pitch: MidiNote::new(127).unwrap(),
                 start_us: 200,
                 dur_us: 100,
                 velocity: v,
+                hand: None,
             },
         ];
         // Shift +2 semitones, +1000 µs: 0→2, 60→62, 127→129 (out of range, dropped).
@@ -547,6 +626,7 @@ mod tests {
             start_us: 0,
             dur_us: 100,
             velocity: v,
+            hand: None,
         };
         let ids2 = tl.insert_shifted(&[low], -3, 0);
         assert_eq!(ids2.len(), 0, "pitch 2-3=-1 must be dropped");
@@ -566,5 +646,140 @@ mod tests {
         assert_eq!(tl.len(), 2);
         let starts: Vec<u64> = tl.notes().map(|(_, n)| n.start_us).collect();
         assert_eq!(starts, vec![0, 1_000]);
+    }
+
+    // ── per-note hand (M14-E) ────────────────────────────────────────────────
+
+    #[test]
+    fn new_notes_follow_the_split_line() {
+        let mut tl = Timeline::new();
+        let id = tl.insert(note(55, 0, 1_000, 100));
+        let n = tl.get(id).unwrap();
+        assert_eq!(n.hand, None, "a fresh note carries no override");
+        assert_eq!(n.effective_hand(DEFAULT_SPLIT), Hand::Left);
+        // Moving the split line alone flips it — that is the default rule.
+        assert_eq!(n.effective_hand(50), Hand::Right);
+    }
+
+    #[test]
+    fn effective_hand_prefers_the_override() {
+        let mut tl = Timeline::new();
+        // A low note the author wants on the right hand (a crossover).
+        let id = tl.insert(note(48, 0, 1_000, 100));
+        assert!(tl.set_hand(id, Some(Hand::Right)));
+        assert_eq!(
+            tl.get(id).unwrap().effective_hand(DEFAULT_SPLIT),
+            Hand::Right
+        );
+        // Clearing it falls back to the split.
+        assert!(tl.set_hand(id, None));
+        assert_eq!(
+            tl.get(id).unwrap().effective_hand(DEFAULT_SPLIT),
+            Hand::Left
+        );
+    }
+
+    #[test]
+    fn set_hand_reports_whether_the_id_existed() {
+        let mut tl = Timeline::new();
+        let id = tl.insert(note(60, 0, 1_000, 100));
+        assert!(tl.set_hand(id, Some(Hand::Left)));
+        tl.remove(id);
+        assert!(!tl.set_hand(id, Some(Hand::Left)));
+    }
+
+    #[test]
+    fn hand_overrides_lists_only_overridden_notes_sorted() {
+        let mut tl = Timeline::new();
+        let a = tl.insert(note(72, 2_000, 500, 100));
+        let _plain = tl.insert(note(64, 1_000, 500, 100));
+        let b = tl.insert(note(48, 1_000, 500, 100));
+        let c = tl.insert(note(50, 1_000, 500, 100));
+        tl.set_hand(a, Some(Hand::Left));
+        tl.set_hand(b, Some(Hand::Right));
+        tl.set_hand(c, Some(Hand::Right));
+
+        let overrides = tl.hand_overrides();
+        assert_eq!(
+            overrides,
+            vec![
+                HandOverride {
+                    pitch: 48,
+                    start_us: 1_000,
+                    hand: Hand::Right
+                },
+                HandOverride {
+                    pitch: 50,
+                    start_us: 1_000,
+                    hand: Hand::Right
+                },
+                HandOverride {
+                    pitch: 72,
+                    start_us: 2_000,
+                    hand: Hand::Left
+                },
+            ],
+            "sorted by (start_us, pitch), un-overridden notes omitted"
+        );
+    }
+
+    #[test]
+    fn apply_hand_overrides_matches_by_pitch_and_start() {
+        let mut tl = Timeline::new();
+        let target = tl.insert(note(48, 1_000, 500, 100));
+        // Same pitch, different start — must NOT be matched.
+        let other_time = tl.insert(note(48, 9_000, 500, 100));
+        // Same start, different pitch — must NOT be matched.
+        let other_pitch = tl.insert(note(49, 1_000, 500, 100));
+
+        tl.apply_hand_overrides(&[
+            HandOverride {
+                pitch: 48,
+                start_us: 1_000,
+                hand: Hand::Right,
+            },
+            // No note here at all: silently ignored (deleted since the save).
+            HandOverride {
+                pitch: 100,
+                start_us: 7_777,
+                hand: Hand::Left,
+            },
+        ]);
+
+        assert_eq!(tl.get(target).unwrap().hand, Some(Hand::Right));
+        assert_eq!(tl.get(other_time).unwrap().hand, None);
+        assert_eq!(tl.get(other_pitch).unwrap().hand, None);
+        assert_eq!(tl.len(), 3, "a stale override never creates a note");
+    }
+
+    #[test]
+    fn overrides_round_trip_through_events_plus_meta() {
+        // The MIDI file drops hand; `meta.json`'s overrides restore it.
+        let mut tl = Timeline::new();
+        let id = tl.insert(note(48, 1_000, 500, 100));
+        tl.insert(note(72, 2_000, 500, 100));
+        tl.set_hand(id, Some(Hand::Right));
+        let saved = tl.hand_overrides();
+
+        let mut reloaded = Timeline::from_events(&tl.to_events());
+        assert!(
+            reloaded.notes().all(|(_, n)| n.hand.is_none()),
+            "song.mid carries no hand"
+        );
+        reloaded.apply_hand_overrides(&saved);
+        assert_eq!(reloaded.hand_overrides(), saved);
+    }
+
+    #[test]
+    fn insert_shifted_carries_the_override_to_the_copy() {
+        // Copy/paste keeps a hand exception on the pasted note.
+        let mut tl = Timeline::new();
+        let src = Note {
+            hand: Some(Hand::Right),
+            ..note(48, 0, 500, 100)
+        };
+        let ids = tl.insert_shifted(&[src], 0, 4_000);
+        assert_eq!(ids.len(), 1);
+        assert_eq!(tl.get(ids[0]).unwrap().hand, Some(Hand::Right));
     }
 }

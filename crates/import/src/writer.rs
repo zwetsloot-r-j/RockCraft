@@ -193,8 +193,9 @@ fn alignment_from_source(source: &SourceMeta) -> Option<AlignmentSidecar> {
 /// bundle-relative name carried by `sliced.backing.file` / `sliced.video.file`.
 /// `background_srcs` pairs each background layer id with its absolute source
 /// image, copied the same way under `sliced.backgrounds[..].file`. `grid`/`key`
-/// are copied from the source piece; the new bundle's `origin` is recorded as
-/// [`TrackOrigin::Edited`].
+/// and `hand_split` are copied from the source piece — the part's per-note hand
+/// exceptions ride along on `sliced.timeline` — and the new bundle's `origin` is
+/// recorded as [`TrackOrigin::Edited`].
 ///
 /// Writes `<dir>/song.mid`, the copied media file(s) (when present), and
 /// `<dir>/meta.json`; returns the bundle directory path. `dir` is created if it
@@ -206,6 +207,7 @@ fn alignment_from_source(source: &SourceMeta) -> Option<AlignmentSidecar> {
 /// kept distinct from [`write_chart_bundle_full`] because the loaded editor
 /// timeline is not an [`ExtractedChart`], it carries `grid`/`key`, and its
 /// `origin` is `Edited` rather than `Imported`.
+#[allow(clippy::too_many_arguments)]
 pub fn write_part_bundle(
     dir: &Path,
     sliced: &SliceResult,
@@ -214,6 +216,7 @@ pub fn write_part_bundle(
     backing_src: Option<&Path>,
     video_src: Option<&Path>,
     background_srcs: &[(String, PathBuf)],
+    hand_split: u8,
 ) -> Result<PathBuf, ImportError> {
     std::fs::create_dir_all(dir)?;
 
@@ -242,6 +245,10 @@ pub fn write_part_bundle(
         origin: Some(TrackOrigin::Edited),
         video: sliced.video.clone(),
         backgrounds: sliced.backgrounds.clone(),
+        // The part inherits the source piece's hand assignment: its split line
+        // and the exceptions on the notes it kept (M14-E).
+        hand_split: Some(hand_split),
+        hand_overrides: sliced.timeline.hand_overrides(),
         version: 1,
     };
     std::fs::write(dir.join("meta.json"), meta.to_json())?;
