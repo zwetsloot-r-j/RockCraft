@@ -104,6 +104,13 @@ pub enum Action {
     SetGridOrigin {
         us: u64,
     },
+    /// Slide the grid **phase origin** by `delta_us` (clamped at 0), keeping the
+    /// note times fixed and moving the bar lines under them. The nudge companion
+    /// to [`Action::SetGridOrigin`]: dialling the phase in by feel while the
+    /// tempo is still being tuned, rather than computing an absolute origin.
+    NudgeGridOrigin {
+        delta_us: i64,
+    },
 
     // ── chord selector ──────────────────────────────────────────────────
     EnterChordMode,
@@ -280,6 +287,7 @@ impl Action {
             Action::SetBpm { .. } => "set_bpm",
             Action::SetTimeSig { .. } => "set_time_sig",
             Action::SetGridOrigin { .. } => "set_grid_origin",
+            Action::NudgeGridOrigin { .. } => "nudge_grid_origin",
             Action::QuantizeRegion { .. } => "quantize_region",
             Action::EnterChordMode => "enter_chord_mode",
             Action::CommitChord => "commit_chord",
@@ -437,6 +445,7 @@ pub fn action_names() -> &'static [&'static str] {
         "set_bpm",
         "set_time_sig",
         "set_grid_origin",
+        "nudge_grid_origin",
         "quantize_region",
         "enter_chord_mode",
         "commit_chord",
@@ -551,6 +560,7 @@ static ACTION_HELP: &[ActionInfo] = {
         ActionInfo { name: "set_bpm", params: &[p("bpm", "u32")], description: "Set the piece tempo to bpm BPM (clamped to 20..=300)." },
         ActionInfo { name: "set_time_sig", params: &[p("beats_per_bar", "u8"), p("beat_unit", "u8")], description: "Set the metre, e.g. beats_per_bar 3 / beat_unit 4 for 3/4. beats_per_bar is clamped to 1..=32; beat_unit snaps to the nearest note value in 1/2/4/8/16/32. Bar lines move; note times do not." },
         ActionInfo { name: "set_grid_origin", params: &[p("us", "u64")], description: "Set the grid phase origin (us): the song time bar 1/beat 1/step 0 lands on. Align to the first downbeat so bar lines fall on the performance." },
+        ActionInfo { name: "nudge_grid_origin", params: &[p("delta_us", "i64")], description: "Slide the grid phase origin by delta_us (clamped at 0), moving the bar lines under fixed note times. The nudge companion to set_grid_origin, for dialling the phase in by feel while the tempo is still being tuned." },
         ActionInfo { name: "quantize_region", params: &[p("start_us", "u64"), p("end_us", "u64"), p("step_us", "u64")], description: "Snap notes whose onset is in [start_us, end_us) onto the grid at resolution step_us (both onset and end, phased from the grid origin; min one step long). Per-bar snapping — skip bars you don't want touched (e.g. glissandi)." },
         // ── chord selector ──────────────────────────────────────────────
         ActionInfo { name: "enter_chord_mode", params: &[], description: "Open the chord selector at the cursor and start previewing a chord." },
@@ -649,6 +659,7 @@ mod tests {
                 beat_unit: 4,
             },
             Action::SetGridOrigin { us: 5_191_846 },
+            Action::NudgeGridOrigin { delta_us: -10_000 },
             Action::QuantizeRegion {
                 start_us: 5_000_000,
                 end_us: 7_000_000,
