@@ -204,6 +204,10 @@ export function HighwayScreen() {
   // Whole-song shift in µs; the video aligns to song *content*, which begins
   // after the pre-roll shift. videoTime = (songTime - shift) + offset.
   let shiftUs = 0;
+  // Backdrop servo state (see driveVideo): wall-clock of the last seek, so seeks
+  // stay throttled, and the previous target so a backward jump is detectable.
+  let lastVideoSeekMs = 0;
+  let prevVideoWant = -1;
   // ── Background image layers (M14-D) ────────────────────────────────────────
   // The piece's keyframed backdrops, back-to-front behind the highway canvas.
   // `layers` is the static half (id + file) from `play_load`; `transforms` is
@@ -331,18 +335,88 @@ export function HighwayScreen() {
     }
   }
 
-  /** Scrub the backdrop `<video>` to the current song time. videoTime =
-   * (songTime - shift) + offset, clamped at 0, in seconds. We set `currentTime`
-   * and never `play()` so the frame tracks the (pausable) song clock exactly. */
-  function syncVideo(timeUs: number): void {
+  /**
+   * Drive the backdrop `<video>` from the song clock. videoTime =
+   * (songTime - shift) + offset, clamped at 0, in seconds.
+   *
+   * This used to set `currentTime` on every `play_state` tick whenever the frame
+   * drifted more than 50 ms — which, since the clock advances continuously, meant
+   * a *seek per tick* for the whole take. WebView2 cannot decode and repaint a
+   * `currentTime` set 30-60x/second, so the element spent playback in a
+   * permanent seek-stall: the stutter this replaces. `EditScreen.driveVideo`
+   * already solved the same problem; this mirrors it.
+   *
+   * Playing: let the clip run natively on its own clock and correct drift by
+   * nudging `playbackRate` — a phase-lock with no seeks at all. A muted backdrop
+   * briefly running at up to 2x to close a gap is invisible, and the decoder
+   * stays fed the whole time.
+   *
+   * Frozen (wait-mode or paused): the element is idle, so seek it exactly —
+   * throttled, and only while the gap is real, so a held note cannot become a
+   * per-tick reseek loop that stalls the decoder black.
+   */
+  function driveVideo(timeUs: number, frozen: boolean): void {
     const v = videoEl;
     const meta = video();
-    if (!v || meta === null) return;
-    const tUs = timeUs - shiftUs + meta.offset_us;
-    const t = Math.max(0, tUs) / 1e6;
-    if (Number.isFinite(t) && Math.abs(v.currentTime - t) > 0.05) {
-      v.currentTime = t;
+    // Hidden backdrop: skip the work entirely. Without this, `v` stopped the
+    // element compositing but left it seeking every tick — which is why turning
+    // the movie off did nothing for the stutter.
+    if (!v || meta === null || backdrop() === "off") return;
+    const dur = v.duration;
+    if (!Number.isFinite(dur) || dur <= 0) return; // metadata not ready yet
+    const want = Math.min(
+      Math.max((timeUs - shiftUs + meta.offset_us) / 1e6, 0),
+      dur,
+    );
+
+    if (frozen || !started()) {
+      if (!v.paused) v.pause();
+      if (v.playbackRate !== 1) v.playbackRate = 1;
+      prevVideoWant = -1; // resuming re-seats without a false back-jump
+      const now = performance.now();
+      if (Math.abs(want - v.currentTime) > 0.1 && !v.seeking && now - lastVideoSeekMs >= 250) {
+        lastVideoSeekMs = now;
+        v.currentTime = want;
+      }
+      return;
     }
+
+    // A backward jump (replay, or scrubbing back) must SEEK: `want` dropped, so
+    // the clip is now far ahead and slowing it would never converge.
+    const backJump = prevVideoWant >= 0 && want < prevVideoWant - 0.2;
+    prevVideoWant = want;
+    if (backJump) {
+      v.currentTime = want;
+      v.playbackRate = 1;
+      lastVideoSeekMs = performance.now();
+      return;
+    }
+
+    // Prefer native playback. If muted autoplay is blocked — common in WebView2
+    // — the element stays paused; fall back to a *throttled* seek (~12 fps)
+    // rather than one per tick.
+    if (v.paused) void v.play().catch(() => {});
+    if (v.paused) {
+      const now = performance.now();
+      if (now - lastVideoSeekMs >= 80) {
+        lastVideoSeekMs = now;
+        v.currentTime = want;
+      }
+      return;
+    }
+
+    const drift = want - v.currentTime; // +: video behind, must speed up
+    if (Math.abs(drift) > 3) {
+      // Too far to servo in reasonable time; one throttled hard seek.
+      const now = performance.now();
+      if (now - lastVideoSeekMs >= 1000) {
+        lastVideoSeekMs = now;
+        v.currentTime = want;
+        v.playbackRate = 1;
+      }
+      return;
+    }
+    v.playbackRate = Math.max(0.5, Math.min(2, 1 + drift * 0.8));
   }
 
   function applyState(s: PlayStateEvent): void {
@@ -355,7 +429,7 @@ export function HighwayScreen() {
       // note once, so pushing whatever arrived spawns exactly one effect each.
       if (s.judgments.length > 0) e.pushJudgments(s.judgments);
     }
-    syncVideo(s.time_us);
+    driveVideo(s.time_us, s.frozen);
     if (s.backgrounds.length > 0) {
       const next: Record<string, BackgroundTransform> = {};
       for (const b of s.backgrounds) next[b.id] = b.transform;
