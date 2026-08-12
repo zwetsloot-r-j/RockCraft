@@ -84,6 +84,11 @@ const BACKING_NUDGE_FINE_US: i64 = 10_000;
 /// Coarse backing-alignment nudge step (250 ms), bound to `;` / `'`.
 const BACKING_NUDGE_COARSE_US: i64 = 250_000;
 
+/// Fine grid-phase nudge step (10 ms), bound to `:` / `"`.
+const GRID_ORIGIN_NUDGE_FINE_US: i64 = 10_000;
+/// Coarse grid-phase nudge step (250 ms), bound to `I` / `O`.
+const GRID_ORIGIN_NUDGE_COARSE_US: i64 = 250_000;
+
 /// Tempo nudge step in BPM, bound to `(` / `)`.
 const BPM_NUDGE: i32 = 5;
 
@@ -221,6 +226,22 @@ fn key_to_action(code: KeyCode) -> Option<Action> {
         },
         KeyCode::Char('\'') => Action::NudgeBackingOffset {
             delta_us: BACKING_NUDGE_COARSE_US,
+        },
+
+        // ── grid phase (slide the bar lines under the notes) ─────────────
+        // Shifted twins of the backing-alignment keys: same fingers, but the
+        // bar lines move instead of the audio.
+        KeyCode::Char(':') => Action::NudgeGridOrigin {
+            delta_us: -GRID_ORIGIN_NUDGE_FINE_US,
+        },
+        KeyCode::Char('"') => Action::NudgeGridOrigin {
+            delta_us: GRID_ORIGIN_NUDGE_FINE_US,
+        },
+        KeyCode::Char('I') => Action::NudgeGridOrigin {
+            delta_us: -GRID_ORIGIN_NUDGE_COARSE_US,
+        },
+        KeyCode::Char('O') => Action::NudgeGridOrigin {
+            delta_us: GRID_ORIGIN_NUDGE_COARSE_US,
         },
 
         // ── loop / metronome / count-in ─────────────────────────────────
@@ -1867,6 +1888,18 @@ impl EditScreen {
                 format!("{} BPM  ", self.grid.bpm),
                 Style::default().fg(Color::Yellow),
             ),
+            // The grid phase, next to the tempo it is tuned alongside: both
+            // numbers have to be right before the bar lines sit on the notes.
+            // Only shown once phased — an unshifted grid is the common case and
+            // the status bar is width-critical at 80 columns.
+            if self.grid.origin_us == 0 {
+                Span::raw("")
+            } else {
+                Span::styled(
+                    format!("origin {}ms  ", self.grid.origin_us / 1000),
+                    Style::default().fg(Color::Yellow),
+                )
+            },
             Span::raw(format!("snap {}  ", self.grid.subdivision.label())),
             backing_span,
             Span::styled(
@@ -1875,7 +1908,7 @@ impl EditScreen {
             ),
             vel_span,
             Span::styled(
-                "[a/x] add/del  []/[] size  [+/-] vel  [(/)] tempo  [T] set BPM  [m] grab  [n] hand  [c] chord  [v] select  [y/p/D] yank/paste/del  [u/U] undo/redo  [R] rec  [t] step/live  [C] count-in  [Space] play/stop  [P] play-start  [o] loop  [{/}] loop in/out  [M] metro  [>/<] subdiv  [hjkl] pitch/time  [H/L] bar  [w/b] oct  [g/G] timeline ends  [0/$] pitch ends  [s] save  [S] save to library  [X] split  [Tab] menu",
+                "[a/x] add/del  []/[] size  [+/-] vel  [(/)] tempo  [T] set BPM  [:/\"] origin  [I/O] origin±  [m] grab  [n] hand  [c] chord  [v] select  [y/p/D] yank/paste/del  [u/U] undo/redo  [R] rec  [t] step/live  [C] count-in  [Space] play/stop  [P] play-start  [o] loop  [{/}] loop in/out  [M] metro  [>/<] subdiv  [hjkl] pitch/time  [H/L] bar  [w/b] oct  [g/G] timeline ends  [0/$] pitch ends  [s] save  [S] save to library  [X] split  [Tab] menu",
                 Style::default().fg(Color::DarkGray),
             ),
         ]);
@@ -2239,6 +2272,12 @@ impl EditScreen {
             Line::from(Span::raw("  +/= : Velocity +8       - : Velocity -8")),
             Line::from(Span::raw("  ( : Tempo -5 BPM        ) : Tempo +5 BPM")),
             Line::from(Span::raw("  T : Set BPM (type a value, Enter to apply)")),
+            Line::from(Span::raw(
+                "  : : Grid origin -10ms     \" : Grid origin +10ms",
+            )),
+            Line::from(Span::raw(
+                "  I : Grid origin -250ms    O : Grid origin +250ms",
+            )),
             Line::from(Span::raw("  m : Grab mode (move note with h/j/k/l)")),
             Line::from(Span::raw("")), // Empty line
             Line::from(Span::styled(

@@ -570,6 +570,15 @@ impl Composer {
                 self.resnap_cursor_from_us(cursor_us);
                 Vec::new()
             }
+            Action::NudgeGridOrigin { delta_us } => {
+                let cursor_us = self.cursor_us();
+                // The origin is a u64 phase that can never go negative, so a
+                // nudge past zero clamps there rather than wrapping.
+                let origin = self.grid.origin_us.saturating_add_signed(delta_us);
+                self.grid.set_origin_us(origin);
+                self.resnap_cursor_from_us(cursor_us);
+                Vec::new()
+            }
             Action::QuantizeRegion {
                 start_us,
                 end_us,
@@ -2751,6 +2760,31 @@ mod tests {
         assert_eq!(c.snapshot().grid_origin_us, 5_191_846);
         // Snap is now phased from the origin: origin itself is a grid line.
         assert_eq!(c.grid().snap(5_191_846), 5_191_846);
+    }
+
+    #[test]
+    fn nudge_grid_origin_slides_phase_both_ways() {
+        let mut c = Composer::new();
+        apply(&mut c, Action::SetGridOrigin { us: 1_000_000 });
+
+        apply(&mut c, Action::NudgeGridOrigin { delta_us: 10_000 });
+        assert_eq!(c.snapshot().grid_origin_us, 1_010_000);
+
+        apply(&mut c, Action::NudgeGridOrigin { delta_us: -250_000 });
+        assert_eq!(c.snapshot().grid_origin_us, 760_000);
+    }
+
+    #[test]
+    fn nudge_grid_origin_clamps_at_zero_instead_of_wrapping() {
+        let mut c = Composer::new();
+        apply(&mut c, Action::SetGridOrigin { us: 5_000 });
+        // A nudge past zero must clamp — the origin is an unsigned phase, so a
+        // wrap here would throw the bar lines to the far end of the timeline.
+        apply(&mut c, Action::NudgeGridOrigin { delta_us: -250_000 });
+        assert_eq!(c.snapshot().grid_origin_us, 0);
+
+        apply(&mut c, Action::NudgeGridOrigin { delta_us: i64::MIN });
+        assert_eq!(c.snapshot().grid_origin_us, 0);
     }
 
     #[test]
