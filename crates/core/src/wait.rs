@@ -86,6 +86,19 @@ impl WaitTracker {
         self.pos > start
     }
 
+    /// Seek to the first step at or after `now_us`, treating earlier steps as
+    /// already-passed. Steps at exactly `now_us` are kept (still to be played).
+    ///
+    /// This is for rebuilding a tracker **mid-take** — e.g. the practice hand
+    /// changed, so the step list is regenerated. A fresh tracker starts at step
+    /// 0 (the song's start), but the player is at the playhead, not the start;
+    /// without this seek the gate would freeze on a step already in the past and
+    /// never advance (the note it waits for was played long ago). Steps are
+    /// time-ordered, so this is the first index whose `time_us >= now_us`.
+    pub fn seek_to(&mut self, now_us: u64) {
+        self.pos = self.steps.partition_point(|s| s.time_us < now_us);
+    }
+
     /// Have all steps been completed?
     pub fn is_complete(&self) -> bool {
         self.pos >= self.steps.len()
@@ -156,6 +169,18 @@ impl WaitGate {
     /// Replace the live held-note set (call on every note-on/off).
     pub fn set_held(&mut self, held: BTreeSet<u8>) {
         self.held = held;
+    }
+
+    /// Seek the tracker to the first step at or after `now_us`, discarding
+    /// earlier steps as already-passed (see [`WaitTracker::seek_to`]). Clears any
+    /// stale frozen flag; the next [`poll`](WaitGate::poll) recomputes it.
+    ///
+    /// Call this after rebuilding a gate mid-take (the practice hand or split
+    /// changed) so it resumes at the playhead instead of freezing on a step the
+    /// player already passed.
+    pub fn seek_to(&mut self, now_us: u64) {
+        self.tracker.seek_to(now_us);
+        self.frozen = false;
     }
 
     /// Advance the tracker past any now-satisfied steps, then report whether the
@@ -324,6 +349,65 @@ mod gate_tests {
         g.set_armed(false);
         assert!(g.awaiting().is_none());
         assert_eq!(g.poll(0), GateState::Running);
+    }
+}
+
+#[cfg(test)]
+mod seek_tests {
+    use super::*;
+
+    fn n(v: u8) -> MidiNote {
+        MidiNote::new(v).unwrap()
+    }
+    fn held(notes: &[u8]) -> BTreeSet<u8> {
+        notes.iter().copied().collect()
+    }
+
+    #[test]
+    fn tracker_seek_skips_past_steps_keeps_current() {
+        let mut t = WaitTracker::from_expected(&[(n(60), 0), (n(62), 1000), (n(64), 2000)]);
+        // Seek to a time between steps: the step at 1000 is kept (>= now).
+        t.seek_to(1000);
+        assert_eq!(t.current().unwrap().notes, vec![62]);
+        // Seek past everything → complete.
+        t.seek_to(9999);
+        assert!(t.is_complete());
+    }
+
+    #[test]
+    fn tracker_seek_between_steps_lands_on_next() {
+        let mut t = WaitTracker::from_expected(&[(n(60), 0), (n(62), 1000)]);
+        t.seek_to(500); // past step@0, before step@1000
+        assert_eq!(t.current().unwrap().notes, vec![62]);
+    }
+
+    /// The regression this fixes: rebuilding the gate mid-take (a fresh tracker
+    /// at step 0) while the clock is far along must NOT freeze on the song's
+    /// first note. Seeking to the playhead resumes the wait at the current step.
+    #[test]
+    fn rebuilt_gate_seeked_to_playhead_does_not_freeze_on_the_past() {
+        // Song's first left-hand note is at t=0; the current one is at t=5000.
+        let mut g = WaitGate::from_expected(&[(n(48), 0), (n(50), 5000)]);
+        g.set_armed(true);
+        // Clock is at 5000 (mid-take). Without seeking, poll would freeze on the
+        // t=0 step forever. Seek to the playhead first:
+        g.seek_to(5000);
+        // Now it correctly freezes on the DUE current step (t=5000), not the past.
+        assert_eq!(g.poll(5000), GateState::Frozen);
+        assert_eq!(g.awaiting().unwrap().notes, vec![50]);
+        // Playing the current note advances and unfreezes.
+        g.set_held(held(&[50]));
+        assert_eq!(g.poll(5000), GateState::Running);
+        assert!(g.is_complete());
+    }
+
+    #[test]
+    fn seek_clears_stale_frozen_flag() {
+        let mut g = WaitGate::from_expected(&[(n(60), 0), (n(62), 5000)]);
+        g.set_armed(true);
+        assert_eq!(g.poll(0), GateState::Frozen); // frozen on step@0
+        g.seek_to(5000); // jump the playhead forward
+        assert!(g.awaiting().is_none(), "seek clears the stale frozen flag");
     }
 }
 

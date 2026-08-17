@@ -966,13 +966,17 @@ impl PlaySession {
     }
 
     /// Rebuild the wait gate from the practiced hand's steps, preserving armed
-    /// state. Practice is normally set before Start, so restarting the gate at the
-    /// first step is fine.
+    /// state. A fresh gate starts at step 0 (the song's start), so when practice
+    /// or the split changes **mid-take** we must seek it to the current playhead —
+    /// otherwise the gate freezes on a step already in the past (a note played
+    /// long ago) and never advances, ignoring the notes the player is actually
+    /// meant to play now.
     fn rebuild_wait_gate(&mut self) {
         let armed = self.wait.is_armed();
         let steps = expected_steps_for(&self.spans, self.practice, self.split_pitch);
         self.wait = WaitGate::from_expected(&steps);
         self.wait.set_armed(armed);
+        self.wait.seek_to(self.clock.now_us());
     }
 
     /// The file position the backing should be at for the current clock, or
@@ -1513,6 +1517,53 @@ mod tests {
         let st = s.status();
         assert_eq!(st.held, vec![60], "status shows what is held");
         assert!(!st.frozen, "satisfied step releases the clock");
+    }
+
+    /// Regression: switching the practice hand **mid-take** must seek the rebuilt
+    /// wait gate to the playhead, not restart it at the song's first note.
+    /// Otherwise the gate freezes on a note already in the past and never accepts
+    /// the note the player is meant to play now — the reported wait-mode lockup.
+    #[test]
+    fn switching_practice_mid_take_does_not_freeze_on_a_past_note() {
+        // Two left-hand notes (48 @0, 50 @500ms — distinct pitches so we can tell
+        // "stuck on the past one" from "waiting on the next one") around a
+        // right-hand note (72 @250ms). Split defaults to 60, so 48/50 are left.
+        let events = vec![
+            on(48, 0),
+            off(48, 200_000),
+            on(72, 250_000),
+            off(72, 450_000),
+            on(50, 500_000),
+            off(50, 700_000),
+        ];
+        let mut s = PlaySession::from_events("t".into(), &events);
+        // Run forward (wait off) to between the two left notes — the "mid-take"
+        // playhead — then switch to left-only practice.
+        s.advance(target_us(1) + 100_000); // ~SHIFT+350ms: past 48@0, before 50@500
+        s.set_practice(Some(Hand::Left));
+        s.set_wait_mode(true);
+
+        let st = s.status();
+        assert!(
+            st.awaiting != vec![48],
+            "must not re-freeze on the already-passed first left note (was: {:?})",
+            st.awaiting
+        );
+
+        // The upcoming left note still gates correctly: freeze on it when due,
+        // release when played.
+        let dt = (target_us(2) + 1).saturating_sub(s.now_us());
+        s.advance(dt);
+        s.advance(16_000);
+        let st = s.status();
+        assert!(st.frozen, "gate freezes on the current (due) left note");
+        assert_eq!(st.awaiting, vec![50], "waits on the note at the playhead");
+        s.ingest(on(50, s.now_us()));
+        s.advance(16_000);
+        assert!(
+            !s.status().frozen,
+            "playing the current left note proceeds — no lockup"
+        );
     }
 
     /// Reading status must not perturb the take it observes — in particular it
