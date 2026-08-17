@@ -315,6 +315,9 @@ export type ActionName =
   | "set_hand_split"
   | "set_note_hand"
   | "cycle_note_hand"
+  // ── time / structure (ripple insert & cut) ──────────────────────────
+  | "insert_bar"
+  | "remove_bar"
   // ── history ─────────────────────────────────────────────────────────
   | "undo"
   | "redo";

@@ -249,6 +249,16 @@ pub enum Action {
     /// note's, or the first selected note's) to decide the next one.
     CycleNoteHand,
 
+    // ── time / structure (ripple insert & cut) ──────────────────────────
+    /// Insert one empty bar at the cursor's bar boundary, sliding every note at
+    /// or after it one bar later. Ripple edit: opens a silent bar without
+    /// disturbing the tail's internal timing.
+    InsertBar,
+    /// Cut the bar the cursor sits in — delete the notes that start in it and
+    /// slide everything after one bar earlier, leaving no gap. Ripple edit; the
+    /// inverse of [`InsertBar`](Action::InsertBar) plus the deletion.
+    RemoveBar,
+
     // ── history ─────────────────────────────────────────────────────────
     Undo,
     Redo,
@@ -329,6 +339,8 @@ impl Action {
             Action::SetHandSplit { .. } => "set_hand_split",
             Action::SetNoteHand { .. } => "set_note_hand",
             Action::CycleNoteHand => "cycle_note_hand",
+            Action::InsertBar => "insert_bar",
+            Action::RemoveBar => "remove_bar",
             Action::Undo => "undo",
             Action::Redo => "redo",
         }
@@ -487,6 +499,8 @@ pub fn action_names() -> &'static [&'static str] {
         "set_hand_split",
         "set_note_hand",
         "cycle_note_hand",
+        "insert_bar",
+        "remove_bar",
         "undo",
         "redo",
     ]
@@ -611,6 +625,8 @@ static ACTION_HELP: &[ActionInfo] = {
         ActionInfo { name: "set_hand_split", params: &[p("pitch", "u8")], description: "Set the piece's left/right hand split line: notes below `pitch` default to the left hand, at/above it to the right. Per-note overrides win over it." },
         ActionInfo { name: "set_note_hand", params: &[p("hand", "HandSetting")], description: "Pin the target notes to a hand: \"left\", \"right\", or \"auto\" to follow the split line. Targets the selection when one is active, else the note under the cursor; a no-op with neither." },
         ActionInfo { name: "cycle_note_hand", params: &[], description: "Cycle the target notes' hand setting auto -> left -> right -> auto. Same target as set_note_hand (selection, else the cursor note)." },
+        ActionInfo { name: "insert_bar", params: &[], description: "Insert one empty bar at the cursor's bar boundary, sliding every note at or after it one bar later (ripple). Opens a silent bar to make room; the tail keeps its internal timing." },
+        ActionInfo { name: "remove_bar", params: &[], description: "Cut the bar the cursor sits in: delete the notes starting in it and slide everything after one bar earlier so no gap is left (ripple)." },
         // ── history ─────────────────────────────────────────────────────
         ActionInfo { name: "undo", params: &[], description: "Undo the last edit." },
         ActionInfo { name: "redo", params: &[], description: "Redo the last undone edit." },
@@ -717,6 +733,8 @@ mod tests {
                 hand: HandSetting::Left,
             },
             Action::CycleNoteHand,
+            Action::InsertBar,
+            Action::RemoveBar,
             Action::Undo,
             Action::Redo,
         ]

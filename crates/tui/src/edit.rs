@@ -189,6 +189,11 @@ fn key_to_action(code: KeyCode) -> Option<Action> {
         // ── edit ────────────────────────────────────────────────────────
         KeyCode::Char('a') | KeyCode::Char('i') => Action::AddNote,
         KeyCode::Char('x') | KeyCode::Char('d') => Action::DeleteNote,
+        // Ripple bar edits: A inserts an empty bar at the cursor ("add a bar",
+        // the Shift-partner of `a`=add note); Z cuts the cursor's bar and closes
+        // the gap. (X is taken by the split panel, `x` by delete-note.)
+        KeyCode::Char('A') => Action::InsertBar,
+        KeyCode::Char('Z') => Action::RemoveBar,
         KeyCode::Char(']') => Action::ResizeNote { delta_steps: 1 },
         KeyCode::Char('[') => Action::ResizeNote { delta_steps: -1 },
         KeyCode::Char('+') | KeyCode::Char('=') => Action::AdjustVelocity {
@@ -1908,7 +1913,7 @@ impl EditScreen {
             ),
             vel_span,
             Span::styled(
-                "[a/x] add/del  []/[] size  [+/-] vel  [(/)] tempo  [T] set BPM  [:/\"] origin  [I/O] origin±  [m] grab  [n] hand  [c] chord  [v] select  [y/p/D] yank/paste/del  [u/U] undo/redo  [R] rec  [t] step/live  [C] count-in  [Space] play/stop  [P] play-start  [o] loop  [{/}] loop in/out  [M] metro  [>/<] subdiv  [hjkl] pitch/time  [H/L] bar  [w/b] oct  [g/G] timeline ends  [0/$] pitch ends  [s] save  [S] save to library  [X] split  [Tab] menu",
+                "[a/x] add/del  [A/Z] insert/cut bar  []/[] size  [+/-] vel  [(/)] tempo  [T] set BPM  [:/\"] origin  [I/O] origin±  [m] grab  [n] hand  [c] chord  [v] select  [y/p/D] yank/paste/del  [u/U] undo/redo  [R] rec  [t] step/live  [C] count-in  [Space] play/stop  [P] play-start  [o] loop  [{/}] loop in/out  [M] metro  [>/<] subdiv  [hjkl] pitch/time  [H/L] bar  [w/b] oct  [g/G] timeline ends  [0/$] pitch ends  [s] save  [S] save to library  [X] split  [Tab] menu",
                 Style::default().fg(Color::DarkGray),
             ),
         ]);

@@ -149,6 +149,57 @@ impl Timeline {
             .map(|(&id, _)| NoteId(id))
     }
 
+    /// The highest-id note at `pitch` whose **onset** falls in `[lo_us, hi_us)`.
+    ///
+    /// [`find_at`](Self::find_at) is a point query: it only sees a note that
+    /// *covers* an exact microsecond. The editor cursor, though, is a grid
+    /// **cell** one `step_us` wide, and imported charts place onsets at their
+    /// true (fractional) microsecond times — so a short note can begin a few µs
+    /// past the integer-floored grid line and be missed by a point query at that
+    /// line (the cursor visually sits on the note, but just left of its onset).
+    /// Matching any note that *starts within the cell* recovers it.
+    pub fn find_starting_in(&self, pitch: u8, lo_us: u64, hi_us: u64) -> Option<NoteId> {
+        self.notes
+            .iter()
+            .rfind(|(_, note)| {
+                note.pitch.value() == pitch && lo_us <= note.start_us && note.start_us < hi_us
+            })
+            .map(|(&id, _)| NoteId(id))
+    }
+
+    /// Ripple-shift in time: add `delta_us` to the `start_us` of every note that
+    /// starts **at or after** `threshold_us`. A negative delta saturates at 0.
+    /// Notes before the threshold are untouched (their duration is unchanged, so
+    /// a note spanning the threshold keeps its onset and simply overlaps the
+    /// shifted region). Backs the insert/cut-bar edits.
+    pub fn shift_from(&mut self, threshold_us: u64, delta_us: i64) {
+        if delta_us == 0 {
+            return;
+        }
+        for note in self.notes.values_mut() {
+            if note.start_us >= threshold_us {
+                note.start_us = note.start_us.saturating_add_signed(delta_us);
+            }
+        }
+    }
+
+    /// Remove every note whose **onset** falls in `[from_us, to_us)`. Returns how
+    /// many were removed. Notes starting before `from_us` (even if they sustain
+    /// into the range) are kept — removal is keyed on the onset, like the editor
+    /// cursor. Backs the cut-bar edit.
+    pub fn remove_in(&mut self, from_us: u64, to_us: u64) -> usize {
+        let ids: Vec<u32> = self
+            .notes
+            .iter()
+            .filter(|(_, n)| from_us <= n.start_us && n.start_us < to_us)
+            .map(|(&id, _)| id)
+            .collect();
+        for id in &ids {
+            self.notes.remove(id);
+        }
+        ids.len()
+    }
+
     /// Set (or clear, with `None`) a note's hand override. Returns false if
     /// `id` is unknown.
     pub fn set_hand(&mut self, id: NoteId, hand: Option<Hand>) -> bool {
@@ -477,6 +528,37 @@ mod tests {
         assert_eq!(tl.find_at(60, 2_000), None); // exclusive end
         assert_eq!(tl.find_at(60, 500), None); // before start
         assert_eq!(tl.find_at(61, 1_500), None); // wrong pitch
+    }
+
+    #[test]
+    fn shift_from_and_remove_in_ripple_time() {
+        let mut tl = Timeline::new();
+        tl.insert(note(60, 0, 100, 100));
+        let mid = tl.insert(note(62, 1_000, 100, 100));
+        let tail = tl.insert(note(64, 2_000, 100, 100));
+        // remove the middle onset, then slide the tail left to close the gap.
+        assert_eq!(tl.remove_in(1_000, 2_000), 1);
+        assert!(tl.get(mid).is_none());
+        tl.shift_from(2_000, -1_000);
+        assert_eq!(tl.get(tail).unwrap().start_us, 1_000);
+        // a positive shift opens a gap; the note before the threshold stays put.
+        tl.shift_from(1_000, 500);
+        assert_eq!(tl.get(tail).unwrap().start_us, 1_500);
+        assert_eq!(tl.notes().next().unwrap().1.start_us, 0);
+    }
+
+    #[test]
+    fn find_starting_in_matches_onset_within_the_cell() {
+        let mut tl = Timeline::new();
+        let id = tl.insert(note(60, 1_050, 100, 100)); // onset 1050, ends 1150
+                                                       // Onset falls in the half-open window.
+        assert_eq!(tl.find_starting_in(60, 1_000, 2_000), Some(id));
+        // The exact-point query at the cell's left edge misses the drifted onset.
+        assert_eq!(tl.find_at(60, 1_000), None);
+        // Onset before / at-or-after the window, and wrong pitch, all miss.
+        assert_eq!(tl.find_starting_in(60, 1_100, 2_000), None);
+        assert_eq!(tl.find_starting_in(60, 500, 1_050), None); // hi is exclusive
+        assert_eq!(tl.find_starting_in(61, 1_000, 2_000), None);
     }
 
     #[test]

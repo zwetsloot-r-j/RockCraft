@@ -84,6 +84,10 @@ export const NORMAL_BINDINGS: Binding[] = [
   // ── edit ──────────────────────────────────────────────────────────────
   { keys: ["a", "i"], action: { name: "add_note" } },
   { keys: ["x", "d"], action: { name: "delete_note" } },
+  // Ripple bar edits: A inserts an empty bar at the cursor ("add a bar"), Z cuts
+  // the cursor's bar and closes the gap. (Uppercase = the bigger, structural op.)
+  { keys: ["A"], action: { name: "insert_bar" } },
+  { keys: ["Z"], action: { name: "remove_bar" } },
   { keys: ["]"], action: { name: "resize_note", params: { delta_steps: 1 } } },
   { keys: ["["], action: { name: "resize_note", params: { delta_steps: -1 } } },
   {

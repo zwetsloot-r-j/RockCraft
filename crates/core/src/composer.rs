@@ -530,6 +530,10 @@ impl Composer {
                 self.set_note_hand(current.next().override_value())
             }
 
+            // ── time / structure (ripple insert & cut) ──────────────────
+            Action::InsertBar => self.insert_bar(),
+            Action::RemoveBar => self.remove_bar(),
+
             Action::ToggleGrab => self.toggle_grab(),
             Action::InsertRun {
                 end_pitch,
@@ -929,9 +933,64 @@ impl Composer {
         self.timeline().len()
     }
 
-    /// The id of the note whose span covers the cursor's `(pitch, step)`, if any.
+    /// Song-time of the start of the bar the cursor sits in, honouring the grid's
+    /// phase [`origin_us`](crate::Grid). Used by the ripple bar edits.
+    fn cursor_bar_start_us(&self) -> u64 {
+        let bar_us = self.grid.bar_us().max(1);
+        let origin = self.grid.origin_us;
+        let rel = self.cursor_us().saturating_sub(origin);
+        origin + (rel / bar_us) * bar_us
+    }
+
+    /// Insert one empty bar at the cursor's bar boundary: every note starting at
+    /// or after that boundary slides one bar later, opening a silent bar. Ripple
+    /// edit — the tail keeps its internal timing. One undo checkpoint.
+    fn insert_bar(&mut self) -> Vec<Effect> {
+        let bar_us = self.grid.bar_us();
+        if bar_us == 0 {
+            return Vec::new();
+        }
+        let at = self.cursor_bar_start_us();
+        self.history.checkpoint();
+        self.history.current_mut().shift_from(at, bar_us as i64);
+        Vec::new()
+    }
+
+    /// Cut the bar the cursor sits in: delete every note that starts within it,
+    /// then slide everything after it one bar earlier so no gap is left. Ripple
+    /// edit. Clears any grab/selection (their targets may have moved or gone).
+    /// One undo checkpoint.
+    fn remove_bar(&mut self) -> Vec<Effect> {
+        let bar_us = self.grid.bar_us();
+        if bar_us == 0 {
+            return Vec::new();
+        }
+        let start = self.cursor_bar_start_us();
+        let end = start + bar_us;
+        self.history.checkpoint();
+        let tl = self.history.current_mut();
+        tl.remove_in(start, end);
+        tl.shift_from(end, -(bar_us as i64));
+        self.grabbed = None;
+        self.selection_anchor = None;
+        Vec::new()
+    }
+
+    /// The id of the note at the cursor's `(pitch, step)`, if any.
+    ///
+    /// Prefers a note whose span *covers* the cursor's grid line, then falls back
+    /// to a note that *starts within* the cursor's one-step-wide cell. The
+    /// fallback matters for imported charts: their onsets sit at true fractional
+    /// microsecond times while the grid's `step_us` is integer-floored, so a short
+    /// note can start a few µs past the grid line and be missed by the exact-point
+    /// query — the cursor looks like it is on the note but edits (hand, move,
+    /// delete) find nothing. See [`Timeline::find_starting_in`].
     pub fn note_under_cursor(&self) -> Option<NoteId> {
-        self.timeline().find_at(self.cursor.pitch, self.cursor_us())
+        let us = self.cursor_us();
+        self.timeline().find_at(self.cursor.pitch, us).or_else(|| {
+            self.timeline()
+                .find_starting_in(self.cursor.pitch, us, us + self.grid.step_us())
+        })
     }
 
     /// Look up note data by id.
@@ -2160,6 +2219,111 @@ mod tests {
         assert_eq!(c.note_count(), 1, "replaced, not stacked");
         let id2 = c.note_under_cursor().unwrap();
         assert_eq!(c.get_note(id2).unwrap().velocity.value(), DEFAULT_NOTE_VEL);
+    }
+
+    /// Regression: an imported note whose onset sits a few µs past the
+    /// integer-floored grid line must still be editable. The grid `step_us` is
+    /// floored (170 bpm eighth = 176_470, not 176_470.59…), so a short note drifts
+    /// between two cursor grid lines; `note_under_cursor` must still resolve it
+    /// (via the cell fallback) or hand/move/delete silently no-op.
+    #[test]
+    fn note_under_cursor_finds_short_note_drifted_off_the_grid_line() {
+        let grid = Grid {
+            bpm: 170,
+            time_sig: TimeSig {
+                beats_per_bar: 3,
+                beat_unit: 4,
+            },
+            subdivision: Subdivision::Eighth,
+            origin_us: 0,
+        };
+        let step = 193u64;
+        let line = grid.us_of_step(step); // 34_058_710, with step_us floored to 176_470
+                                          // A short note starting 96 µs past the grid line and ending before the
+                                          // NEXT line — so no grid line lands inside it (the drift failure).
+        let start = line + 96;
+        let dur = 175_000; // < step_us, ends before us_of_step(step+1)
+        let mut tl = Timeline::new();
+        let id = tl.insert(note(47, start, dur));
+        // The exact-point query misses it at both adjacent grid lines.
+        assert_eq!(tl.find_at(47, line), None);
+        assert_eq!(tl.find_at(47, grid.us_of_step(step + 1)), None);
+
+        let mut c = Composer::from_timeline(tl, grid);
+        apply(&mut c, Action::SetCursor { pitch: 47, step });
+        assert_eq!(
+            c.note_under_cursor(),
+            Some(id),
+            "the note starting in the cursor's grid cell must be editable"
+        );
+        // And a real edit now lands on it.
+        apply(&mut c, Action::CycleNoteHand);
+        assert_eq!(c.get_note(id).unwrap().hand, Some(Hand::Left));
+    }
+
+    #[test]
+    fn insert_bar_and_remove_bar_ripple_the_tail() {
+        let grid = Grid {
+            bpm: 120,
+            time_sig: TimeSig {
+                beats_per_bar: 4,
+                beat_unit: 4,
+            },
+            subdivision: Subdivision::Quarter,
+            origin_us: 0,
+        };
+        let bar = grid.bar_us(); // 2_000_000
+        let build = || {
+            let mut tl = Timeline::new();
+            tl.insert(note(60, 0, 100_000)); // bar 0
+            tl.insert(note(62, bar, 100_000)); // bar 1
+            tl.insert(note(64, 2 * bar, 100_000)); // bar 2
+            tl
+        };
+        let step_in_bar1 = grid.step_index(bar);
+        let starts = |c: &Composer| -> Vec<(u8, u64)> {
+            let mut v: Vec<(u8, u64)> = c
+                .timeline()
+                .notes()
+                .map(|(_, n)| (n.pitch.value(), n.start_us))
+                .collect();
+            v.sort();
+            v
+        };
+
+        // remove_bar: the cursor's bar (bar 1) is deleted and the tail slides left.
+        let mut c = Composer::from_timeline(build(), grid);
+        apply(
+            &mut c,
+            Action::SetCursor {
+                pitch: 60,
+                step: step_in_bar1,
+            },
+        );
+        apply(&mut c, Action::RemoveBar);
+        assert_eq!(
+            starts(&c),
+            vec![(60, 0), (64, bar)],
+            "bar-1 note gone; bar-2 note slid to bar 1"
+        );
+        apply(&mut c, Action::Undo);
+        assert_eq!(c.note_count(), 3, "remove_bar is one undo step");
+
+        // insert_bar: everything at/after the cursor's bar slides one bar later.
+        let mut c = Composer::from_timeline(build(), grid);
+        apply(
+            &mut c,
+            Action::SetCursor {
+                pitch: 60,
+                step: step_in_bar1,
+            },
+        );
+        apply(&mut c, Action::InsertBar);
+        assert_eq!(
+            starts(&c),
+            vec![(60, 0), (62, 2 * bar), (64, 3 * bar)],
+            "bar-0 untouched; bars 1 and 2 pushed one bar later"
+        );
     }
 
     #[test]

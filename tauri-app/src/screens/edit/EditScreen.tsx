@@ -2706,6 +2706,10 @@ function HelpOverlay(props: { onClose: () => void }): JSX.Element {
       rows: [
         "a / i         Add note",
         "x / d         Delete note",
+        "A             Insert an empty bar at the cursor (ripple; slides",
+        "              everything after one bar later)",
+        "Z             Cut the cursor's bar (ripple; deletes it and slides",
+        "              everything after one bar earlier — closes the gap)",
         "]             Lengthen note (+1 step)",
         "[             Shorten note (−1 step)",
         "+ / =         Velocity +8",
