@@ -444,6 +444,7 @@ below is an at-a-glance convenience only.
 | `import_score` | `{ path: String }` | Start importing a local score file (MusicXML/`.xml`/`.mxl`/`.abc`/`.krn`). The notated tempo, metre and key seed the new bundle's grid |
 | `import_score` (scan) | `{ path: String }` | The same command with a `.pdf`/`.png`/`.jpg`/`.jpeg`/`.tif`/`.tiff`/`.bmp` path runs optical music recognition first. Lossy: notes carry a derived `confidence`, and the import log emits `omr: imported N notes, M flagged …`. Needs an OMR engine installed — see [`IMPORT.md`](IMPORT.md#scanned-sheet-music-omr-m13-b) |
 | `audio_status` / `midi_status` / `record_status` | none | Read-only status snapshots |
+| `midi_rescan` | none | Re-scan for a live USB-MIDI device and adopt it if one is now present — reconnect a piano powered on or replugged after launch, without restarting the app. Leaves the current source untouched when none is found. Returns the resulting MIDI status |
 | `app_quit` | none | Shut the app down gracefully (exit 0); the socket closes as the process exits |
 
 Not every frontend supports every command: the TUI's record/import/backing

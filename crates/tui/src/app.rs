@@ -861,6 +861,10 @@ impl rockcraft_control::HostServices for Shell {
             HostCommand::ImportScore { .. } => Err(HostError::Unsupported("import_score".into())),
             HostCommand::AudioStatus => Err(HostError::Unsupported("audio_status".into())),
             HostCommand::MidiStatus => Err(HostError::Unsupported("midi_status".into())),
+            // The TUI takes its `NoteSource` by value at startup and holds no
+            // rescannable device handle, so — like `midi_status` — it cannot
+            // reconnect a piano here. The Tauri backend performs the real rescan.
+            HostCommand::MidiRescan => Err(HostError::Unsupported("midi_rescan".into())),
             HostCommand::RecordStatus => Err(HostError::Unsupported("record_status".into())),
             HostCommand::AppQuit => Err(HostError::Unsupported("app_quit".into())),
         }
@@ -1258,6 +1262,7 @@ mod tests {
             HostCommand::QueryMixer,
             HostCommand::AudioStatus,
             HostCommand::MidiStatus,
+            HostCommand::MidiRescan,
             HostCommand::RecordStatus,
             HostCommand::AppQuit,
         ]

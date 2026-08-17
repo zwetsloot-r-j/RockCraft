@@ -165,13 +165,19 @@ pub enum HostCommand {
     /// sidecar decides which an input is, so the frontends never have to.
     ImportScore { path: String },
 
-    // ── status / device (read-only) ─────────────────────────────────────
+    // ── status / device ─────────────────────────────────────────────────
     /// Current audio/backing status as JSON.
     AudioStatus,
     /// Current MIDI input status as JSON.
     MidiStatus,
     /// Current record session status as JSON.
     RecordStatus,
+    /// Re-scan for a live USB-MIDI device and adopt it if one is now present —
+    /// reconnect a piano powered on or replugged after launch, without
+    /// restarting the app. Returns the resulting MIDI input status. This is the
+    /// one device command that *mutates* (it can swap the active input source);
+    /// frontends without a rescannable handle (the TUI) report it Unsupported.
+    MidiRescan,
 
     // ── app lifecycle ───────────────────────────────────────────────────
     /// Shut the application down gracefully (exit code 0). Lets an agent close
@@ -217,6 +223,7 @@ impl HostCommand {
             HostCommand::ImportScore { .. } => "import_score",
             HostCommand::AudioStatus => "audio_status",
             HostCommand::MidiStatus => "midi_status",
+            HostCommand::MidiRescan => "midi_rescan",
             HostCommand::RecordStatus => "record_status",
             HostCommand::AppQuit => "app_quit",
         }
@@ -349,6 +356,7 @@ pub fn host_command_names() -> &'static [&'static str] {
         "import_score",
         "audio_status",
         "midi_status",
+        "midi_rescan",
         "record_status",
         "app_quit",
     ]
@@ -420,6 +428,7 @@ static HOST_HELP: &[HostCommandInfo] = {
         // ── status / device ──────────────────────────────────────────────
         HostCommandInfo { name: "audio_status", params: &[], description: "Return the current audio/backing status." },
         HostCommandInfo { name: "midi_status", params: &[], description: "Return the current MIDI input status." },
+        HostCommandInfo { name: "midi_rescan", params: &[], description: "Re-scan for a live USB-MIDI device and adopt it if one is now present — reconnect a piano powered on or replugged after launch, without restarting the app. Leaves the current source untouched when none is found. Returns the resulting MIDI input status." },
         HostCommandInfo { name: "record_status", params: &[], description: "Return the current record session status." },
         // ── app lifecycle ────────────────────────────────────────────────
         HostCommandInfo { name: "app_quit", params: &[], description: "Shut the application down gracefully (exit code 0). The connection closes as the process exits." },
@@ -503,6 +512,7 @@ mod tests {
             },
             HostCommand::AudioStatus,
             HostCommand::MidiStatus,
+            HostCommand::MidiRescan,
             HostCommand::RecordStatus,
             HostCommand::AppQuit,
         ]
