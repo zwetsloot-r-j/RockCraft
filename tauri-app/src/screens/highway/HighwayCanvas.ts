@@ -143,19 +143,23 @@ export class HighwayCanvas {
   // so it's clear which notes the player is responsible for. Hand is derived by
   // the configurable split pitch (matches the backend).
   private practiceMode: "both" | "left" | "right" = "both";
-  private practiceSplit = 60;
 
-  /** Set the practiced hand + split so auto-played (other-hand) notes grey out. */
-  setPractice(mode: "both" | "left" | "right", split: number): void {
+  /** Set the practiced hand so auto-played (other-hand) notes grey out. The
+   * split is not needed here: classification reads each note's baked hand. */
+  setPractice(mode: "both" | "left" | "right"): void {
     this.practiceMode = mode;
-    this.practiceSplit = split;
   }
 
   /** True when a note belongs to the auto-played (non-practiced) hand. */
-  private isAutoPlayed(note: number): boolean {
+  private isAutoPlayed(nt: NoteSpan): boolean {
     if (this.practiceMode === "both") return false;
-    const hand = note < this.practiceSplit ? "left" : "right";
-    return hand !== this.practiceMode;
+    // Classify by the note's authored/effective hand (resolved by the backend,
+    // so it already honors per-note overrides), NOT by re-deriving from the
+    // split. Re-deriving misclassifies an overridden crossover note — an
+    // "overwritten" left-hand note above the split would show as a must-play
+    // right-hand note during right practice (and vice versa).
+    const practiced: "L" | "R" = this.practiceMode === "left" ? "L" : "R";
+    return nt.hand !== practiced;
   }
 
   // ── Background video backdrop (M9-G) ──────────────────────────────────────
@@ -532,7 +536,7 @@ export class HighwayCanvas {
     const baseCol = this.noteColor(nt, light);
     // Auto-played (other-hand) notes render greyed so the player can see at a
     // glance which notes are theirs to play (#3).
-    const col = this.isAutoPlayed(nt.note)
+    const col = this.isAutoPlayed(nt)
       ? `oklch(${0.5 + light * 0.12} 0.015 260)`
       : ksty.shadeMul
         ? shade(baseCol, ksty.shadeMul)
