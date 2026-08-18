@@ -15,6 +15,7 @@ function info(notes: PlaySpan[], over: Partial<PlayInfo> = {}): PlayInfo {
     hear_song: true,
     bpm: 120,
     beats_per_bar: 4,
+    split_pitch: 60,
     ...over,
   };
 }

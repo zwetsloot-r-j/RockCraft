@@ -453,6 +453,11 @@ export function HighwayScreen() {
       .then((info) => {
         setHearSong(info.hear_song);
         shiftUs = info.shift_us;
+        // The piece's authored split (meta.hand_split) is authoritative: seed
+        // the play-mode split from it so moving the splitter in edit mode
+        // takes effect here, instead of a machine-global localStorage value
+        // clobbering it (which made right-hand practice include left notes).
+        setSplit(info.split_pitch);
         const sd = songFromInfo(info);
         setSong(sd);
         const engine = new HighwayCanvas(

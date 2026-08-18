@@ -154,6 +154,11 @@ pub struct PlayInfo {
     pub bpm: u32,
     /// Beats per bar (time-signature numerator); defaults to 4.
     pub beats_per_bar: u8,
+    /// The piece's left/right hand split pitch (`meta.hand_split`, or the
+    /// default). The play screen seeds its split from THIS so a piece's
+    /// authored hand assignment drives practice, instead of a machine-global
+    /// value clobbering it on load.
+    pub split_pitch: u8,
 }
 
 /// One span projected for the webview: pitch + ms bounds + the hand that plays
@@ -490,6 +495,12 @@ pub struct PlaySession {
     /// Judgments queued since the last [`live_state`](PlaySession::live_state),
     /// drained by it so each judged note fires exactly one effect (M14-B).
     pending_feedback: Vec<HitFeedbackView>,
+    /// The `frozen` flag as of the last emitted `play_state`. The tick thread
+    /// throttles the steady-state scroll but emits IMMEDIATELY when this flips,
+    /// so a wait-mode freeze reaches the webview at once (it pins the highway
+    /// to the note) instead of queuing behind stale advancing events — which
+    /// let the note scroll past the hit line before the freeze landed.
+    last_emitted_frozen: bool,
 
     /// "Hear the song" audition trigger bookkeeping (span indices fired).
     song_on_fired: HashSet<usize>,
@@ -561,6 +572,7 @@ impl PlaySession {
             live_hits: 0,
             live_misses: 0,
             pending_feedback: Vec::new(),
+            last_emitted_frozen: false,
             song_on_fired: HashSet::new(),
             song_off_fired: HashSet::new(),
         }
@@ -697,6 +709,7 @@ impl PlaySession {
                 })
                 .collect(),
             hear_song: self.hear_song,
+            split_pitch: self.split_pitch,
             bpm: self.bpm,
             beats_per_bar: self.beats_per_bar,
         }
@@ -1410,6 +1423,7 @@ pub fn tick_play(
     audio: &AudioState,
     midi_events: &[NoteEvent],
     dt_us: u64,
+    throttle_due: bool,
 ) -> Option<PlayStateEvent> {
     let mut guard = state.0.lock().expect("play state mutex poisoned");
     let session = guard.as_mut()?;
@@ -1468,7 +1482,17 @@ pub fn tick_play(
     let target = session.backing_target_us();
     audio.sync_play_backing(session.backing(), target, frozen);
 
-    Some(session.live_state())
+    // Emit on the throttle cadence, but ALWAYS the instant the freeze flag
+    // flips — a late freeze is what lets the note scroll past the hit line.
+    // Skipped ticks leave `pending_feedback` queued (bounded), so judgments
+    // still ride the next emit; they are not lost.
+    let frozen_transition = frozen != session.last_emitted_frozen;
+    if throttle_due || frozen_transition {
+        session.last_emitted_frozen = frozen;
+        Some(session.live_state())
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]

@@ -62,6 +62,13 @@ struct ActionAck {
 /// immediately, regardless of this throttle.
 const PLAYHEAD_EMIT_PERIOD: std::time::Duration = std::time::Duration::from_millis(33);
 
+/// Minimum spacing between steady-state `play_state` pushes (~60 Hz). The tick
+/// thread runs at 250 Hz; emitting every tick (~4x this rate) floods the WebView IPC
+/// and delays the freeze event behind stale advancing ones (the note scrolls
+/// past the hit line before wait mode pins it). A freeze/unfreeze transition
+/// bypasses this and emits at once (see `tick_play`).
+const PLAY_STATE_EMIT_PERIOD: std::time::Duration = std::time::Duration::from_millis(16);
+
 /// Event name carrying a fresh [`ComposerSnapshot`] to the webview.
 pub(crate) const EVENT_SNAPSHOT: &str = "snapshot";
 /// Event name carrying a **notes-stripped** snapshot for note-invariant
@@ -405,6 +412,9 @@ fn spawn_tick_thread(app: tauri::AppHandle) {
         let mut last = Instant::now();
         // Wall-clock of the last pushed `playhead` event, to throttle it.
         let mut last_playhead_emit = Instant::now();
+        // Wall-clock of the last steady-state `play_state` push, to throttle it
+        // (a freeze transition bypasses the throttle inside `tick_play`).
+        let mut last_play_emit = Instant::now();
         // Last playback-rate we pushed to the backing sink, to send set_speed
         // only when it changes (not every tick).
         let mut last_backing_rate: f64 = 1.0;
@@ -433,7 +443,11 @@ fn spawn_tick_thread(app: tauri::AppHandle) {
                     // Feed record session even during play mode.
                     record_state.push(*ev);
                 }
-                if let Some(snapshot) = crate::play::tick_play(&play_state, &audio, &raw, dt_us) {
+                let play_due = now.duration_since(last_play_emit) >= PLAY_STATE_EMIT_PERIOD;
+                if let Some(snapshot) =
+                    crate::play::tick_play(&play_state, &audio, &raw, dt_us, play_due)
+                {
+                    last_play_emit = now;
                     let _ = app.emit(EVENT_PLAY_STATE, &snapshot);
                 }
                 continue;
