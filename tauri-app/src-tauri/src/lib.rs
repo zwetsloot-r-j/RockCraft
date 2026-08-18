@@ -44,6 +44,16 @@ use crate::state::{
 /// so the injected `dt_us` for scoring / audition boundaries is precise.
 const TICK_PERIOD: std::time::Duration = std::time::Duration::from_millis(4);
 
+/// The `run_action` invoke result. Deliberately snapshot-free: the webview
+/// stays in sync via the `snapshot`/`meta` events, so returning the full
+/// (all-notes) snapshot here too was pure duplicate serialisation on every
+/// action — the second half of the cursor-lag cost on dense pieces.
+#[derive(serde::Serialize)]
+struct ActionAck {
+    effects: Vec<rockcraft_core::Effect>,
+    dirty: bool,
+}
+
 /// Minimum spacing between the lightweight `playhead` pushes **while the
 /// transport is playing** (~30 Hz). At the 250 Hz tick rate this would flood the
 /// WebView IPC channel; the payload is tiny (position + flag), but the frontend
@@ -54,6 +64,13 @@ const PLAYHEAD_EMIT_PERIOD: std::time::Duration = std::time::Duration::from_mill
 
 /// Event name carrying a fresh [`ComposerSnapshot`] to the webview.
 pub(crate) const EVENT_SNAPSHOT: &str = "snapshot";
+/// Event name carrying a **notes-stripped** snapshot for note-invariant
+/// actions (cursor moves, transport, grid tweaks). Same shape as a full
+/// snapshot but with an empty `notes` array; the webview merges every other
+/// field and keeps its existing note store, so a dense chart is not
+/// re-serialised (and re-diffed) on every keystroke — the fix for cursor
+/// input lag on large pieces.
+pub(crate) const EVENT_META: &str = "meta";
 /// Event name carrying a batch of effects to the webview.
 const EVENT_EFFECTS: &str = "effects";
 /// Event name carrying a lightweight [`PlayheadEvent`] during playback — just
@@ -85,7 +102,7 @@ fn run_action(
     prev_transport: State<'_, PrevTransport>,
     name: String,
     params: serde_json::Value,
-) -> Result<ActionReply, String> {
+) -> Result<ActionAck, String> {
     let reply = state::run_action(&state, &name, &params)?;
     // Route effects to the synth (note audition, chord preview, all-off).
     audio::apply_effects(&audio, state::is_playing(&state), &reply.effects);
@@ -111,11 +128,27 @@ fn run_action(
         };
     }
     // The helper has already released the composer lock; emit afterwards.
-    let _ = app.emit(EVENT_SNAPSHOT, &reply.snapshot);
-    if !reply.effects.is_empty() {
-        let _ = app.emit(EVENT_EFFECTS, &reply.effects);
+    // Only ship the full (all-notes) snapshot when the notes actually
+    // changed; otherwise send a notes-stripped `meta` event so the webview
+    // updates cursor/transport/grid without re-serialising the whole chart
+    // (the cursor-lag fix for dense pieces). `mem::take` drops the notes so
+    // they are never serialised on the meta path.
+    let ActionReply {
+        mut snapshot,
+        effects,
+        dirty,
+        notes_changed,
+    } = reply;
+    if notes_changed {
+        let _ = app.emit(EVENT_SNAPSHOT, &snapshot);
+    } else {
+        snapshot.notes = Vec::new();
+        let _ = app.emit(EVENT_META, &snapshot);
     }
-    Ok(reply)
+    if !effects.is_empty() {
+        let _ = app.emit(EVENT_EFFECTS, &effects);
+    }
+    Ok(ActionAck { effects, dirty })
 }
 
 /// Current composer snapshot — mirrors `query state`.
@@ -323,7 +356,7 @@ fn mock_key(midi: State<'_, MidiState>, key: char, down: bool) -> Result<(), Str
 struct TransportSnapshot {
     playing: bool,
     playhead_us: u64,
-    offset_us: u64,
+    offset_us: i64,
 }
 
 /// Lightweight playback push (see [`EVENT_PLAYHEAD`]): the moving playhead and

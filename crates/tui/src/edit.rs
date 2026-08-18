@@ -194,6 +194,16 @@ fn key_to_action(code: KeyCode) -> Option<Action> {
         // the gap. (X is taken by the split panel, `x` by delete-note.)
         KeyCode::Char('A') => Action::InsertBar,
         KeyCode::Char('Z') => Action::RemoveBar,
+        // Per-bar length by one grid STEP — moves the bar LINES only, no
+        // notes/time (Q shorter / W longer; use </> for finer/coarser steps).
+        // Per-bar tempo re-times the notes inside (e faster / r slower) — the
+        // four bar ops sit on the QWER row. (F/V are taken by the split panel
+        // and video backdrop in the Tauri frontend, so tempo uses e/r there and
+        // here to stay in lockstep.)
+        KeyCode::Char('Q') => Action::NudgeBarLength { delta_steps: -1 },
+        KeyCode::Char('W') => Action::NudgeBarLength { delta_steps: 1 },
+        KeyCode::Char('e') => Action::NudgeBarTempo { delta: -1 },
+        KeyCode::Char('r') => Action::NudgeBarTempo { delta: 1 },
         KeyCode::Char(']') => Action::ResizeNote { delta_steps: 1 },
         KeyCode::Char('[') => Action::ResizeNote { delta_steps: -1 },
         KeyCode::Char('+') | KeyCode::Char('=') => Action::AdjustVelocity {
@@ -415,7 +425,7 @@ pub struct EditScreen {
     prev_playhead_us: u64,
     /// Backing offset at the previous `poll_backing`; a change while playing
     /// (an alignment nudge) triggers a re-seek so the shift is audible at once.
-    prev_offset_us: u64,
+    prev_offset_us: i64,
     /// Background image sources carried for save/split round-trip (M14-D), one
     /// per layer in the composer's stack. The TUI renders none of them.
     background_srcs: Vec<BackgroundSrc>,
@@ -508,7 +518,7 @@ impl EditScreen {
     /// Attach a backing audio track that plays in lock-step with the transport.
     /// `audio_start_us` is the file position lining up with song time 0 (default
     /// 0; M5-E makes it adjustable). Builder form, mirroring `PlayScreen`.
-    pub fn with_backing(mut self, path: PathBuf, audio_start_us: u64) -> Self {
+    pub fn with_backing(mut self, path: PathBuf, audio_start_us: i64) -> Self {
         self.backing = Some(Backing { path });
         // The offset is composer state (editable + snapshot-visible); seed it
         // from the loaded value so a reopened bundle restores its alignment.
@@ -690,6 +700,7 @@ impl EditScreen {
             // The piece's authored hand assignment (M14-E).
             hand_split: Some(self.composer.hand_split()),
             hand_overrides: self.composer.timeline().hand_overrides(),
+            bar_starts: self.composer.bar_starts().to_vec(),
             version: 1,
         };
         std::fs::write(bundle_dir.join("meta.json"), meta.to_json())?;
@@ -1873,7 +1884,7 @@ impl EditScreen {
                 format!(
                     "backing {} {:+}ms [,/.·;/'·B]  ",
                     name,
-                    self.composer.backing_offset_us() as i64 / 1000
+                    self.composer.backing_offset_us() / 1000
                 ),
                 Style::default().fg(Color::Cyan),
             )
@@ -1913,7 +1924,7 @@ impl EditScreen {
             ),
             vel_span,
             Span::styled(
-                "[a/x] add/del  [A/Z] insert/cut bar  []/[] size  [+/-] vel  [(/)] tempo  [T] set BPM  [:/\"] origin  [I/O] origin±  [m] grab  [n] hand  [c] chord  [v] select  [y/p/D] yank/paste/del  [u/U] undo/redo  [R] rec  [t] step/live  [C] count-in  [Space] play/stop  [P] play-start  [o] loop  [{/}] loop in/out  [M] metro  [>/<] subdiv  [hjkl] pitch/time  [H/L] bar  [w/b] oct  [g/G] timeline ends  [0/$] pitch ends  [s] save  [S] save to library  [X] split  [Tab] menu",
+                "[a/x] add/del  [A/Z] insert/cut bar  [Q/W] bar -/+ step  [e/r] bar faster/slower  []/[] size  [+/-] vel  [(/)] tempo  [T] set BPM  [:/\"] origin  [I/O] origin±  [m] grab  [n] hand  [c] chord  [v] select  [y/p/D] yank/paste/del  [u/U] undo/redo  [R] rec  [t] step/live  [C] count-in  [Space] play/stop  [P] play-start  [o] loop  [{/}] loop in/out  [M] metro  [>/<] subdiv  [hjkl] pitch/time  [H/L] bar  [w/b] oct  [g/G] timeline ends  [0/$] pitch ends  [s] save  [S] save to library  [X] split  [Tab] menu",
                 Style::default().fg(Color::DarkGray),
             ),
         ]);
@@ -4528,10 +4539,11 @@ mod tests {
         // Fine earlier (-10ms).
         e.on_key(KeyCode::Char(','));
         assert_eq!(e.composer.backing_offset_us(), 250_000);
-        // Coarse earlier twice clamps at 0 (never negative).
+        // Coarse earlier twice goes negative — a negative offset delays the
+        // audio (silent lead-in), no longer clamped at 0.
         e.on_key(KeyCode::Char(';'));
         e.on_key(KeyCode::Char(';'));
-        assert_eq!(e.composer.backing_offset_us(), 0);
+        assert_eq!(e.composer.backing_offset_us(), -250_000);
     }
 
     #[test]

@@ -110,6 +110,14 @@ struct NoteSpan {
 
 /// The pure composer state machine. See the module docs for the contract.
 pub struct Composer {
+    /// Variable-tempo map: `bar_starts[b]` is the song-time (µs) of bar `b`'s
+    /// downbeat. **Empty means a uniform grid** (legacy / composed pieces) — every
+    /// positional query then reproduces [`Grid`]'s constant-tempo math exactly, so
+    /// behaviour is unchanged when there is no map. A populated map lets the bar
+    /// lines follow a performance whose tempo breathes (e.g. an imported chart
+    /// warped to a recording). The metre/subdivision stay fixed, so only bar
+    /// *durations* vary; steps-per-bar is constant. Persisted in `RecordingMeta`.
+    bar_starts: Vec<u64>,
     history: History,
     grid: Grid,
     cursor: Cursor,
@@ -169,7 +177,7 @@ pub struct Composer {
     /// time 0. Adjusted by [`Action::NudgeBackingOffset`] and consumed by the
     /// frontend's [`crate::backing_position_us`] seek. Pure state: the composer
     /// owns no audio, only the number frontends and `query state` read.
-    backing_offset_us: u64,
+    backing_offset_us: i64,
 
     // ── background images (M14-D) ───────────────────────────────────────────
     /// The piece's background image layers plus the one edit actions address.
@@ -226,6 +234,7 @@ impl Composer {
         Self {
             history: History::new(timeline, HISTORY_CAPACITY),
             grid,
+            bar_starts: Vec::new(),
             cursor: Cursor {
                 pitch: DEFAULT_CURSOR_PITCH,
                 step: 0,
@@ -319,14 +328,14 @@ impl Composer {
 
     /// The backing-track alignment offset (`audio_start_us`): the file position
     /// lining up with song time 0. Frontends read this to seek the audio.
-    pub fn backing_offset_us(&self) -> u64 {
+    pub fn backing_offset_us(&self) -> i64 {
         self.backing_offset_us
     }
 
     /// Set the backing-track alignment offset, e.g. when loading a bundle whose
     /// `meta.json` declared one. Live editing goes through
-    /// [`Action::NudgeBackingOffset`] instead.
-    pub fn set_backing_offset_us(&mut self, us: u64) {
+    /// [`Action::NudgeBackingOffset`] instead. May be negative (delays the audio).
+    pub fn set_backing_offset_us(&mut self, us: i64) {
         self.backing_offset_us = us;
     }
 
@@ -533,6 +542,9 @@ impl Composer {
             // ── time / structure (ripple insert & cut) ──────────────────
             Action::InsertBar => self.insert_bar(),
             Action::RemoveBar => self.remove_bar(),
+            Action::NudgeTail { delta_steps } => self.nudge_tail(delta_steps),
+            Action::NudgeBarTempo { delta } => self.nudge_bar_tempo(delta),
+            Action::NudgeBarLength { delta_steps } => self.nudge_bar_length(delta_steps),
 
             Action::ToggleGrab => self.toggle_grab(),
             Action::InsertRun {
@@ -544,18 +556,8 @@ impl Composer {
             // Tempo lives in the grid (single source of truth, persisted in
             // RecordingMeta.grid). Changing it re-snaps the cursor so its
             // position holds steady across the new step spacing.
-            Action::AdjustBpm { delta } => {
-                let cursor_us = self.cursor_us();
-                self.grid.adjust_bpm(delta);
-                self.resnap_cursor_from_us(cursor_us);
-                Vec::new()
-            }
-            Action::SetBpm { bpm } => {
-                let cursor_us = self.cursor_us();
-                self.grid.set_bpm(bpm);
-                self.resnap_cursor_from_us(cursor_us);
-                Vec::new()
-            }
+            Action::AdjustBpm { delta } => self.retempo(|g| g.adjust_bpm(delta)),
+            Action::SetBpm { bpm } => self.retempo(|g| g.set_bpm(bpm)),
             Action::SetTimeSig {
                 beats_per_bar,
                 beat_unit,
@@ -637,12 +639,11 @@ impl Composer {
             }
 
             // ── backing alignment ───────────────────────────────────────
-            // Slide the backing offset, clamped at 0 (it can never be
-            // negative). Frontends re-seek the audio to the new mapping.
+            // Slide the backing offset. May go negative — that delays the audio,
+            // holding the backing silent until its start lines up with the
+            // highway. Frontends re-seek the audio to the new mapping.
             Action::NudgeBackingOffset { delta_us } => {
-                self.backing_offset_us = (self.backing_offset_us as i64)
-                    .saturating_add(delta_us)
-                    .max(0) as u64;
+                self.backing_offset_us = self.backing_offset_us.saturating_add(delta_us);
                 Vec::new()
             }
 
@@ -883,6 +884,7 @@ impl Composer {
             frozen: self.wait_frozen,
             awaiting: self.awaiting_notes(),
             hand_split: self.hand_split,
+            bar_starts: self.bar_starts.clone(),
         }
     }
 
@@ -933,46 +935,149 @@ impl Composer {
         self.timeline().len()
     }
 
-    /// Song-time of the start of the bar the cursor sits in, honouring the grid's
-    /// phase [`origin_us`](crate::Grid). Used by the ripple bar edits.
-    fn cursor_bar_start_us(&self) -> u64 {
-        let bar_us = self.grid.bar_us().max(1);
-        let origin = self.grid.origin_us;
-        let rel = self.cursor_us().saturating_sub(origin);
-        origin + (rel / bar_us) * bar_us
-    }
-
     /// Insert one empty bar at the cursor's bar boundary: every note starting at
-    /// or after that boundary slides one bar later, opening a silent bar. Ripple
-    /// edit — the tail keeps its internal timing. One undo checkpoint.
+    /// or after that boundary slides one (local-length) bar later, opening a
+    /// silent bar. Ripple edit — the tail keeps its internal timing. Under a tempo
+    /// map the map gains a matching boundary. One undo checkpoint.
     fn insert_bar(&mut self) -> Vec<Effect> {
-        let bar_us = self.grid.bar_us();
-        if bar_us == 0 {
+        let bar = self.bar_at_us(self.cursor_us());
+        let at = self.bar_start_us(bar);
+        let dur = self.bar_dur_us(bar);
+        if dur == 0 {
             return Vec::new();
         }
-        let at = self.cursor_bar_start_us();
         self.history.checkpoint();
-        self.history.current_mut().shift_from(at, bar_us as i64);
+        self.history.current_mut().shift_from(at, dur as i64);
+        // Keep the tempo map consistent: later boundaries slide, a new one appears.
+        if (bar as usize) < self.bar_starts.len() {
+            for t in self.bar_starts.iter_mut() {
+                if *t > at {
+                    *t = t.saturating_add(dur);
+                }
+            }
+            let idx = ((bar + 1) as usize).min(self.bar_starts.len());
+            self.bar_starts.insert(idx, at + dur);
+        }
         Vec::new()
     }
 
     /// Cut the bar the cursor sits in: delete every note that starts within it,
-    /// then slide everything after it one bar earlier so no gap is left. Ripple
-    /// edit. Clears any grab/selection (their targets may have moved or gone).
-    /// One undo checkpoint.
+    /// then slide everything after it one (local-length) bar earlier so no gap is
+    /// left. Ripple edit; drops the matching tempo-map boundary. Clears any
+    /// grab/selection (their targets may have moved or gone). One undo checkpoint.
     fn remove_bar(&mut self) -> Vec<Effect> {
-        let bar_us = self.grid.bar_us();
-        if bar_us == 0 {
+        let bar = self.bar_at_us(self.cursor_us());
+        let start = self.bar_start_us(bar);
+        let dur = self.bar_dur_us(bar);
+        if dur == 0 {
             return Vec::new();
         }
-        let start = self.cursor_bar_start_us();
-        let end = start + bar_us;
+        let end = start + dur;
         self.history.checkpoint();
         let tl = self.history.current_mut();
         tl.remove_in(start, end);
-        tl.shift_from(end, -(bar_us as i64));
+        tl.shift_from(end, -(dur as i64));
+        if (bar as usize) < self.bar_starts.len() {
+            let rem = (bar + 1) as usize;
+            if rem < self.bar_starts.len() {
+                self.bar_starts.remove(rem);
+            }
+            for t in self.bar_starts.iter_mut() {
+                if *t > start {
+                    *t = t.saturating_sub(dur);
+                }
+            }
+        }
         self.grabbed = None;
         self.selection_anchor = None;
+        Vec::new()
+    }
+
+    /// Ripple-shift every note at or after the cursor by `delta_steps` grid steps
+    /// (signed) — re-phases the rest of the song against the grid in one move.
+    /// Undoable (a plain timeline edit).
+    fn nudge_tail(&mut self, delta_steps: i32) -> Vec<Effect> {
+        let from = self.cursor_us();
+        let target = (self.cursor.step as i64 + delta_steps as i64).max(0) as u64;
+        let delta = self.pos_us_of_step(target) as i64 - from as i64;
+        if delta == 0 {
+            return Vec::new();
+        }
+        self.history.checkpoint();
+        self.history.current_mut().shift_from(from, delta);
+        Vec::new()
+    }
+
+    /// Populate the tempo map with the piece's current (uniform) bar times so a
+    /// single bar's length can then be changed. No-op if a map already exists.
+    fn ensure_bar_map(&mut self) {
+        if !self.bar_starts.is_empty() {
+            return;
+        }
+        let end_us = self
+            .timeline()
+            .notes()
+            .map(|(_, n)| n.start_us + n.dur_us)
+            .max()
+            .unwrap_or(0);
+        let nbars = self.bar_at_us(end_us) + 2;
+        self.bar_starts = (0..=nbars).map(|b| self.grid.us_of_bar(b)).collect();
+    }
+
+    /// Slow (`delta > 0`) or speed (`delta < 0`) the cursor's bar by `delta` grid
+    /// steps of length: the notes inside re-time to stay on their beats and
+    /// everything after ripples by the change. Re-times the whole undo history so
+    /// undo/redo stay aligned (the tempo edit is not itself an undo step).
+    fn nudge_bar_tempo(&mut self, delta: i32) -> Vec<Effect> {
+        if delta == 0 {
+            return Vec::new();
+        }
+        self.ensure_bar_map();
+        let bar = self.bar_at_us(self.cursor_us());
+        let bstart = self.bar_start_us(bar);
+        let old_dur = self.bar_dur_us(bar);
+        let step = (old_dur / self.steps_per_bar()).max(1);
+        let new_dur = ((old_dur as i64) + delta as i64 * step as i64).max(step as i64) as u64;
+        if new_dur == old_dur {
+            return Vec::new();
+        }
+        let shift = new_dur as i64 - old_dur as i64;
+        self.history.retempo_bar_all(bstart, old_dur, new_dur);
+        for t in self.bar_starts.iter_mut() {
+            if *t > bstart {
+                *t = t.saturating_add_signed(shift);
+            }
+        }
+        Vec::new()
+    }
+
+    /// Change the length of the cursor's bar by `delta_steps` grid steps (at the
+    /// live subdivision) and slide every bar line after it by the same amount —
+    /// **without moving any note**. For an odd-length measure (e.g. a 2-beat bar
+    /// in 3/4) the notes stay put and the bar lines re-align to them; the step
+    /// size follows the subdivision, so a finer subdivision gives a finer nudge.
+    /// Clamps so the bar keeps at least one step.
+    fn nudge_bar_length(&mut self, delta_steps: i32) -> Vec<Effect> {
+        if delta_steps == 0 {
+            return Vec::new();
+        }
+        self.ensure_bar_map();
+        let bar = self.bar_at_us(self.cursor_us());
+        let bstart = self.bar_start_us(bar);
+        let old_dur = self.bar_dur_us(bar);
+        let step = self.grid.step_us().max(1);
+        let mut shift = delta_steps as i64 * step as i64;
+        if old_dur as i64 + shift < step as i64 {
+            shift = step as i64 - old_dur as i64; // don't shrink below one step
+        }
+        if shift == 0 {
+            return Vec::new();
+        }
+        for t in self.bar_starts.iter_mut() {
+            if *t > bstart {
+                *t = t.saturating_add_signed(shift);
+            }
+        }
         Vec::new()
     }
 
@@ -987,9 +1092,10 @@ impl Composer {
     /// delete) find nothing. See [`Timeline::find_starting_in`].
     pub fn note_under_cursor(&self) -> Option<NoteId> {
         let us = self.cursor_us();
+        let cell_end = self.pos_us_of_step(self.cursor.step + 1);
         self.timeline().find_at(self.cursor.pitch, us).or_else(|| {
             self.timeline()
-                .find_starting_in(self.cursor.pitch, us, us + self.grid.step_us())
+                .find_starting_in(self.cursor.pitch, us, cell_end)
         })
     }
 
@@ -1065,9 +1171,8 @@ impl Composer {
         if let Some(id) = self.grabbed {
             self.history.checkpoint();
             let new_step = self.cursor.step.saturating_sub(1);
-            self.history
-                .current_mut()
-                .set_start(id, self.grid.us_of_step(new_step));
+            let new_us = self.pos_us_of_step(new_step);
+            self.history.current_mut().set_start(id, new_us);
             self.cursor.step = new_step;
             self.audition_note(id)
         } else {
@@ -1081,9 +1186,8 @@ impl Composer {
         if let Some(id) = self.grabbed {
             self.history.checkpoint();
             let new_step = self.cursor.step + 1;
-            self.history
-                .current_mut()
-                .set_start(id, self.grid.us_of_step(new_step));
+            let new_us = self.pos_us_of_step(new_step);
+            self.history.current_mut().set_start(id, new_us);
             self.cursor.step = new_step;
             self.audition_note(id)
         } else {
@@ -1178,7 +1282,7 @@ impl Composer {
             } else {
                 start_step
             };
-            let start_us = self.grid.us_of_step(step);
+            let start_us = self.pos_us_of_step(step);
             if let Some(id) = self.timeline().find_at(pitch_val, start_us) {
                 self.history.current_mut().remove(id);
                 if self.grabbed == Some(id) {
@@ -1496,7 +1600,7 @@ impl Composer {
         if self.counting_in {
             return;
         }
-        let at = self.grid.snap(self.record_playhead_us);
+        let at = self.pos_snap(self.record_playhead_us);
         match ev.kind {
             NoteEventKind::On { velocity } if !velocity.is_note_off() => {
                 self.live_pending.push((ev.note, at, velocity));
@@ -1744,9 +1848,9 @@ impl Composer {
         let pitch_hi = anchor.pitch.max(self.cursor.pitch);
         let step_lo = anchor.step.min(self.cursor.step);
         let step_hi = anchor.step.max(self.cursor.step);
-        let us_lo = self.grid.us_of_step(step_lo);
+        let us_lo = self.pos_us_of_step(step_lo);
         // Include the whole last step so a single-step selection is non-empty.
-        let us_hi = self.grid.us_of_step(step_hi) + self.grid.step_us();
+        let us_hi = self.pos_us_of_step(step_hi + 1);
         Some((pitch_lo, pitch_hi, us_lo, us_hi))
     }
 
@@ -1825,7 +1929,127 @@ impl Composer {
 
     /// Steps per bar = `bar_us / step_us` (at least 1).
     fn steps_per_bar(&self) -> u64 {
-        (self.grid.bar_us() / self.grid.step_us()).max(1)
+        (self.grid.bar_us() / self.grid.step_us().max(1)).max(1)
+    }
+
+    // ── tempo map (variable bar durations) ──────────────────────────────
+    // When `bar_starts` is empty every method below delegates to `Grid`'s
+    // uniform math, so the un-mapped (legacy) behaviour is byte-identical.
+
+    /// Downbeat time (µs) of bar `bar`. From the map when present; bars past its
+    /// end extrapolate with the last mapped bar's duration; falls back to the
+    /// uniform grid when there is no usable map.
+    fn bar_start_us(&self, bar: u64) -> u64 {
+        if let Some(&t) = self.bar_starts.get(bar as usize) {
+            return t;
+        }
+        let n = self.bar_starts.len();
+        if n >= 2 {
+            let dur = self.bar_starts[n - 1]
+                .saturating_sub(self.bar_starts[n - 2])
+                .max(1);
+            return self.bar_starts[n - 1] + (bar - (n as u64 - 1)) * dur;
+        }
+        self.grid.us_of_bar(bar)
+    }
+
+    /// Duration (µs) of bar `bar`.
+    fn bar_dur_us(&self, bar: u64) -> u64 {
+        self.bar_start_us(bar + 1)
+            .saturating_sub(self.bar_start_us(bar))
+            .max(1)
+    }
+
+    /// Bar index containing song time `us` (tempo-map aware).
+    fn bar_at_us(&self, us: u64) -> u64 {
+        let n = self.bar_starts.len();
+        if n >= 2 {
+            if us < self.bar_starts[0] {
+                return 0;
+            }
+            if us >= self.bar_starts[n - 1] {
+                let dur = self.bar_starts[n - 1]
+                    .saturating_sub(self.bar_starts[n - 2])
+                    .max(1);
+                return (n as u64 - 1) + (us - self.bar_starts[n - 1]) / dur;
+            }
+            return match self.bar_starts.binary_search(&us) {
+                Ok(i) => i as u64,
+                Err(i) => (i - 1) as u64,
+            };
+        }
+        let bar_us = self.grid.bar_us().max(1);
+        us.saturating_sub(self.grid.origin_us) / bar_us
+    }
+
+    /// Song time (µs) of grid `step` — tempo-map aware. Bar `step / spb`, then a
+    /// fraction of that bar's (variable) duration for the sub-step.
+    fn pos_us_of_step(&self, step: u64) -> u64 {
+        if self.bar_starts.is_empty() {
+            return self.grid.us_of_step(step);
+        }
+        let spb = self.steps_per_bar();
+        let bar = step / spb;
+        let sub = step % spb;
+        self.bar_start_us(bar) + sub * self.bar_dur_us(bar) / spb
+    }
+
+    /// Grid step nearest song time `us` — the inverse of [`pos_us_of_step`].
+    fn pos_step_index(&self, us: u64) -> u64 {
+        if self.bar_starts.is_empty() {
+            return self.grid.step_index(us);
+        }
+        let spb = self.steps_per_bar();
+        let bar = self.bar_at_us(us);
+        let bd = self.bar_dur_us(bar);
+        let sub = (us.saturating_sub(self.bar_start_us(bar)) * spb + bd / 2) / bd;
+        bar * spb + sub.min(spb)
+    }
+
+    /// Snap `us` to the nearest grid line at the live subdivision — tempo-aware.
+    fn pos_snap(&self, us: u64) -> u64 {
+        if self.bar_starts.is_empty() {
+            return self.grid.snap(us);
+        }
+        self.pos_us_of_step(self.pos_step_index(us))
+    }
+
+    /// Apply a tempo change and **re-time the notes to follow it**, so a note on
+    /// beat *b* stays on beat *b* (the piece speeds up / slows down rather than
+    /// the bar lines sliding out from under fixed notes). Every note time, the
+    /// grid phase, the loop bounds, and the tempo map scale by `old_bpm/new_bpm`;
+    /// the whole undo history scales too, so undo/redo stay aligned at the new
+    /// tempo. The cursor stays on its (beat-relative) step. A no-op if the tempo
+    /// is unchanged (e.g. already clamped at a bound).
+    fn retempo(&mut self, change: impl FnOnce(&mut Grid)) -> Vec<Effect> {
+        let old = self.grid.bpm.max(1);
+        change(&mut self.grid);
+        let new = self.grid.bpm.max(1);
+        if new == old {
+            return Vec::new();
+        }
+        let sc = |us: u64| ((us as u128 * old as u128 + (new as u128) / 2) / new as u128) as u64;
+        self.history.scale_all_times(old as u64, new as u64);
+        self.grid.origin_us = sc(self.grid.origin_us);
+        self.loop_start_us = sc(self.loop_start_us);
+        self.loop_end_us = sc(self.loop_end_us);
+        for t in self.bar_starts.iter_mut() {
+            *t = sc(*t);
+        }
+        Vec::new()
+    }
+
+    /// The tempo map, for persistence. Empty for a uniform-grid piece.
+    pub fn bar_starts(&self) -> &[u64] {
+        &self.bar_starts
+    }
+
+    /// Replace the tempo map (bar downbeat times, ascending). Empty = uniform.
+    /// Re-snaps the cursor so it stays on a grid line under the new map.
+    pub fn set_bar_starts(&mut self, bars: Vec<u64>) {
+        let us = self.cursor_us();
+        self.bar_starts = bars;
+        self.cursor.step = self.pos_step_index(us);
     }
 
     /// Grid step of the last note's end (0 for an empty timeline) — the `$` jump.
@@ -1836,7 +2060,7 @@ impl Composer {
             .map(|(_, n)| n.start_us + n.dur_us)
             .max()
             .unwrap_or(0);
-        self.grid.step_index(end_us)
+        self.pos_step_index(end_us)
     }
 
     /// Change to a finer subdivision, re-snapping the cursor to the new grid.
@@ -1856,21 +2080,19 @@ impl Composer {
     /// Re-snap the cursor to the nearest grid line given a µs position from the
     /// previous grid.
     fn resnap_cursor_from_us(&mut self, cursor_us: u64) {
-        let snapped_us = self.grid.snap(cursor_us);
-        self.cursor.step = self.grid.step_index(snapped_us);
+        let snapped_us = self.pos_snap(cursor_us);
+        self.cursor.step = self.pos_step_index(snapped_us);
     }
 
     /// Bar bounds `(start_us, end_us)` for the bar containing the cursor.
     fn current_bar_bounds(&self) -> (u64, u64) {
-        let bar_us = self.grid.bar_us();
-        let cursor_us = self.cursor_us();
-        let bar_start = cursor_us / bar_us * bar_us;
-        (bar_start, bar_start + bar_us)
+        let bar = self.bar_at_us(self.cursor_us());
+        (self.bar_start_us(bar), self.bar_start_us(bar + 1))
     }
 
     /// Microsecond position of the cursor on the time axis.
     fn cursor_us(&self) -> u64 {
-        self.grid.us_of_step(self.cursor.step)
+        self.pos_us_of_step(self.cursor.step)
     }
 }
 
@@ -1931,7 +2153,9 @@ pub struct ComposerSnapshot {
     pub clipboard_len: usize,
     /// Backing-track alignment offset (`audio_start_us`): the file position that
     /// lines up with song time 0. `0` when no backing or no nudge applied.
-    pub backing_offset_us: u64,
+    /// **May be negative** — a negative value delays the audio (silent until its
+    /// start reaches the highway).
+    pub backing_offset_us: i64,
     /// Background image layers with each transform **already evaluated** at the
     /// playhead, back-to-front. Empty for pieces without any. Frontends render
     /// these verbatim — the interpolation math lives in `core`.
@@ -1963,6 +2187,12 @@ pub struct ComposerSnapshot {
     /// [`NoteView::hand`] for a note's effective hand.
     #[serde(default = "default_hand_split")]
     pub hand_split: u8,
+    /// Variable-tempo map: song-time (µs) of each bar's downbeat. **Empty means a
+    /// uniform grid** — frontends then space bar/beat lines by the constant
+    /// `bpm`/`time_sig`/`subdivision`. When populated (e.g. a chart warped to a
+    /// recording), the lines follow it so bars land on the performance.
+    #[serde(default)]
+    pub bar_starts: Vec<u64>,
 }
 
 /// Serde default for [`ComposerSnapshot::hand_split`] so older snapshots (no
@@ -2324,6 +2554,195 @@ mod tests {
             vec![(60, 0), (62, 2 * bar), (64, 3 * bar)],
             "bar-0 untouched; bars 1 and 2 pushed one bar later"
         );
+    }
+
+    #[test]
+    fn nudge_tail_ripples_notes_at_or_after_the_cursor() {
+        let grid = Grid {
+            bpm: 120,
+            time_sig: TimeSig {
+                beats_per_bar: 4,
+                beat_unit: 4,
+            },
+            subdivision: Subdivision::Quarter,
+            origin_us: 0,
+        };
+        let mut tl = Timeline::new();
+        tl.insert(note(60, 0, 100_000));
+        tl.insert(note(62, 1_000_000, 100_000));
+        tl.insert(note(64, 2_000_000, 100_000));
+        let mut c = Composer::from_timeline(tl, grid);
+        // Cursor at step 3 (1.5s). Nudge the tail +1 step (+500ms).
+        apply(&mut c, Action::SetCursor { pitch: 60, step: 3 });
+        apply(&mut c, Action::NudgeTail { delta_steps: 1 });
+        let mut starts: Vec<(u8, u64)> = c
+            .timeline()
+            .notes()
+            .map(|(_, n)| (n.pitch.value(), n.start_us))
+            .collect();
+        starts.sort();
+        assert_eq!(
+            starts,
+            vec![(60, 0), (62, 1_000_000), (64, 2_500_000)],
+            "only notes at/after 1.5s shift +500ms"
+        );
+        apply(&mut c, Action::Undo);
+        assert_eq!(
+            c.timeline()
+                .notes()
+                .find(|(_, n)| n.pitch.value() == 64)
+                .unwrap()
+                .1
+                .start_us,
+            2_000_000,
+            "nudge_tail is undoable"
+        );
+    }
+
+    #[test]
+    fn nudge_bar_tempo_stretches_the_cursor_bar_and_ripples() {
+        let grid = Grid {
+            bpm: 120,
+            time_sig: TimeSig {
+                beats_per_bar: 4,
+                beat_unit: 4,
+            },
+            subdivision: Subdivision::Quarter,
+            origin_us: 0,
+        };
+        let mut tl = Timeline::new();
+        tl.insert(note(60, 1_000_000, 100_000)); // bar 0 (beat 2)
+        tl.insert(note(62, 2_000_000, 100_000)); // bar 1 downbeat
+        tl.insert(note(64, 4_000_000, 100_000)); // bar 2 downbeat
+        let mut c = Composer::from_timeline(tl, grid);
+        apply(&mut c, Action::SetCursor { pitch: 60, step: 1 }); // inside bar 0
+                                                                 // Slow bar 0 by one step (bar 2s → 2.5s).
+        apply(&mut c, Action::NudgeBarTempo { delta: 1 });
+        let s = |c: &Composer, p: u8| {
+            c.timeline()
+                .notes()
+                .find(|(_, n)| n.pitch.value() == p)
+                .unwrap()
+                .1
+                .start_us
+        };
+        assert_eq!(s(&c, 60), 1_250_000, "in-bar note scales to the longer bar");
+        assert_eq!(s(&c, 62), 2_500_000, "bar-1 downbeat ripples +500ms");
+        assert_eq!(s(&c, 64), 4_500_000, "everything after ripples too");
+        // The tempo map now marks bar 1 starting at 2.5s.
+        assert_eq!(c.bar_starts()[1], 2_500_000);
+    }
+
+    #[test]
+    fn nudge_bar_length_moves_bar_lines_not_notes() {
+        let grid = Grid {
+            bpm: 120,
+            time_sig: TimeSig {
+                beats_per_bar: 3,
+                beat_unit: 4,
+            },
+            subdivision: Subdivision::Quarter,
+            origin_us: 0,
+        };
+        // bar = 1.5s, beat = 0.5s
+        let mut tl = Timeline::new();
+        tl.insert(note(60, 0, 100_000));
+        tl.insert(note(62, 1_500_000, 100_000));
+        tl.insert(note(64, 3_000_000, 100_000));
+        let mut c = Composer::from_timeline(tl, grid);
+        apply(&mut c, Action::SetCursor { pitch: 60, step: 0 }); // in bar 0
+                                                                 // At Quarter subdivision one step == one beat, so -1 step trims a beat.
+        apply(&mut c, Action::NudgeBarLength { delta_steps: -1 }); // 3-beat bar → 2-beat
+        let mut starts: Vec<(u8, u64)> = c
+            .timeline()
+            .notes()
+            .map(|(_, n)| (n.pitch.value(), n.start_us))
+            .collect();
+        starts.sort();
+        assert_eq!(
+            starts,
+            vec![(60, 0), (62, 1_500_000), (64, 3_000_000)],
+            "no note moves"
+        );
+        // Bar lines after bar 0 slide one beat earlier so they land on the notes.
+        assert_eq!(c.bar_starts()[1], 1_000_000, "bar-1 line moved -1 beat");
+        assert_eq!(c.bar_starts()[2], 2_500_000);
+    }
+
+    #[test]
+    fn tempo_change_retimes_notes_and_history_stays_aligned() {
+        let grid = Grid {
+            bpm: 120,
+            time_sig: TimeSig {
+                beats_per_bar: 4,
+                beat_unit: 4,
+            },
+            subdivision: Subdivision::Quarter,
+            origin_us: 0,
+        };
+        let mut tl = Timeline::new();
+        tl.insert(note(60, 1_000_000, 500_000)); // beat 2 at 120 BPM
+        let mut c = Composer::from_timeline(tl, grid);
+        // An undoable edit, so the history holds a past snapshot to check.
+        apply(&mut c, Action::SetCursor { pitch: 64, step: 0 });
+        apply(&mut c, Action::AddNote);
+        // Double the tempo: note times halve so beats are preserved.
+        apply(&mut c, Action::SetBpm { bpm: 240 });
+        assert_eq!(c.snapshot().bpm, 240.0);
+        let s = |c: &Composer, p: u8| {
+            c.timeline()
+                .notes()
+                .find(|(_, n)| n.pitch.value() == p)
+                .unwrap()
+                .1
+                .start_us
+        };
+        assert_eq!(
+            s(&c, 60),
+            500_000,
+            "note re-timed to keep beat 2 (500ms @240)"
+        );
+        // Undo the add: the earlier snapshot was scaled too, so the surviving
+        // note stays tempo-consistent (not back at its pre-scale 1s position).
+        apply(&mut c, Action::Undo);
+        assert_eq!(s(&c, 60), 500_000, "undo restores a tempo-aligned snapshot");
+    }
+
+    #[test]
+    fn tempo_map_makes_grid_positions_follow_variable_bar_lengths() {
+        // 4/4 @120, quarter subdivision → 4 steps per bar.
+        let grid = Grid {
+            bpm: 120,
+            time_sig: TimeSig {
+                beats_per_bar: 4,
+                beat_unit: 4,
+            },
+            subdivision: Subdivision::Quarter,
+            origin_us: 0,
+        };
+        let mut c = Composer::from_timeline(Timeline::new(), grid);
+        // bar 0: [0,1s) (fast), bar 1: [1s,3s) (slow), bar 2 starts at 3s.
+        c.set_bar_starts(vec![0, 1_000_000, 3_000_000]);
+        // Downbeats follow the map, not the uniform 2s bar.
+        assert_eq!(c.pos_us_of_step(0), 0);
+        assert_eq!(c.pos_us_of_step(4), 1_000_000, "bar 1 downbeat");
+        assert_eq!(c.pos_us_of_step(8), 3_000_000, "bar 2 downbeat");
+        // Sub-steps split each bar's own (variable) duration.
+        assert_eq!(c.pos_us_of_step(2), 500_000); // bar 0 is 1s / 4 * 2
+        assert_eq!(c.pos_us_of_step(6), 2_000_000); // bar 1 is 2s / 4 * 2 past 1s
+                                                    // Inverse round-trips.
+        for step in [0u64, 2, 4, 6, 8, 9] {
+            assert_eq!(
+                c.pos_step_index(c.pos_us_of_step(step)),
+                step,
+                "step {step}"
+            );
+        }
+        // Bar bounds honour the map.
+        c.apply(Action::SetCursor { pitch: 60, step: 6 }).unwrap(); // inside bar 1
+        assert_eq!(c.current_bar_bounds(), (1_000_000, 3_000_000));
+        // Past the mapped end, bars extrapolate with the last bar's length (2s).
+        assert_eq!(c.pos_us_of_step(12), 5_000_000, "bar 3 extrapolated");
     }
 
     #[test]
@@ -3463,15 +3882,15 @@ mod tests {
         apply(&mut c, Action::NudgeBackingOffset { delta_us: -10_000 });
         assert_eq!(c.backing_offset_us(), 250_000);
 
-        // It clamps at 0 — never negative.
+        // It may go negative — a negative offset delays the audio (silent lead-in).
         apply(
             &mut c,
             Action::NudgeBackingOffset {
                 delta_us: -1_000_000,
             },
         );
-        assert_eq!(c.backing_offset_us(), 0);
-        assert_eq!(c.snapshot().backing_offset_us, 0);
+        assert_eq!(c.backing_offset_us(), -750_000);
+        assert_eq!(c.snapshot().backing_offset_us, -750_000);
     }
 
     #[test]

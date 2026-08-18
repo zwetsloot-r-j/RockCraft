@@ -258,6 +258,29 @@ pub enum Action {
     /// slide everything after one bar earlier, leaving no gap. Ripple edit; the
     /// inverse of [`InsertBar`](Action::InsertBar) plus the deletion.
     RemoveBar,
+    /// Ripple-shift **everything at or after the cursor** by `delta_steps` grid
+    /// steps (signed), re-phasing the rest of the song against the grid/backing in
+    /// one move. The one-shot fix for a constant timing offset that begins at a
+    /// point (e.g. an added/dropped beat). Notes before the cursor are untouched.
+    NudgeTail {
+        delta_steps: i32,
+    },
+    /// Slow (`delta > 0`) or speed (`delta < 0`) the **bar the cursor sits in** by
+    /// `delta` grid steps of length, re-timing the notes inside it to stay on
+    /// their beats and rippling everything after by the change. Builds/uses the
+    /// per-bar tempo map, so bar lines stay put where the tempo isn't touched.
+    NudgeBarTempo {
+        delta: i32,
+    },
+    /// Change the length of the bar the cursor sits in by `delta_steps` grid
+    /// steps (at the live subdivision), sliding every **bar line after it** by
+    /// that amount. Purely a grid edit — **no note is moved and no time is added
+    /// or removed** — for fixing an odd-length measure so the bar lines land back
+    /// on the (fixed) notes. The step size follows the subdivision, so `<`/`>`
+    /// gives finer/coarser control (down to a 1/32 note). Uses the tempo map.
+    NudgeBarLength {
+        delta_steps: i32,
+    },
 
     // ── history ─────────────────────────────────────────────────────────
     Undo,
@@ -341,6 +364,9 @@ impl Action {
             Action::CycleNoteHand => "cycle_note_hand",
             Action::InsertBar => "insert_bar",
             Action::RemoveBar => "remove_bar",
+            Action::NudgeTail { .. } => "nudge_tail",
+            Action::NudgeBarTempo { .. } => "nudge_bar_tempo",
+            Action::NudgeBarLength { .. } => "nudge_bar_length",
             Action::Undo => "undo",
             Action::Redo => "redo",
         }
@@ -501,6 +527,9 @@ pub fn action_names() -> &'static [&'static str] {
         "cycle_note_hand",
         "insert_bar",
         "remove_bar",
+        "nudge_tail",
+        "nudge_bar_tempo",
+        "nudge_bar_length",
         "undo",
         "redo",
     ]
@@ -596,7 +625,7 @@ static ACTION_HELP: &[ActionInfo] = {
         ActionInfo { name: "play", params: &[p("from_us", "u64")], description: "Start playback from from_us microseconds." },
         ActionInfo { name: "set_playhead", params: &[p("us", "u64")], description: "Move the playhead to us microseconds." },
         // ── backing alignment ───────────────────────────────────────────
-        ActionInfo { name: "nudge_backing_offset", params: &[p("delta_us", "i64")], description: "Slide the backing track's audio_start_us by delta_us (clamped at 0) to align it under the highway." },
+        ActionInfo { name: "nudge_backing_offset", params: &[p("delta_us", "i64")], description: "Slide the backing track's audio_start_us by delta_us to align it under the highway. May go negative: a negative offset delays the audio, holding the backing silent until its start reaches the highway." },
         ActionInfo { name: "set_playback_rate", params: &[p("rate_permille", "u16")], description: "Set playback speed in permille (1000 = 1x, 500 = half speed), clamped 0.25x-2x. Slows/speeds the transport for practice without changing the chart." },
         // ── loop / metronome / count-in ─────────────────────────────────
         ActionInfo { name: "toggle_loop", params: &[], description: "Toggle looped playback over the loop region." },
@@ -627,6 +656,9 @@ static ACTION_HELP: &[ActionInfo] = {
         ActionInfo { name: "cycle_note_hand", params: &[], description: "Cycle the target notes' hand setting auto -> left -> right -> auto. Same target as set_note_hand (selection, else the cursor note)." },
         ActionInfo { name: "insert_bar", params: &[], description: "Insert one empty bar at the cursor's bar boundary, sliding every note at or after it one bar later (ripple). Opens a silent bar to make room; the tail keeps its internal timing." },
         ActionInfo { name: "remove_bar", params: &[], description: "Cut the bar the cursor sits in: delete the notes starting in it and slide everything after one bar earlier so no gap is left (ripple)." },
+        ActionInfo { name: "nudge_tail", params: &[p("delta_steps", "i32")], description: "Ripple-shift every note at or after the cursor by delta_steps grid steps (signed) — re-phases the rest of the song in one move to fix a constant timing offset that starts at a point. Notes before the cursor are untouched." },
+        ActionInfo { name: "nudge_bar_tempo", params: &[p("delta", "i32")], description: "Slow (delta>0) or speed (delta<0) the bar the cursor sits in by delta grid steps of length; the notes inside re-time to stay on their beats and everything after ripples. Uses the per-bar tempo map so untouched bars stay put." },
+        ActionInfo { name: "nudge_bar_length", params: &[p("delta_steps", "i32")], description: "Change the length of the cursor's bar by delta_steps grid steps (at the live subdivision) and slide every bar line after it by that amount. Grid-only: NO note moves and NO time is added/removed — for fixing an odd-length measure so bar lines land back on the fixed notes. Use </> to change the subdivision for finer/coarser steps (down to 1/32)." },
         // ── history ─────────────────────────────────────────────────────
         ActionInfo { name: "undo", params: &[], description: "Undo the last edit." },
         ActionInfo { name: "redo", params: &[], description: "Redo the last undone edit." },
@@ -735,6 +767,9 @@ mod tests {
             Action::CycleNoteHand,
             Action::InsertBar,
             Action::RemoveBar,
+            Action::NudgeTail { delta_steps: -2 },
+            Action::NudgeBarTempo { delta: 1 },
+            Action::NudgeBarLength { delta_steps: -1 },
             Action::Undo,
             Action::Redo,
         ]

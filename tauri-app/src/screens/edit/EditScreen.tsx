@@ -41,6 +41,7 @@ import {
   loadBundle,
   onPlayhead,
   onSnapshot,
+  onMeta,
   editAttachBackground,
   editDetachBackground,
   openBackingFilePicker,
@@ -671,6 +672,20 @@ export function EditScreen(props: Props): JSX.Element {
     // repaints (stutter). So only draw here when *not* playing (edits, cursor
     // moves, scrubs need an immediate repaint).
     if (!s.playing) render();
+  }
+
+  /**
+   * Apply a `meta` push: a snapshot with an empty `notes` array, emitted for
+   * note-invariant actions (cursor moves, transport, grid tweaks). Merge every
+   * field but keep the existing note store, so the (possibly huge) note array
+   * is neither re-stored nor re-diffed — the fix for cursor lag on dense
+   * pieces. Mirrors {@link applySnapshot} otherwise.
+   */
+  function applyMeta(m: ComposerSnapshot): void {
+    updateClock(m.playhead_us, m.playing, m.frozen ?? false);
+    setStore("snap", (prev) => (prev ? { ...m, notes: prev.notes } : m));
+    setRev((r) => r + 1);
+    if (!m.playing) render();
   }
 
   /**
@@ -1670,6 +1685,10 @@ export function EditScreen(props: Props): JSX.Element {
     onSnapshot(applySnapshot).then((fn) => {
       unlisten = fn;
     });
+    let unlistenMeta: UnlistenFn | undefined;
+    onMeta(applyMeta).then((fn) => {
+      unlistenMeta = fn;
+    });
 
     // Re-attach the backdrop/backing when a bundle is (re)loaded over the control
     // socket. The backend pushes a `navigate → edit` on load, but a same-screen
@@ -1776,6 +1795,7 @@ export function EditScreen(props: Props): JSX.Element {
       clearTimeout(flashTimeout);
       if (scrubTimer !== undefined) clearTimeout(scrubTimer);
       unlisten?.();
+      unlistenMeta?.();
       unlistenPlayhead?.();
       unlistenMidi?.();
       unlistenNav?.();
@@ -2710,6 +2730,13 @@ function HelpOverlay(props: { onClose: () => void }): JSX.Element {
         "              everything after one bar later)",
         "Z             Cut the cursor's bar (ripple; deletes it and slides",
         "              everything after one bar earlier — closes the gap)",
+        "Q / W         Make the cursor's bar shorter / longer one grid STEP,",
+        "              sliding the bar lines after it — no note moves, no time",
+        "              added/removed. Fixes an odd-length measure. Use < / > to",
+        "              change the step size for finer / coarser (down to 1/32).",
+        "e / r         Make the cursor's bar faster / slower one step; the notes",
+        "              inside re-time onto the new beats and everything after",
+        "              ripples rigidly (per-bar tempo — fixes a slight in-bar drift)",
         "]             Lengthen note (+1 step)",
         "[             Shorten note (−1 step)",
         "+ / =         Velocity +8",

@@ -16,12 +16,14 @@ pub use crate::hand::HandOverride;
 ///
 /// `file` is the bundle-relative filename only (e.g. `"backing.mp3"`) — never
 /// an absolute path, so the bundle stays movable. `audio_start_us` is the
-/// position in the audio file that lines up with recording time 0 (usually 0;
-/// a nonzero value allows a trimmed lead-in).
+/// position in the audio file that lines up with recording time 0: **positive**
+/// trims a lead-in (start partway into the file), **zero** plays from the top,
+/// and **negative** delays the audio — the backing stays silent for the first
+/// `|audio_start_us|` of song time, then starts from the file's beginning.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackingTrack {
     pub file: String,
-    pub audio_start_us: u64,
+    pub audio_start_us: i64,
 }
 
 /// Describes a background video attached to a recording bundle.
@@ -111,6 +113,14 @@ pub struct RecordingMeta {
     /// Empty for pieces with no exceptions, including every legacy bundle.
     #[serde(default)]
     pub hand_overrides: Vec<HandOverride>,
+    /// Variable-tempo map (M-tempo): song-time (µs) of each bar's downbeat.
+    /// Empty — every bundle written before this field existed — means a **uniform**
+    /// grid, spaced by [`grid`](Self::grid)'s constant BPM. A populated map lets
+    /// the editor's bar lines follow a performance whose tempo breathes (e.g. a
+    /// chart warped to a recording). Ascending; the metre/subdivision still come
+    /// from `grid`.
+    #[serde(default)]
+    pub bar_starts: Vec<u64>,
     /// Schema version; always written as `1`. Kept for forward-compat.
     #[serde(default = "default_version")]
     pub version: u32,
@@ -145,6 +155,7 @@ impl RecordingMeta {
             backgrounds: Vec::new(),
             hand_split: None,
             hand_overrides: Vec::new(),
+            bar_starts: Vec::new(),
             version: 1,
         }
     }
@@ -177,13 +188,16 @@ pub fn song_shift_us(first_note_us: u64, pre_roll_us: u64, lead_us: u64) -> u64 
 
 /// Compute the playback position in the backing audio file at a given clock time.
 ///
-/// Returns `None` while the clock is before `shift_us` (the audio has not started
-/// yet). Once playback has passed the shift point, returns
-/// `Some((clock_us - shift_us) + audio_start_us)`.
-pub fn backing_position_us(clock_us: u64, shift_us: u64, audio_start_us: u64) -> Option<u64> {
-    clock_us
-        .checked_sub(shift_us)
-        .map(|elapsed| elapsed + audio_start_us)
+/// Returns `None` — the backing is **silent** — while the clock is before
+/// `shift_us` (playback hasn't started) OR while the computed file position is
+/// still negative (a negative `audio_start_us` delays the audio). Otherwise
+/// returns `Some((clock_us - shift_us) + audio_start_us)`. A negative
+/// `audio_start_us` thus holds the backing silent for its first `|audio_start_us|`
+/// of song time, then plays from file position 0.
+pub fn backing_position_us(clock_us: u64, shift_us: u64, audio_start_us: i64) -> Option<u64> {
+    let elapsed = clock_us.checked_sub(shift_us)? as i64;
+    let pos = elapsed + audio_start_us;
+    (pos >= 0).then_some(pos as u64)
 }
 
 #[cfg(test)]
@@ -215,6 +229,7 @@ mod tests {
             backgrounds: Vec::new(),
             hand_split: None,
             hand_overrides: Vec::new(),
+            bar_starts: Vec::new(),
             version: 1,
         };
         let json = meta.to_json();
@@ -238,6 +253,7 @@ mod tests {
             backgrounds: Vec::new(),
             hand_split: None,
             hand_overrides: Vec::new(),
+            bar_starts: Vec::new(),
             version: 1,
         };
         let json = meta.to_json();
@@ -261,6 +277,7 @@ mod tests {
             backgrounds: Vec::new(),
             hand_split: None,
             hand_overrides: Vec::new(),
+            bar_starts: Vec::new(),
             version: 1,
         };
         let back = RecordingMeta::from_json(&meta.to_json()).unwrap();
@@ -282,6 +299,7 @@ mod tests {
             }),
             hand_split: None,
             hand_overrides: Vec::new(),
+            bar_starts: Vec::new(),
             version: 1,
         };
         let json = meta.to_json();
@@ -313,6 +331,7 @@ mod tests {
             backgrounds: Vec::new(),
             hand_split: None,
             hand_overrides: Vec::new(),
+            bar_starts: Vec::new(),
             version: 1,
         };
 
@@ -506,6 +525,16 @@ mod tests {
             backing_position_us(1_000 + 1_000_000, 1_000, 0),
             Some(1_000_000)
         );
+    }
+
+    #[test]
+    fn negative_offset_delays_the_audio_then_plays_from_zero() {
+        // shift 0, offset -500ms: silent until 500ms of song time, then plays
+        // from file position 0.
+        assert_eq!(backing_position_us(0, 0, -500_000), None);
+        assert_eq!(backing_position_us(499_000, 0, -500_000), None);
+        assert_eq!(backing_position_us(500_000, 0, -500_000), Some(0));
+        assert_eq!(backing_position_us(700_000, 0, -500_000), Some(200_000));
     }
 
     #[test]

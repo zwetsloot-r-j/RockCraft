@@ -14,6 +14,7 @@
 
 import type { HitFeedback } from "../../ipc/types";
 import type { HighwayConfig, KeyInfo, KeyLayout, NoteSpan, SongData } from "./types";
+import { visibleRange } from "../cull";
 import {
   clamp,
   feedbackFx,
@@ -109,6 +110,9 @@ export class HighwayCanvas {
   private ctx: CanvasRenderingContext2D;
   private cfg: FullConfig;
   private song: SongData;
+  // Longest note span (ms), to pad the cull window's lower edge. Set in the
+  // constructor once the sorted note list is known.
+  private maxNoteDurMs = 0;
 
   t0: number;
   private lastNow = 0;
@@ -272,6 +276,13 @@ export class HighwayCanvas {
     this.ctx = canvas.getContext("2d")!;
     this.cfg = { ...DEFAULTS, ...cfg };
     this.song = song;
+    // Keep notes sorted by start so a frame can binary-search the visible
+    // slice instead of scanning the whole chart (dense imported songs).
+    this.song.notes.sort((a, b) => a.start - b.start);
+    for (const nt of this.song.notes) {
+      const d = nt.end - nt.start;
+      if (d > this.maxNoteDurMs) this.maxNoteDurMs = d;
+    }
     this.t0 = performance.now();
     this.ro = new ResizeObserver(() => this.resize());
     this.ro.observe(canvas);
@@ -339,9 +350,25 @@ export class HighwayCanvas {
     return this.hitY * (1 - (t - now) / this.cfg.lead);
   }
 
+  /** Index range [lo,hi) of notes whose span can contain the instant `now`
+   * (start in [now-maxDur, now]) — the sorted-window fast path for the
+   * per-frame "which notes sit at the hit line" scans. Valid in both modes:
+   * these checks never use the demo's loop-copies. */
+  private spanning(now: number): [number, number] {
+    return visibleRange(
+      this.song.notes,
+      now,
+      now,
+      this.maxNoteDurMs,
+      (n) => n.start,
+    );
+  }
+
   private activeTargets(now: number): Map<number, "L" | "R"> {
     const set = new Map<number, "L" | "R">();
-    for (const nt of this.song.notes) {
+    const [lo, hi] = this.spanning(now);
+    for (let i = lo; i < hi; i++) {
+      const nt = this.song.notes[i];
       if (nt.start <= now && now < nt.end) set.set(nt.note, nt.hand);
     }
     return set;
@@ -438,7 +465,29 @@ export class HighwayCanvas {
   private drawNotes(now: number): void {
     const c = this.cfg;
     const lead = c.lead;
-    // draw across loop copies so the scroll is seamless
+    if (this.live) {
+      // Live bundles never wrap (LOOP sits past the song), so only the k=0
+      // copy is ever on screen. Cull to [now, now+lead] via the sorted
+      // window instead of scanning the whole (possibly huge) chart.
+      const notes = this.song.notes;
+      const [lo, hi] = visibleRange(
+        notes,
+        now,
+        now + lead,
+        this.maxNoteDurMs,
+        (n) => n.start,
+      );
+      for (let idx = lo; idx < hi; idx++) {
+        const nt = notes[idx];
+        const lane = this.kl.byNote[nt.note];
+        if (!lane) continue;
+        if (nt.end < now || nt.start > now + lead) continue;
+        this.drawNote(nt, lane, nt.start, nt.end, now);
+      }
+      return;
+    }
+    // Demo mode loops a short prototype chart; draw across loop copies so the
+    // scroll is seamless (its note count makes culling pointless).
     for (const nt of this.song.notes) {
       const lane = this.kl.byNote[nt.note];
       if (!lane) continue;
@@ -707,7 +756,9 @@ export class HighwayCanvas {
     const set = new Set<number>();
     // Live (#168): a "match" is a target note the player is actually holding.
     if (this.live) {
-      for (const nt of this.song.notes) {
+      const [lo, hi] = this.spanning(now);
+      for (let i = lo; i < hi; i++) {
+        const nt = this.song.notes[i];
         if (nt.start <= now && now < nt.end && this.liveHeld.has(nt.note)) {
           set.add(nt.note);
         }
@@ -716,7 +767,9 @@ export class HighwayCanvas {
     }
     // Demo: notes whose onset was recently "hit" by the sim, still sounding.
     if (!this.cfg.scoring) return set;
-    for (const nt of this.song.notes) {
+    const [lo, hi] = this.spanning(now);
+    for (let i = lo; i < hi; i++) {
+      const nt = this.song.notes[i];
       if (nt.start <= now && now < nt.end && this.hitNotes.has(nt)) set.add(nt.note);
     }
     return set;

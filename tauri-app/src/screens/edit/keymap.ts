@@ -88,6 +88,15 @@ export const NORMAL_BINDINGS: Binding[] = [
   // the cursor's bar and closes the gap. (Uppercase = the bigger, structural op.)
   { keys: ["A"], action: { name: "insert_bar" } },
   { keys: ["Z"], action: { name: "remove_bar" } },
+  // Per-bar length by one grid STEP — moves the bar LINES only, no notes/time
+  // (Q shorter / W longer; use </> to change the step size for finer/coarser).
+  // Per-bar tempo re-times the notes inside the bar (e faster / r slower) — the
+  // four bar ops sit on the QWER row. (F/V are owned by the split editor and the
+  // video backdrop in EditScreen, so tempo uses e/r instead of the TUI's F/V.)
+  { keys: ["Q"], action: { name: "nudge_bar_length", params: { delta_steps: -1 } } },
+  { keys: ["W"], action: { name: "nudge_bar_length", params: { delta_steps: 1 } } },
+  { keys: ["e"], action: { name: "nudge_bar_tempo", params: { delta: -1 } } },
+  { keys: ["r"], action: { name: "nudge_bar_tempo", params: { delta: 1 } } },
   { keys: ["]"], action: { name: "resize_note", params: { delta_steps: 1 } } },
   { keys: ["["], action: { name: "resize_note", params: { delta_steps: -1 } } },
   {

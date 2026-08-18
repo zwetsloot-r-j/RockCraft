@@ -135,6 +135,7 @@ impl RecordSession {
             backgrounds: Vec::new(),
             hand_split: None,
             hand_overrides: Vec::new(),
+            bar_starts: Vec::new(),
             version: 1,
         };
         std::fs::write(bundle_dir.join("meta.json"), meta.to_json())?;
@@ -516,6 +517,7 @@ mod tests {
             backgrounds: Vec::new(),
             hand_split: None,
             hand_overrides: Vec::new(),
+            bar_starts: Vec::new(),
             version: 1,
         };
         std::fs::write(bundle_dir.join("meta.json"), meta.to_json()).unwrap();

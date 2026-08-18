@@ -83,7 +83,7 @@ pub fn slice_segment(
 
     let backing = backing.map(|b| BackingTrack {
         file: b.file.clone(),
-        audio_start_us: b.audio_start_us + seg.start_us,
+        audio_start_us: b.audio_start_us + seg.start_us as i64,
     });
     let video = video.map(|v| BackgroundVideo {
         file: v.file.clone(),

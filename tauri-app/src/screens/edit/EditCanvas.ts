@@ -14,7 +14,8 @@
 // The background fill is kept as its own step so the M7-tauri-N video backdrop
 // can later draw a frame *behind* the grid (make the fill translucent / skip it).
 
-import type { ComposerSnapshot } from "../../ipc/types";
+import type { ComposerSnapshot, NoteView } from "../../ipc/types";
+import { visibleRange } from "../cull";
 import {
   isBlack,
   keyNoteStyle,
@@ -33,6 +34,63 @@ import { gridTiming, Viewport } from "./viewport";
  * may be negative when the viewport bottom edge sits before the grid origin. */
 function mod(a: number, b: number): number {
   return ((a % b) + b) % b;
+}
+
+// ── variable-tempo grid (mirror of `core::Composer`'s tempo-map math) ─────────
+// `bars` is the song-time (µs) of each bar's downbeat. Empty ⇒ uniform grid.
+type GridTiming = { stepUs: number; beatUs: number; barUs: number };
+
+function stepsPerBar(g: GridTiming): number {
+  return Math.max(1, Math.round(g.barUs / g.stepUs));
+}
+
+/** Downbeat µs of `bar`, from the map (extrapolating past its end) or uniform. */
+function barStartUs(bar: number, bars: number[], originUs: number, barUs: number): number {
+  const n = bars.length;
+  if (n === 0) return originUs + bar * barUs;
+  if (bar < n) return bars[bar];
+  const dur = n >= 2 ? Math.max(1, bars[n - 1] - bars[n - 2]) : barUs;
+  return bars[n - 1] + (bar - (n - 1)) * dur;
+}
+
+/** Song-time (µs) of grid `step` — tempo-map aware (mirror of `pos_us_of_step`). */
+function usOfStep(step: number, bars: number[], g: GridTiming, originUs: number): number {
+  if (bars.length === 0) return originUs + step * g.stepUs;
+  const spb = stepsPerBar(g);
+  const bar = Math.floor(step / spb);
+  const sub = step - bar * spb;
+  const bs = barStartUs(bar, bars, originUs, g.barUs);
+  const bd = Math.max(1, barStartUs(bar + 1, bars, originUs, g.barUs) - bs);
+  return bs + (sub * bd) / spb;
+}
+
+/** Bar index containing `us` (mirror of `bar_at_us`). */
+function barAtUs(us: number, bars: number[], originUs: number, barUs: number): number {
+  const n = bars.length;
+  if (n === 0) return Math.floor((us - originUs) / barUs);
+  if (us < bars[0]) return 0;
+  if (us >= bars[n - 1]) {
+    const dur = n >= 2 ? Math.max(1, bars[n - 1] - bars[n - 2]) : barUs;
+    return n - 1 + Math.floor((us - bars[n - 1]) / dur);
+  }
+  let lo = 0;
+  let hi = n - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (bars[mid] <= us) lo = mid;
+    else hi = mid - 1;
+  }
+  return lo;
+}
+
+/** Grid step nearest `us` — inverse of {@link usOfStep} (mirror of `pos_step_index`). */
+function stepIndexOf(us: number, bars: number[], g: GridTiming, originUs: number): number {
+  if (bars.length === 0) return Math.floor((us - originUs) / g.stepUs);
+  const spb = stepsPerBar(g);
+  const bar = barAtUs(us, bars, originUs, g.barUs);
+  const bs = barStartUs(bar, bars, originUs, g.barUs);
+  const bd = Math.max(1, barStartUs(bar + 1, bars, originUs, g.barUs) - bs);
+  return bar * spb + Math.round(((us - bs) * spb) / bd);
 }
 
 const BG = "#0f1016";
@@ -312,7 +370,12 @@ export class EditCanvas {
     // playhead while playing, else the cursor step. The cursor's µs position is
     // phased by the grid origin (step 0 sits at the origin, not song time 0).
     const gridOriginUs = snapshot.grid_origin_us ?? 0;
-    const cursorUs = gridOriginUs + snapshot.cursor.step * g.stepUs;
+    const bars = snapshot.bar_starts ?? [];
+    const cursorUs = usOfStep(snapshot.cursor.step, bars, g, gridOriginUs);
+    // The cursor cell is one grid step wide — but under a tempo map a step's µs
+    // width varies per bar, so measure it locally rather than using g.stepUs.
+    const cursorStepUs =
+      usOfStep(snapshot.cursor.step + 1, bars, g, gridOriginUs) - cursorUs;
     const reviewing = scrollAnchorUs !== undefined;
     const anchorUs = reviewing
       ? scrollAnchorUs
@@ -334,17 +397,17 @@ export class EditCanvas {
 
     this.drawLanes(vp);
     this.drawLoopRegion(snapshot, vp);
-    this.drawGridlines(g, vp, gridOriginUs);
+    this.drawGridlines(g, vp, gridOriginUs, bars);
     // Crosshair guides sit under the notes so a note on the cursor's column /
     // row stays fully legible, but over the gridlines so the selected timeslot
     // reads at a glance even on a sparse grid.
-    this.drawCrosshair(snapshot, vp, cursorUs, g.stepUs);
+    this.drawCrosshair(snapshot, vp, cursorUs, cursorStepUs);
     this.drawHandSplit(snapshot, vp);
     this.drawNotes(snapshot, vp);
     this.drawSelection(snapshot, vp);
     this.drawSplits(vp);
-    this.drawChordPreview(snapshot, vp, cursorUs, g.stepUs);
-    this.drawCursor(snapshot, vp, cursorUs, g.stepUs);
+    this.drawChordPreview(snapshot, vp, cursorUs, cursorStepUs);
+    this.drawCursor(snapshot, vp, cursorUs, cursorStepUs);
     this.drawPlayhead(snapshot, vp, reviewing ? scrollAnchorUs : playheadUs, reviewing);
     this.drawLaneLabels(vp);
     // The piano keyboard strip sits on top of everything at the bottom edge,
@@ -480,28 +543,28 @@ export class EditCanvas {
   // ── horizontal gridlines (per step / beat / bar) ────────────────────────
 
   private drawGridlines(
-    g: { stepUs: number; beatUs: number; barUs: number },
+    g: GridTiming,
     vp: Viewport,
     gridOriginUs: number,
+    bars: number[],
   ): void {
     const ctx = this.ctx;
     // The top edge is the latest visible time (originUs is the bottom edge).
     const endUs = vp.originUs + this.h / vp.pxPerUs;
-    // Grid lines fall at `gridOriginUs + i·stepUs`. Classify bar/beat lines by the
-    // INTEGER step index `i` (steps-per-bar / -beat) rather than a float modulo of
-    // the time — `stepUs` is fractional (e.g. 60e6/172/4), so a `t % barUs` would
-    // accumulate error and miss downbeats. Start at the first index at/after the
-    // bottom (earliest) edge.
-    const stepsPerBar = Math.max(1, Math.round(g.barUs / g.stepUs));
-    const stepsPerBeat = Math.max(1, Math.round(g.beatUs / g.stepUs));
-    let i = Math.floor((vp.originUs - gridOriginUs) / g.stepUs);
+    // Classify bar/beat lines by the INTEGER step index `i` (steps-per-bar /
+    // -beat), not a float modulo of time. Under a tempo map each line's µs
+    // position comes from `usOfStep` (variable bar lengths); without a map that
+    // reduces to `gridOriginUs + i·stepUs`. Start one step below the bottom edge.
+    const perBar = stepsPerBar(g);
+    const perBeat = Math.max(1, Math.round(g.beatUs / g.stepUs));
+    let i = stepIndexOf(vp.originUs, bars, g, gridOriginUs) - 1;
     for (; ; i++) {
-      const t = gridOriginUs + i * g.stepUs;
+      const t = usOfStep(i, bars, g, gridOriginUs);
       if (t > endUs) break;
       const y = vp.yOf(t);
       if (y < 0 || y > this.h) continue;
-      const onBar = mod(i, stepsPerBar) === 0;
-      const onBeat = mod(i, stepsPerBeat) === 0;
+      const onBar = mod(i, perBar) === 0;
+      const onBeat = mod(i, perBeat) === 0;
       // Heaviest per bar, heavier per beat, faint per subdivision step.
       ctx.strokeStyle = onBar
         ? "rgba(255,255,255,0.16)"
@@ -517,11 +580,47 @@ export class EditCanvas {
   }
 
   // ── notes ───────────────────────────────────────────────────────────────
+  // Time-sorted view of the current note set for viewport culling, rebuilt
+  // only when the snapshot's `notes` array changes (an edit) — never per
+  // frame. `notes` arrives in id order (see core Timeline), not time order,
+  // so it must be sorted before the binary-search window can be applied.
+  private notesRef: readonly NoteView[] | null = null;
+  private sortedNotes: NoteView[] = [];
+  private maxNoteDurUs = 0;
+
+  /** The current notes, sorted ascending by `start_us` (cached by array
+   * identity), also refreshing the longest-note extent used to pad the
+   * cull window's lower edge. */
+  private sortedNotesFor(notes: readonly NoteView[]): NoteView[] {
+    if (notes !== this.notesRef) {
+      this.notesRef = notes;
+      this.sortedNotes = [...notes].sort((a, b) => a.start_us - b.start_us);
+      let m = 0;
+      for (const n of this.sortedNotes) if (n.dur_us > m) m = n.dur_us;
+      this.maxNoteDurUs = m;
+    }
+    return this.sortedNotes;
+  }
+
 
   private drawNotes(snapshot: ComposerSnapshot, vp: Viewport): void {
     const ctx = this.ctx;
     const split = snapshot.hand_split ?? DEFAULT_SPLIT;
-    for (const n of snapshot.notes) {
+    // Cull to the visible time span: iterate only the notes whose onset
+    // could fall on screen, not the whole chart. The bottom edge (y = h) is
+    // song time `originUs`; the top edge (y = 0) is one span higher. The
+    // per-note vertical clip below still has the final say.
+    const notes = this.sortedNotesFor(snapshot.notes);
+    const topUs = vp.originUs + vp.height / vp.pxPerUs;
+    const [lo, hi] = visibleRange(
+      notes,
+      vp.originUs,
+      topUs,
+      this.maxNoteDurUs,
+      (n) => n.start_us,
+    );
+    for (let idx = lo; idx < hi; idx++) {
+      const n = notes[idx];
       if (!vp.pitchVisible(n.pitch)) continue;
       const x = vp.xOf(n.pitch);
       // The onset is the lower edge; the note grows upward by its duration.

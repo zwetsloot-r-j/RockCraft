@@ -131,10 +131,31 @@ pub enum GateState {
 /// step. The gate freezes only once the clock has *reached* a step's `time_us`
 /// and that step is unsatisfied; while disarmed it never freezes (free
 /// play-through).
+///
+/// # Fresh-strike requirement
+///
+/// A step is satisfied only when every required pitch is held **and at least
+/// one of them was *freshly struck*** — i.e. received a note-on after the gate
+/// arrived at this step. A pitch that is merely *held over* from a previous
+/// step never satisfies a repeat of itself: without this a repeated note (or a
+/// re-hit chord) would auto-advance while you keep the key down, the "wait mode
+/// resumes while I'm still holding the same note" bug. The check is deliberately
+/// **generous**: re-striking any *single* required pitch is enough (you needn't
+/// re-hit a whole chord) and timing is irrelevant, so a legato common tone held
+/// across a chord change still passes as long as *something* in the new chord is
+/// struck. A fresh strike is inferred from the held set growing; releasing a
+/// pitch drops its pending strike, so a clean release-and-repress always counts.
 #[derive(Debug, Clone)]
 pub struct WaitGate {
     tracker: WaitTracker,
     held: BTreeSet<u8>,
+    /// The held set as of the previous [`set_held`](WaitGate::set_held), to
+    /// diff against for freshly-struck pitches.
+    prev_held: BTreeSet<u8>,
+    /// Pitches with a pending fresh strike (struck since the last time a step
+    /// consumed them) that are still held. A step consumes its required pitches
+    /// from this set as it advances, so a later repeat needs a new strike.
+    struck: BTreeSet<u8>,
     armed: bool,
     /// The result of the most recent [`poll`](WaitGate::poll); backs
     /// [`awaiting`](WaitGate::awaiting).
@@ -148,6 +169,8 @@ impl WaitGate {
         Self {
             tracker: WaitTracker::from_expected(notes),
             held: BTreeSet::new(),
+            prev_held: BTreeSet::new(),
+            struck: BTreeSet::new(),
             armed: false,
             frozen: false,
         }
@@ -166,9 +189,45 @@ impl WaitGate {
         self.armed
     }
 
-    /// Replace the live held-note set (call on every note-on/off).
+    /// Replace the live held-note set (call on every note-on/off). Any pitch
+    /// that newly appears counts as a *fresh strike*; a pitch that disappears
+    /// drops its pending strike, so re-pressing it after a release counts again.
+    /// See the [type-level note](WaitGate#fresh-strike-requirement).
     pub fn set_held(&mut self, held: BTreeSet<u8>) {
+        for &n in held.difference(&self.prev_held) {
+            self.struck.insert(n);
+        }
+        // A released key is no longer a pending strike (and can't satisfy a
+        // repeat until it is struck again).
+        self.struck.retain(|n| held.contains(n));
+        self.prev_held = held.clone();
         self.held = held;
+    }
+
+    /// Whether `step` is satisfied *now*: all its pitches held AND at least one
+    /// of them freshly struck (not merely held over). See the
+    /// [type-level note](WaitGate#fresh-strike-requirement).
+    fn fresh_satisfied(&self, step: &Step) -> bool {
+        step.notes.iter().all(|n| self.held.contains(n))
+            && step.notes.iter().any(|n| self.struck.contains(n))
+    }
+
+    /// Advance past every consecutive step that is due, all-held, and has a
+    /// fresh strike — consuming that step's pitches from the pending-strike set
+    /// so a following repeat of the same pitch still waits for a new strike.
+    fn advance_fresh(&mut self, now_us: u64) {
+        // `.cloned()` ends the borrow of `steps` in the condition so the body can
+        // mutate `struck`/`pos`.
+        while let Some(step) = self.tracker.steps.get(self.tracker.pos).cloned() {
+            if step.time_us <= now_us && self.fresh_satisfied(&step) {
+                for n in &step.notes {
+                    self.struck.remove(n);
+                }
+                self.tracker.pos += 1;
+            } else {
+                break;
+            }
+        }
     }
 
     /// Seek the tracker to the first step at or after `now_us`, discarding
@@ -181,17 +240,24 @@ impl WaitGate {
     pub fn seek_to(&mut self, now_us: u64) {
         self.tracker.seek_to(now_us);
         self.frozen = false;
+        // Discard pending strikes: after a jump the player re-articulates the
+        // note under the new playhead from scratch.
+        self.struck.clear();
     }
 
     /// Advance the tracker past any now-satisfied steps, then report whether the
     /// clock must freeze. Returns [`GateState::Frozen`] when armed AND the
     /// current step's `time_us <= now_us` AND it is unsatisfied; otherwise
     /// [`GateState::Running`]. Always `Running` while disarmed.
+    ///
+    /// "Satisfied" here means every required pitch is held *and* at least one was
+    /// freshly struck — a held-over note does not carry a repeat (see the
+    /// [type-level note](WaitGate#fresh-strike-requirement)). Advancing only
+    /// through steps that are BOTH due and satisfied also means a note held
+    /// before its time (e.g. the key used to start the take, still down during
+    /// the lead-in) never pre-satisfies a not-yet-due step and skips its wait.
     pub fn poll(&mut self, now_us: u64) -> GateState {
-        // Advance only through steps that are BOTH due and satisfied: a note held
-        // before its time (e.g. the key used to start the take, still down during
-        // the lead-in) must not pre-satisfy a not-yet-due step and skip its wait.
-        self.tracker.advance_due(&self.held, now_us);
+        self.advance_fresh(now_us);
 
         if !self.armed {
             self.frozen = false;
@@ -199,7 +265,7 @@ impl WaitGate {
         }
 
         match self.tracker.current() {
-            Some(step) if step.time_us <= now_us && !self.tracker.is_satisfied(&self.held) => {
+            Some(step) if step.time_us <= now_us && !self.fresh_satisfied(step) => {
                 self.frozen = true;
                 GateState::Frozen
             }
@@ -213,6 +279,15 @@ impl WaitGate {
     /// Have all steps been satisfied? Delegates to the tracker.
     pub fn is_complete(&self) -> bool {
         self.tracker.is_complete()
+    }
+
+    /// The `time_us` of the step the gate is currently pointed at (the next one
+    /// that can freeze), or `None` when complete. A caller advancing a clock can
+    /// clamp its step to this so a large tick never carries the clock *past* an
+    /// unsatisfied wait-step's onset — the freeze then pins the note at its
+    /// onset instead of wherever the overshoot landed.
+    pub fn next_step_time(&self) -> Option<u64> {
+        self.tracker.current().map(|s| s.time_us)
     }
 
     /// The step currently being waited on, if the last [`poll`](WaitGate::poll)
@@ -296,15 +371,61 @@ mod gate_tests {
     }
 
     #[test]
-    fn multiple_satisfied_steps_skip_in_one_poll() {
+    fn repeated_note_needs_a_fresh_strike_not_a_hold() {
+        // Two C-steps in a row: striking C once clears the first, but the repeat
+        // must NOT auto-advance while the key is still held — it waits for a new
+        // strike (the "wait mode resumes while I'm still holding the same note"
+        // bug). A release + re-press then advances past it.
         let mut g = WaitGate::from_expected(&[(n(60), 0), (n(60), 100), (n(62), 200)]);
         g.set_armed(true);
-        // Holding C satisfies both consecutive C-steps at once.
+        g.set_held(held(&[60])); // strike C → clears step@0
+        assert_eq!(g.poll(150), GateState::Frozen, "the repeated C still waits");
+        assert_eq!(g.awaiting().unwrap().notes, vec![60]);
+        assert_eq!(g.awaiting().unwrap().time_us, 100);
+        // Still holding — no fresh strike — stays frozen.
+        assert_eq!(g.poll(150), GateState::Frozen);
+        // Release and re-strike C → advances past the repeat.
+        g.set_held(held(&[]));
         g.set_held(held(&[60]));
         assert_eq!(g.poll(150), GateState::Running);
         // Now waiting on the D step; due at 200.
         assert_eq!(g.poll(200), GateState::Frozen);
         assert_eq!(g.awaiting().unwrap().notes, vec![62]);
+    }
+
+    #[test]
+    fn holding_over_the_next_notes_pitch_does_not_advance() {
+        // The exact report: the current step's note equals one you're already
+        // holding from before. It must still freeze until you re-strike it.
+        let mut g = WaitGate::from_expected(&[(n(60), 0), (n(60), 1000)]);
+        g.set_armed(true);
+        g.set_held(held(&[60])); // strike C, satisfies step@0
+        assert_eq!(g.poll(0), GateState::Running);
+        // Keep holding C through to the repeat's time — it must freeze, not skip.
+        assert_eq!(g.poll(1000), GateState::Frozen);
+        assert_eq!(g.awaiting().unwrap().notes, vec![60]);
+        // A fresh strike (release + press) releases it.
+        g.set_held(held(&[]));
+        g.set_held(held(&[60]));
+        assert_eq!(g.poll(1000), GateState::Running);
+        assert!(g.is_complete());
+    }
+
+    #[test]
+    fn a_held_common_tone_passes_if_the_chord_changes() {
+        // Generous rule: a legato common tone (C) held across a chord change does
+        // NOT need re-striking, because the *other* note of the new chord (G) is
+        // freshly struck. Only a step with no fresh strike at all freezes.
+        let mut g = WaitGate::from_expected(&[(n(60), 0), (n(64), 0), (n(60), 100), (n(67), 100)]);
+        g.set_armed(true);
+        g.set_held(held(&[60, 64])); // strike C+E → clears the C/E chord
+        assert_eq!(g.poll(50), GateState::Running);
+        // Release E, keep C down (legato), strike G: the C/G chord is satisfied
+        // even though C was never released — G is the fresh strike.
+        g.set_held(held(&[60])); // E up, C sustained
+        g.set_held(held(&[60, 67])); // G struck
+        assert_eq!(g.poll(100), GateState::Running);
+        assert!(g.is_complete());
     }
 
     #[test]

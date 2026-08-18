@@ -58,6 +58,33 @@ impl History {
         &mut self.current
     }
 
+    /// Scale note times by `num / den` across the **entire** history — every
+    /// undo and redo snapshot as well as the current timeline. Used by a tempo
+    /// change: re-timing all states keeps undo/redo aligned to the new tempo
+    /// without making the tempo change itself a discrete undo step.
+    pub fn scale_all_times(&mut self, num: u64, den: u64) {
+        for tl in self.past.iter_mut() {
+            tl.scale_time(num, den);
+        }
+        self.current.scale_time(num, den);
+        for tl in self.future.iter_mut() {
+            tl.scale_time(num, den);
+        }
+    }
+
+    /// Apply a single-bar re-time (see [`Timeline::retempo_bar`]) across the
+    /// **entire** history, so undo/redo snapshots stay aligned to the new bar
+    /// layout without the bar edit becoming a discrete undo step.
+    pub fn retempo_bar_all(&mut self, bar_start: u64, old_dur: u64, new_dur: u64) {
+        for tl in self.past.iter_mut() {
+            tl.retempo_bar(bar_start, old_dur, new_dur);
+        }
+        self.current.retempo_bar(bar_start, old_dur, new_dur);
+        for tl in self.future.iter_mut() {
+            tl.retempo_bar(bar_start, old_dur, new_dur);
+        }
+    }
+
     /// Save the current state as a checkpoint *before* a mutation, clearing
     /// the redo stack. If the undo stack would exceed `capacity`, the oldest
     /// entry is silently dropped.

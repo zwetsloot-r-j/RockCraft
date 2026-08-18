@@ -183,6 +183,43 @@ impl Timeline {
         }
     }
 
+    /// Re-time for a single-bar tempo change. Notes starting inside the bar
+    /// `[bar_start, bar_start + old_dur)` scale to `new_dur` (staying on their
+    /// beats within the bar); notes at or after the bar's old end shift by
+    /// `new_dur - old_dur` (the ripple). A no-op when the duration is unchanged.
+    pub fn retempo_bar(&mut self, bar_start: u64, old_dur: u64, new_dur: u64) {
+        if old_dur == 0 || old_dur == new_dur {
+            return;
+        }
+        let old_end = bar_start + old_dur;
+        let delta = new_dur as i64 - old_dur as i64;
+        let (n, d) = (new_dur as u128, old_dur as u128);
+        for note in self.notes.values_mut() {
+            if note.start_us >= old_end {
+                note.start_us = note.start_us.saturating_add_signed(delta);
+            } else if note.start_us >= bar_start {
+                let rel = (note.start_us - bar_start) as u128;
+                note.start_us = bar_start + (rel * n / d) as u64;
+                note.dur_us = ((note.dur_us as u128 * n / d) as u64).max(1);
+            }
+        }
+    }
+
+    /// Scale every note's `start_us` and `dur_us` by `num / den` (rounded), so a
+    /// note on beat *b* stays on beat *b* when the tempo changes. Durations keep a
+    /// 1 µs floor. A no-op when `num == den`. Backs the "re-time on tempo change"
+    /// edit.
+    pub fn scale_time(&mut self, num: u64, den: u64) {
+        if num == den || den == 0 {
+            return;
+        }
+        let (n, d) = (num as u128, den as u128);
+        for note in self.notes.values_mut() {
+            note.start_us = ((note.start_us as u128 * n + d / 2) / d) as u64;
+            note.dur_us = (((note.dur_us as u128 * n + d / 2) / d) as u64).max(1);
+        }
+    }
+
     /// Remove every note whose **onset** falls in `[from_us, to_us)`. Returns how
     /// many were removed. Notes starting before `from_us` (even if they sustain
     /// into the range) are kept — removal is keyed on the onset, like the editor

@@ -123,7 +123,7 @@ pub struct BackgroundTransformView {
 #[derive(Debug, Clone)]
 pub struct Backing {
     pub path: PathBuf,
-    pub audio_start_us: u64,
+    pub audio_start_us: i64,
 }
 
 /// Static song info returned by `play_load` so the webview can configure the
@@ -567,7 +567,7 @@ impl PlaySession {
     }
 
     /// Attach a backing track resolved from the bundle's `meta.json`.
-    pub fn with_backing(mut self, path: PathBuf, audio_start_us: u64) -> Self {
+    pub fn with_backing(mut self, path: PathBuf, audio_start_us: i64) -> Self {
         self.backing = Some(Backing {
             path,
             audio_start_us,
@@ -771,7 +771,25 @@ impl PlaySession {
         } else if !frozen && !self.clock.is_running() {
             self.clock.resume();
         }
-        self.clock.advance(dt_us);
+        // Clamp this tick so an armed wait never carries the clock *past* the next
+        // note's onset. The tick thread feeds a wall-clock `dt` (~4 ms nominal),
+        // but a stall — a WebView2 video decode, GC, lock contention — spikes it
+        // to tens/hundreds of ms. Without the clamp the clock leaps past the
+        // onset and the gate freezes wherever it landed, so the note you must
+        // play sits in the past (at/after its end) — the "wait mode pauses after
+        // the fact" bug. Landing exactly on the onset makes the next tick freeze
+        // there, pinning the note at the hit line. Only while advancing (a freeze
+        // already parks the clock) and armed (free play is untouched).
+        let mut step_us = dt_us;
+        if !frozen && self.wait.is_armed() {
+            if let Some(next) = self.wait.next_step_time() {
+                let now = self.clock.now_us();
+                if next > now {
+                    step_us = step_us.min(next - now);
+                }
+            }
+        }
+        self.clock.advance(step_us);
         self.score_due();
         frozen
     }
@@ -1714,6 +1732,40 @@ mod tests {
         assert_eq!(s.now_us(), SHIFT + 250_000, "advances once held");
     }
 
+    /// Evidence + regression for the "wait mode pauses after the fact" report: a
+    /// single oversized tick (a ~4 ms tick thread starved by a video decode / GC
+    /// / lock spike) must NOT carry the clock past an unsatisfied wait-step's
+    /// onset. Before the clamp, one big `advance` parked the clock wherever it
+    /// overshot (here 1 s past a 200 ms note — well after the note ended), so the
+    /// freeze landed after the fact. Now the tick is clamped to the onset and the
+    /// freeze pins the note at the hit line.
+    #[test]
+    fn a_large_tick_freezes_at_the_note_onset_not_past_it() {
+        let mut s = session();
+        s.set_wait_mode(true);
+        // One 1-second tick from a standstill: the first note (onset at SHIFT,
+        // 200 ms long) is leapt over entirely. The clamp stops the clock dead on
+        // the onset instead of at SHIFT + 1 s.
+        s.advance(SHIFT + 1_000_000);
+        assert_eq!(
+            s.now_us(),
+            target_us(0),
+            "an armed tick must not overshoot the note onset"
+        );
+        // The next tick, now sitting exactly on the onset, freezes there.
+        s.advance(250_000);
+        assert!(s.live_state().frozen, "armed + unsatisfied → frozen");
+        assert_eq!(
+            s.now_us(),
+            target_us(0),
+            "the freeze pins the note at its onset, not past it"
+        );
+        // Playing the note releases the freeze and it advances normally.
+        s.ingest(on(60, target_us(0)));
+        s.advance(10_000);
+        assert!(!s.live_state().frozen, "playing the awaited note resumes");
+    }
+
     /// Toggling wait off unfreezes a frozen clock immediately.
     #[test]
     fn toggle_wait_off_resumes() {
@@ -1849,6 +1901,7 @@ mod tests {
             backgrounds: Vec::new(),
             hand_split: None,
             hand_overrides: Vec::new(),
+            bar_starts: Vec::new(),
             version: 1,
         };
         std::fs::write(dir.join("meta.json"), meta.to_json()).unwrap();

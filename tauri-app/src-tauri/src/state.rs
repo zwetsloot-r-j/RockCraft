@@ -14,8 +14,8 @@ use std::sync::Mutex;
 
 use rockcraft_core::{
     action_from_name, action_help, slice_segment, ActionError, BackgroundImage, BackgroundStack,
-    BackgroundVideo, BackingTrack, Composer, ComposerSnapshot, Effect, Grid, HandOverride, Key,
-    Keyframe, NoteView, RecordingMeta, Scale, Segment, Timeline, TrackOrigin, Transform,
+    BackgroundVideo, BackingTrack, Composer, ComposerSnapshot, Effect, Grid, Hand, HandOverride,
+    Key, Keyframe, NoteView, RecordingMeta, Scale, Segment, Timeline, TrackOrigin, Transform,
     DEFAULT_SPLIT,
 };
 use rockcraft_midi::{events_to_smf_bytes, smf_bytes_to_events};
@@ -150,6 +150,11 @@ pub struct ActionReply {
     pub effects: Vec<Effect>,
     pub snapshot: ComposerSnapshot,
     pub dirty: bool,
+    /// Whether this action changed the timeline notes. When false (a cursor
+    /// move, transport toggle, grid tweak…) the webview command skips the
+    /// heavy full-snapshot emit and ships a notes-stripped `meta` event
+    /// instead, so a dense chart is not re-serialised every keystroke.
+    pub notes_changed: bool,
 }
 
 /// Apply a named action to the composer and return the effects + new snapshot.
@@ -177,7 +182,8 @@ pub fn run_action(
     let snapshot = composer.snapshot();
     drop(composer);
     // Mark dirty if the timeline content changed.
-    if timeline_fingerprint_snapshot(&snapshot.notes) != fp_before {
+    let notes_changed = timeline_fingerprint_snapshot(&snapshot.notes) != fp_before;
+    if notes_changed {
         let mut dirty = state.dirty.lock().expect("dirty mutex poisoned");
         *dirty = true;
     }
@@ -186,7 +192,20 @@ pub fn run_action(
         effects,
         snapshot,
         dirty,
+        notes_changed,
     })
+}
+
+/// Encode a note's hand override as a small int so the fingerprint reflects
+/// hand edits (which change `NoteView` but not its geometry). Without this a
+/// `cycle_note_hand` would look note-invariant and ship a `meta` event, so the
+/// re-tinted note never reached the canvas (and the piece never went dirty).
+fn hand_code(h: Option<Hand>) -> u64 {
+    match h {
+        None => 0,
+        Some(Hand::Left) => 1,
+        Some(Hand::Right) => 2,
+    }
 }
 
 /// Cheap timeline fingerprint: a sum of (id, pitch, start_us, dur_us, vel) for
@@ -200,6 +219,7 @@ fn timeline_fingerprint(timeline: &Timeline) -> u64 {
                 .wrapping_add(n.start_us)
                 .wrapping_add(n.dur_us)
                 .wrapping_add(n.velocity.value() as u64)
+                .wrapping_add(hand_code(n.hand))
         })
         .fold(0u64, u64::wrapping_add)
 }
@@ -215,6 +235,7 @@ fn timeline_fingerprint_snapshot(notes: &[NoteView]) -> u64 {
                 .wrapping_add(n.start_us)
                 .wrapping_add(n.dur_us)
                 .wrapping_add(n.velocity as u64)
+                .wrapping_add(hand_code(n.hand))
         })
         .fold(0u64, u64::wrapping_add)
 }
@@ -267,6 +288,7 @@ fn save_bundle_into(state: &AppState, bundle_dir: &std::path::Path) -> Result<()
     let backgrounds = composer.backgrounds().layers().to_vec();
     let hand_split = composer.hand_split();
     let hand_overrides = composer.timeline().hand_overrides();
+    let bar_starts = composer.bar_starts().to_vec();
     drop(composer);
 
     let key = *state.key.lock().expect("key mutex poisoned");
@@ -296,6 +318,7 @@ fn save_bundle_into(state: &AppState, bundle_dir: &std::path::Path) -> Result<()
         &background_srcs,
         hand_split,
         hand_overrides,
+        bar_starts,
     )
     .map_err(|e| e.to_string())?;
 
@@ -336,12 +359,13 @@ fn write_bundle(
     key: Key,
     origin: TrackOrigin,
     backing_path: Option<&std::path::Path>,
-    backing_offset_us: u64,
+    backing_offset_us: i64,
     video: Option<&AttachedVideo>,
     backgrounds: &[BackgroundImage],
     background_srcs: &[AttachedBackground],
     hand_split: u8,
     hand_overrides: Vec<HandOverride>,
+    bar_starts: Vec<u64>,
 ) -> std::io::Result<()> {
     std::fs::create_dir_all(bundle_dir)?;
     let bytes = events_to_smf_bytes(&timeline.to_events());
@@ -396,6 +420,7 @@ fn write_bundle(
         // per-note exceptions, keyed by `(pitch, start_us)`.
         hand_split: Some(hand_split),
         hand_overrides,
+        bar_starts,
         version: 1,
     };
     std::fs::write(bundle_dir.join("meta.json"), meta.to_json())?;
@@ -564,11 +589,12 @@ pub fn load_bundle(state: &AppState, dir: &str) -> Result<ComposerSnapshot, Stri
         Key,
         TrackOrigin,
         Option<std::path::PathBuf>,
-        u64,
+        i64,
         Option<AttachedVideo>,
         Vec<BackgroundImage>,
         u8,
         Vec<HandOverride>,
+        Vec<u64>,
     );
     let default_meta = || -> MetaTuple {
         (
@@ -584,6 +610,7 @@ pub fn load_bundle(state: &AppState, dir: &str) -> Result<ComposerSnapshot, Stri
             Vec::new(),
             DEFAULT_SPLIT,
             Vec::new(),
+            Vec::new(),
         )
     };
     let (
@@ -596,6 +623,7 @@ pub fn load_bundle(state: &AppState, dir: &str) -> Result<ComposerSnapshot, Stri
         backgrounds,
         hand_split,
         hand_overrides,
+        bar_starts,
     ) = match std::fs::read_to_string(bundle_dir.join("meta.json")) {
         Ok(json) => match RecordingMeta::from_json(&json) {
             Ok(meta) => {
@@ -630,6 +658,7 @@ pub fn load_bundle(state: &AppState, dir: &str) -> Result<ComposerSnapshot, Stri
                     meta.backgrounds,
                     hand_split,
                     meta.hand_overrides,
+                    meta.bar_starts,
                 )
             }
             Err(_) => default_meta(),
@@ -650,6 +679,7 @@ pub fn load_bundle(state: &AppState, dir: &str) -> Result<ComposerSnapshot, Stri
         composer.set_backing_offset_us(backing_offset_us);
         composer.set_backgrounds(BackgroundStack::from_layers(backgrounds.clone()));
         composer.set_hand_split(hand_split);
+        composer.set_bar_starts(bar_starts);
     }
 
     // Update the side-channel state.
@@ -950,7 +980,7 @@ pub fn is_playing(state: &AppState) -> bool {
 /// playhead push stops, exactly like a manual pause. The full snapshot still
 /// reports `playing = true` (with `frozen = true`) so the highway stays anchored
 /// on the playhead.
-pub fn transport_fields(state: &AppState) -> (bool, u64, u64, f64) {
+pub fn transport_fields(state: &AppState) -> (bool, u64, i64, f64) {
     let composer = state.composer.lock().expect("composer mutex poisoned");
     (
         composer.is_advancing(),
@@ -1006,6 +1036,7 @@ mod tests {
             &[],
             DEFAULT_SPLIT,
             Vec::new(),
+            Vec::new(),
         )
         .expect("in-place save must not fail on a self-copy");
 
@@ -1050,6 +1081,7 @@ mod tests {
             &[],
             &[],
             DEFAULT_SPLIT,
+            Vec::new(),
             Vec::new(),
         );
         std::env::set_current_dir(prev_cwd).unwrap();
@@ -1190,6 +1222,7 @@ mod tests {
                 &[],
                 DEFAULT_SPLIT,
                 Vec::new(),
+                Vec::new(),
             )
             .expect("write_bundle should succeed");
         }
@@ -1304,6 +1337,7 @@ mod tests {
                 &[],
                 &[],
                 DEFAULT_SPLIT,
+                Vec::new(),
                 Vec::new(),
             )
             .expect("write_bundle with backing should succeed");
@@ -1662,6 +1696,7 @@ mod tests {
                 &[],
                 DEFAULT_SPLIT,
                 Vec::new(),
+                Vec::new(),
             )
             .expect("write_bundle should succeed");
         };
@@ -1784,7 +1819,10 @@ mod tests {
             .unwrap();
             assert_eq!(meta.origin, Some(TrackOrigin::Edited));
             assert!(meta.grid.is_some() && meta.key.is_some());
-            assert_eq!(meta.backing.unwrap().audio_start_us, 250_000 + seg_start);
+            assert_eq!(
+                meta.backing.unwrap().audio_start_us,
+                250_000 + seg_start as i64
+            );
             assert_eq!(meta.video.unwrap().offset_us, -100_000 + seg_start as i64);
         }
 
