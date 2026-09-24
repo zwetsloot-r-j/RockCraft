@@ -15,6 +15,7 @@ pub mod error;
 pub mod parser;
 pub mod pipeline;
 pub mod schema;
+pub mod tempo;
 pub mod writer;
 
 pub use error::ImportError;
@@ -24,6 +25,9 @@ pub use pipeline::{
 };
 pub use rockcraft_core::{BackgroundVideo, BackingTrack, RecordingMeta, Timeline};
 pub use schema::{ExtractedChart, ExtractedNote, Hand, NotationMeta, SourceMeta};
+pub use tempo::{
+    detect_tempo_map, file_to_song_us, song_to_file_us, DetectedTempoMap, TempoMapOpts,
+};
 pub use writer::{
     import_output_dir, write_chart_bundle, write_chart_bundle_full,
     write_chart_bundle_with_backing, write_part_bundle,

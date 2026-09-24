@@ -68,4 +68,10 @@ describe("songFromInfo", () => {
     expect(song.tempoBpm).toBe(120);
     expect(song.timeSig).toBe("4/4");
   });
+
+  it("carries the tempo map through in ms (absent = uniform)", () => {
+    expect(songFromInfo(info([])).BARS).toEqual([]);
+    const song = songFromInfo(info([], { bar_starts_us: [3_500_000, 6_000_000] }));
+    expect(song.BARS).toEqual([3500, 6000]);
+  });
 });

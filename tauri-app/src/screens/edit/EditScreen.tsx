@@ -30,6 +30,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   alignmentLoad,
   alignmentSave,
+  detectTempoMap,
   editClearBacking,
   editClearVideo,
   editQueryBackgrounds,
@@ -57,7 +58,7 @@ import {
 import type { AlignmentDto } from "../../ipc/bridge";
 import type { BackgroundView, ComposerSnapshot } from "../../ipc/types";
 import { onMidiEvent } from "../../ipc/midi";
-import { EditCanvas } from "./EditCanvas";
+import { cursorUsOf, EditCanvas } from "./EditCanvas";
 import { StatusBar } from "./StatusBar";
 import { RecordControls } from "./RecordControls";
 import { DEFAULT_SPLIT } from "./hand";
@@ -920,6 +921,30 @@ export function EditScreen(props: Props): JSX.Element {
     flashTimeout = window.setTimeout(() => setSaveFlash(null), 2500);
   }
 
+  let inferringTempo = false;
+  function inferTempoMap(anchorUs: number): void {
+    if (inferringTempo) return;
+    if (backingName() === null) {
+      showFlash("Tempo map needs a backing track (B to attach one)");
+      return;
+    }
+    inferringTempo = true;
+    showFlash("Detecting tempo map from the backing audio…");
+    detectTempoMap({ anchorUs })
+      .then((r) => {
+        applySnapshot(r.snapshot);
+        setDirty(true);
+        showFlash(
+          `Tempo map: ${r.bars.length - 1} bars, ~${r.bpm.toFixed(1)} BPM ` +
+            `(downbeat ${(r.anchor_us / 1e6).toFixed(2)}s)`,
+        );
+      })
+      .catch((err) => showFlash(`Tempo detection failed: ${String(err)}`))
+      .finally(() => {
+        inferringTempo = false;
+      });
+  }
+
   function doSave(): void {
     // Overwrite the loaded / last-saved bundle in place — no name prompt. A
     // brand-new piece (never loaded or saved) falls back to a quick-save take.
@@ -1486,6 +1511,13 @@ export function EditScreen(props: Props): JSX.Element {
         e.preventDefault();
         setBpmText(String(Math.round(s.bpm)));
         setOverlay("set-bpm");
+        return;
+      }
+      // `I` infers a per-bar tempo map from the backing audio (M16-A), with
+      // the cursor's time as the known downbeat. Grid-only: no note moves.
+      if (e.key === "I") {
+        e.preventDefault();
+        inferTempoMap(cursorUsOf(s));
         return;
       }
       // `F` opens / closes the split & trim editor (M10-C).
@@ -2743,6 +2775,8 @@ function HelpOverlay(props: { onClose: () => void }): JSX.Element {
         "-             Velocity −8",
         "( / )         Tempo −/+ 5 BPM",
         "T             Set BPM (type a value, Enter to apply)",
+        "I             Infer a per-bar tempo map from the backing audio,",
+        "              with the cursor as a downbeat (bar lines only — no note moves)",
         "m             Toggle grab (move note with h/j/k/l)",
       ],
     },

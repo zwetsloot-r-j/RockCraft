@@ -1,0 +1,5 @@
+# Tempo-map detector (M16-A) — runtime + test deps. numpy only, by design.
+numpy>=1.24
+
+# Test-only:
+pytest>=7.0

@@ -768,6 +768,80 @@ pub fn query_backing(state: &AppState) -> Option<BackingRef> {
         })
 }
 
+/// Result of [`detect_tempo_map`] (M16-A), in **song** time.
+#[derive(Debug, Clone, Serialize)]
+pub struct TempoMapReply {
+    /// The installed bar downbeats (µs).
+    pub bars: Vec<u64>,
+    /// Median detected beat tempo.
+    pub bpm: f64,
+    /// The tracker's raw pulse rate before folding to beats.
+    pub pulse_bpm: f64,
+    /// The downbeat the bars were grouped from.
+    pub anchor_us: u64,
+    pub snapshot: ComposerSnapshot,
+}
+
+/// Detect a per-bar tempo map from the attached backing audio and install it
+/// (`Action::SetBarStarts`). Shared by the webview IPC command and
+/// `HostCommand::DetectTempoMap`. The sidecar runs **without** the composer lock
+/// held (it takes seconds). File↔song time uses the backing offset; downbeats
+/// before song time 0 are dropped. Grid-only: no note moves.
+pub fn detect_tempo_map(
+    state: &AppState,
+    beats_per_bar: Option<u8>,
+    anchor_us: Option<u64>,
+    tempo_hint_bpm: Option<f64>,
+) -> Result<TempoMapReply, String> {
+    let audio = state
+        .backing_path
+        .lock()
+        .expect("backing_path mutex poisoned")
+        .clone()
+        .ok_or("no backing track attached — tempo detection needs the piece's audio")?;
+    let (offset, bpb) = {
+        let composer = state.composer.lock().expect("composer mutex poisoned");
+        (
+            composer.backing_offset_us(),
+            composer.grid().time_sig.beats_per_bar,
+        )
+    };
+    let opts = rockcraft_import::TempoMapOpts {
+        beats_per_bar: beats_per_bar.unwrap_or(bpb),
+        anchor_file_us: anchor_us.and_then(|a| rockcraft_import::song_to_file_us(a, offset)),
+        tempo_hint_bpm,
+    };
+    let map = rockcraft_import::detect_tempo_map(&audio, &opts).map_err(|e| e.to_string())?;
+    let bars: Vec<u64> = map
+        .bars_us
+        .iter()
+        .filter_map(|&b| rockcraft_import::file_to_song_us(b, offset))
+        .collect();
+    if bars.len() < 2 {
+        return Err(format!(
+            "tempo detection found {} usable bar line(s); need at least 2",
+            bars.len()
+        ));
+    }
+    let mut composer = state.composer.lock().expect("composer mutex poisoned");
+    composer
+        .apply(rockcraft_core::Action::SetBarStarts {
+            bars_us: bars.clone(),
+        })
+        .map_err(|e| e.to_string())?;
+    let snapshot = composer.snapshot();
+    drop(composer);
+    // The map is saved with the piece: a new one is an unsaved change.
+    *state.dirty.lock().expect("dirty mutex poisoned") = true;
+    Ok(TempoMapReply {
+        bars,
+        bpm: map.bpm,
+        pulse_bpm: map.pulse_bpm,
+        anchor_us: rockcraft_import::file_to_song_us(map.anchor_us, offset).unwrap_or(0),
+        snapshot,
+    })
+}
+
 /// Serializable background-video reference for the edit screen — the absolute
 /// `path` the webview wraps with `convertFileSrc`, plus the alignment offset.
 #[derive(Debug, Clone, Serialize)]

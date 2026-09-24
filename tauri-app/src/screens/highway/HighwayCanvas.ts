@@ -15,6 +15,7 @@
 import type { HitFeedback } from "../../ipc/types";
 import type { HighwayConfig, KeyInfo, KeyLayout, NoteSpan, SongData } from "./types";
 import { visibleRange } from "../cull";
+import { mappedGridLines, uniformGridLines } from "./gridLines";
 import {
   clamp,
   feedbackFx,
@@ -448,13 +449,15 @@ export class HighwayCanvas {
     const ctx = this.ctx,
       c = this.cfg;
     if (c.gridlines === "none") return;
-    const { BEAT, BAR } = this.song;
+    const { BEAT, BAR, BARS } = this.song;
     // draw beat & bar lines within the visible window
-    const firstBeat = Math.floor(now / BEAT) * BEAT;
-    for (let t = firstBeat; t <= now + c.lead; t += BEAT) {
+    const lines =
+      BARS && BARS.length >= 2
+        ? mappedGridLines(BARS, Math.max(1, Math.round(BAR / BEAT)), now, now + c.lead)
+        : uniformGridLines(BEAT, BAR, now, now + c.lead);
+    for (const { t, bar } of lines) {
       const y = this.yOf(t, now);
       if (y < 0 || y > this.hitY) continue;
-      const bar = Math.round(t) % BAR === 0;
       const s = this.sAt(y);
       const half = (this.boardW / 2) * s;
       ctx.beginPath();

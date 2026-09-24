@@ -859,6 +859,9 @@ impl rockcraft_control::HostServices for Shell {
             }
             HostCommand::ImportStart { .. } => Err(HostError::Unsupported("import_start".into())),
             HostCommand::ImportScore { .. } => Err(HostError::Unsupported("import_score".into())),
+            HostCommand::DetectTempoMap { .. } => {
+                Err(HostError::Unsupported("detect_tempo_map".into()))
+            }
             HostCommand::AudioStatus => Err(HostError::Unsupported("audio_status".into())),
             HostCommand::MidiStatus => Err(HostError::Unsupported("midi_status".into())),
             // The TUI takes its `NoteSource` by value at startup and holds no
@@ -1263,6 +1266,11 @@ mod tests {
             HostCommand::AudioStatus,
             HostCommand::MidiStatus,
             HostCommand::MidiRescan,
+            HostCommand::DetectTempoMap {
+                beats_per_bar: None,
+                anchor_us: None,
+                tempo_hint_bpm: None,
+            },
             HostCommand::RecordStatus,
             HostCommand::AppQuit,
         ]

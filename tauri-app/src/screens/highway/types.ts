@@ -26,6 +26,9 @@ export interface SongData {
   LOOP: number;
   BEAT: number;
   BAR: number;
+  /** Tempo-mapped bar downbeats (ms); when present (≥ 2) the grid follows them
+   * instead of the uniform BEAT/BAR spacing. */
+  BARS?: number[];
 }
 
 export interface HighwayConfig {

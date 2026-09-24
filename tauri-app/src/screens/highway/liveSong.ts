@@ -54,5 +54,6 @@ export function songFromInfo(info: PlayInfo): SongData {
     LOOP: loop,
     BEAT,
     BAR,
+    BARS: (info.bar_starts_us ?? []).map((us) => us / 1000),
   };
 }
