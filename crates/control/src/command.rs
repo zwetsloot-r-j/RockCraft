@@ -113,7 +113,7 @@ impl CommandServer {
 async fn handle_connection(
     stream: TcpStream,
     commands: mpsc::Sender<RemoteCommand>,
-) -> Result<(), WsError> {
+) -> Result<(), Box<WsError>> {
     let ws = tokio_tungstenite::accept_async(stream).await?;
     let (mut write, mut read) = ws.split();
 
