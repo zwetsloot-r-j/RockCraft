@@ -18,12 +18,17 @@ import type { NoteSpan, SongData } from "./types";
  * wraps a visible second copy — live bundles play once, not on a loop.
  */
 export function songFromInfo(info: PlayInfo): SongData {
-  const notes: NoteSpan[] = info.notes.map((n) => ({
-    note: n.note,
-    start: n.start,
-    end: n.end,
-    hand: n.hand === "left" ? "L" : "R",
-  }));
+  const notes: NoteSpan[] = info.notes
+    .map((n) => ({
+      note: n.note,
+      start: n.start,
+      end: n.end,
+      hand: (n.hand === "left" ? "L" : "R") as "L" | "R",
+    }))
+    // Sort by start so the highway engine can binary-search the visible
+    // window (viewport culling for dense charts). The engine also sorts
+    // defensively, but doing it here keeps the boundary output canonical.
+    .sort((a, b) => a.start - b.start);
 
   // Bar/beat grid at the piece's real tempo (the backend bar-aligns the pre-roll
   // shift, so timeline bars land on these play-clock bar lines).

@@ -40,7 +40,7 @@ const HEAR_VELOCITY: u8 = 80;
 /// lines up with recording time 0 (`audio_start_us`, from Task C).
 struct Backing {
     path: PathBuf,
-    audio_start_us: u64,
+    audio_start_us: i64,
 }
 
 pub struct PlayScreen {
@@ -155,7 +155,7 @@ impl PlayScreen {
     /// Attach a backing audio track from the loaded bundle. `audio_start_us` is
     /// the position in the file that lines up with recording time 0 (Task C).
     /// Playback is armed lazily: it begins when the clock reaches `shift_us`.
-    pub fn with_backing(mut self, path: PathBuf, audio_start_us: u64) -> Self {
+    pub fn with_backing(mut self, path: PathBuf, audio_start_us: i64) -> Self {
         self.backing = Some(Backing {
             path,
             audio_start_us,

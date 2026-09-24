@@ -31,6 +31,8 @@ import type {
 
 /** Event name the backend emits a fresh {@link ComposerSnapshot} on. */
 const EVENT_SNAPSHOT = "snapshot";
+/** Notes-stripped snapshot for note-invariant actions (see {@link onMeta}). */
+const EVENT_META = "meta";
 /** Event name the backend emits a batch of {@link Effect}s on. */
 const EVENT_EFFECTS = "effects";
 /** Event name the backend emits a lightweight {@link PlayheadEvent} on during
@@ -77,6 +79,19 @@ export function onSnapshot(
   cb: (snapshot: ComposerSnapshot) => void,
 ): Promise<UnlistenFn> {
   return listen<ComposerSnapshot>(EVENT_SNAPSHOT, (e) => cb(e.payload));
+}
+
+/**
+ * Subscribe to `meta` events: a snapshot with an **empty `notes` array**,
+ * emitted for note-invariant actions (cursor moves, transport, grid tweaks)
+ * instead of the heavy full snapshot. Merge every field except `notes` and
+ * keep the existing note store — a dense chart is never re-serialised or
+ * re-diffed per keystroke. Returns the Tauri unlisten function.
+ */
+export function onMeta(
+  cb: (meta: ComposerSnapshot) => void,
+): Promise<UnlistenFn> {
+  return listen<ComposerSnapshot>(EVENT_META, (e) => cb(e.payload));
 }
 
 /**

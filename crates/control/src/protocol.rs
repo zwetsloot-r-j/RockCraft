@@ -56,6 +56,10 @@ impl Request {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+// `Ok` carries the (large) composer snapshot while `Err`/acks are tiny. This is a
+// short-lived, immediately-serialised response — the size gap doesn't matter, and
+// boxing would only add an allocation on the hot reply path.
+#[allow(clippy::large_enum_variant)]
 pub enum Response {
     Ok {
         id: Option<u64>,

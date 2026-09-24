@@ -493,6 +493,10 @@ impl HostServices for TauriHost<'_> {
                 "midi_status",
                 crate::midi::midi_status(&app.state::<MidiState>()),
             ),
+            HostCommand::MidiRescan => json_payload(
+                "midi_rescan",
+                crate::midi::midi_rescan(&app.state::<MidiState>()),
+            ),
             HostCommand::RecordStatus => json_payload(
                 "record_status",
                 crate::record::record_status(app.state::<RecordState>()),

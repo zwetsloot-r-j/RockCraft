@@ -128,7 +128,7 @@ fn split_writes_kept_parts_with_copied_media_and_derived_offsets() {
 
         let b = meta.backing.expect("backing persisted");
         assert_eq!(b.file, "backing.wav");
-        assert_eq!(b.audio_start_us, 250_000 + seg.start_us);
+        assert_eq!(b.audio_start_us, 250_000 + seg.start_us as i64);
 
         let v = meta.video.expect("video persisted");
         assert_eq!(v.file, "background.mp4");

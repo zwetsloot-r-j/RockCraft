@@ -125,6 +125,13 @@ export interface ComposerSnapshot {
    * where middle C (60) is the implied value.
    */
   hand_split?: number;
+  /**
+   * Variable-tempo map: song-time (µs) of each bar's downbeat. Absent/empty means
+   * a uniform grid — space bar/beat lines by the constant bpm/time_sig. When
+   * populated (a chart warped to a recording), the lines follow it so bars land
+   * on the performance. See `screens/edit/EditCanvas`.
+   */
+  bar_starts?: number[];
 }
 
 /**
@@ -182,14 +189,17 @@ export type Effect =
   | { effect: "all_off" };
 
 /**
- * The result of a successful `run_action` — mirror of `state::ActionReply`.
+ * The result of a successful `run_action` — mirror of the backend `ActionAck`.
+ *
+ * Snapshot-free by design: the webview renders off the `snapshot` / `meta`
+ * events, so the invoke return only carries the dirty flag (+ effects). This
+ * is what keeps a keystroke from re-serialising a dense chart twice.
  *
  * `dirty` mirrors the backend's `AppState::dirty` flag: true when the timeline
  * has unsaved changes since the last save or load.
  */
 export interface ActionReply {
   effects: Effect[];
-  snapshot: ComposerSnapshot;
   dirty: boolean;
 }
 
@@ -315,6 +325,12 @@ export type ActionName =
   | "set_hand_split"
   | "set_note_hand"
   | "cycle_note_hand"
+  // ── time / structure (ripple insert & cut) ──────────────────────────
+  | "insert_bar"
+  | "remove_bar"
+  | "nudge_tail"
+  | "nudge_bar_tempo"
+  | "nudge_bar_length"
   // ── history ─────────────────────────────────────────────────────────
   | "undo"
   | "redo";
@@ -395,6 +411,10 @@ export interface PlayInfo {
   bpm: number;
   /** Beats per bar (time-signature numerator); 4 when no grid. */
   beats_per_bar: number;
+  /** The piece's left/right hand split pitch (`meta.hand_split`). The play
+   * screen seeds its split from this so the authored hand assignment drives
+   * practice, instead of a machine-global localStorage value. */
+  split_pitch: number;
 }
 
 /**

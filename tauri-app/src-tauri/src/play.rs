@@ -123,7 +123,7 @@ pub struct BackgroundTransformView {
 #[derive(Debug, Clone)]
 pub struct Backing {
     pub path: PathBuf,
-    pub audio_start_us: u64,
+    pub audio_start_us: i64,
 }
 
 /// Static song info returned by `play_load` so the webview can configure the
@@ -154,6 +154,11 @@ pub struct PlayInfo {
     pub bpm: u32,
     /// Beats per bar (time-signature numerator); defaults to 4.
     pub beats_per_bar: u8,
+    /// The piece's left/right hand split pitch (`meta.hand_split`, or the
+    /// default). The play screen seeds its split from THIS so a piece's
+    /// authored hand assignment drives practice, instead of a machine-global
+    /// value clobbering it on load.
+    pub split_pitch: u8,
 }
 
 /// One span projected for the webview: pitch + ms bounds + the hand that plays
@@ -490,6 +495,12 @@ pub struct PlaySession {
     /// Judgments queued since the last [`live_state`](PlaySession::live_state),
     /// drained by it so each judged note fires exactly one effect (M14-B).
     pending_feedback: Vec<HitFeedbackView>,
+    /// The `frozen` flag as of the last emitted `play_state`. The tick thread
+    /// throttles the steady-state scroll but emits IMMEDIATELY when this flips,
+    /// so a wait-mode freeze reaches the webview at once (it pins the highway
+    /// to the note) instead of queuing behind stale advancing events — which
+    /// let the note scroll past the hit line before the freeze landed.
+    last_emitted_frozen: bool,
 
     /// "Hear the song" audition trigger bookkeeping (span indices fired).
     song_on_fired: HashSet<usize>,
@@ -561,13 +572,14 @@ impl PlaySession {
             live_hits: 0,
             live_misses: 0,
             pending_feedback: Vec::new(),
+            last_emitted_frozen: false,
             song_on_fired: HashSet::new(),
             song_off_fired: HashSet::new(),
         }
     }
 
     /// Attach a backing track resolved from the bundle's `meta.json`.
-    pub fn with_backing(mut self, path: PathBuf, audio_start_us: u64) -> Self {
+    pub fn with_backing(mut self, path: PathBuf, audio_start_us: i64) -> Self {
         self.backing = Some(Backing {
             path,
             audio_start_us,
@@ -697,6 +709,7 @@ impl PlaySession {
                 })
                 .collect(),
             hear_song: self.hear_song,
+            split_pitch: self.split_pitch,
             bpm: self.bpm,
             beats_per_bar: self.beats_per_bar,
         }
@@ -771,7 +784,25 @@ impl PlaySession {
         } else if !frozen && !self.clock.is_running() {
             self.clock.resume();
         }
-        self.clock.advance(dt_us);
+        // Clamp this tick so an armed wait never carries the clock *past* the next
+        // note's onset. The tick thread feeds a wall-clock `dt` (~4 ms nominal),
+        // but a stall — a WebView2 video decode, GC, lock contention — spikes it
+        // to tens/hundreds of ms. Without the clamp the clock leaps past the
+        // onset and the gate freezes wherever it landed, so the note you must
+        // play sits in the past (at/after its end) — the "wait mode pauses after
+        // the fact" bug. Landing exactly on the onset makes the next tick freeze
+        // there, pinning the note at the hit line. Only while advancing (a freeze
+        // already parks the clock) and armed (free play is untouched).
+        let mut step_us = dt_us;
+        if !frozen && self.wait.is_armed() {
+            if let Some(next) = self.wait.next_step_time() {
+                let now = self.clock.now_us();
+                if next > now {
+                    step_us = step_us.min(next - now);
+                }
+            }
+        }
+        self.clock.advance(step_us);
         self.score_due();
         frozen
     }
@@ -966,13 +997,17 @@ impl PlaySession {
     }
 
     /// Rebuild the wait gate from the practiced hand's steps, preserving armed
-    /// state. Practice is normally set before Start, so restarting the gate at the
-    /// first step is fine.
+    /// state. A fresh gate starts at step 0 (the song's start), so when practice
+    /// or the split changes **mid-take** we must seek it to the current playhead —
+    /// otherwise the gate freezes on a step already in the past (a note played
+    /// long ago) and never advances, ignoring the notes the player is actually
+    /// meant to play now.
     fn rebuild_wait_gate(&mut self) {
         let armed = self.wait.is_armed();
         let steps = expected_steps_for(&self.spans, self.practice, self.split_pitch);
         self.wait = WaitGate::from_expected(&steps);
         self.wait.set_armed(armed);
+        self.wait.seek_to(self.clock.now_us());
     }
 
     /// The file position the backing should be at for the current clock, or
@@ -1388,6 +1423,7 @@ pub fn tick_play(
     audio: &AudioState,
     midi_events: &[NoteEvent],
     dt_us: u64,
+    throttle_due: bool,
 ) -> Option<PlayStateEvent> {
     let mut guard = state.0.lock().expect("play state mutex poisoned");
     let session = guard.as_mut()?;
@@ -1446,7 +1482,17 @@ pub fn tick_play(
     let target = session.backing_target_us();
     audio.sync_play_backing(session.backing(), target, frozen);
 
-    Some(session.live_state())
+    // Emit on the throttle cadence, but ALWAYS the instant the freeze flag
+    // flips — a late freeze is what lets the note scroll past the hit line.
+    // Skipped ticks leave `pending_feedback` queued (bounded), so judgments
+    // still ride the next emit; they are not lost.
+    let frozen_transition = frozen != session.last_emitted_frozen;
+    if throttle_due || frozen_transition {
+        session.last_emitted_frozen = frozen;
+        Some(session.live_state())
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -1513,6 +1559,53 @@ mod tests {
         let st = s.status();
         assert_eq!(st.held, vec![60], "status shows what is held");
         assert!(!st.frozen, "satisfied step releases the clock");
+    }
+
+    /// Regression: switching the practice hand **mid-take** must seek the rebuilt
+    /// wait gate to the playhead, not restart it at the song's first note.
+    /// Otherwise the gate freezes on a note already in the past and never accepts
+    /// the note the player is meant to play now — the reported wait-mode lockup.
+    #[test]
+    fn switching_practice_mid_take_does_not_freeze_on_a_past_note() {
+        // Two left-hand notes (48 @0, 50 @500ms — distinct pitches so we can tell
+        // "stuck on the past one" from "waiting on the next one") around a
+        // right-hand note (72 @250ms). Split defaults to 60, so 48/50 are left.
+        let events = vec![
+            on(48, 0),
+            off(48, 200_000),
+            on(72, 250_000),
+            off(72, 450_000),
+            on(50, 500_000),
+            off(50, 700_000),
+        ];
+        let mut s = PlaySession::from_events("t".into(), &events);
+        // Run forward (wait off) to between the two left notes — the "mid-take"
+        // playhead — then switch to left-only practice.
+        s.advance(target_us(1) + 100_000); // ~SHIFT+350ms: past 48@0, before 50@500
+        s.set_practice(Some(Hand::Left));
+        s.set_wait_mode(true);
+
+        let st = s.status();
+        assert!(
+            st.awaiting != vec![48],
+            "must not re-freeze on the already-passed first left note (was: {:?})",
+            st.awaiting
+        );
+
+        // The upcoming left note still gates correctly: freeze on it when due,
+        // release when played.
+        let dt = (target_us(2) + 1).saturating_sub(s.now_us());
+        s.advance(dt);
+        s.advance(16_000);
+        let st = s.status();
+        assert!(st.frozen, "gate freezes on the current (due) left note");
+        assert_eq!(st.awaiting, vec![50], "waits on the note at the playhead");
+        s.ingest(on(50, s.now_us()));
+        s.advance(16_000);
+        assert!(
+            !s.status().frozen,
+            "playing the current left note proceeds — no lockup"
+        );
     }
 
     /// Reading status must not perturb the take it observes — in particular it
@@ -1663,6 +1756,40 @@ mod tests {
         assert_eq!(s.now_us(), SHIFT + 250_000, "advances once held");
     }
 
+    /// Evidence + regression for the "wait mode pauses after the fact" report: a
+    /// single oversized tick (a ~4 ms tick thread starved by a video decode / GC
+    /// / lock spike) must NOT carry the clock past an unsatisfied wait-step's
+    /// onset. Before the clamp, one big `advance` parked the clock wherever it
+    /// overshot (here 1 s past a 200 ms note — well after the note ended), so the
+    /// freeze landed after the fact. Now the tick is clamped to the onset and the
+    /// freeze pins the note at the hit line.
+    #[test]
+    fn a_large_tick_freezes_at_the_note_onset_not_past_it() {
+        let mut s = session();
+        s.set_wait_mode(true);
+        // One 1-second tick from a standstill: the first note (onset at SHIFT,
+        // 200 ms long) is leapt over entirely. The clamp stops the clock dead on
+        // the onset instead of at SHIFT + 1 s.
+        s.advance(SHIFT + 1_000_000);
+        assert_eq!(
+            s.now_us(),
+            target_us(0),
+            "an armed tick must not overshoot the note onset"
+        );
+        // The next tick, now sitting exactly on the onset, freezes there.
+        s.advance(250_000);
+        assert!(s.live_state().frozen, "armed + unsatisfied → frozen");
+        assert_eq!(
+            s.now_us(),
+            target_us(0),
+            "the freeze pins the note at its onset, not past it"
+        );
+        // Playing the note releases the freeze and it advances normally.
+        s.ingest(on(60, target_us(0)));
+        s.advance(10_000);
+        assert!(!s.live_state().frozen, "playing the awaited note resumes");
+    }
+
     /// Toggling wait off unfreezes a frozen clock immediately.
     #[test]
     fn toggle_wait_off_resumes() {
@@ -1798,6 +1925,7 @@ mod tests {
             backgrounds: Vec::new(),
             hand_split: None,
             hand_overrides: Vec::new(),
+            bar_starts: Vec::new(),
             version: 1,
         };
         std::fs::write(dir.join("meta.json"), meta.to_json()).unwrap();

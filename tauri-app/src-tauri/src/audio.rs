@@ -479,8 +479,13 @@ pub fn apply_effects(audio: &AudioState, playing: bool, effects: &[Effect]) {
 /// that aligns with song time 0. The result is `playhead + offset` µs.
 ///
 /// Pure helper; headless-testable.
-pub fn backing_pos(playhead_us: u64, offset_us: u64) -> u64 {
-    playhead_us + offset_us
+/// File position the backing should sit at for `playhead_us` and the alignment
+/// `offset_us`. `None` — the backing is **silent** — while that position is still
+/// negative (a negative offset delays the audio). Mirrors core's
+/// `backing_position_us` with a zero shift (the edit transport has no pre-roll).
+pub fn backing_pos(playhead_us: u64, offset_us: i64) -> Option<u64> {
+    let pos = playhead_us as i64 + offset_us;
+    (pos >= 0).then_some(pos as u64)
 }
 
 // ── Backing transport coupling ───────────────────────────────────────────────
@@ -494,22 +499,32 @@ pub fn sync_backing(
     audio: &AudioState,
     playing: bool,
     playhead_us: u64,
-    backing_offset_us: u64,
+    backing_offset_us: i64,
     prev_playing: bool,
     prev_playhead_us: u64,
-    prev_offset_us: u64,
+    prev_offset_us: i64,
 ) {
-    if playing && !prev_playing {
-        // Transport just started.
-        let pos = backing_pos(playhead_us, backing_offset_us);
-        audio.send_backing(BackingMsg::PlayAt(pos));
-    } else if playing && (playhead_us < prev_playhead_us || backing_offset_us != prev_offset_us) {
-        // Seek while playing (loop wrap, rewind, or nudge).
-        let pos = backing_pos(playhead_us, backing_offset_us);
-        audio.send_backing(BackingMsg::Seek(pos));
-    } else if !playing && prev_playing {
-        // Transport just paused.
-        audio.send_backing(BackingMsg::Pause);
+    if !playing {
+        if prev_playing {
+            // Transport just paused.
+            audio.send_backing(BackingMsg::Pause);
+        }
+        return;
+    }
+    let cur = backing_pos(playhead_us, backing_offset_us);
+    let just_started = !prev_playing;
+    let seeked = playhead_us < prev_playhead_us || backing_offset_us != prev_offset_us;
+    if just_started || seeked {
+        // Start / re-seek: play at the position, or stay paused while the audio
+        // is still in its (negative-offset) silent lead-in.
+        match cur {
+            Some(pos) if just_started => audio.send_backing(BackingMsg::PlayAt(pos)),
+            Some(pos) => audio.send_backing(BackingMsg::Seek(pos)),
+            None => audio.send_backing(BackingMsg::Pause),
+        }
+    } else if cur.is_some() && backing_pos(prev_playhead_us, prev_offset_us).is_none() {
+        // Forward playback just crossed out of the silent lead-in: start the audio.
+        audio.send_backing(BackingMsg::PlayAt(cur.unwrap()));
     }
 }
 
@@ -663,33 +678,48 @@ mod tests {
         // Reached here without panicking — pass.
     }
 
-    /// Pure helper: `backing_pos(0, 0)` → 0.
+    /// Pure helper: `backing_pos(0, 0)` → Some(0).
     #[test]
     fn backing_pos_zero() {
-        assert_eq!(backing_pos(0, 0), 0);
+        assert_eq!(backing_pos(0, 0), Some(0));
     }
 
     /// `backing_pos` adds offset to playhead.
     #[test]
     fn backing_pos_adds_offset() {
-        assert_eq!(backing_pos(1_000_000, 250_000), 1_250_000);
+        assert_eq!(backing_pos(1_000_000, 250_000), Some(1_250_000));
+    }
+
+    /// A negative offset delays the audio: silent until the playhead catches up.
+    #[test]
+    fn backing_pos_negative_offset_is_silent_then_plays() {
+        assert_eq!(backing_pos(0, -500_000), None);
+        assert_eq!(backing_pos(499_000, -500_000), None);
+        assert_eq!(backing_pos(500_000, -500_000), Some(0));
+        assert_eq!(backing_pos(700_000, -500_000), Some(200_000));
     }
 
     /// Large values stay in-range (no wrapping/overflow in normal use).
     #[test]
     fn backing_pos_large_values() {
         let playhead = 10 * 60 * 1_000_000u64; // 10 minutes
-        let offset = 5_000_000u64; // 5 seconds
-        assert_eq!(backing_pos(playhead, offset), playhead + offset);
+        let offset = 5_000_000i64; // 5 seconds
+        assert_eq!(
+            backing_pos(playhead, offset),
+            Some(playhead + offset as u64)
+        );
     }
 
     /// Nudge accumulation: successive offset changes stack.
     #[test]
     fn backing_pos_nudges_accumulate() {
         let base = 1_000_000u64;
-        let nudge1 = 10_000u64;
-        let nudge2 = 250_000u64;
-        assert_eq!(backing_pos(base, nudge1 + nudge2), base + nudge1 + nudge2);
+        let nudge1 = 10_000i64;
+        let nudge2 = 250_000i64;
+        assert_eq!(
+            backing_pos(base, nudge1 + nudge2),
+            Some(base + (nudge1 + nudge2) as u64)
+        );
     }
 
     /// The mix survives a device-less start: settings are `core` state, so the
