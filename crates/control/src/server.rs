@@ -107,7 +107,7 @@ impl ControlServer {
 async fn handle_connection(
     stream: TcpStream,
     composer: Arc<Mutex<Composer>>,
-) -> Result<(), WsError> {
+) -> Result<(), Box<WsError>> {
     let ws = tokio_tungstenite::accept_async(stream).await?;
     let (mut write, mut read) = ws.split();
 
