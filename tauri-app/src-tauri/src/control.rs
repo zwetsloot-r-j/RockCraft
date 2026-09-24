@@ -473,6 +473,19 @@ impl HostServices for TauriHost<'_> {
                     Err(e) => failed("import_start", e),
                 }
             }
+            HostCommand::DetectTempoMap {
+                beats_per_bar,
+                anchor_us,
+                tempo_hint_bpm,
+            } => match crate::state::detect_tempo_map(
+                &app.state::<AppState>(),
+                beats_per_bar,
+                anchor_us,
+                tempo_hint_bpm,
+            ) {
+                Ok(reply) => json_payload("detect_tempo_map", reply),
+                Err(e) => failed("detect_tempo_map", e),
+            },
             HostCommand::ImportScore { path } => {
                 match crate::import::import_start(
                     app.clone(),

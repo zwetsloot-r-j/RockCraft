@@ -165,6 +165,18 @@ pub enum HostCommand {
     /// sidecar decides which an input is, so the frontends never have to.
     ImportScore { path: String },
 
+    // ── tempo ───────────────────────────────────────────────────────────
+    /// Detect a per-bar tempo map from the loaded piece's backing audio (runs
+    /// the `tools/tempo-map` sidecar) and install it via
+    /// `core::Action::SetBarStarts`. `beats_per_bar` defaults to the grid's;
+    /// `anchor_us` is a known downbeat in **song** time; `tempo_hint_bpm`
+    /// resolves half/double time. Needs an attached backing track.
+    DetectTempoMap {
+        beats_per_bar: Option<u8>,
+        anchor_us: Option<u64>,
+        tempo_hint_bpm: Option<f64>,
+    },
+
     // ── status / device ─────────────────────────────────────────────────
     /// Current audio/backing status as JSON.
     AudioStatus,
@@ -221,6 +233,7 @@ impl HostCommand {
             HostCommand::QueryBackgrounds => "query_backgrounds",
             HostCommand::ImportStart { .. } => "import_start",
             HostCommand::ImportScore { .. } => "import_score",
+            HostCommand::DetectTempoMap { .. } => "detect_tempo_map",
             HostCommand::AudioStatus => "audio_status",
             HostCommand::MidiStatus => "midi_status",
             HostCommand::MidiRescan => "midi_rescan",
@@ -354,6 +367,7 @@ pub fn host_command_names() -> &'static [&'static str] {
         "query_backgrounds",
         "import_start",
         "import_score",
+        "detect_tempo_map",
         "audio_status",
         "midi_status",
         "midi_rescan",
@@ -425,6 +439,8 @@ static HOST_HELP: &[HostCommandInfo] = {
         // ── import ──────────────────────────────────────────────────────
         HostCommandInfo { name: "import_start", params: &[p("url", "String")], description: "Start importing audio/video from a URL." },
         HostCommandInfo { name: "import_score", params: &[p("path", "String")], description: "Start importing a local score file (MusicXML/.xml/.mxl/.abc/.krn) or a scan (.pdf/.png/.jpg/.jpeg/.tif/.tiff/.bmp). A score file is a deterministic transform whose notated tempo, metre and key seed the new bundle's grid. A scan goes through an optical music recognition engine first, which is lossy: its notes carry a derived confidence, the import log reports how many were flagged, and it needs an OMR engine installed (see docs/IMPORT.md)." },
+        // ── tempo ───────────────────────────────────────────────────────
+        HostCommandInfo { name: "detect_tempo_map", params: &[p("beats_per_bar", "u8?"), p("anchor_us", "u64?"), p("tempo_hint_bpm", "f64?")], description: "Detect a per-bar tempo map from the loaded piece's backing audio and install it (set_bar_starts): bar lines then follow a performance whose tempo breathes. beats_per_bar defaults to the grid's; anchor_us is a known downbeat in song time (snapped to the nearest detected beat; omitted = picked from bass accents); tempo_hint_bpm resolves half/double time (e.g. 86 vs 172). Grid-only: no note moves. Needs an attached backing track and python3 with numpy. Returns {bars, bpm, pulse_bpm, anchor_us}." },
         // ── status / device ──────────────────────────────────────────────
         HostCommandInfo { name: "audio_status", params: &[], description: "Return the current audio/backing status." },
         HostCommandInfo { name: "midi_status", params: &[], description: "Return the current MIDI input status." },
@@ -510,6 +526,11 @@ mod tests {
             HostCommand::ImportScore {
                 path: "score.musicxml".into(),
             },
+            HostCommand::DetectTempoMap {
+                beats_per_bar: Some(4),
+                anchor_us: None,
+                tempo_hint_bpm: Some(86.0),
+            },
             HostCommand::AudioStatus,
             HostCommand::MidiStatus,
             HostCommand::MidiRescan,
@@ -575,6 +596,7 @@ mod tests {
                     "i64" => json!(0),
                     "u16" => json!(1000),
                     "f32" => json!(0.5),
+                    "u8?" | "u64?" | "f64?" => json!(4),
                     "SynthBus" | "MixerBus" => json!("player"),
                     "SaveDest" => json!({ "kind": "quick_save" }),
                     "Vec<SegmentSpec>" => {

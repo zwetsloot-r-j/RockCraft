@@ -553,13 +553,13 @@ fn env_fetch_cmd(workspace: &Path) -> Option<PathBuf> {
 
 /// Resolve the ffmpeg command: `$ROCKCRAFT_FFMPEG` if set, else bare `ffmpeg`
 /// (found via `PATH`). Used to extract the source video's audio (issue #152).
-fn env_ffmpeg_cmd() -> PathBuf {
+pub(crate) fn env_ffmpeg_cmd() -> PathBuf {
     std::env::var_os("ROCKCRAFT_FFMPEG")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("ffmpeg"))
 }
 
-fn workspace_root() -> PathBuf {
+pub(crate) fn workspace_root() -> PathBuf {
     if let Ok(root) = std::env::var("ROCKCRAFT_WORKSPACE") {
         return PathBuf::from(root);
     }

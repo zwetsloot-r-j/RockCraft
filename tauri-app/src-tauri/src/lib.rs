@@ -246,6 +246,29 @@ fn split_bundle(
     state::split_bundle(&state, segments)
 }
 
+/// Detect a per-bar tempo map from the attached backing audio and install it
+/// (M16-A). The webview-facing mirror of `HostCommand::DetectTempoMap`: both
+/// route through [`state::detect_tempo_map`]. Async + blocking pool, because the
+/// detector runs for seconds and must not stall the UI thread.
+#[tauri::command]
+async fn detect_tempo_map(
+    app: tauri::AppHandle,
+    beats_per_bar: Option<u8>,
+    anchor_us: Option<u64>,
+    tempo_hint_bpm: Option<f64>,
+) -> Result<state::TempoMapReply, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        state::detect_tempo_map(
+            &app.state::<AppState>(),
+            beats_per_bar,
+            anchor_us,
+            tempo_hint_bpm,
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Attach (or replace) the edit-screen background video (M9-G). `path` is the
 /// absolute file the webview picked; `offset_us` is the alignment offset
 /// (`videoTime = songTime + offset_us`). Persisted into the bundle on save.
@@ -586,6 +609,7 @@ pub fn run() {
             load_bundle,
             query_dirty,
             split_bundle,
+            detect_tempo_map,
             edit_set_video,
             edit_set_video_offset,
             edit_clear_video,

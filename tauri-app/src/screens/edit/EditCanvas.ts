@@ -54,7 +54,7 @@ function barStartUs(bar: number, bars: number[], originUs: number, barUs: number
 }
 
 /** Song-time (µs) of grid `step` — tempo-map aware (mirror of `pos_us_of_step`). */
-function usOfStep(step: number, bars: number[], g: GridTiming, originUs: number): number {
+export function usOfStep(step: number, bars: number[], g: GridTiming, originUs: number): number {
   if (bars.length === 0) return originUs + step * g.stepUs;
   const spb = stepsPerBar(g);
   const bar = Math.floor(step / spb);
@@ -117,6 +117,12 @@ const FONT_MONO = "'IBM Plex Mono', ui-monospace, monospace";
 
 /** µs spanned across the canvas height (~8 bars at 120 4/4): the vertical zoom. */
 const DEFAULT_SPAN_US = 16_000_000;
+
+/** Song-time (µs) of the snapshot's cursor — tempo-map aware. */
+export function cursorUsOf(snapshot: ComposerSnapshot): number {
+  const g = gridTiming(snapshot.bpm, snapshot.time_sig, snapshot.subdivision);
+  return usOfStep(snapshot.cursor.step, snapshot.bar_starts ?? [], g, snapshot.grid_origin_us ?? 0);
+}
 
 export class EditCanvas {
   private canvas: HTMLCanvasElement;

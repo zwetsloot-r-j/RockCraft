@@ -545,6 +545,10 @@ impl Composer {
             Action::NudgeTail { delta_steps } => self.nudge_tail(delta_steps),
             Action::NudgeBarTempo { delta } => self.nudge_bar_tempo(delta),
             Action::NudgeBarLength { delta_steps } => self.nudge_bar_length(delta_steps),
+            Action::SetBarStarts { bars_us } => {
+                self.install_bar_starts(bars_us);
+                Vec::new()
+            }
 
             Action::ToggleGrab => self.toggle_grab(),
             Action::InsertRun {
@@ -1321,13 +1325,24 @@ impl Composer {
             return Vec::new();
         }
         self.history.checkpoint();
+        // With a tempo map the step length varies per bar: quantise to the same
+        // number of divisions per bar that `step_us` gives on the nominal grid.
+        let divs = (self.grid.bar_us() + step / 2) / step;
         for id in ids {
             let Some(note) = self.timeline().get(id).copied() else {
                 continue;
             };
-            let new_start = self.grid.snap_to_step(note.start_us, step);
-            let snapped_end = self.grid.snap_to_step(note.start_us + note.dur_us, step);
-            let new_end = snapped_end.max(new_start + step);
+            let end_us = note.start_us + note.dur_us;
+            let (new_start, snapped_end, min_len) = if self.bar_starts.is_empty() {
+                let s = self.grid.snap_to_step(note.start_us, step);
+                (s, self.grid.snap_to_step(end_us, step), step)
+            } else {
+                let start = self.map_snap(note.start_us, divs);
+                // Minimum length: one division of the bar the onset landed in.
+                let min_len = (self.bar_dur_us(self.bar_at_us(start)) / divs.max(1)).max(1);
+                (start, self.map_snap(end_us, divs), min_len)
+            };
+            let new_end = snapped_end.max(new_start + min_len);
             self.history.current_mut().set_start(id, new_start);
             self.history.current_mut().resize(id, new_end - new_start);
         }
@@ -1742,8 +1757,18 @@ impl Composer {
     /// Emit a metronome click when the beat index advances, releasing the prior
     /// click first. Pushes `AuditionNote` effects (velocity 0 = the click off).
     fn tick_metronome_click(&mut self, now: u64, effects: &mut Vec<Effect>) {
-        let beat_us = self.grid.quarter_us();
-        let current_beat = now / beat_us;
+        let beats_per_bar = self.grid.time_sig.beats_per_bar as u64;
+        // With a tempo map the beats follow each bar's own length; otherwise
+        // one click per quarter from time 0, as before.
+        let current_beat = match self.bar_starts.first() {
+            Some(&first) if now >= first => {
+                let bar = self.bar_at_us(now);
+                let into = now - self.bar_start_us(bar);
+                bar * beats_per_bar
+                    + (into * beats_per_bar / self.bar_dur_us(bar)).min(beats_per_bar - 1)
+            }
+            _ => now / self.grid.quarter_us(),
+        };
 
         // Release pending click note_off if its time has come.
         if let Some(off_at) = self.click_pending_off {
@@ -1758,7 +1783,6 @@ impl Composer {
 
         // Fire note_on when a new beat starts.
         if self.last_click_beat != Some(current_beat) {
-            let beats_per_bar = self.grid.time_sig.beats_per_bar as u64;
             let is_accent = current_beat.is_multiple_of(beats_per_bar);
             let velocity = if is_accent {
                 CLICK_VEL_ACCENT
@@ -2050,6 +2074,49 @@ impl Composer {
         let us = self.cursor_us();
         self.bar_starts = bars;
         self.cursor.step = self.pos_step_index(us);
+    }
+
+    /// [`Action::SetBarStarts`]: validate and install a whole tempo map, and
+    /// point the uniform grid (origin + BPM) at it so the fallback, the status
+    /// bar and anything still reading `grid.bpm` agree. Notes never move.
+    fn install_bar_starts(&mut self, bars: Vec<u64>) {
+        if bars.is_empty() {
+            self.set_bar_starts(bars);
+            return;
+        }
+        if bars.len() < 2 || bars.windows(2).any(|w| w[1] <= w[0]) {
+            return;
+        }
+        let mut durs: Vec<u64> = bars.windows(2).map(|w| w[1] - w[0]).collect();
+        durs.sort_unstable();
+        let median = durs[durs.len() / 2];
+        let ts = self.grid.time_sig;
+        // bar_us = beats_per_bar · quarter · 4 / beat_unit  →  solve for BPM.
+        let bpm = (240_000_000u64 * ts.beats_per_bar as u64 + median * ts.beat_unit as u64 / 2)
+            / (median * ts.beat_unit as u64);
+        self.grid.set_bpm(bpm.min(u32::MAX as u64) as u32);
+        self.grid.set_origin_us(bars[0]);
+        self.set_bar_starts(bars);
+    }
+
+    /// Snap `us` to the nearest of `divs` equal divisions of the (tempo-mapped)
+    /// bar containing it; the bar's end rolls over to the next downbeat.
+    fn map_snap(&self, us: u64, divs: u64) -> u64 {
+        let divs = divs.max(1);
+        if let Some(&first) = self.bar_starts.first() {
+            if us < first {
+                // A pickup before the first mapped downbeat: extend the first
+                // bar's division spacing backwards rather than piling onto it.
+                let dur = self.bar_dur_us(0);
+                let k = ((first - us) * divs + dur / 2) / dur;
+                return first.saturating_sub(k * dur / divs);
+            }
+        }
+        let bar = self.bar_at_us(us);
+        let start = self.bar_start_us(bar);
+        let dur = self.bar_dur_us(bar);
+        let k = (us.saturating_sub(start) * divs + dur / 2) / dur;
+        start + k.min(divs) * dur / divs
     }
 
     /// Grid step of the last note's end (0 for an empty timeline) — the `$` jump.
@@ -3703,6 +3770,142 @@ mod tests {
         assert_eq!(start, 5 * step);
         assert_eq!(end, 6 * step, "end pushed past the new start");
         assert!(end > start);
+    }
+
+    fn grid_4_4(bpm: u32, sub: Subdivision) -> Grid {
+        Grid {
+            bpm,
+            time_sig: TimeSig {
+                beats_per_bar: 4,
+                beat_unit: 4,
+            },
+            subdivision: sub,
+            origin_us: 0,
+        }
+    }
+
+    #[test]
+    fn set_bar_starts_installs_map_and_follows_grid_without_moving_notes() {
+        let mut tl = Timeline::new();
+        tl.insert(note(60, 1_234_567, 100_000));
+        let mut c = Composer::from_timeline(tl, grid_4_4(120, Subdivision::Quarter));
+        // Bars of 2.0s, 2.4s, 2.8s (median 2.4s = 100 BPM in 4/4).
+        let bars = vec![500_000, 2_500_000, 4_900_000, 7_700_000];
+        apply(
+            &mut c,
+            Action::SetBarStarts {
+                bars_us: bars.clone(),
+            },
+        );
+        assert_eq!(c.bar_starts(), bars.as_slice());
+        assert_eq!(c.grid().bpm, 100, "BPM = median bar tempo");
+        assert_eq!(c.grid().origin_us, 500_000, "origin = first downbeat");
+        let starts: Vec<u64> = c.timeline().notes().map(|(_, n)| n.start_us).collect();
+        assert_eq!(starts, vec![1_234_567], "no note moves");
+        // Steps follow the map: bar 1's 2nd quarter is 2.5s + 2.4s/4.
+        assert_eq!(c.pos_us_of_step(5), 3_100_000);
+    }
+
+    #[test]
+    fn set_bar_starts_rejects_malformed_and_empty_clears() {
+        let mut c = Composer::from_timeline(Timeline::new(), grid_4_4(120, Subdivision::Quarter));
+        let good = vec![0, 2_000_000, 4_000_000];
+        apply(
+            &mut c,
+            Action::SetBarStarts {
+                bars_us: good.clone(),
+            },
+        );
+        for bad in [vec![5], vec![0, 0, 1], vec![0, 3_000_000, 2_000_000]] {
+            apply(&mut c, Action::SetBarStarts { bars_us: bad });
+            assert_eq!(c.bar_starts(), good.as_slice(), "malformed map is a no-op");
+        }
+        apply(&mut c, Action::SetBarStarts { bars_us: vec![] });
+        assert!(
+            c.bar_starts().is_empty(),
+            "empty clears to the uniform grid"
+        );
+    }
+
+    #[test]
+    fn quantize_region_follows_the_tempo_map() {
+        // 120 BPM nominal: 1/8 step = 250ms = 8 divisions per bar.
+        let mut tl = Timeline::new();
+        // Bar 1 is 3.2s long (400ms eighths), starting at 2.0s.
+        tl.insert(note(60, 2_000_000 + 390_000, 380_000)); // ~1 eighth in, ~1 long
+        tl.insert(note(62, 5_190_000, 50_000)); // just before bar 2 → rolls onto it
+        tl.insert(note(64, 1_700_000, 100_000)); // bar 0 (2.0s long, 250ms eighths)
+        let mut c = Composer::from_timeline(tl, grid_4_4(120, Subdivision::Eighth));
+        apply(
+            &mut c,
+            Action::SetBarStarts {
+                bars_us: vec![0, 2_000_000, 5_200_000, 7_200_000],
+            },
+        );
+        apply(
+            &mut c,
+            Action::QuantizeRegion {
+                start_us: 0,
+                end_us: 7_200_000,
+                step_us: 250_000,
+            },
+        );
+        let snap = c.snapshot();
+        let by = |p: u8| snap.notes.iter().find(|n| n.pitch == p).copied().unwrap();
+        assert_eq!(by(60).start_us, 2_400_000, "bar-1 eighths are 400ms");
+        assert_eq!(by(60).dur_us, 400_000);
+        assert_eq!(by(62).start_us, 5_200_000, "rolls onto the next downbeat");
+        assert_eq!(
+            by(62).dur_us,
+            250_000,
+            "min length = one division of its bar"
+        );
+        assert_eq!(by(64).start_us, 1_750_000, "bar-0 eighths are 250ms");
+    }
+
+    #[test]
+    fn quantize_pickup_before_the_map_extends_the_first_bar_backwards() {
+        let mut tl = Timeline::new();
+        tl.insert(note(60, 1_480_000, 100_000)); // 0.52s before the first downbeat
+        let mut c = Composer::from_timeline(tl, grid_4_4(120, Subdivision::Eighth));
+        apply(
+            &mut c,
+            Action::SetBarStarts {
+                bars_us: vec![2_000_000, 4_000_000, 6_000_000],
+            },
+        );
+        apply(
+            &mut c,
+            Action::QuantizeRegion {
+                start_us: 0,
+                end_us: 6_000_000,
+                step_us: 250_000,
+            },
+        );
+        let n = c.snapshot().notes[0];
+        assert_eq!(n.start_us, 1_500_000, "two eighths before the downbeat");
+    }
+
+    #[test]
+    fn metronome_follows_the_tempo_map() {
+        let mut c = Composer::from_timeline(Timeline::new(), grid_4_4(120, Subdivision::Quarter));
+        // Bar 0: 2s (500ms beats); bar 1: 4s (1s beats).
+        apply(
+            &mut c,
+            Action::SetBarStarts {
+                bars_us: vec![0, 2_000_000, 6_000_000],
+            },
+        );
+        apply(&mut c, Action::ToggleMetronome);
+        apply(&mut c, Action::PlayFromStart);
+        let mut counts = Vec::new();
+        for _ in 0..12 {
+            c.advance(500_000); // to 6.0s in 500ms ticks
+            counts.push(c.metronome_click_count());
+        }
+        // 4 clicks across bar 0, then one per second across bar 1.
+        assert_eq!(counts[3], 4, "bar 0 beats every 500ms");
+        assert_eq!(counts[11], 8, "bar 1 beats every 1s");
     }
 
     #[test]

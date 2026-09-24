@@ -281,6 +281,15 @@ pub enum Action {
     NudgeBarLength {
         delta_steps: i32,
     },
+    /// Install a whole tempo map at once: `bars_us` is the song time (µs) of
+    /// every bar's downbeat, strictly ascending, with at least two entries (the
+    /// last closes the final bar). Empty clears the map back to the uniform grid;
+    /// any other malformed list is a no-op. Grid-only — **no note moves** — and
+    /// the grid's origin/BPM follow the map (origin = first downbeat, BPM = the
+    /// median bar's tempo). Typically fed by an audio beat detector.
+    SetBarStarts {
+        bars_us: Vec<u64>,
+    },
 
     // ── history ─────────────────────────────────────────────────────────
     Undo,
@@ -367,6 +376,7 @@ impl Action {
             Action::NudgeTail { .. } => "nudge_tail",
             Action::NudgeBarTempo { .. } => "nudge_bar_tempo",
             Action::NudgeBarLength { .. } => "nudge_bar_length",
+            Action::SetBarStarts { .. } => "set_bar_starts",
             Action::Undo => "undo",
             Action::Redo => "redo",
         }
@@ -530,6 +540,7 @@ pub fn action_names() -> &'static [&'static str] {
         "nudge_tail",
         "nudge_bar_tempo",
         "nudge_bar_length",
+        "set_bar_starts",
         "undo",
         "redo",
     ]
@@ -659,6 +670,7 @@ static ACTION_HELP: &[ActionInfo] = {
         ActionInfo { name: "nudge_tail", params: &[p("delta_steps", "i32")], description: "Ripple-shift every note at or after the cursor by delta_steps grid steps (signed) — re-phases the rest of the song in one move to fix a constant timing offset that starts at a point. Notes before the cursor are untouched." },
         ActionInfo { name: "nudge_bar_tempo", params: &[p("delta", "i32")], description: "Slow (delta>0) or speed (delta<0) the bar the cursor sits in by delta grid steps of length; the notes inside re-time to stay on their beats and everything after ripples. Uses the per-bar tempo map so untouched bars stay put." },
         ActionInfo { name: "nudge_bar_length", params: &[p("delta_steps", "i32")], description: "Change the length of the cursor's bar by delta_steps grid steps (at the live subdivision) and slide every bar line after it by that amount. Grid-only: NO note moves and NO time is added/removed — for fixing an odd-length measure so bar lines land back on the fixed notes. Use </> to change the subdivision for finer/coarser steps (down to 1/32)." },
+        ActionInfo { name: "set_bar_starts", params: &[p("bars_us", "Vec<u64>")], description: "Install a whole per-bar tempo map: bars_us = song time (µs) of every bar's downbeat, strictly ascending, >= 2 entries (the last closes the final bar). [] clears it back to the uniform grid; a malformed list is a no-op. Grid-only: no note moves. The grid origin becomes the first downbeat and the BPM the median bar's tempo. See the detect_tempo_map host command to fill it from the backing audio." },
         // ── history ─────────────────────────────────────────────────────
         ActionInfo { name: "undo", params: &[], description: "Undo the last edit." },
         ActionInfo { name: "redo", params: &[], description: "Redo the last undone edit." },
@@ -770,6 +782,9 @@ mod tests {
             Action::NudgeTail { delta_steps: -2 },
             Action::NudgeBarTempo { delta: 1 },
             Action::NudgeBarLength { delta_steps: -1 },
+            Action::SetBarStarts {
+                bars_us: vec![0, 2_000_000, 4_100_000],
+            },
             Action::Undo,
             Action::Redo,
         ]
@@ -837,6 +852,7 @@ mod tests {
                     "bool" => json!(true),
                     "Easing" => json!("linear"),
                     "HandSetting" => json!("auto"),
+                    "Vec<u64>" => json!([0, 1_000_000]),
                     _ => json!(1), // small in-range value for every numeric type
                 };
                 params.insert(p.name.to_string(), sample);

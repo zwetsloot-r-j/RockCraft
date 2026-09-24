@@ -196,6 +196,32 @@ export function splitBundle(segments: SegmentSpec[]): Promise<string[]> {
   return invoke<string[]>("split_bundle", { segments });
 }
 
+/** Result of {@link detectTempoMap} (M16-A) — song-time µs. */
+export interface TempoMapReply {
+  bars: number[];
+  bpm: number;
+  pulse_bpm: number;
+  anchor_us: number;
+  snapshot: ComposerSnapshot;
+}
+
+/**
+ * Detect a per-bar tempo map from the attached backing audio and install it
+ * (mirror of `HostCommand::DetectTempoMap`). Grid-only: no note moves. Takes a
+ * few seconds; rejects when no backing is attached or python3/numpy is missing.
+ */
+export function detectTempoMap(opts: {
+  beatsPerBar?: number;
+  anchorUs?: number;
+  tempoHintBpm?: number;
+}): Promise<TempoMapReply> {
+  return invoke<TempoMapReply>("detect_tempo_map", {
+    beatsPerBar: opts.beatsPerBar ?? null,
+    anchorUs: opts.anchorUs ?? null,
+    tempoHintBpm: opts.tempoHintBpm ?? null,
+  });
+}
+
 // ── Audio commands ────────────────────────────────────────────────────────
 
 /** Audio status returned by {@link audioStatus}. */

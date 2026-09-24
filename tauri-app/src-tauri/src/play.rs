@@ -154,6 +154,10 @@ pub struct PlayInfo {
     pub bpm: u32,
     /// Beats per bar (time-signature numerator); defaults to 4.
     pub beats_per_bar: u8,
+    /// Tempo map (M16-A): bar downbeats in **play-clock** µs (already shifted),
+    /// so the highway draws bar/beat lines that follow the performance. Empty
+    /// for a uniform-grid piece — use `bpm`/`beats_per_bar` then.
+    pub bar_starts_us: Vec<u64>,
     /// The piece's left/right hand split pitch (`meta.hand_split`, or the
     /// default). The play screen seeds its split from THIS so a piece's
     /// authored hand assignment drives practice, instead of a machine-global
@@ -477,6 +481,8 @@ pub struct PlaySession {
     /// shift keeps timeline bars on play bar lines.
     bpm: u32,
     beats_per_bar: u8,
+    /// The piece's tempo map shifted into play-clock µs (empty = uniform).
+    bar_starts_us: Vec<u64>,
 
     /// Live held-note set, updated by every ingested MIDI event.
     held: BTreeSet<u8>,
@@ -563,6 +569,7 @@ impl PlaySession {
             cfg: ScoreConfig::default(),
             bpm: grid.map(|g| g.bpm).unwrap_or(120),
             beats_per_bar: grid.map(|g| g.beats_per_bar).unwrap_or(4),
+            bar_starts_us: Vec::new(),
             held: BTreeSet::new(),
             played: Vec::new(),
             scored: HashSet::new(),
@@ -584,6 +591,14 @@ impl PlaySession {
             path,
             audio_start_us,
         });
+        self
+    }
+
+    /// Adopt the piece's tempo map (`meta.bar_starts`, song µs), shifting it
+    /// into play-clock time alongside the notes so the highway's bar lines stay
+    /// on the notes.
+    pub fn with_bar_starts(mut self, bars: &[u64]) -> Self {
+        self.bar_starts_us = bars.iter().map(|b| b + self.shift_us).collect();
         self
     }
 
@@ -712,6 +727,7 @@ impl PlaySession {
             split_pitch: self.split_pitch,
             bpm: self.bpm,
             beats_per_bar: self.beats_per_bar,
+            bar_starts_us: self.bar_starts_us.clone(),
         }
     }
 
@@ -1198,6 +1214,7 @@ fn load_session_from_dir(dir: &Path) -> Result<PlaySession, String> {
         // Hand assignment first: it sets `split_pitch`, and every later
         // hand-aware read (practice gate, scoring, colouring) goes through it.
         session = session.with_hands(&meta.hand_overrides, meta.split_or_default());
+        session = session.with_bar_starts(&meta.bar_starts);
         if let Some(backing) = meta.backing {
             session = session.with_backing(dir.join(&backing.file), backing.audio_start_us);
             has_backing = true;
@@ -2177,6 +2194,23 @@ mod tests {
         }];
         PlaySession::from_events("test".into(), &four_note_events())
             .with_hands(&overrides, DEFAULT_SPLIT)
+    }
+
+    #[test]
+    fn with_bar_starts_shifts_the_map_into_play_clock_time() {
+        let s = PlaySession::from_events("test".into(), &four_note_events())
+            .with_bar_starts(&[0, 2_000_000, 4_500_000]);
+        let shift = s.shift_us();
+        assert_eq!(
+            s.info().bar_starts_us,
+            vec![shift, 2_000_000 + shift, 4_500_000 + shift],
+            "bar lines move with the notes' pre-roll shift"
+        );
+        let plain = PlaySession::from_events("test".into(), &four_note_events());
+        assert!(
+            plain.info().bar_starts_us.is_empty(),
+            "no map = uniform grid"
+        );
     }
 
     #[test]

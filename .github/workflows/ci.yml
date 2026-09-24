@@ -98,3 +98,10 @@ jobs:
         run: |
           python3 -m pip install -r requirements.txt
           python3 -m pytest
+
+      # tools/tempo-map (M16-A) is numpy-only; its tests use synthetic clicks.
+      - name: tempo-map sidecar tests
+        working-directory: tools/tempo-map
+        run: |
+          python3 -m pip install -r requirements.txt
+          python3 -m pytest

@@ -411,6 +411,9 @@ export interface PlayInfo {
   bpm: number;
   /** Beats per bar (time-signature numerator); 4 when no grid. */
   beats_per_bar: number;
+  /** Tempo map (M16-A): bar downbeats in play-clock µs, already shifted. Empty
+   * (or absent) for a uniform grid — space lines by `bpm` then. */
+  bar_starts_us?: number[];
   /** The piece's left/right hand split pitch (`meta.hand_split`). The play
    * screen seeds its split from this so the authored hand assignment drives
    * practice, instead of a machine-global localStorage value. */
