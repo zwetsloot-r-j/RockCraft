@@ -55,6 +55,7 @@ mod tests {
 
     fn source() -> SourceMeta {
         SourceMeta {
+            clock_offset_us: None,
             title: Some("Test".into()),
             fps: None,
             scroll_px_per_s: None,

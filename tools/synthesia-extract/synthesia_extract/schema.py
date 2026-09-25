@@ -77,6 +77,9 @@ class SourceMeta:
     frame_height_px: Optional[int] = None
     hit_line_px: Optional[int] = None
     audio_fusion: Optional[str] = None
+    # Constant shift (µs) audio fusion applied to every note to align the chart
+    # with its audio; the importer offsets the source movie by the opposite.
+    clock_offset_us: Optional[int] = None
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {"extractor_version": self.extractor_version}
@@ -92,6 +95,8 @@ class SourceMeta:
             out["hit_line_px"] = int(self.hit_line_px)
         if self.audio_fusion is not None:
             out["audio_fusion"] = str(self.audio_fusion)
+        if self.clock_offset_us is not None:
+            out["clock_offset_us"] = int(self.clock_offset_us)
         return out
 
 
