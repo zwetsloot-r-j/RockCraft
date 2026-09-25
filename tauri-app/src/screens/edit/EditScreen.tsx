@@ -64,7 +64,7 @@ import { RecordControls } from "./RecordControls";
 import { DEFAULT_SPLIT } from "./hand";
 import { resolveBackgroundKey, resolveKey } from "./keymap";
 import { IDENTITY_TRANSFORM, layerStyle } from "../highway/backgrounds";
-import { HIGHEST_MIDI, LOWEST_MIDI, stepUs } from "./viewport";
+import { HIGHEST_MIDI, LOWEST_MIDI } from "./viewport";
 import {
   keptSegmentSpecs,
   pieceLengthUs,
@@ -367,8 +367,10 @@ export function EditScreen(props: Props): JSX.Element {
    */
   function anchorUsOf(s: ComposerSnapshot): number {
     if (s.playing) return interpolatedPlayheadUs(s);
-    // Cursor step 0 sits at the grid origin, not song time 0.
-    return (s.grid_origin_us ?? 0) + s.cursor.step * stepUs(s.bpm, s.subdivision);
+    // Tempo-map aware (the same mapping the canvas draws with): a uniform
+    // `origin + step·stepUs` drifts the paused backdrop off the notes wherever
+    // the piece's bars differ from the grid's nominal BPM.
+    return cursorUsOf(s);
   }
 
   /**
@@ -721,9 +723,7 @@ export function EditScreen(props: Props): JSX.Element {
     const r = reviewUs();
     if (r !== null) return r;
     const s = store.snap;
-    return s
-      ? (s.grid_origin_us ?? 0) + s.cursor.step * stepUs(s.bpm, s.subdivision)
-      : 0;
+    return s ? cursorUsOf(s) : 0;
   }
 
   /** Open the ALIGN overlay, seeding a shared inspection head so ↑/↓ scrub from
@@ -737,9 +737,7 @@ export function EditScreen(props: Props): JSX.Element {
         seed = notes.reduce((m, n) => Math.min(m, n.start_us), Infinity);
       } else {
         const s = store.snap;
-        seed = s
-          ? (s.grid_origin_us ?? 0) + s.cursor.step * stepUs(s.bpm, s.subdivision)
-          : 0;
+        seed = s ? cursorUsOf(s) : 0;
       }
       setReviewUs(seed);
     }
