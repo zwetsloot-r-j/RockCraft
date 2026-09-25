@@ -86,5 +86,11 @@ pub struct SourceMeta {
     /// notes are struck). Pairs with `frame_height_px` for the overlay calibration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hit_line_px: Option<u32>,
+    /// Constant shift (µs) the extractor's audio-fusion pass applied to every
+    /// note to align the chart with its audio (negative = moved earlier). The
+    /// source movie keeps the original timing, so the importer offsets the
+    /// retained backdrop by the opposite amount. `None` when not applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock_offset_us: Option<i64>,
     pub extractor_version: String,
 }

@@ -22,6 +22,7 @@ fn c_major_scale() -> ExtractedChart {
     ExtractedChart {
         notes,
         source: SourceMeta {
+            clock_offset_us: None,
             title: Some("Synthetic C-major scale".into()),
             fps: None,
             scroll_px_per_s: None,

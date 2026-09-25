@@ -129,9 +129,6 @@ fn run_pipeline(
         return run_score_pipeline(&path, on_progress, ctx);
     }
     let video_path = resolve_input(input, on_progress, ctx)?;
-    let chart_json = run_sidecar(&video_path, on_progress, &ctx.workspace)?;
-    let chart = from_json(&chart_json)?;
-    on_progress(Progress::Writing);
     let out_dir = ctx
         .workspace
         .join("import-out")
@@ -139,11 +136,29 @@ fn run_pipeline(
     std::fs::create_dir_all(&out_dir)?;
     // Best-effort: attach the source video's audio as the default backing track.
     // ffmpeg is optional — a missing or failing binary leaves `backing: null`.
+    // Extracted *before* the sidecar so its audio-fusion pass can align the
+    // chart's clock to the audio and fill velocities (M6-F).
     let backing = extract_backing(&video_path, &out_dir, &ctx.ffmpeg_cmd);
+    let audio = backing.as_ref().map(|b| out_dir.join(&b.file));
+    let chart = match run_sidecar(&video_path, audio.as_deref(), on_progress, &ctx.workspace)
+        .and_then(|json| from_json(&json))
+    {
+        Ok(chart) => chart,
+        Err(e) => {
+            // Don't leave a half-built bundle (just the backing) behind.
+            let _ = std::fs::remove_dir_all(&out_dir);
+            return Err(e);
+        }
+    };
+    on_progress(Progress::Writing);
     // Retain the original source video inside the bundle so the imported piece
     // comes with its background backdrop already attached (M9-G). Best-effort:
     // a copy failure leaves `video: null` and the import still succeeds.
-    let video = retain_source_video(&video_path, &out_dir, &ctx.ffmpeg_cmd);
+    let mut video = retain_source_video(&video_path, &out_dir, &ctx.ffmpeg_cmd);
+    // The chart may have been shifted onto its audio clock; the movie was not.
+    if let (Some(v), Some(shift)) = (video.as_mut(), chart.source.clock_offset_us) {
+        v.offset_us = backdrop_offset_for_clock_shift(shift);
+    }
     let bundle = write_chart_bundle_full(&chart, &out_dir, backing, video)?;
     on_progress(Progress::Done(bundle.clone()));
     Ok(bundle)
@@ -326,6 +341,13 @@ fn copy_source_video(video_path: &Path, out_dir: &Path) -> Option<BackgroundVide
     }
 }
 
+/// Backdrop offset (`videoTime = songTime + offset`) for a chart whose notes
+/// were shifted by `shift_us` onto the audio clock: a note the movie shows at
+/// `t` now sits at song time `t + shift`, so the movie runs `-shift` ahead.
+fn backdrop_offset_for_clock_shift(shift_us: i64) -> i64 {
+    -shift_us
+}
+
 fn resolve_input(
     input: ImportInput,
     on_progress: &mut dyn FnMut(Progress),
@@ -437,26 +459,33 @@ fn run_fetch(
     Ok(())
 }
 
+/// Run the video extractor. With `audio` (the bundle's extracted backing WAV)
+/// it also runs the audio-fusion pass: clock alignment to the audio, velocities,
+/// onset refinement. The sidecar itself decides whether the audio is clean
+/// enough to use, so passing a full mix is safe.
 fn run_sidecar(
     video_path: &Path,
+    audio: Option<&Path>,
     on_progress: &mut dyn FnMut(Progress),
     workspace: &Path,
 ) -> Result<String, ImportError> {
     on_progress(Progress::Extracting(0.0));
     let sidecar = find_sidecar(workspace)?;
-    let output = Command::new("python3")
-        .arg(&sidecar)
+    let mut cmd = Command::new("python3");
+    cmd.arg(&sidecar)
         .arg("--in")
         .arg(video_path)
         .arg("--out")
-        .arg("-")
-        .output()
-        .map_err(|e| {
-            ImportError::SidecarMissing(format!(
-                "could not launch python3: {e}; install python3 and set up \
+        .arg("-");
+    if let Some(audio) = audio {
+        cmd.arg("--audio-fusion").arg("--audio").arg(audio);
+    }
+    let output = cmd.output().map_err(|e| {
+        ImportError::SidecarMissing(format!(
+            "could not launch python3: {e}; install python3 and set up \
                  tools/synthesia-extract/ (see docs/IMPORT.md)"
-            ))
-        })?;
+        ))
+    })?;
     if !output.status.success() {
         return Err(ImportError::SidecarFailed(
             String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -1062,6 +1091,130 @@ mod tests {
         assert!(
             std::fs::metadata(&audio).unwrap().len() > 0,
             "extracted audio must be non-empty"
+        );
+    }
+
+    /// Stub ffmpeg (unix) writing non-empty bytes to its last argument.
+    #[cfg(unix)]
+    fn stub_ffmpeg(tmp: &TempDir) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let ffmpeg_sh = tmp.path().join("ffmpeg.sh");
+        std::fs::write(
+            &ffmpeg_sh,
+            "#!/bin/sh\nfor out; do :; done\nprintf 'RIFFfake' > \"$out\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&ffmpeg_sh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ffmpeg_sh
+    }
+
+    /// With a backing track, the extractor runs its audio-fusion pass on it:
+    /// the audio is extracted first and handed to the sidecar.
+    #[cfg(unix)]
+    #[test]
+    fn import_passes_the_backing_to_the_sidecar_for_fusion() {
+        let tmp = TempDir::new().unwrap();
+        let video = tmp.path().join("clip.mp4");
+        std::fs::write(&video, b"stub-video").unwrap();
+        let fixture_path = tmp.path().join("fixture.json");
+        std::fs::write(&fixture_path, FIXTURE_JSON).unwrap();
+        let args_path = tmp.path().join("args.txt");
+        let sidecar_dir = tmp.path().join("tools/synthesia-extract");
+        std::fs::create_dir_all(&sidecar_dir).unwrap();
+        std::fs::write(
+            sidecar_dir.join("extract.py"),
+            format!(
+                "import os, sys\nargs = sys.argv[1:]\n\
+                 open('{args}', 'w').write('\\n'.join(args))\n\
+                 audio = args[args.index('--audio') + 1]\n\
+                 assert os.path.getsize(audio) > 0, 'backing extracted before the sidecar'\n\
+                 sys.stdout.write(open('{fx}').read())\n",
+                args = args_path.display(),
+                fx = fixture_path.display()
+            ),
+        )
+        .unwrap();
+        let ctx = PipelineCtx {
+            workspace: tmp.path().to_path_buf(),
+            fetch_cmd: None,
+            ffmpeg_cmd: stub_ffmpeg(&tmp),
+        };
+        let bundle =
+            run_pipeline(ImportInput::File(video), &mut |_| {}, &ctx).expect("import succeeds");
+        let args = std::fs::read_to_string(&args_path).unwrap();
+        let args: Vec<&str> = args.lines().collect();
+        assert!(
+            args.contains(&"--audio-fusion"),
+            "fusion requested: {args:?}"
+        );
+        let audio = args[args.iter().position(|a| *a == "--audio").unwrap() + 1];
+        assert_eq!(Path::new(audio), bundle.join(BACKING_FILENAME));
+    }
+
+    /// When fusion shifted the chart onto its audio clock, the retained movie
+    /// (which keeps its original timing) is offset by the opposite amount.
+    #[cfg(unix)]
+    #[test]
+    fn clock_shift_offsets_the_retained_backdrop() {
+        let tmp = TempDir::new().unwrap();
+        let video = tmp.path().join("clip.mp4");
+        std::fs::write(&video, b"stub-video").unwrap();
+        let shifted = FIXTURE_JSON.replacen(
+            "\"source\": {",
+            "\"source\": {\"clock_offset_us\": -99000,",
+            1,
+        );
+        assert_ne!(shifted, FIXTURE_JSON, "fixture has a source block");
+        let fixture_path = tmp.path().join("fixture.json");
+        std::fs::write(&fixture_path, shifted).unwrap();
+        let sidecar_dir = tmp.path().join("tools/synthesia-extract");
+        std::fs::create_dir_all(&sidecar_dir).unwrap();
+        std::fs::write(
+            sidecar_dir.join("extract.py"),
+            format!(
+                "import sys\nsys.stdout.write(open('{}').read())\n",
+                fixture_path.display()
+            ),
+        )
+        .unwrap();
+        let ctx = PipelineCtx {
+            workspace: tmp.path().to_path_buf(),
+            fetch_cmd: None,
+            ffmpeg_cmd: stub_ffmpeg(&tmp),
+        };
+        let bundle = run_pipeline(ImportInput::File(video), &mut |_| {}, &ctx).unwrap();
+        let video = meta_video(&bundle).expect("backdrop retained");
+        assert_eq!(
+            video.offset_us, 99_000,
+            "movie runs 99 ms ahead of the chart"
+        );
+    }
+
+    /// A sidecar failure after the backing was extracted leaves no half-built
+    /// bundle directory behind.
+    #[cfg(unix)]
+    #[test]
+    fn failed_extraction_removes_the_partial_bundle() {
+        let tmp = TempDir::new().unwrap();
+        let video = tmp.path().join("clip.mp4");
+        std::fs::write(&video, b"stub-video").unwrap();
+        let sidecar_dir = tmp.path().join("tools/synthesia-extract");
+        std::fs::create_dir_all(&sidecar_dir).unwrap();
+        std::fs::write(sidecar_dir.join("extract.py"), "import sys\nsys.exit(3)\n").unwrap();
+        let ctx = PipelineCtx {
+            workspace: tmp.path().to_path_buf(),
+            fetch_cmd: None,
+            ffmpeg_cmd: stub_ffmpeg(&tmp),
+        };
+        let err = run_pipeline(ImportInput::File(video), &mut |_| {}, &ctx);
+        assert!(err.is_err());
+        let out = tmp.path().join("import-out");
+        let leftovers: Vec<_> = std::fs::read_dir(&out)
+            .map(|d| d.flatten().collect())
+            .unwrap_or_default();
+        assert!(
+            leftovers.is_empty(),
+            "partial bundle removed: {leftovers:?}"
         );
     }
 

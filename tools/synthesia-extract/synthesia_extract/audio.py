@@ -324,6 +324,108 @@ def _fuse_with_stats(
     return fused, matched
 
 
+# Clock alignment: the largest chart<->audio lag searched, and how clearly the
+# cross-correlation peak must stand out (z-score over all lags) to be trusted.
+CLOCK_MAX_LAG_US = 500_000
+CLOCK_MIN_Z = 4.0
+_CLOCK_HOP = 128
+_CLOCK_NFFT = 512
+# How far an attack precedes the flux peak's frame label at the ~22 kHz analysis
+# rate (a 23 ms window). Calibrated on synthetic tones in the tests.
+_CLOCK_LEAD_US = 14_000
+
+
+def _onset_envelope(samples: np.ndarray, sample_rate: int) -> tuple[np.ndarray, float]:
+    """Spectral-flux onset strength per hop and the envelope's frame rate."""
+    x = np.asarray(samples, dtype=np.float32)
+    if x.ndim > 1:
+        x = x.mean(axis=1)
+    # Analyse at ~22 kHz whatever the input rate, so the window (and with it the
+    # flux's lead over the attack, see _CLOCK_LEAD_US) is a fixed duration.
+    factor = max(1, int(round(sample_rate / 22050)))
+    if factor > 1:
+        n = len(x) // factor * factor
+        x = x[:n].reshape(-1, factor).mean(axis=1)
+        sample_rate = sample_rate / factor
+    if len(x) < _CLOCK_NFFT:
+        return np.zeros(0, np.float32), sample_rate / _CLOCK_HOP
+    n = 1 + (len(x) - _CLOCK_NFFT) // _CLOCK_HOP
+    win = np.hanning(_CLOCK_NFFT).astype(np.float32)
+    idx = np.arange(_CLOCK_NFFT)[None, :]
+    env = np.empty(n, np.float32)
+    prev = None
+    for s in range(0, n, 4096):
+        f = np.arange(s, min(n, s + 4096))[:, None] * _CLOCK_HOP + idx
+        mag = np.log1p(100.0 * np.abs(np.fft.rfft(x[f] * win, axis=1)))
+        cat = mag if prev is None else np.vstack([prev, mag])
+        d = np.maximum(0.0, np.diff(cat, axis=0)).sum(axis=1)
+        env[s : s + len(mag)] = d if prev is not None else np.concatenate([[0.0], d])
+        prev = mag[-1:]
+    k = max(1, int(round(0.5 * sample_rate / _CLOCK_HOP)))  # 0.5 s detrend
+    env = np.maximum(0.0, env - np.convolve(env, np.ones(k) / k, mode="same"))
+    return env, sample_rate / _CLOCK_HOP
+
+
+def estimate_clock_offset(
+    notes: Sequence[ExtractedNote],
+    samples: np.ndarray,
+    sample_rate: int,
+    *,
+    max_lag_us: int = CLOCK_MAX_LAG_US,
+    min_z: float = CLOCK_MIN_Z,
+) -> Optional[int]:
+    """Constant lag (µs) to ADD to every visual onset so it lands on the audio.
+
+    Video tutorials often carry a fixed picture/sound offset (render latency,
+    the hit-line sitting a few pixels off the true contact row), which would
+    leave the whole chart early or late against its own backing track.
+    Cross-correlates the chart's onset train with the audio's onset envelope
+    over ``±max_lag_us`` and returns the peak lag — or ``None`` when the peak is
+    not clearly above the rest (``min_z``), so a doubtful estimate never moves
+    the chart.
+    """
+    env, rate = _onset_envelope(samples, sample_rate)
+    onsets = sorted({int(n.start_us) for n in notes})
+    if len(env) == 0 or len(onsets) < 8:
+        return None
+    frames = np.round(np.asarray(onsets) * rate / 1e6).astype(np.int64)
+    max_lag = int(round(max_lag_us * rate / 1e6))
+    lags = np.arange(-max_lag, max_lag + 1)
+    score = np.empty(len(lags))
+    for i, lag in enumerate(lags):
+        f = frames + lag
+        f = f[(f >= 0) & (f < len(env))]
+        score[i] = env[f].sum()
+    k = int(np.argmax(score))
+    sd = float(score.std())
+    if sd <= 0 or (score[k] - float(score.mean())) / sd < min_z:
+        return None
+    frac = 0.0
+    if 0 < k < len(score) - 1:  # parabolic refinement
+        a, b, c = score[k - 1], score[k], score[k + 1]
+        d = a - 2 * b + c
+        if d < 0:
+            frac = 0.5 * (a - c) / d
+    # A frame is labelled by its window START, but the flux fires as an attack
+    # moves into the window — _CLOCK_LEAD_US later on average.
+    return int(round((lags[k] + frac) * 1e6 / rate)) + _CLOCK_LEAD_US
+
+
+def shift_notes(notes: Sequence[ExtractedNote], delta_us: int) -> list[ExtractedNote]:
+    """Every note moved by ``delta_us`` (onsets clamped at 0)."""
+    return [
+        ExtractedNote(
+            pitch=n.pitch,
+            start_us=max(0, n.start_us + delta_us),
+            dur_us=n.dur_us,
+            hand=n.hand,
+            velocity=n.velocity,
+            confidence=n.confidence,
+        )
+        for n in notes
+    ]
+
+
 def fuse_chart(
     chart: ExtractedChart,
     samples: np.ndarray,
@@ -351,15 +453,23 @@ def fuse_chart(
     if match_tol_us is None:
         match_tol_us = 2 * frame_us
 
-    pitches = [n.pitch for n in chart.notes]
+    # Align the clock first: a constant picture/sound lag larger than the match
+    # window would otherwise leave nearly every note unmatched.
+    offset = estimate_clock_offset(chart.notes, samples, sample_rate)
+    notes = shift_notes(chart.notes, offset) if offset else list(chart.notes)
+    clock = f"clock {offset / 1000:+.0f} ms" if offset else "clock unchanged"
+    if offset:
+        chart.source.clock_offset_us = int(offset)
+
+    pitches = [n.pitch for n in notes]
     transcribed = transcribe(samples, sample_rate, pitches)
     fused_notes, matched = _fuse_with_stats(
-        chart.notes,
+        notes,
         transcribed,
         frame_uncertainty_us=frame_uncertainty_us,
         match_tol_us=match_tol_us,
     )
     chart.source.audio_fusion = (
-        f"applied: {reason}; {matched}/{len(fused_notes)} notes matched"
+        f"applied: {reason}; {clock}; {matched}/{len(fused_notes)} notes matched"
     )
     return ExtractedChart(notes=fused_notes, source=chart.source)

@@ -16,6 +16,7 @@ import subprocess
 import sys
 
 import numpy as np
+import pytest
 
 HERE = os.path.dirname(__file__)
 ROOT = os.path.dirname(HERE)
@@ -326,3 +327,63 @@ def test_cli_audio_fusion_requires_audio(tmp_path):
     )
     assert result.returncode == 2
     assert "requires --audio" in result.stderr
+
+
+# --------------------------------------------------------------------------- #
+# Clock alignment: a constant picture/sound lag is measured and removed
+# --------------------------------------------------------------------------- #
+def _dense_song(n: int = 80, seed: int = 1) -> list[SynthNote]:
+    rng = np.random.default_rng(seed)
+    t, notes = 500_000, []
+    for _ in range(n):
+        notes.append(
+            SynthNote(
+                pitch=int(rng.integers(48, 80)),
+                start_us=t,
+                dur_us=int(rng.integers(150_000, 500_000)),
+                hand="Right",
+                velocity=int(rng.integers(50, 110)),
+            )
+        )
+        t += int(rng.integers(150_000, 450_000))
+    return notes
+
+
+def _as_chart(notes: list[SynthNote], lag_us: int) -> list[ExtractedNote]:
+    return [
+        ExtractedNote(pitch=n.pitch, start_us=n.start_us + lag_us, dur_us=n.dur_us, hand=Hand.RIGHT)
+        for n in notes
+    ]
+
+
+@pytest.mark.parametrize("sample_rate", [22050, 44100])
+@pytest.mark.parametrize("lag_us", [0, 84_000, -120_000, 300_000])
+def test_clock_offset_recovers_a_constant_lag(sample_rate, lag_us):
+    notes = _dense_song()
+    clean = render_audio(notes, sample_rate=sample_rate, harmonics=(1.0, 0.5, 0.25))
+    est = audio.estimate_clock_offset(_as_chart(notes, lag_us), clean, sample_rate)
+    assert est is not None
+    assert abs(est + lag_us) <= 8_000, f"lag {lag_us}: estimated {est}"
+
+
+def test_clock_offset_rejects_an_unrelated_chart():
+    notes = _dense_song()
+    clean = render_audio(notes, sample_rate=44100, harmonics=(1.0, 0.5, 0.25))
+    rng = np.random.default_rng(7)
+    unrelated = [
+        ExtractedNote(pitch=60, start_us=int(t), dur_us=100_000, hand=Hand.RIGHT)
+        for t in rng.uniform(0, notes[-1].start_us, len(notes))
+    ]
+    assert audio.estimate_clock_offset(unrelated, clean, 44100) is None
+
+
+def test_fuse_chart_aligns_a_late_chart_before_matching():
+    notes = _dense_song()
+    clean = render_audio(notes, sample_rate=DEFAULT_SAMPLE_RATE, harmonics=(1.0, 0.5, 0.25))
+    late = ExtractedChart(notes=_as_chart(notes, 100_000), source=SourceMeta(fps=30.0))
+    fused = audio.fuse_chart(late, clean, DEFAULT_SAMPLE_RATE)
+    assert "clock -" in fused.source.audio_fusion
+    assert fused.source.clock_offset_us is not None
+    assert abs(fused.source.clock_offset_us + 100_000) <= 8_000
+    errs = [abs(_nearest(fused.notes, n.pitch, n.start_us).start_us - n.start_us) for n in notes]
+    assert np.median(errs) <= 15_000, "the 100 ms lag is removed"

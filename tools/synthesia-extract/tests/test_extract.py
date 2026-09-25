@@ -25,6 +25,7 @@ from synthesia_extract import schema  # noqa: E402
 from synthesia_extract.pipeline import (  # noqa: E402
     calibrate_keyboard,
     detect_hit_line,
+    detect_keyboard_band,
     estimate_scroll,
     extract_chart,
     linear_keyboard,
@@ -128,6 +129,44 @@ def test_full_clip_matches_ground_truth():
         assert abs(m.start_us - gt.start_us) <= tol, f"onset off for {gt}"
         assert abs(m.dur_us - gt.dur_us) <= tol, f"dur off for {gt}"
         assert m.hand.value == gt.hand, f"hand off for {gt}: {m.hand}"
+
+
+def _stack_filmed_piano(frame: np.ndarray, hit_line: int) -> np.ndarray:
+    """Append a stand-in *filmed* piano below the rendered keyboard.
+
+    Some tutorials show the pianist's real keys under the rendered keyboard. A
+    copy of the keyboard band after a thin dark gap is the worst case: it looks
+    exactly like a keyboard, and it is the block touching the frame bottom.
+    """
+    band = frame[hit_line:]
+    gap = np.zeros((8, frame.shape[1], 3), dtype=frame.dtype)
+    return np.concatenate([frame, gap, band], axis=0)
+
+
+def test_stacked_filmed_piano_keeps_the_rendered_keyboard():
+    cfg = SynthConfig()
+    notes, _ = c_major_demo(cfg)
+    frames, kb_truth = render_frames(notes, cfg)
+    stacked = _stack_filmed_piano(frames[len(frames) // 2], cfg.hit_line)
+    top, bottom = detect_keyboard_band(stacked)
+    assert abs(top - cfg.hit_line) <= 2, "hit-line on the rendered keyboard, not the filmed one"
+    assert abs(bottom - frames[0].shape[0]) <= 2
+    kb = calibrate_keyboard(stacked[:bottom], top)
+    assert kb.white_pitches == kb_truth.white_pitches
+
+
+def test_stacked_filmed_piano_full_clip_matches_ground_truth():
+    cfg = SynthConfig()
+    notes, _ = c_major_demo(cfg)
+    frames, _ = render_frames(notes, cfg)
+    frames = [_stack_filmed_piano(f, cfg.hit_line) for f in frames]
+    chart = extract_chart(frames, cfg.fps)
+    tol = _frame_tol_us(cfg, frames=2)
+    assert sorted(n.pitch for n in chart.notes) == sorted(n.pitch for n in notes)
+    for gt in notes:
+        m = _match(chart.notes, gt.pitch, gt.start_us)
+        assert m is not None, f"missing note pitch={gt.pitch}"
+        assert abs(m.start_us - gt.start_us) <= tol, f"onset off for {gt}"
 
 
 def test_source_meta_populated():

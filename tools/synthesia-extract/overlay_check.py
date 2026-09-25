@@ -35,7 +35,7 @@ from synthesia_extract import io as sio
 from synthesia_extract.pipeline import (
     background_plate,
     calibrate_keyboard,
-    detect_hit_line,
+    detect_keyboard_band,
 )
 
 
@@ -53,8 +53,9 @@ def _calibrate(video, hit_hint):
         raise SystemExit("could not read frames from video")
     ref = background_plate(sample)
     ref = ref if ref is not None else sample[len(sample) // 2]
-    hit = int(hit_hint) if hit_hint else detect_hit_line(ref)
-    kb = calibrate_keyboard(ref, hit)
+    top, bottom = detect_keyboard_band(ref)
+    hit = int(hit_hint) if hit_hint else top
+    kb = calibrate_keyboard(ref[:bottom], hit)
     centers = {p: x for (x, p) in kb.centers}
     white_w = int(np.median(np.diff(sorted(kb.white_centers)))) if len(kb.white_centers) > 1 else 8
     return hit, centers, white_w

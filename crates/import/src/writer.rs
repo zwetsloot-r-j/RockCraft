@@ -356,6 +356,7 @@ mod tests {
 
     fn geometry_source() -> SourceMeta {
         SourceMeta {
+            clock_offset_us: None,
             title: None,
             fps: Some(30.0),
             scroll_px_per_s: Some(200.0),
@@ -405,6 +406,7 @@ mod tests {
     fn no_sidecar_without_geometry() {
         let tmp = TempDir::new().unwrap();
         let source = SourceMeta {
+            clock_offset_us: None,
             scroll_px_per_s: Some(200.0),
             frame_height_px: None,
             hit_line_px: None,
@@ -420,6 +422,7 @@ mod tests {
     #[test]
     fn degenerate_geometry_rejected() {
         let source = SourceMeta {
+            clock_offset_us: None,
             hit_line_px: Some(9999),
             ..geometry_source()
         };
@@ -430,6 +433,7 @@ mod tests {
 
     fn plain_source() -> SourceMeta {
         SourceMeta {
+            clock_offset_us: None,
             title: None,
             fps: None,
             scroll_px_per_s: None,

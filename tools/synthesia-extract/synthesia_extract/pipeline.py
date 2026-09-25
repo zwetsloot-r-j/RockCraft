@@ -181,25 +181,65 @@ def bar_mask(
 def detect_hit_line(frame: np.ndarray) -> int:
     """Row index of the keyboard's top edge (the hit-line).
 
-    The keyboard rows are mostly white (white keys dominate even across the
-    black-key band); the falling region above is dark.  The hit-line is the top
-    of the contiguous bottom block of high-white-fraction rows.
+    See :func:`detect_keyboard_band`; this is its top row.
     """
-    white = np.all(frame > 200, axis=2)  # HxW
-    white_frac = white.mean(axis=1)  # per-row
+    return detect_keyboard_band(frame)[0]
+
+
+def detect_keyboard_band(frame: np.ndarray) -> tuple[int, int]:
+    """``(top, bottom)`` rows of the rendered keyboard (bottom exclusive).
+
+    Keyboard rows are mostly white (white keys dominate even across the
+    black-key band); the falling region above is dark.  Usually the keyboard is
+    the bottom block of the frame, but some tutorials stack a *filmed* piano
+    (hands on real keys) below the rendered one — calibrating on that puts the
+    hit-line on the wrong keyboard, skewing every onset and pitch.  So every
+    bright row-block is a candidate, and the **topmost** one that has a dark
+    falling region directly above it and reads as a regular keyboard wins.
+    With no such block, the legacy rule applies: the block touching the bottom.
+    """
     h = frame.shape[0]
+    white_frac = np.all(frame > 200, axis=2).mean(axis=1)
     keyboard_row = white_frac > 0.3
-    # Walk up from the bottom while we stay in the keyboard block.
+    blocks = _row_blocks(keyboard_row, max_gap=4, min_len=20)
+    for top, bottom in blocks:
+        above = white_frac[max(0, top - 24) : max(0, top - 4)]
+        if top < 24 or float(np.median(above)) >= 0.08:
+            continue
+        if _reads_as_keyboard(frame[:bottom], top):
+            return top, bottom
+    # Legacy: walk up from the bottom while we stay in the keyboard block.
     top = h - 1
     if not keyboard_row[top]:
         # Bottom row isn't bright (unexpected) — fall back to the lowest bright row.
         bright = np.where(keyboard_row)[0]
         if bright.size == 0:
-            return h  # no keyboard found; whole frame is falling region
+            return h, h  # no keyboard found; whole frame is falling region
         top = int(bright[-1])
     while top > 0 and keyboard_row[top - 1]:
         top -= 1
-    return top
+    return top, h
+
+
+def _row_blocks(rows: np.ndarray, max_gap: int, min_len: int) -> list[tuple[int, int]]:
+    """True-runs of ``rows`` merged across gaps <= ``max_gap``, >= ``min_len`` tall."""
+    merged: list[list[int]] = []
+    for a, b in _find_runs(rows):
+        if merged and a - merged[-1][1] <= max_gap:
+            merged[-1][1] = b
+        else:
+            merged.append([a, b])
+    return [(a, b) for a, b in merged if b - a >= min_len]
+
+
+def _reads_as_keyboard(frame: np.ndarray, top: int) -> bool:
+    """Does the band ``frame[top:]`` calibrate to a plausible, regular keyboard?"""
+    kb = _calibrate_white_runs(frame, top)
+    wc = kb.white_centers
+    if len(wc) < 20:
+        return False
+    gaps = np.diff(wc)
+    return float(np.std(gaps)) <= 0.25 * float(np.mean(gaps))
 
 
 # --------------------------------------------------------------------------- #
@@ -1383,13 +1423,13 @@ def extract_chart(
     # (a BackgroundModel) so scene changes in the artwork don't flood the mask.
     plate = background_plate(frames)
     ref = plate if plate is not None else frames[len(frames) // 2]
-    hit_line = detect_hit_line(ref)
+    hit_line, kb_bottom = detect_keyboard_band(ref)
     if hit_line <= 1 or hit_line >= ref.shape[0]:
         return ExtractedChart(notes=[], source=source)
     kb = (
         linear_keyboard(ref.shape[1], hit_line)
         if force_linear_kb
-        else calibrate_keyboard(ref, hit_line, anchor_c4_x=anchor_c4_x)
+        else calibrate_keyboard(ref[:kb_bottom], hit_line, anchor_c4_x=anchor_c4_x)
     )
     # Frame geometry for the overlay's auto-calibration (see SourceMeta).
     source.frame_height_px = int(ref.shape[0])
@@ -1604,13 +1644,13 @@ def extract_chart_streaming(
 
     plate = background_plate(sample)
     ref = plate if plate is not None else sample[len(sample) // 2]
-    hit_line = detect_hit_line(ref)
+    hit_line, kb_bottom = detect_keyboard_band(ref)
     if hit_line <= 1 or hit_line >= ref.shape[0]:
         return ExtractedChart(notes=[], source=source)
     kb = (
         linear_keyboard(ref.shape[1], hit_line)
         if force_linear_kb
-        else calibrate_keyboard(ref, hit_line, anchor_c4_x=anchor_c4_x)
+        else calibrate_keyboard(ref[:kb_bottom], hit_line, anchor_c4_x=anchor_c4_x)
     )
     # Frame geometry for the overlay's auto-calibration (see SourceMeta). ``h``
     # is the native frame height from video_info — the true source resolution.
