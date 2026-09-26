@@ -15,13 +15,17 @@
 //! [`SynthHandle::set_gain`], the backing track through
 //! [`BackingHandle::set_gain`]. The settings themselves are `core::Mixer`.
 
+mod fade;
 pub mod synth;
 
 pub use rockcraft_core as core;
 pub use synth::{synth_from_sf2_bytes, SynthError, SynthHandle, SynthSource};
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+
+use fade::{steps_for, Ramp};
 
 use rockcraft_core::Gain;
 use rodio::{OutputStream, OutputStreamHandle, Source};
@@ -135,10 +139,11 @@ impl AudioOut {
         track: &DecodedTrack,
         start: std::time::Duration,
     ) -> Result<BackingHandle, AudioError> {
-        let sink = backing_sink(&self.stream_handle, track, start)?;
+        let (sink, fade) = backing_sink(&self.stream_handle, track, start)?;
         Ok(BackingHandle {
             _stream: None,
             sink,
+            fade,
         })
     }
 }
@@ -164,6 +169,7 @@ pub struct BackingHandle {
     // keeps the stream alive, so a second stream is neither held nor opened.
     _stream: Option<OutputStream>,
     sink: rodio::Sink,
+    fade: Arc<FadeCtl>,
 }
 
 impl BackingHandle {
@@ -194,6 +200,20 @@ impl BackingHandle {
         } else {
             self.resume();
         }
+    }
+
+    /// Fade the track out over `over`, then hold it silent in place — a soft
+    /// [`pause`](BackingHandle::pause) (the wait-mode freeze). Undo with
+    /// [`fade_in`](BackingHandle::fade_in); a re-[`seek`](BackingHandle::seek)
+    /// first picks the position it resumes from.
+    pub fn fade_out(&self, over: std::time::Duration) {
+        self.fade.set(true, over);
+    }
+
+    /// Fade back in over `over` from a [`fade_out`](BackingHandle::fade_out),
+    /// turning around mid-fade if need be. A no-op at full level.
+    pub fn fade_in(&self, over: std::time::Duration) {
+        self.fade.set(false, over);
     }
 
     /// Whether playback is currently paused.
@@ -252,10 +272,11 @@ pub fn play_file_at(
     let track = DecodedTrack::load(path)?;
     let (stream, stream_handle) =
         OutputStream::try_default().map_err(|e| AudioError::Device(e.to_string()))?;
-    let sink = backing_sink(&stream_handle, &track, start)?;
+    let (sink, fade) = backing_sink(&stream_handle, &track, start)?;
     Ok(BackingHandle {
         _stream: Some(stream),
         sink,
+        fade,
     })
 }
 
@@ -266,15 +287,16 @@ fn backing_sink(
     stream_handle: &OutputStreamHandle,
     track: &DecodedTrack,
     start: std::time::Duration,
-) -> Result<rodio::Sink, AudioError> {
+) -> Result<(rodio::Sink, Arc<FadeCtl>), AudioError> {
     let sink = rodio::Sink::try_new(stream_handle).map_err(|e| AudioError::Play(e.to_string()))?;
     let mut source = track.source();
+    let fade = source.fade.clone();
     // Position the source before it reaches the sink: a sink-level seek is only
     // applied once the device pulls samples, so the first few ms would play
     // from the top.
     source.seek_to(start);
     sink.append(source);
-    Ok(sink)
+    Ok((sink, fade))
 }
 
 /// A backing-track audio file decoded fully into memory.
@@ -323,7 +345,26 @@ impl DecodedTrack {
         TrackSource {
             track: self.clone(),
             pos: 0,
+            fade: Arc::default(),
+            ramp: Ramp::FULL,
+            emitted: 0,
         }
+    }
+}
+
+/// The app side's say over a playing track's fade: which way, and how fast.
+/// Read by the audio thread once per frame; lock-free.
+#[derive(Default)]
+struct FadeCtl {
+    out: AtomicBool,
+    ms: AtomicU32,
+}
+
+impl FadeCtl {
+    fn set(&self, out: bool, over: std::time::Duration) {
+        let ms = over.as_millis().min(u32::MAX as u128) as u32;
+        self.ms.store(ms, Ordering::Relaxed);
+        self.out.store(out, Ordering::Relaxed);
     }
 }
 
@@ -333,6 +374,12 @@ struct TrackSource {
     /// Index of the next sample (interleaved), always on a frame boundary
     /// after a seek.
     pos: usize,
+    fade: Arc<FadeCtl>,
+    /// The fade as applied, stepped once per frame.
+    ramp: Ramp,
+    /// Samples handed out, silence included — frames are counted off this, so
+    /// the channels stay in step even while silent samples stand in for audio.
+    emitted: u64,
 }
 
 impl TrackSource {
@@ -343,19 +390,44 @@ impl TrackSource {
     }
 }
 
+impl TrackSource {
+    /// Once per frame: pick up a new fade request and step the ramp.
+    fn step_fade(&mut self) {
+        let out = self.fade.out.load(Ordering::Relaxed);
+        if out != self.ramp.is_fading_out() {
+            let ms = self.fade.ms.load(Ordering::Relaxed);
+            self.ramp
+                .fade(out, steps_for(ms, self.track.sample_rate as f64));
+        }
+        if !self.ramp.is_steady() {
+            self.ramp.tick();
+        }
+    }
+}
+
 impl Iterator for TrackSource {
     type Item = i16;
 
     fn next(&mut self) -> Option<i16> {
+        if self.emitted.is_multiple_of(self.track.channels as u64) {
+            self.step_fade();
+        }
+        self.emitted += 1;
+        // Faded out: hold the position and play silence until faded back in.
+        if self.ramp.is_silent() {
+            return Some(0);
+        }
         let sample = self.track.samples.get(self.pos).copied()?;
         self.pos += 1;
-        Some(sample)
+        Some((sample as f32 * self.ramp.level()) as i16)
     }
 }
 
 impl Source for TrackSource {
     fn current_frame_len(&self) -> Option<usize> {
-        Some(self.track.samples.len() - self.pos)
+        // Channels and rate never change mid-track. (Not the remaining sample
+        // count: while faded out the source plays silence without advancing.)
+        None
     }
 
     fn channels(&self) -> u16 {
@@ -452,6 +524,29 @@ mod tests {
         assert_eq!(src.next(), None);
         src.seek_to(Duration::from_millis(1_049)); // frame 10 → sample 20
         assert_eq!(src.pos, 20);
+    }
+
+    /// A fade-out ramps down to silence and then holds the position; fading
+    /// back in resumes from exactly there.
+    #[test]
+    fn a_faded_out_track_holds_its_place() {
+        let track = DecodedTrack {
+            channels: 2,
+            sample_rate: 1_000,
+            samples: vec![1_000; 2_000].into(),
+        };
+        let mut src = track.source();
+        src.fade.set(true, Duration::from_millis(4)); // 4 frames
+        let out: Vec<i16> = src.by_ref().take(12).collect();
+        // Both channels of a frame share a level: 0.75, 0.5, 0.25, then silence.
+        assert_eq!(out, [750, 750, 500, 500, 250, 250, 0, 0, 0, 0, 0, 0]);
+        let parked = src.pos;
+        assert_eq!(parked, 6, "3 audible frames consumed, then held");
+        assert_eq!(src.by_ref().take(100).filter(|&s| s != 0).count(), 0);
+        assert_eq!(src.pos, parked);
+        src.fade.set(false, Duration::from_millis(2));
+        let back: Vec<i16> = src.by_ref().take(6).collect();
+        assert_eq!(back, [500, 500, 1_000, 1_000, 1_000, 1_000]);
     }
 
     #[test]

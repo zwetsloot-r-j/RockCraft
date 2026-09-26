@@ -47,6 +47,14 @@ fn effective_gain(gain: Gain, muted: bool) -> Gain {
     }
 }
 
+/// How long the play-mode audio takes to fade out when the transport freezes
+/// (a wait-mode step, or a pause) — quick, but long enough that the music
+/// doesn't stop dead.
+pub const FREEZE_FADE: Duration = Duration::from_millis(250);
+/// How long it takes to come back when the transport resumes: just enough to
+/// avoid a click, short enough to feel instant.
+pub const THAW_FADE: Duration = Duration::from_millis(15);
+
 /// Commands sent from the app thread to the backing-manager thread.
 enum BackingMsg {
     /// Attach a backing file (replaces any previous one; does not play yet).
@@ -60,6 +68,9 @@ enum BackingMsg {
     Seek(u64, Instant),
     /// Pause the current playback.
     Pause,
+    /// Fade the current playback out to a held silence ([`FREEZE_FADE`]); the
+    /// next `PlayAt` fades it back in.
+    FadeOut,
     /// Set the playback speed multiplier (resamples; pitch shifts with speed).
     /// Keeps the backing in step with a slowed/sped transport.
     SetSpeed(f32),
@@ -221,6 +232,7 @@ impl AudioState {
                         if let Some(h) = &handle {
                             h.seek(pos);
                             h.set_paused(false);
+                            h.fade_in(THAW_FADE); // undo a freeze's FadeOut
                         } else {
                             // Share the synth's output stream (one device stream,
                             // second sink) — a separate stream is silent on
@@ -240,6 +252,11 @@ impl AudioState {
                     BackingMsg::Pause => {
                         if let Some(h) = &handle {
                             h.set_paused(true);
+                        }
+                    }
+                    BackingMsg::FadeOut => {
+                        if let Some(h) = &handle {
+                            h.fade_out(FREEZE_FADE);
                         }
                     }
                     BackingMsg::SetSpeed(s) => {
@@ -384,8 +401,8 @@ impl AudioState {
     /// position the session expects *now* (`None` while the clock is still in the
     /// lead-in); `frozen` is whether wait mode has frozen the clock. Mirrors the
     /// TUI `tick_backing` / `advance` pause logic: start lazily at the shift
-    /// boundary, pause while frozen, resume (re-seeking to the live position) on
-    /// thaw.
+    /// boundary, fade out while frozen, resume (re-seeking to the live position,
+    /// fading back in) on thaw.
     pub fn sync_play_backing(
         &self,
         backing: Option<&super::play::Backing>,
@@ -416,9 +433,9 @@ impl AudioState {
         let Some(pos) = target_us else { return };
 
         if frozen {
-            // Freeze: pause once and hold position.
+            // Freeze: fade out once and hold position (the resume re-seeks).
             if pb.started && !pb.paused {
-                self.send_backing(BackingMsg::Pause);
+                self.send_backing(BackingMsg::FadeOut);
                 pb.paused = true;
             }
             return;
@@ -439,6 +456,20 @@ impl AudioState {
             // Playing normally — the audio thread drives playback; we only track
             // the latest target so a future jump (rewind) is detectable.
             pb.last_target_us = pos;
+        }
+    }
+}
+
+#[cfg(test)]
+impl AudioState {
+    /// No device, no backing thread: every audio call is a no-op. For tests
+    /// that drive the transport logic headless.
+    pub(crate) fn silent() -> AudioState {
+        AudioState {
+            synth: None,
+            backing_tx: Mutex::new(None),
+            mixer: Mutex::new(Mixer::new()),
+            play_backing: Mutex::new(PlayBacking::default()),
         }
     }
 }
@@ -689,12 +720,7 @@ mod tests {
     /// A silent `AudioState` — no device, no backing thread. The headless CI
     /// path, and what every test here drives.
     fn silent_state() -> AudioState {
-        AudioState {
-            synth: None,
-            backing_tx: Mutex::new(None),
-            mixer: Mutex::new(Mixer::new()),
-            play_backing: Mutex::new(PlayBacking::default()),
-        }
+        AudioState::silent()
     }
 
     /// `apply_effects` with no audio device is a no-op — must not panic.

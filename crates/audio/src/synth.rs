@@ -27,12 +27,22 @@ use rockcraft_core::{Gain, Instrument, MidiNote, NoteEvent, NoteEventKind, Synth
 use rodio::Source;
 use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
 
+use crate::fade::{steps_for, Ramp};
+
 /// MIDI status byte for a program change (instrument select) on a channel.
 const PROGRAM_CHANGE: i32 = 0xC0;
 /// MIDI status byte for a control change.
 const CONTROL_CHANGE: i32 = 0xB0;
 /// Controller 7: channel volume — how a bus's level is set on the synth.
 const CC_CHANNEL_VOLUME: i32 = 7;
+/// Controller 39: channel volume LSB. Paired with CC7 it gives a 14-bit volume,
+/// fine enough for a fade to glide instead of stepping audibly.
+const CC_CHANNEL_VOLUME_LSB: i32 = 39;
+/// MIDI channels a synth has; per-channel fade state is kept for each.
+const CHANNELS: usize = 16;
+/// The synthesizer's own initial channel volume (the MIDI default), until a
+/// bus's level is set.
+const DEFAULT_VOLUME: u8 = 100;
 
 /// A command handed from the app thread to the audio thread. Tiny and `Copy`
 /// so enqueuing is cheap and allocation-free. `channel` is the bus's MIDI
@@ -59,6 +69,13 @@ enum SynthCommand {
     Volume {
         channel: u8,
         value: u8,
+    },
+    /// Fade one bus out (then silence its voices) or back in, over `ms` for a
+    /// full swing.
+    Fade {
+        channel: u8,
+        out: bool,
+        ms: u16,
     },
 }
 
@@ -153,6 +170,28 @@ impl SynthHandle {
         });
     }
 
+    /// Fade this bus to silence over `over`, then cut whatever it is still
+    /// sounding — a soft stop instead of a dead one (the wait-mode freeze). The
+    /// bus stays silent until [`fade_in`](SynthHandle::fade_in) (or
+    /// [`all_off`](SynthHandle::all_off)); other buses are untouched.
+    pub fn fade_out(&self, over: Duration) {
+        self.send_fade(true, over);
+    }
+
+    /// Bring this bus back to its level over `over` — undoing
+    /// [`fade_out`](SynthHandle::fade_out), turning around mid-fade if need be.
+    pub fn fade_in(&self, over: Duration) {
+        self.send_fade(false, over);
+    }
+
+    fn send_fade(&self, out: bool, over: Duration) {
+        let _ = self.tx.send(SynthCommand::Fade {
+            channel: self.bus.midi_channel(),
+            out,
+            ms: over.as_millis().min(u16::MAX as u128) as u16,
+        });
+    }
+
     /// Route a [`NoteEvent`] straight to the synth. A note-on with velocity 0 is
     /// treated as a note-off, mirroring the MIDI convention used everywhere else.
     pub fn apply(&self, ev: &NoteEvent) {
@@ -180,6 +219,10 @@ pub struct SynthSource {
     frame: Vec<f32>,
     // Read cursor into `frame`; when it reaches the end we render the next block.
     pos: usize,
+    // Each channel's level as last set (CC7), before any fade.
+    volume: [u8; CHANNELS],
+    // Each channel's fade, stepped once per rendered block.
+    fade: [Ramp; CHANNELS],
 }
 
 impl SynthSource {
@@ -198,7 +241,16 @@ impl SynthSource {
                 Ok(SynthCommand::NoteOff { channel, note }) => {
                     self.synth.note_off(channel as i32, note as i32);
                 }
-                Ok(SynthCommand::AllOff) => self.synth.note_off_all(false),
+                Ok(SynthCommand::AllOff) => {
+                    self.synth.note_off_all(false);
+                    // A clean slate: nothing stays faded out.
+                    for ch in 0..CHANNELS {
+                        if self.fade[ch] != Ramp::FULL {
+                            self.fade[ch] = Ramp::FULL;
+                            self.apply_volume(ch);
+                        }
+                    }
+                }
                 Ok(SynthCommand::Program { channel, program }) => {
                     self.synth.process_midi_message(
                         channel as i32,
@@ -208,22 +260,76 @@ impl SynthSource {
                     );
                 }
                 Ok(SynthCommand::Volume { channel, value }) => {
-                    self.synth.process_midi_message(
-                        channel as i32,
-                        CONTROL_CHANGE,
-                        CC_CHANNEL_VOLUME,
-                        value as i32,
-                    );
+                    if let Some(v) = self.volume.get_mut(channel as usize) {
+                        *v = value;
+                        self.apply_volume(channel as usize);
+                    }
+                }
+                Ok(SynthCommand::Fade { channel, out, ms }) => {
+                    let rate = self.sample_rate as f64 / self.left.len().max(1) as f64;
+                    if let Some(f) = self.fade.get_mut(channel as usize) {
+                        // Back in from full silence: the voices were cut, so
+                        // there is nothing to ramp — jump, and new notes start
+                        // at their true level.
+                        let steps = if !out && f.is_silent() {
+                            0
+                        } else {
+                            steps_for(ms as u32, rate)
+                        };
+                        f.fade(out, steps);
+                    }
                 }
                 // Nothing pending, or the handle was dropped: stop draining and
                 // render whatever is currently sounding (release tails, silence).
                 Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
             }
         }
+        self.step_fades();
         self.synth.render(&mut self.left, &mut self.right);
         interleave(&self.left, &self.right, &mut self.frame);
         self.pos = 0;
     }
+
+    /// Advance every in-flight fade by one block. A fade-out that reaches
+    /// silence cuts the channel's voices outright — inaudible at zero volume,
+    /// and it keeps long release tails from surfacing when the level returns.
+    fn step_fades(&mut self) {
+        for ch in 0..CHANNELS {
+            if self.fade[ch].is_steady() {
+                continue;
+            }
+            self.fade[ch].tick();
+            self.apply_volume(ch);
+            if self.fade[ch].is_silent() {
+                self.synth.note_off_all_channel(ch as i32, true);
+            }
+        }
+    }
+
+    /// Push channel `ch`'s effective volume — its level scaled by its fade — to
+    /// the synth as a 14-bit CC7/CC39 pair. At full fade this is exactly the
+    /// plain CC7 level.
+    fn apply_volume(&mut self, ch: usize) {
+        let v14 = fade_volume(self.volume[ch], self.fade[ch].level());
+        self.synth.process_midi_message(
+            ch as i32,
+            CONTROL_CHANGE,
+            CC_CHANNEL_VOLUME,
+            (v14 >> 7) as i32,
+        );
+        self.synth.process_midi_message(
+            ch as i32,
+            CONTROL_CHANGE,
+            CC_CHANNEL_VOLUME_LSB,
+            (v14 & 0x7F) as i32,
+        );
+    }
+}
+
+/// A CC7 `volume` scaled by a fade `level` (`0.0..=1.0`), as a 14-bit channel
+/// volume (`volume << 7` at full level).
+fn fade_volume(volume: u8, level: f32) -> u16 {
+    ((volume as f32 * 128.0 * level).round() as u16).min(0x3FFF)
 }
 
 impl Iterator for SynthSource {
@@ -309,6 +415,8 @@ pub fn synth_from_sf2_bytes(
         right: vec![0.0; block],
         frame: Vec::with_capacity(block * 2),
         pos: 0, // empty `frame` forces a render on the first `next()`
+        volume: [DEFAULT_VOLUME; CHANNELS],
+        fade: [Ramp::FULL; CHANNELS],
     };
     Ok((
         source,
@@ -399,6 +507,39 @@ mod tests {
                 note: 60
             }]
         );
+    }
+
+    #[test]
+    fn fades_address_the_handles_bus() {
+        let (player, rx) = handle();
+        let song = player.for_bus(SynthBus::Song);
+        song.fade_out(Duration::from_millis(250));
+        song.fade_in(Duration::from_millis(20));
+        assert_eq!(
+            drain(&rx),
+            vec![
+                SynthCommand::Fade {
+                    channel: SONG,
+                    out: true,
+                    ms: 250
+                },
+                SynthCommand::Fade {
+                    channel: SONG,
+                    out: false,
+                    ms: 20
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn fade_volume_scales_the_bus_level_in_14_bits() {
+        assert_eq!(fade_volume(100, 1.0), 100 << 7); // full: plain CC7, LSB 0
+        assert_eq!(fade_volume(127, 1.0), 127 << 7);
+        assert_eq!(fade_volume(100, 0.5), 50 << 7);
+        assert_eq!(fade_volume(100, 0.0), 0);
+        // Finer than CC7 alone: a step the coarse byte would round away.
+        assert_eq!(fade_volume(100, 0.999), 12787);
     }
 
     #[test]
