@@ -28,9 +28,9 @@
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Sender};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use rockcraft_audio::{AudioOut, BackingHandle, SynthHandle};
+use rockcraft_audio::{AudioOut, BackingHandle, DecodedTrack, SynthHandle};
 use rockcraft_core::{Effect, Gain, Mixer, MixerBus, MixerReport, SynthBus};
 use serde::Serialize;
 
@@ -53,10 +53,11 @@ enum BackingMsg {
     Attach(PathBuf),
     /// Remove the backing file (stops playback).
     Detach,
-    /// Play or re-seek to `pos_us` from the start; resume if paused.
-    PlayAt(u64),
-    /// Seek to `pos_us` while already playing.
-    Seek(u64),
+    /// Play or re-seek to `pos_us` from the start; resume if paused. Built by
+    /// [`BackingMsg::play_at`], which stamps when it was sent.
+    PlayAt(u64, Instant),
+    /// Seek to `pos_us` while already playing. Built by [`BackingMsg::seek`].
+    Seek(u64, Instant),
     /// Pause the current playback.
     Pause,
     /// Set the playback speed multiplier (resamples; pitch shifts with speed).
@@ -71,6 +72,24 @@ enum BackingMsg {
     SetMuted(bool),
     /// Query the current backing file name (reply on the one-shot channel).
     QueryFileName(Sender<Option<String>>),
+}
+
+impl BackingMsg {
+    fn play_at(pos_us: u64) -> Self {
+        BackingMsg::PlayAt(pos_us, Instant::now())
+    }
+
+    fn seek(pos_us: u64) -> Self {
+        BackingMsg::Seek(pos_us, Instant::now())
+    }
+}
+
+/// Where a `PlayAt`/`Seek` for `pos_us`, sent at `sent`, should land now. Both
+/// are sent while the transport is running, so any time the message spent
+/// queued — e.g. behind a backing track still decoding on attach — the
+/// transport kept moving; skip ahead by as much, or the audio trails the notes.
+fn queued_pos(pos_us: u64, sent: Instant, speed: f32) -> Duration {
+    Duration::from_micros(pos_us) + sent.elapsed().mul_f32(speed.max(0.0))
 }
 
 // ── Audio state ──────────────────────────────────────────────────────────────
@@ -146,6 +165,8 @@ impl AudioState {
             // isn't opening a silent second stream on Windows.
 
             let mut path: Option<PathBuf> = None;
+            // `path`, decoded; `None` while detached or if decoding failed.
+            let mut track: Option<DecodedTrack> = None;
             let mut handle: Option<BackingHandle> = None;
             // Current speed multiplier, re-applied whenever a fresh sink is made
             // (a new BackingHandle starts at 1.0×) so slow-mo survives a restart.
@@ -162,6 +183,15 @@ impl AudioState {
                         if let Some(h) = handle.take() {
                             h.stop();
                         }
+                        // Decode now, on attach, so pressing play starts the
+                        // audio at once and every seek is exact.
+                        track = match DecodedTrack::load(&p) {
+                            Ok(t) => Some(t),
+                            Err(e) => {
+                                eprintln!("[rockcraft-tauri] backing: {}: {e}", p.display());
+                                None
+                            }
+                        };
                         path = Some(p);
                     }
                     BackingMsg::Detach => {
@@ -169,10 +199,25 @@ impl AudioState {
                             h.stop();
                         }
                         path = None;
+                        track = None;
                     }
-                    BackingMsg::PlayAt(pos_us) => {
-                        let Some(ref p) = path else { continue };
-                        let pos = Duration::from_micros(pos_us);
+                    BackingMsg::Seek(pos_us, sent)
+                        if !handle.as_ref().is_some_and(BackingHandle::is_finished) =>
+                    {
+                        if let Some(h) = &handle {
+                            h.seek(queued_pos(pos_us, sent, speed));
+                        }
+                    }
+                    // A seek into a track that already played out restarts it,
+                    // exactly as a play would.
+                    BackingMsg::PlayAt(pos_us, sent) | BackingMsg::Seek(pos_us, sent) => {
+                        let Some(ref t) = track else { continue };
+                        let pos = queued_pos(pos_us, sent, speed);
+                        // A track that played to its end is gone from its sink;
+                        // replace it rather than seeking an empty sink (silent).
+                        if handle.as_ref().is_some_and(BackingHandle::is_finished) {
+                            handle = None;
+                        }
                         if let Some(h) = &handle {
                             h.seek(pos);
                             h.set_paused(false);
@@ -180,7 +225,7 @@ impl AudioState {
                             // Share the synth's output stream (one device stream,
                             // second sink) — a separate stream is silent on
                             // Windows/WASAPI.
-                            match out.play_backing_at(p, pos) {
+                            match out.play_backing_at(t, pos) {
                                 Ok(h) => {
                                     h.set_speed(speed); // carry slow-mo across restarts
                                     h.set_gain(effective_gain(gain, muted)); // …fader + mute
@@ -190,11 +235,6 @@ impl AudioState {
                                     eprintln!("[rockcraft-tauri] backing: play failed: {e}")
                                 }
                             }
-                        }
-                    }
-                    BackingMsg::Seek(pos_us) => {
-                        if let Some(h) = &handle {
-                            h.seek(Duration::from_micros(pos_us));
                         }
                     }
                     BackingMsg::Pause => {
@@ -386,13 +426,13 @@ impl AudioState {
 
         if !pb.started {
             // First time the clock reached the shift point: start it.
-            self.send_backing(BackingMsg::PlayAt(pos));
+            self.send_backing(BackingMsg::play_at(pos));
             pb.started = true;
             pb.paused = false;
             pb.last_target_us = pos;
         } else if pb.paused {
             // Resuming after a freeze: re-seek to the live position and play.
-            self.send_backing(BackingMsg::PlayAt(pos));
+            self.send_backing(BackingMsg::play_at(pos));
             pb.paused = false;
             pb.last_target_us = pos;
         } else {
@@ -518,13 +558,13 @@ pub fn sync_backing(
         // Start / re-seek: play at the position, or stay paused while the audio
         // is still in its (negative-offset) silent lead-in.
         match cur {
-            Some(pos) if just_started => audio.send_backing(BackingMsg::PlayAt(pos)),
-            Some(pos) => audio.send_backing(BackingMsg::Seek(pos)),
+            Some(pos) if just_started => audio.send_backing(BackingMsg::play_at(pos)),
+            Some(pos) => audio.send_backing(BackingMsg::seek(pos)),
             None => audio.send_backing(BackingMsg::Pause),
         }
     } else if cur.is_some() && backing_pos(prev_playhead_us, prev_offset_us).is_none() {
         // Forward playback just crossed out of the silent lead-in: start the audio.
-        audio.send_backing(BackingMsg::PlayAt(cur.unwrap()));
+        audio.send_backing(BackingMsg::play_at(cur.unwrap()));
     }
 }
 
@@ -543,7 +583,7 @@ pub fn attach_backing_inner(state: &AudioState, path: PathBuf) {
 /// Called by [`crate::record`] when a recording session begins with a backing
 /// track so audio plays from the first moment of recording.
 pub fn play_backing_now(state: &AudioState) {
-    state.send_backing(BackingMsg::PlayAt(0));
+    state.send_backing(BackingMsg::play_at(0));
 }
 
 /// Detach the backing track (stops playback) without a Tauri `State` wrapper.
@@ -676,6 +716,23 @@ mod tests {
             ],
         );
         // Reached here without panicking — pass.
+    }
+
+    /// A seek that sat in the queue lands where the transport is *now*: 2 s at
+    /// 5 s, sent 1.5 s ago, is 3.5 s; at half speed only 0.75 s went by.
+    #[test]
+    fn queued_pos_skips_ahead_by_the_time_spent_queued() {
+        let sent = Instant::now() - Duration::from_millis(1_500);
+        let at = |speed| queued_pos(2_000_000, sent, speed);
+        let near = |got: Duration, want_ms: u64| {
+            let want = Duration::from_millis(want_ms);
+            assert!(
+                got >= want && got < want + Duration::from_millis(250),
+                "{got:?}"
+            );
+        };
+        near(at(1.0), 3_500);
+        near(at(0.5), 2_750);
     }
 
     /// Pure helper: `backing_pos(0, 0)` → Some(0).
