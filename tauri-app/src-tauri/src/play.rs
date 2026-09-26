@@ -507,6 +507,10 @@ pub struct PlaySession {
     /// to the note) instead of queuing behind stale advancing events — which
     /// let the note scroll past the hit line before the freeze landed.
     last_emitted_frozen: bool,
+    /// Whether the play audio (song bus, backing) is currently faded out for a
+    /// freeze — see [`tick_play`]. Tracked apart from `last_emitted_frozen`,
+    /// which follows the throttled emit cadence rather than every tick.
+    audio_parked: bool,
 
     /// "Hear the song" audition trigger bookkeeping (span indices fired).
     song_on_fired: HashSet<usize>,
@@ -580,6 +584,7 @@ impl PlaySession {
             live_misses: 0,
             pending_feedback: Vec::new(),
             last_emitted_frozen: false,
+            audio_parked: false,
             song_on_fired: HashSet::new(),
             song_off_fired: HashSet::new(),
         }
@@ -1118,10 +1123,20 @@ impl PlaySession {
         }
     }
 
+    /// Whether the transport is held at the clock's *current* position: paused,
+    /// or parked on an unsatisfied wait step. Unlike [`advance`]'s result (the
+    /// state going *into* the tick), this is true on the very tick the clock
+    /// lands on the step's onset. Re-polls the gate — an idempotent read.
+    ///
+    /// [`advance`]: PlaySession::advance
+    pub fn parked(&mut self) -> bool {
+        self.paused || self.wait.poll(self.now_us()) == GateState::Frozen
+    }
+
     pub fn live_state(&mut self) -> PlayStateEvent {
-        // Re-poll the gate to surface the awaited notes (idempotent read). A
-        // manual pause also reads as frozen so the webview sees the clock held.
-        let frozen = self.paused || self.wait.poll(self.now_us()) == GateState::Frozen;
+        // Surface the awaited notes; a manual pause also reads as frozen so the
+        // webview sees the clock held.
+        let frozen = self.parked();
         let awaiting = self
             .wait
             .awaiting()
@@ -1477,9 +1492,35 @@ pub fn tick_play(
     }
     let frozen = session.advance(dt_us);
 
-    // Route "hear the song" auditions through the **song** bus.
-    let (need_on, need_off) = session.pending_song_triggers();
-    if let Some(synth) = audio.bus(SynthBus::Song) {
+    // Soften a freeze: fade the song voice (and, below, the backing) out rather
+    // than letting the music stop dead, and bring it straight back on the thaw.
+    // Keyed off `parked` — the state *after* this tick — because in legato music
+    // the notes before a wait step end exactly at its onset, i.e. on the very
+    // tick the clock lands there; `frozen` only turns true a tick later, by
+    // which time those notes would already have been released.
+    let parked = session.parked();
+    let song_bus = audio.bus(SynthBus::Song);
+    if parked != session.audio_parked {
+        session.audio_parked = parked;
+        if let Some(synth) = &song_bus {
+            if parked {
+                synth.fade_out(crate::audio::FREEZE_FADE);
+            } else {
+                synth.fade_in(crate::audio::THAW_FADE);
+            }
+        }
+    }
+
+    // Route "hear the song" auditions through the **song** bus. While parked,
+    // hold them back: the releases, so the fade carries the sounding notes out
+    // instead of a damper cutting them; the onsets, so the song comes back in
+    // with the key you are waiting on rather than before it.
+    let (need_on, need_off) = if parked {
+        (Vec::new(), Vec::new())
+    } else {
+        session.pending_song_triggers()
+    };
+    if let Some(synth) = song_bus {
         let vel = rockcraft_core::Velocity::new(HEAR_VELOCITY);
         for &i in &need_on {
             if let (Some(p), Some(v)) = (session.span_note(i).and_then(MidiNote::new), vel) {
@@ -1497,7 +1538,7 @@ pub fn tick_play(
     // Sync the backing track to the clock (start at the shift boundary, pause
     // while frozen) using core's shared position formula so audio never drifts.
     let target = session.backing_target_us();
-    audio.sync_play_backing(session.backing(), target, frozen);
+    audio.sync_play_backing(session.backing(), target, parked);
 
     // Emit on the throttle cadence, but ALWAYS the instant the freeze flag
     // flips — a late freeze is what lets the note scroll past the hit line.
@@ -1858,6 +1899,56 @@ mod tests {
         s.ingest(on(60, SHIFT));
         s.advance(250_000);
         assert_eq!(s.now_us(), SHIFT + 250_000);
+    }
+
+    /// A wait-mode freeze holds the song's releases (so the fade, not a damper,
+    /// ends the sounding notes) and its next onsets (so the song re-enters with
+    /// the awaited key). In legato the first note ends exactly where the
+    /// second — the wait step — begins, and that release falls on the very tick
+    /// the clock lands there, so the hold must key off the post-tick state.
+    #[test]
+    fn a_wait_freeze_holds_the_song_until_the_key_is_played() {
+        let legato = [
+            on(60, 0),
+            off(60, 250_000),
+            on(62, 250_000),
+            off(62, 500_000),
+        ];
+        let mut s = PlaySession::from_events("legato".into(), &legato).with_hear_song(true);
+        s.set_wait_mode(true);
+        s.ingest(on(60, SHIFT)); // play the first note; wait for the second
+        let state = PlayState(Mutex::new(Some(s)));
+        let audio = crate::audio::AudioState::silent();
+        let fired = |state: &PlayState| {
+            let g = state.0.lock().unwrap();
+            let s = g.as_ref().unwrap();
+            (s.song_on_fired.clone(), s.song_off_fired.clone())
+        };
+
+        tick_play(&state, &audio, &[], SHIFT, false);
+        tick_play(&state, &audio, &[], 1_000_000, false); // clamped: lands on step 2
+        assert_eq!(
+            state.0.lock().unwrap().as_ref().unwrap().now_us(),
+            target_us(1)
+        );
+        let (ons, offs) = fired(&state);
+        assert_eq!(
+            ons,
+            HashSet::from([0]),
+            "step 2 isn't sounded before it's played"
+        );
+        assert!(offs.is_empty(), "note 1 isn't released at the freeze");
+        tick_play(&state, &audio, &[], 1_000_000, false); // still waiting
+        assert!(fired(&state).1.is_empty());
+
+        tick_play(&state, &audio, &[on(62, 0)], 4_000, false);
+        let (ons, offs) = fired(&state);
+        assert_eq!(
+            ons,
+            HashSet::from([0, 1]),
+            "the song re-enters with the key"
+        );
+        assert_eq!(offs, HashSet::from([0]), "and the held release goes out");
     }
 
     /// "Hear the song" audition fires note_on at the shifted span start, once.
