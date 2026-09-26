@@ -76,6 +76,7 @@ const cfgFusion: HighwayConfig = {
   radius: 3,
   scoring: true,
   laneTint: "rgba(255,255,255,0.012)",
+  laneGuides: true,
 };
 
 /** localStorage key for the persisted wait-mode preference. */
