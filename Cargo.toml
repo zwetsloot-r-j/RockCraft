@@ -48,3 +48,15 @@ futures-util = "0.3"
 [profile.release]
 lto = "thin"
 strip = true
+
+# Backing tracks are decoded fully into memory on attach
+# (`rockcraft_audio::DecodedTrack`); an unoptimized decoder takes several
+# seconds on a full song, so optimize the decoders even in dev builds.
+[profile.dev.package]
+rodio = { opt-level = 3 }
+lewton = { opt-level = 3 }
+ogg = { opt-level = 3 }
+claxon = { opt-level = 3 }
+hound = { opt-level = 3 }
+symphonia-core = { opt-level = 3 }
+symphonia-bundle-mp3 = { opt-level = 3 }

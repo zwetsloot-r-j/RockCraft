@@ -7,7 +7,9 @@
 //! [`play_file`] plays a decoded audio file (wav/mp3/ogg/flac) on a separate
 //! output stream, returning a [`BackingHandle`] to stop, pause, resume, or seek
 //! it; [`play_file_at`] starts it seeked to a position, for syncing a backing
-//! track to the highway.
+//! track to the highway. Backing tracks are decoded fully into memory
+//! ([`DecodedTrack`]) so they seek exactly in every format; long-lived callers
+//! load once and play through [`AudioOut::play_backing_at`].
 //!
 //! Levels are per source (M14-C): the two synth buses take theirs through
 //! [`SynthHandle::set_gain`], the backing track through
@@ -19,9 +21,10 @@ pub use rockcraft_core as core;
 pub use synth::{synth_from_sf2_bytes, SynthError, SynthHandle, SynthSource};
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use rockcraft_core::Gain;
-use rodio::{OutputStream, OutputStreamHandle};
+use rodio::{OutputStream, OutputStreamHandle, Source};
 
 /// Output sample rate the synth renders at. rodio resamples to the device rate
 /// if it differs.
@@ -119,7 +122,7 @@ impl AudioOut {
         self.handle.clone()
     }
 
-    /// Play a backing-track file on the **same** output stream as the synth.
+    /// Play a decoded backing track on the **same** output stream as the synth.
     ///
     /// Sharing the synth's `OutputStream` (one device stream, a second `Sink`)
     /// is rodio's supported pattern for concurrent playback. Opening a *second*
@@ -129,10 +132,10 @@ impl AudioOut {
     /// already exists so the backing is actually audible alongside the synth.
     pub fn play_backing_at(
         &self,
-        path: &std::path::Path,
+        track: &DecodedTrack,
         start: std::time::Duration,
     ) -> Result<BackingHandle, AudioError> {
-        let sink = backing_sink(&self.stream_handle, path, start)?;
+        let sink = backing_sink(&self.stream_handle, track, start)?;
         Ok(BackingHandle {
             _stream: None,
             sink,
@@ -198,13 +201,18 @@ impl BackingHandle {
         self.sink.is_paused()
     }
 
-    /// Jump to `pos` in the track, best-effort.
-    ///
-    /// Mirrors the seeking in [`play_file_at`]: if the decoder can't seek, the
-    /// request is ignored rather than erroring. The paused/playing state is
-    /// preserved across the seek. Does not block.
+    /// Whether the track has played to its end. A finished handle can't be
+    /// sought back into; start a fresh one to play again.
+    pub fn is_finished(&self) -> bool {
+        self.sink.empty()
+    }
+
+    /// Jump to `pos` in the track. Exact and instant for every format, since
+    /// the track is decoded in memory ([`DecodedTrack`]); a `pos` past the end
+    /// just runs out. The paused/playing state is preserved across the seek.
     pub fn seek(&self, pos: std::time::Duration) {
-        // Best-effort: ignore decoders that don't support seeking.
+        // `TrackSource::try_seek` never fails; an error here only means the
+        // sink has already finished, which leaves nothing to seek.
         let _ = self.sink.try_seek(pos);
     }
 
@@ -225,49 +233,214 @@ impl BackingHandle {
 
 /// Decode and start playing `path` on the default output device.
 ///
-/// Returns immediately; playback runs on the rodio audio thread. Supports
-/// wav, mp3, ogg, and flac via rodio/symphonia.
+/// Returns once the file is decoded; playback runs on the rodio audio thread.
+/// Supports wav, mp3, ogg, and flac.
 pub fn play_file(path: &std::path::Path) -> Result<BackingHandle, AudioError> {
     play_file_at(path, std::time::Duration::ZERO)
 }
 
-/// Like [`play_file`], but seek to `start` before playback begins.
+/// Like [`play_file`], but start at `start` in the file.
 ///
 /// Used to sync a backing track to the falling-note highway: the caller decides
-/// the file position with `rockcraft_core::backing_position_us`. Seeking is
-/// best-effort — if the decoder can't seek (some formats), playback falls back
-/// to the start rather than failing, which is inaudible for the sub-frame
-/// offsets this is normally called with.
+/// the file position with `rockcraft_core::backing_position_us`. Decodes the
+/// whole file first ([`DecodedTrack::load`]); a caller that plays the same file
+/// repeatedly should load it once and use [`AudioOut::play_backing_at`].
 pub fn play_file_at(
     path: &std::path::Path,
     start: std::time::Duration,
 ) -> Result<BackingHandle, AudioError> {
+    let track = DecodedTrack::load(path)?;
     let (stream, stream_handle) =
         OutputStream::try_default().map_err(|e| AudioError::Device(e.to_string()))?;
-    let sink = backing_sink(&stream_handle, path, start)?;
+    let sink = backing_sink(&stream_handle, &track, start)?;
     Ok(BackingHandle {
         _stream: Some(stream),
         sink,
     })
 }
 
-/// Build a paused-or-playing backing `Sink` on an existing output stream:
-/// decode `path`, append it, and seek to `start` (best-effort). Shared by the
-/// standalone [`play_file_at`] (own stream) and [`AudioOut::play_backing_at`]
-/// (synth's stream).
+/// Build a playing backing `Sink` on an existing output stream, positioned at
+/// `start`. Shared by the standalone [`play_file_at`] (own stream) and
+/// [`AudioOut::play_backing_at`] (synth's stream).
 fn backing_sink(
     stream_handle: &OutputStreamHandle,
-    path: &std::path::Path,
+    track: &DecodedTrack,
     start: std::time::Duration,
 ) -> Result<rodio::Sink, AudioError> {
     let sink = rodio::Sink::try_new(stream_handle).map_err(|e| AudioError::Play(e.to_string()))?;
-    let file = std::fs::File::open(path).map_err(AudioError::Io)?;
-    let source = rodio::Decoder::new(std::io::BufReader::new(file))
-        .map_err(|e| AudioError::Decode(e.to_string()))?;
+    let mut source = track.source();
+    // Position the source before it reaches the sink: a sink-level seek is only
+    // applied once the device pulls samples, so the first few ms would play
+    // from the top.
+    source.seek_to(start);
     sink.append(source);
-    if !start.is_zero() {
-        // Best-effort: ignore decoders that don't support seeking.
-        let _ = sink.try_seek(start);
-    }
     Ok(sink)
+}
+
+/// A backing-track audio file decoded fully into memory.
+///
+/// Streaming decoders can't be trusted to seek: rodio 0.20's Vorbis and FLAC
+/// decoders don't support it at all, so a backing `.ogg` ignored every seek and
+/// kept playing from wherever it was instead of following the playhead. Holding
+/// the samples makes every seek exact and instant, for every format, and keeps
+/// decoding off the real-time audio thread. Load it once (it can take a moment
+/// for a long track) and play it any number of times; clones share the samples.
+#[derive(Clone)]
+pub struct DecodedTrack {
+    channels: u16,
+    sample_rate: u32,
+    samples: Arc<[i16]>,
+}
+
+impl DecodedTrack {
+    /// Decode the audio file at `path` (wav, mp3, ogg, or flac).
+    pub fn load(path: &std::path::Path) -> Result<Self, AudioError> {
+        let file = std::fs::File::open(path).map_err(AudioError::Io)?;
+        let decoder = rodio::Decoder::new(std::io::BufReader::new(file))
+            .map_err(|e| AudioError::Decode(e.to_string()))?;
+        let channels = decoder.channels();
+        let sample_rate = decoder.sample_rate();
+        if channels == 0 || sample_rate == 0 {
+            return Err(AudioError::Decode(format!(
+                "{}: no audio ({channels} channels at {sample_rate} Hz)",
+                path.display()
+            )));
+        }
+        Ok(Self {
+            channels,
+            sample_rate,
+            samples: decoder.collect(),
+        })
+    }
+
+    /// Length of the track.
+    pub fn duration(&self) -> std::time::Duration {
+        let frames = self.samples.len() / self.channels as usize;
+        std::time::Duration::from_secs_f64(frames as f64 / self.sample_rate as f64)
+    }
+
+    fn source(&self) -> TrackSource {
+        TrackSource {
+            track: self.clone(),
+            pos: 0,
+        }
+    }
+}
+
+/// A playing cursor over a [`DecodedTrack`]; seeking just moves `pos`.
+struct TrackSource {
+    track: DecodedTrack,
+    /// Index of the next sample (interleaved), always on a frame boundary
+    /// after a seek.
+    pos: usize,
+}
+
+impl TrackSource {
+    fn seek_to(&mut self, pos: std::time::Duration) {
+        let frame = (pos.as_secs_f64() * self.track.sample_rate as f64).round() as usize;
+        let sample = frame.saturating_mul(self.track.channels as usize);
+        self.pos = sample.min(self.track.samples.len());
+    }
+}
+
+impl Iterator for TrackSource {
+    type Item = i16;
+
+    fn next(&mut self) -> Option<i16> {
+        let sample = self.track.samples.get(self.pos).copied()?;
+        self.pos += 1;
+        Some(sample)
+    }
+}
+
+impl Source for TrackSource {
+    fn current_frame_len(&self) -> Option<usize> {
+        Some(self.track.samples.len() - self.pos)
+    }
+
+    fn channels(&self) -> u16 {
+        self.track.channels
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.track.sample_rate
+    }
+
+    fn total_duration(&self) -> Option<std::time::Duration> {
+        Some(self.track.duration())
+    }
+
+    fn try_seek(&mut self, pos: std::time::Duration) -> Result<(), rodio::source::SeekError> {
+        self.seek_to(pos);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// 3 s of a 440 Hz mono tone at 8 kHz, in each supported backing format.
+    fn fixture(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/audio")
+            .join(name)
+    }
+
+    const FORMATS: [&str; 3] = ["tone-3s.wav", "tone-3s.ogg", "tone-3s.flac"];
+
+    /// Regression: rodio's Vorbis decoder can't seek, so an imported
+    /// `backing.ogg` ignored every seek and drifted from the playhead.
+    #[test]
+    fn every_backing_format_seeks_exactly() {
+        for name in FORMATS {
+            let track = DecodedTrack::load(&fixture(name)).expect(name);
+            assert_eq!((track.channels, track.sample_rate), (1, 8_000), "{name}");
+            let mut src = track.source();
+            src.try_seek(Duration::from_secs(2))
+                .unwrap_or_else(|e| panic!("{name}: seek failed: {e}"));
+            // Exactly 1 s of 8 kHz mono left, give or take codec padding.
+            let left = src.count();
+            assert!(
+                (7_900..=8_100).contains(&left),
+                "{name}: {left} samples left after seeking to 2 s of 3 s"
+            );
+        }
+    }
+
+    /// Seeking backwards — restarting playback — rewinds to the top.
+    #[test]
+    fn seeking_back_rewinds() {
+        let track = DecodedTrack::load(&fixture("tone-3s.ogg")).unwrap();
+        let mut src = track.source();
+        src.try_seek(Duration::from_millis(2_500)).unwrap();
+        src.try_seek(Duration::ZERO).unwrap();
+        assert_eq!(src.pos, 0);
+        assert_eq!(src.count(), track.samples.len());
+    }
+
+    /// A seek past the end, or mid-frame, stays in range and frame-aligned.
+    #[test]
+    fn seek_clamps_to_the_track() {
+        let track = DecodedTrack {
+            channels: 2,
+            sample_rate: 10,
+            samples: vec![0; 40].into(),
+        };
+        assert_eq!(track.duration(), Duration::from_secs(2));
+        let mut src = track.source();
+        src.seek_to(Duration::from_secs(60));
+        assert_eq!(src.next(), None);
+        src.seek_to(Duration::from_millis(1_049)); // frame 10 → sample 20
+        assert_eq!(src.pos, 20);
+    }
+
+    #[test]
+    fn load_reports_a_missing_file() {
+        assert!(matches!(
+            DecodedTrack::load(&fixture("no-such-file.ogg")),
+            Err(AudioError::Io(_))
+        ));
+    }
 }
