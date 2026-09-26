@@ -381,43 +381,61 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    /// 3 s of a 440 Hz mono tone at 8 kHz, in each supported backing format.
-    fn fixture(name: &str) -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../fixtures/audio")
-            .join(name)
+    /// Write `secs` of 8 kHz mono 16-bit PCM WAV — a ramp, so every sample
+    /// tells where it came from — into a per-test temp file. Generated rather
+    /// than committed: the repo keeps no audio in git (`check-no-media.sh`).
+    fn ramp_wav(name: &str, secs: u32) -> PathBuf {
+        let samples: Vec<i16> = (0..8_000 * secs).map(|i| (i % 30_000) as i16).collect();
+        let data_len = samples.len() as u32 * 2;
+        let mut wav = Vec::with_capacity(44 + data_len as usize);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk size
+        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+        wav.extend_from_slice(&8_000u32.to_le_bytes()); // sample rate
+        wav.extend_from_slice(&16_000u32.to_le_bytes()); // byte rate
+        wav.extend_from_slice(&2u16.to_le_bytes()); // block align
+        wav.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_len.to_le_bytes());
+        for s in samples {
+            wav.extend_from_slice(&s.to_le_bytes());
+        }
+        let path =
+            std::env::temp_dir().join(format!("rockcraft-audio-{}-{name}.wav", std::process::id()));
+        std::fs::write(&path, wav).unwrap();
+        path
     }
 
-    const FORMATS: [&str; 3] = ["tone-3s.wav", "tone-3s.ogg", "tone-3s.flac"];
-
-    /// Regression: rodio's Vorbis decoder can't seek, so an imported
-    /// `backing.ogg` ignored every seek and drifted from the playhead.
+    /// Regression: rodio 0.20 can't seek Vorbis/FLAC streams, so an imported
+    /// `backing.ogg` ignored every seek and drifted from the playhead. A decoded
+    /// track seeks in memory — exactly, and independent of the file format.
     #[test]
-    fn every_backing_format_seeks_exactly() {
-        for name in FORMATS {
-            let track = DecodedTrack::load(&fixture(name)).expect(name);
-            assert_eq!((track.channels, track.sample_rate), (1, 8_000), "{name}");
-            let mut src = track.source();
-            src.try_seek(Duration::from_secs(2))
-                .unwrap_or_else(|e| panic!("{name}: seek failed: {e}"));
-            // Exactly 1 s of 8 kHz mono left, give or take codec padding.
-            let left = src.count();
-            assert!(
-                (7_900..=8_100).contains(&left),
-                "{name}: {left} samples left after seeking to 2 s of 3 s"
-            );
-        }
+    fn a_decoded_track_seeks_exactly() {
+        let path = ramp_wav("seek", 3);
+        let track = DecodedTrack::load(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!((track.channels, track.sample_rate), (1, 8_000));
+        assert_eq!(track.duration(), Duration::from_secs(3));
+        let mut src = track.source();
+        src.try_seek(Duration::from_secs(2)).unwrap();
+        assert_eq!(src.next(), Some(16_000)); // sample 2 s × 8 kHz
+        assert_eq!(src.count(), 8_000 - 1);
     }
 
     /// Seeking backwards — restarting playback — rewinds to the top.
     #[test]
     fn seeking_back_rewinds() {
-        let track = DecodedTrack::load(&fixture("tone-3s.ogg")).unwrap();
+        let path = ramp_wav("rewind", 3);
+        let track = DecodedTrack::load(&path).unwrap();
+        std::fs::remove_file(&path).ok();
         let mut src = track.source();
         src.try_seek(Duration::from_millis(2_500)).unwrap();
         src.try_seek(Duration::ZERO).unwrap();
-        assert_eq!(src.pos, 0);
-        assert_eq!(src.count(), track.samples.len());
+        assert_eq!(src.next(), Some(0));
+        assert_eq!(src.count(), track.samples.len() - 1);
     }
 
     /// A seek past the end, or mid-frame, stays in range and frame-aligned.
@@ -439,7 +457,7 @@ mod tests {
     #[test]
     fn load_reports_a_missing_file() {
         assert!(matches!(
-            DecodedTrack::load(&fixture("no-such-file.ogg")),
+            DecodedTrack::load(std::path::Path::new("no/such/file.ogg")),
             Err(AudioError::Io(_))
         ));
     }
