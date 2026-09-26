@@ -16,6 +16,7 @@ import type { HitFeedback } from "../../ipc/types";
 import type { HighwayConfig, KeyInfo, KeyLayout, NoteSpan, SongData } from "./types";
 import { visibleRange } from "../cull";
 import { mappedGridLines, uniformGridLines } from "./gridLines";
+import { nextPerLane } from "./laneGuides";
 import {
   clamp,
   feedbackFx,
@@ -36,6 +37,7 @@ interface FullConfig {
   lead: number;
   bg: string;
   laneTint: string;
+  laneGuides: boolean;
   boardInset: number;
   kbRatio: number;
   noteGap: number;
@@ -59,6 +61,7 @@ const DEFAULTS: FullConfig = {
   lead: 2600, // ms of look-ahead shown top→hit-line
   bg: "#0e0f13",
   laneTint: "rgba(255,255,255,0.018)",
+  laneGuides: false, // live: tint each lane from its next note down to the keys
   boardInset: 0, // px inset on each side of the keyboard
   kbRatio: 0.18, // keyboard height as fraction of canvas height
   noteGap: 0.16, // fraction of lane width trimmed (white notes)
@@ -399,6 +402,7 @@ export class HighwayCanvas {
     this.ctx.clearRect(0, 0, this.w, this.h);
     this.drawBackground();
     this.drawGrid(now);
+    if (c.laneGuides && this.live) this.drawLaneGuides(now);
     this.drawNotes(now);
     this.drawHitLine();
     this.drawKeyboard(now);
@@ -466,6 +470,46 @@ export class HighwayCanvas {
       ctx.lineWidth = bar ? 1.4 : 1;
       ctx.strokeStyle = bar ? "rgba(255,255,255,0.13)" : "rgba(255,255,255,0.05)";
       ctx.stroke();
+    }
+  }
+
+  /** Guide opacity at the note's onset and at the hit line: faint, rising
+   * toward the keyboard so the key the note lands on is what catches the eye. */
+  private static readonly GUIDE_ALPHA_NOTE = 0.04;
+  private static readonly GUIDE_ALPHA_KEYS = 0.13;
+
+  /** Lane guides: behind the notes, each lane's next note casts a faint column
+   * of its colour down to the keyboard, marking where it will land. One per
+   * lane (the closest); none for the auto-played hand, whose notes aren't the
+   * player's to find. Black-key lanes go last so they sit over the white ones,
+   * as on the keyboard. */
+  private drawLaneGuides(now: number): void {
+    const ctx = this.ctx;
+    const notes = this.song.notes;
+    const horizon = now + this.cfg.lead;
+    const [lo, hi] = visibleRange(notes, now, horizon, 0, (n) => n.start);
+    const guides = nextPerLane(notes, lo, hi, now, horizon, (n) => this.isAutoPlayed(n));
+    const black = (n: { note: number }) => Number(!!this.kl.byNote[n.note]?.black);
+    guides.sort((a, b) => black(a) - black(b));
+    for (const nt of guides) {
+      const lane = this.kl.byNote[nt.note];
+      if (!lane) continue;
+      const yTop = clamp(this.yOf(nt.start, now), 0, this.hitY);
+      if (this.hitY - yTop < 1) continue; // already on the keys
+      const col = this.noteColor(nt);
+      const g = ctx.createLinearGradient(0, yTop, 0, this.hitY);
+      g.addColorStop(0, withAlpha(col, HighwayCanvas.GUIDE_ALPHA_NOTE));
+      g.addColorStop(1, withAlpha(col, HighwayCanvas.GUIDE_ALPHA_KEYS));
+      ctx.fillStyle = g;
+      const sT = this.sAt(yTop),
+        sB = this.sAt(this.hitY);
+      ctx.beginPath();
+      ctx.moveTo(this.xP(lane.x, sT), yTop);
+      ctx.lineTo(this.xP(lane.x + lane.w, sT), yTop);
+      ctx.lineTo(this.xP(lane.x + lane.w, sB), this.hitY);
+      ctx.lineTo(this.xP(lane.x, sB), this.hitY);
+      ctx.closePath();
+      ctx.fill();
     }
   }
 

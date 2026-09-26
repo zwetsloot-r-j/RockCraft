@@ -48,6 +48,8 @@ export interface HighwayConfig {
   scoring?: boolean;
   pitchRuler?: boolean;
   laneTint?: string;
+  /** Live mode: tint each lane from its next note down to the keyboard. */
+  laneGuides?: boolean;
 }
 
 export interface KeyInfo {
