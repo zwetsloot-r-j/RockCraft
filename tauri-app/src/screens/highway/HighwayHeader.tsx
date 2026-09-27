@@ -9,6 +9,7 @@ import { For, Show } from "solid-js";
 import type { HighwayCanvas } from "./HighwayCanvas";
 import type { PlayStateEvent } from "../../ipc/types";
 import type { SongData } from "./types";
+import { loopBadgeText } from "./practiceLoop";
 
 interface HighwayHeaderProps {
   eng: () => HighwayCanvas | null;
@@ -204,6 +205,25 @@ export function HighwayHeader(props: HighwayHeaderProps) {
             >
               🐢 {((props.rate?.() ?? 1000) / 1000).toFixed(2)}×
             </span>
+          </Show>
+          <Show when={loopBadgeText(props.playState?.()?.practice_loop ?? null)}>
+            {(text) => (
+              <span
+                style={{
+                  "font-size": "11px",
+                  "font-family": monoFont,
+                  padding: "2px 8px",
+                  "border-radius": "6px",
+                  background: props.playState?.()?.practice_loop?.running
+                    ? "rgba(143,182,255,0.2)"
+                    : "rgba(255,255,255,0.05)",
+                  color: props.playState?.()?.practice_loop?.running ? "#8fb6ff" : "#b9bccb",
+                }}
+                title="[ ] — mark bars · l — start/stop the practice loop · ← → — step a bar"
+              >
+                🔁 {text()}
+              </span>
+            )}
           </Show>
           <Show when={(props.practice?.() ?? "both") !== "both"}>
             <span

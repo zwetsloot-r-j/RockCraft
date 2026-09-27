@@ -14,8 +14,12 @@ import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import {
   onPlayState,
+  playClearLoop,
   playFinish,
   playLoad,
+  playMarkLoop,
+  playSeekBar,
+  playSetLoop,
   playSetPractice,
   playSetRate,
   playSetSplit,
@@ -44,6 +48,7 @@ import { HighwayHeader } from "./HighwayHeader";
 import { MixerPanel } from "./MixerPanel";
 import { PlaySummaryPanel } from "./PlaySummaryPanel";
 import { songFromInfo } from "./liveSong";
+import { loopBand, loopKeyCommand, type LoopCommand } from "./practiceLoop";
 import type { HighwayConfig, SongData } from "./types";
 
 /** Empty song used as the initial signal value before a bundle loads. */
@@ -272,6 +277,17 @@ export function HighwayScreen() {
       }
       return;
     }
+    // Practice loop (M17-A): ←/→ bar steps, [ ] marks, l start/stop.
+    const cmd = loopKeyCommand(
+      e.key,
+      playState()?.bar ?? 0,
+      playState()?.practice_loop ?? null,
+    );
+    if (cmd) {
+      e.preventDefault();
+      runLoopCommand(cmd);
+      return;
+    }
     switch (e.key) {
       case " ":
         // Play/pause toggle once running.
@@ -332,6 +348,24 @@ export function HighwayScreen() {
         nudgeSplit(1);
         break;
       default:
+        break;
+    }
+  }
+
+  /** Send a practice-loop command; the next `play_state` carries the result. */
+  function runLoopCommand(cmd: LoopCommand): void {
+    switch (cmd.kind) {
+      case "seek":
+        void playSeekBar(cmd.delta);
+        break;
+      case "mark":
+        void playMarkLoop(cmd.edge);
+        break;
+      case "set":
+        void playSetLoop(cmd.firstBar, cmd.lastBar);
+        break;
+      case "clear":
+        void playClearLoop();
         break;
     }
   }
@@ -429,6 +463,7 @@ export function HighwayScreen() {
       // Per-note hit/near/miss effects (M14-B). The backend sends each judged
       // note once, so pushing whatever arrived spawns exactly one effect each.
       if (s.judgments.length > 0) e.pushJudgments(s.judgments);
+      e.setLoop(loopBand(s.practice_loop));
     }
     driveVideo(s.time_us, s.frozen);
     if (s.backgrounds.length > 0) {

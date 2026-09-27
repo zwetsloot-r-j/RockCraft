@@ -21,8 +21,10 @@ import type {
   ComposerSnapshot,
   Effect,
   LibraryEntryDto,
+  LoopEdge,
   PlayInfo,
   PlayStateEvent,
+  PlayStatus,
   PlaySummary,
   SaveBundleResult,
   SaveDest,
@@ -478,6 +480,29 @@ export function playSetSplit(pitch: number): Promise<number> {
  * Finish the take: tear the session down (stop backing, silence the synth) and
  * return the end-of-take summary. Idempotent.
  */
+// ── Practice loop (M17-A) ───────────────────────────────────────────────
+
+/** `←` / `→`: pause and jump to the start of the bar `delta` bars away. A no-op
+ * while a practice loop runs. Returns the play status. */
+export function playSeekBar(delta: number): Promise<PlayStatus> {
+  return invoke<PlayStatus>("play_seek_bar", { delta });
+}
+
+/** `[` / `]`: mark the loop's first / last bar at the playhead. */
+export function playMarkLoop(edge: LoopEdge): Promise<PlayStatus> {
+  return invoke<PlayStatus>("play_mark_loop", { edge });
+}
+
+/** Mark bars `firstBar..=lastBar` (0-based) and start the practice loop. */
+export function playSetLoop(firstBar: number, lastBar: number): Promise<PlayStatus> {
+  return invoke<PlayStatus>("play_set_loop", { firstBar, lastBar });
+}
+
+/** Stop the running loop (pausing at its start), or clear the marks. */
+export function playClearLoop(): Promise<PlayStatus> {
+  return invoke<PlayStatus>("play_clear_loop");
+}
+
 export function playFinish(): Promise<PlaySummary> {
   return invoke<PlaySummary>("play_finish");
 }
