@@ -33,6 +33,8 @@ target
 
 # Windows-side build output (native midir/TUI work; WSL uses /target)
 /target-win/
+# Separate Windows target dir for running the CI gate while the app holds target-win
+/target-win-gate/
 
 # Python sidecars (tools/*) — virtualenvs and bytecode caches are per-machine.
 # Every sidecar's README tells you to create its venv in-tree, so these must not

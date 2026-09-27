@@ -16,7 +16,7 @@ score is no more committable than an `.mp4`.
 
 | Allowed | Not allowed |
 |---------|-------------|
-| Rust source, scripts, CI config, docs | Video files (`*.mp4`, `*.mkv`, `*.webm`, `*.mov`, `*.m4a`) |
+| Rust source, scripts, CI config, docs | Video files (`*.mp4`, `*.mkv`, `*.webm`, `*.mov`, `*.m4a`) outside `fixtures/` |
 | Curated test fixtures under `fixtures/` | Audio files (`*.mp3`, `*.wav`, `*.ogg`, `*.flac`) outside `fixtures/` |
 | `fixtures/**/*.mid` (hand-crafted test MIDIs) | Extracted `.mid` charts anywhere outside `fixtures/` |
 | `fixtures/score/**` — synthetic plain-text scores (`*.musicxml`, `*.xml`, `*.abc`, `*.krn`) | Those same score formats anywhere outside `fixtures/` |
@@ -48,7 +48,7 @@ The following paths and extensions are gitignored at the repo root so that
 Every CI run executes this script before the Rust build. It scans all tracked
 and staged files and **fails** if it finds:
 
-- Any media extension (video or audio) anywhere in the tree.
+- Any media extension (video or audio) **outside** `fixtures/`.
 - Any published/opaque score format (`.pdf`, `.mxl`, `.mscz`, `.sib`, `.gp*`)
   anywhere in the tree.
 - Any `.mid` / `.midi` file **outside** `fixtures/`.
@@ -58,7 +58,7 @@ and staged files and **fails** if it finds:
   element is `<score-partwise>` / `<score-timewise>` counts as a score.
 
 A clean tree passes silently. The curated `fixtures/` directory is the only
-allowed home for tracked `.mid` or audio test assets.
+allowed home for tracked `.mid` or media test assets.
 
 ### 3. Local pre-commit hook (optional)
 
