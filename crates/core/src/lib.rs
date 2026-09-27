@@ -11,6 +11,7 @@
 
 pub mod action;
 pub mod background;
+pub mod bars;
 pub mod buffer;
 pub mod chord;
 pub mod composer;
@@ -20,6 +21,7 @@ pub mod hand;
 pub mod history;
 pub mod mixer;
 pub mod play_clock;
+pub mod practice_loop;
 pub mod scoring;
 pub mod segment;
 pub mod song;
@@ -34,6 +36,7 @@ pub use background::{
     BackgroundImage, BackgroundStack, BackgroundView, Easing, Keyframe, Transform, MAX_SCALE,
     MIN_SCALE, POS_LIMIT,
 };
+pub use bars::BarMap;
 pub use buffer::EventBuffer;
 pub use chord::{ChordKind, Key, Scale};
 pub use composer::{Composer, ComposerSnapshot, Cursor, InputMode, NoteView, SelectionView};
@@ -46,6 +49,7 @@ pub use mixer::{
     MixerError, MixerReport, SynthBus, DEFAULT_INSTRUMENT,
 };
 pub use play_clock::PlayClock;
+pub use practice_loop::{LoopPhase, LoopStep, Pass, PracticeLoop};
 pub use scoring::{score, ExpectedNote, Feedback, NoteJudgment, ScoreConfig, ScoreReport, Timing};
 pub use segment::{segments_from_splits, slice_segment, Segment, SliceResult};
 pub use song::{

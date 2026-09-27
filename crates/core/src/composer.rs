@@ -30,6 +30,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::action::{Action, ActionError, Effect};
 use crate::background::{BackgroundStack, BackgroundView, Easing, Transform};
+use crate::bars::BarMap;
 use crate::chord::{ChordKind, Key, Scale};
 use crate::events::{MidiNote, NoteEvent, NoteEventKind, Velocity};
 use crate::grid::{Grid, Subdivision, TimeSig};
@@ -1960,21 +1961,16 @@ impl Composer {
     // When `bar_starts` is empty every method below delegates to `Grid`'s
     // uniform math, so the un-mapped (legacy) behaviour is byte-identical.
 
+    /// The tempo map as a [`BarMap`], falling back to the uniform grid.
+    fn bar_map(&self) -> BarMap<'_> {
+        BarMap::new(&self.bar_starts, self.grid.bar_us()).with_origin(self.grid.origin_us)
+    }
+
     /// Downbeat time (µs) of bar `bar`. From the map when present; bars past its
     /// end extrapolate with the last mapped bar's duration; falls back to the
     /// uniform grid when there is no usable map.
     fn bar_start_us(&self, bar: u64) -> u64 {
-        if let Some(&t) = self.bar_starts.get(bar as usize) {
-            return t;
-        }
-        let n = self.bar_starts.len();
-        if n >= 2 {
-            let dur = self.bar_starts[n - 1]
-                .saturating_sub(self.bar_starts[n - 2])
-                .max(1);
-            return self.bar_starts[n - 1] + (bar - (n as u64 - 1)) * dur;
-        }
-        self.grid.us_of_bar(bar)
+        self.bar_map().bar_start(bar)
     }
 
     /// Duration (µs) of bar `bar`.
@@ -1986,24 +1982,7 @@ impl Composer {
 
     /// Bar index containing song time `us` (tempo-map aware).
     fn bar_at_us(&self, us: u64) -> u64 {
-        let n = self.bar_starts.len();
-        if n >= 2 {
-            if us < self.bar_starts[0] {
-                return 0;
-            }
-            if us >= self.bar_starts[n - 1] {
-                let dur = self.bar_starts[n - 1]
-                    .saturating_sub(self.bar_starts[n - 2])
-                    .max(1);
-                return (n as u64 - 1) + (us - self.bar_starts[n - 1]) / dur;
-            }
-            return match self.bar_starts.binary_search(&us) {
-                Ok(i) => i as u64,
-                Err(i) => (i - 1) as u64,
-            };
-        }
-        let bar_us = self.grid.bar_us().max(1);
-        us.saturating_sub(self.grid.origin_us) / bar_us
+        self.bar_map().bar_at(us)
     }
 
     /// Song time (µs) of grid `step` — tempo-map aware. Bar `step / spb`, then a
