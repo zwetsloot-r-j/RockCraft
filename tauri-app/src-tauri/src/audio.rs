@@ -429,8 +429,16 @@ impl AudioState {
             pb.last_target_us = 0;
         }
 
-        // Still in the lead-in: nothing to play yet.
-        let Some(pos) = target_us else { return };
+        // Still in the lead-in: nothing to play yet. A jump back into it (a
+        // practice-loop count-in, a bar step) stops what is playing; reaching
+        // the song again re-seeks through the resume path below.
+        let Some(pos) = target_us else {
+            if pb.started && !pb.paused {
+                self.send_backing(BackingMsg::FadeOut);
+                pb.paused = true;
+            }
+            return;
+        };
 
         if frozen {
             // Freeze: fade out once and hold position (the resume re-seeks).
@@ -452,11 +460,44 @@ impl AudioState {
             self.send_backing(BackingMsg::play_at(pos));
             pb.paused = false;
             pb.last_target_us = pos;
+        } else if backing_jumped(pb.last_target_us, pos) {
+            // The clock jumped (a practice-loop wrap, a bar step): re-seek.
+            self.send_backing(BackingMsg::play_at(pos));
+            pb.last_target_us = pos;
         } else {
             // Playing normally — the audio thread drives playback; we only track
-            // the latest target so a future jump (rewind) is detectable.
+            // the latest target so a jump is detectable.
             pb.last_target_us = pos;
         }
+    }
+}
+
+/// How far a backing target may run ahead of the last one before it counts as
+/// a jump rather than ordinary playback (a tick, or a stalled one).
+const BACKING_JUMP_US: u64 = 250_000;
+
+/// Whether the backing target moved discontinuously since the last tick: back
+/// in time at all, or forward by more than [`BACKING_JUMP_US`].
+fn backing_jumped(last_target_us: u64, target_us: u64) -> bool {
+    target_us < last_target_us || target_us > last_target_us + BACKING_JUMP_US
+}
+
+#[cfg(test)]
+mod jump_tests {
+    use super::backing_jumped;
+
+    #[test]
+    fn ordinary_ticks_are_not_jumps() {
+        assert!(!backing_jumped(1_000_000, 1_000_000));
+        assert!(!backing_jumped(1_000_000, 1_016_000));
+        assert!(!backing_jumped(1_000_000, 1_250_000));
+    }
+
+    #[test]
+    fn rewinds_and_leaps_are_jumps() {
+        assert!(backing_jumped(1_000_000, 999_999));
+        assert!(backing_jumped(5_000_000, 1_000_000));
+        assert!(backing_jumped(1_000_000, 1_250_001));
     }
 }
 

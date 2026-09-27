@@ -807,6 +807,16 @@ impl rockcraft_control::HostServices for Shell {
                 }
             }
             HostCommand::PlayFinish => Err(HostError::Unsupported("play_finish".into())),
+            // The practice loop (M17-A) is a Tauri play-screen feature.
+            HostCommand::PlaySeekBar { .. } => Err(HostError::Unsupported("play_seek_bar".into())),
+            HostCommand::PlayMarkLoop { .. } => {
+                Err(HostError::Unsupported("play_mark_loop".into()))
+            }
+            HostCommand::PlaySetLoop { .. } => Err(HostError::Unsupported("play_set_loop".into())),
+            HostCommand::PlayClearLoop => Err(HostError::Unsupported("play_clear_loop".into())),
+            HostCommand::PlaySetPractice { .. } => {
+                Err(HostError::Unsupported("play_set_practice".into()))
+            }
             HostCommand::RecordStart { .. } => Err(HostError::Unsupported("record_start".into())),
             HostCommand::RecordStop => Err(HostError::Unsupported("record_stop".into())),
             HostCommand::RecordSave => Err(HostError::Unsupported("record_save".into())),
@@ -1236,6 +1246,16 @@ mod tests {
             HostCommand::PlayToggleHearSong,
             HostCommand::PlayTogglePause,
             HostCommand::PlayFinish,
+            HostCommand::PlaySeekBar { delta: 1 },
+            HostCommand::PlayMarkLoop {
+                edge: rockcraft_control::LoopEdge::Start,
+            },
+            HostCommand::PlaySetLoop {
+                first_bar: 0,
+                last_bar: 1,
+            },
+            HostCommand::PlayClearLoop,
+            HostCommand::PlaySetPractice { hand: None },
             HostCommand::RecordStart { backing: None },
             HostCommand::RecordStop,
             HostCommand::RecordSave,
@@ -1404,6 +1424,32 @@ mod tests {
                 .unwrap_err(),
             rockcraft_control::HostError::Unsupported("import_score".into())
         );
+    }
+
+    /// The practice loop is Tauri-only: the TUI reports its commands
+    /// Unsupported (M17-A).
+    #[test]
+    fn practice_loop_commands_are_unsupported_in_the_tui() {
+        for cmd in [
+            HostCommand::PlaySeekBar { delta: -1 },
+            HostCommand::PlayMarkLoop {
+                edge: rockcraft_control::LoopEdge::End,
+            },
+            HostCommand::PlaySetLoop {
+                first_bar: 2,
+                last_bar: 3,
+            },
+            HostCommand::PlayClearLoop,
+            HostCommand::PlaySetPractice { hand: None },
+        ] {
+            let name = cmd.name();
+            let mut shell = make_shell();
+            assert_eq!(
+                shell.dispatch(cmd),
+                Err(rockcraft_control::HostError::Unsupported(name.into())),
+                "{name}"
+            );
+        }
     }
 
     /// `play_toggle_pause` off the play screen is a clean no-op error, not a

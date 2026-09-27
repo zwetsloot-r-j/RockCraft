@@ -23,7 +23,7 @@
 //! `HostCommand` reuses `core`'s [`ParamInfo`] / [`ActionError`] so the wire
 //! shapes and error vocabulary stay identical to the action tier.
 
-use rockcraft_core::{ActionError, MixerBus, ParamInfo, SynthBus};
+use rockcraft_core::{ActionError, Hand, MixerBus, ParamInfo, SynthBus};
 use serde::{Deserialize, Serialize};
 
 /// Where [`HostCommand::SaveBundle`] writes the current timeline.
@@ -60,6 +60,14 @@ pub struct SegmentSpec {
     pub end_us: u64,
     /// Becomes the new bundle's library slug/name.
     pub name: String,
+}
+
+/// Which end of the practice loop [`HostCommand::PlayMarkLoop`] sets (M17-A).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoopEdge {
+    Start,
+    End,
 }
 
 /// Every app-level workflow command, transport-agnostic.
@@ -111,6 +119,20 @@ pub enum HostCommand {
     /// Read-only: observing never perturbs the take. `play_state` events reach
     /// the webview only, so this is the socket's sole window onto a running game.
     PlayStatus,
+    /// Pause the play session and jump the playhead `delta` bars from the bar
+    /// under it, to that bar's start (`←` / `→`). Outside a practice loop only.
+    PlaySeekBar { delta: i32 },
+    /// Mark the practice loop's first (`start`) or last (`end`) bar as the bar
+    /// under the playhead (`[` / `]`). Restarts a running loop on the new range.
+    PlayMarkLoop { edge: LoopEdge },
+    /// Mark bars `first_bar..=last_bar` (0-based) and start the practice loop
+    /// over them: count-in, demo, count-in, your turn, repeat.
+    PlaySetLoop { first_bar: u32, last_bar: u32 },
+    /// Stop a running practice loop (pausing at its start with normal play
+    /// restored), or clear the marks when none is running.
+    PlayClearLoop,
+    /// Set the practised hand (`"left"` / `"right"`; `null` = both).
+    PlaySetPractice { hand: Option<Hand> },
 
     // ── record ──────────────────────────────────────────────────────────
     /// Start a record session, optionally over a backing audio file.
@@ -216,6 +238,11 @@ impl HostCommand {
             HostCommand::PlayTogglePause => "play_toggle_pause",
             HostCommand::PlayFinish => "play_finish",
             HostCommand::PlayStatus => "play_status",
+            HostCommand::PlaySeekBar { .. } => "play_seek_bar",
+            HostCommand::PlayMarkLoop { .. } => "play_mark_loop",
+            HostCommand::PlaySetLoop { .. } => "play_set_loop",
+            HostCommand::PlayClearLoop => "play_clear_loop",
+            HostCommand::PlaySetPractice { .. } => "play_set_practice",
             HostCommand::RecordStart { .. } => "record_start",
             HostCommand::RecordStop => "record_stop",
             HostCommand::RecordSave => "record_save",
@@ -350,6 +377,11 @@ pub fn host_command_names() -> &'static [&'static str] {
         "play_toggle_pause",
         "play_finish",
         "play_status",
+        "play_seek_bar",
+        "play_mark_loop",
+        "play_set_loop",
+        "play_clear_loop",
+        "play_set_practice",
         "record_start",
         "record_stop",
         "record_save",
@@ -416,6 +448,11 @@ static HOST_HELP: &[HostCommandInfo] = {
         HostCommandInfo { name: "play_toggle_pause", params: &[], description: "Toggle pause on the active play session, freezing/thawing the clock and backing at the current position. No-op when no session is active." },
         HostCommandInfo { name: "play_finish", params: &[], description: "Finish the play session and return the score summary." },
         HostCommandInfo { name: "play_status", params: &[], description: "The live take's full state: clock, paused/frozen, wait gate (awaiting vs held pitches), practice hand + split, speed, score, and the chart's note count. Returns loaded:false when no take is running. Read-only — observing never perturbs the take." },
+        HostCommandInfo { name: "play_seek_bar", params: &[p("delta", "i32")], description: "Pause the play session and jump the playhead to the start of the bar `delta` bars from the one under it (-1 = previous, 1 = next), clamped to the song. No-op while a practice loop runs. Returns play status." },
+        HostCommandInfo { name: "play_mark_loop", params: &[p("edge", "LoopEdge")], description: "Mark the practice loop's first (edge \"start\") or last (edge \"end\", inclusive) bar as the bar under the playhead. Doesn't pause; restarts a running loop on the new range. Returns play status (practice_loop names the marked bars)." },
+        HostCommandInfo { name: "play_set_loop", params: &[p("first_bar", "u32"), p("last_bar", "u32")], description: "Mark bars first_bar..=last_bar (0-based; swapped if reversed) and start the practice loop: a one-bar count-in, a demo (the app plays the practised hand), another count-in, then your turn (scored, wait mode applies), repeating. Each finished your-turn pass is published as practice_loop.last_pass. Returns play status." },
+        HostCommandInfo { name: "play_clear_loop", params: &[], description: "Stop a running practice loop, pausing at the loop start with normal play restored; with no loop running, clear the loop marks. Returns play status." },
+        HostCommandInfo { name: "play_set_practice", params: &[p("hand", "Hand?")], description: "Set the practised hand: \"left\" or \"right\" (the other hand auto-plays and isn't scored), or null for both. Returns the applied hand (\"left\"/\"right\"/\"both\")." },
         // ── record ────────────────────────────────────────────────────────
         HostCommandInfo { name: "record_start", params: &[p("backing", "String?")], description: "Start a record session, optionally over a backing audio file path." },
         HostCommandInfo { name: "record_stop", params: &[], description: "Stop the record session without saving." },
@@ -492,6 +529,18 @@ mod tests {
             HostCommand::PlayTogglePause,
             HostCommand::PlayFinish,
             HostCommand::PlayStatus,
+            HostCommand::PlaySeekBar { delta: -1 },
+            HostCommand::PlayMarkLoop {
+                edge: LoopEdge::End,
+            },
+            HostCommand::PlaySetLoop {
+                first_bar: 4,
+                last_bar: 7,
+            },
+            HostCommand::PlayClearLoop,
+            HostCommand::PlaySetPractice {
+                hand: Some(Hand::Left),
+            },
             HostCommand::RecordStart { backing: None },
             HostCommand::RecordStop,
             HostCommand::RecordSave,
@@ -593,7 +642,9 @@ mod tests {
             for p in info.params {
                 let sample = match p.ty {
                     "bool" => json!(true),
-                    "i64" => json!(0),
+                    "i64" | "i32" | "u32" => json!(0),
+                    "LoopEdge" => json!("start"),
+                    "Hand?" => json!("left"),
                     "u16" => json!(1000),
                     "f32" => json!(0.5),
                     "u8?" | "u64?" | "f64?" => json!(4),
@@ -696,6 +747,31 @@ mod tests {
                 ]
             }
         );
+    }
+
+    #[test]
+    fn practice_loop_commands_parse_their_typed_params() {
+        assert_eq!(
+            host_command_from_name("play_mark_loop", &json!({ "edge": "start" })).unwrap(),
+            HostCommand::PlayMarkLoop {
+                edge: LoopEdge::Start
+            }
+        );
+        assert_eq!(
+            host_command_from_name("play_seek_bar", &json!({ "delta": 1 })).unwrap(),
+            HostCommand::PlaySeekBar { delta: 1 }
+        );
+        assert_eq!(
+            host_command_from_name("play_set_practice", &json!({ "hand": null })).unwrap(),
+            HostCommand::PlaySetPractice { hand: None }
+        );
+        assert_eq!(
+            host_command_from_name("play_set_practice", &json!({ "hand": "right" })).unwrap(),
+            HostCommand::PlaySetPractice {
+                hand: Some(Hand::Right)
+            }
+        );
+        assert!(host_command_from_name("play_mark_loop", &json!({ "edge": "middle" })).is_err());
     }
 
     #[test]
