@@ -44,8 +44,13 @@ if errorlevel 1 ( popd & echo error: frontend build failed & exit /b 1 )
 popd
 
 REM Bump the timestamp so cargo re-embeds the frontend (see the header).
+REM `copy /b FILE +,,` only touches FILE in place when FILE is in the current
+REM directory; given a path it writes a fresh copy into the cwd instead (a stray
+REM lib.rs in the repo root) and leaves the real file's timestamp alone.
 echo [2/3] touch lib.rs so the frontend is re-embedded
-copy /b "tauri-app\src-tauri\src\lib.rs" +,, >nul
+pushd tauri-app\src-tauri\src
+copy /b lib.rs +,, >nul
+popd
 
 echo [3/3] Windows binary ^(%PROFILE%^)
 cargo build -p rockcraft-tauri --features tauri/custom-protocol --target-dir target-win %CARGO_ARGS%

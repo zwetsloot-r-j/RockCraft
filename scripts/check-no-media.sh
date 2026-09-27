@@ -2,8 +2,8 @@
 # check-no-media.sh — CI guard and pre-commit hook
 #
 # Fails if any disallowed media/chart/score files are tracked or staged.
-# Allowed exception: *.mid / *.midi / audio / score-source files inside fixtures/
-# (curated test assets).
+# Allowed exception: anything inside fixtures/ (curated test assets: .mid,
+# audio, score sources). Published/opaque score formats stay banned everywhere.
 
 set -euo pipefail
 
@@ -34,10 +34,12 @@ ALL_FILES=$(
 while IFS= read -r file; do
   [[ -z "$file" ]] && continue
 
-  # Check media extensions (never allowed anywhere).
+  # Check media extensions (allowed only under fixtures/).
   if echo "$file" | grep -qiE "$MEDIA_EXTENSIONS"; then
-    OFFENDERS+=("$file  [media file]")
-    FAIL=1
+    if ! echo "$file" | grep -q '^fixtures/'; then
+      OFFENDERS+=("$file  [media file outside fixtures/]")
+      FAIL=1
+    fi
     continue
   fi
 
@@ -83,7 +85,7 @@ if [[ $FAIL -ne 0 ]]; then
   done
   echo "" >&2
   echo "The TOOL is shared; the SONGS are not." >&2
-  echo "  - Media files (video/audio) must never be committed." >&2
+  echo "  - Media files (video/audio) must never be committed outside fixtures/." >&2
   echo "  - Published or opaque scores (.pdf/.mxl/.mscz/.sib/.gp*) must never be" >&2
   echo "    committed; .mxl is a zip container, so it is unreviewable in a diff." >&2
   echo "  - Extracted .mid charts belong in /import-out/ (gitignored), not in git." >&2
