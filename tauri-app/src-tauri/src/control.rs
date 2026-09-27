@@ -367,6 +367,34 @@ impl HostServices for TauriHost<'_> {
                 let paused = crate::play::play_toggle_pause(app.state::<PlayState>());
                 Ok(serde_json::json!({ "paused": paused }))
             }
+            HostCommand::PlaySeekBar { delta } => {
+                let status = crate::play::play_seek_bar(app.state::<PlayState>(), delta);
+                json_payload("play_seek_bar", status)
+            }
+            HostCommand::PlayMarkLoop { edge } => {
+                let status = crate::play::play_mark_loop(app.state::<PlayState>(), edge);
+                json_payload("play_mark_loop", status)
+            }
+            HostCommand::PlaySetLoop {
+                first_bar,
+                last_bar,
+            } => {
+                let status =
+                    crate::play::play_set_loop(app.state::<PlayState>(), first_bar, last_bar);
+                json_payload("play_set_loop", status)
+            }
+            HostCommand::PlayClearLoop => {
+                let status = crate::play::play_clear_loop(app.state::<PlayState>());
+                json_payload("play_clear_loop", status)
+            }
+            HostCommand::PlaySetPractice { hand } => {
+                let wire = hand.map(|h| match h {
+                    rockcraft_core::Hand::Left => "left".to_string(),
+                    rockcraft_core::Hand::Right => "right".to_string(),
+                });
+                let applied = crate::play::play_set_practice(app.state::<PlayState>(), wire);
+                Ok(serde_json::json!({ "practice": applied }))
+            }
             HostCommand::PlayFinish => {
                 let summary =
                     crate::play::play_finish(app.state::<PlayState>(), app.state::<AudioState>());

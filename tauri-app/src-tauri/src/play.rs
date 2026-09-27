@@ -25,15 +25,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use rockcraft_core::{
-    backing_position_us, hand::hand_of_pitch_value, score, song_shift_us, BackgroundImage,
-    ExpectedNote, Feedback, GateState, Hand, HandOverride, MidiNote, NoteEvent, NoteEventKind,
-    NoteJudgment, PlayClock, RecordingMeta, ScoreConfig, ScoreReport, Summary, SynthBus, Timing,
-    Transform, WaitGate, DEFAULT_SPLIT,
+    backing_position_us, hand::hand_of_pitch_value, score, song_shift_us, BackgroundImage, BarMap,
+    ExpectedNote, Feedback, GateState, Hand, HandOverride, LoopPhase, LoopStep, MidiNote,
+    NoteEvent, NoteEventKind, NoteJudgment, Pass, PlayClock, PracticeLoop, RecordingMeta,
+    ScoreConfig, ScoreReport, Summary, SynthBus, Timing, Transform, WaitGate, DEFAULT_SPLIT,
 };
 use rockcraft_midi::smf_bytes_to_events;
 use serde::Serialize;
 
 use crate::audio::AudioState;
+use rockcraft_control::LoopEdge;
 
 /// How far into the future the top of the highway represents (microseconds).
 /// Matches the TUI `play.rs` `LEAD_US` so a bundle scrolls identically.
@@ -46,6 +47,18 @@ pub const PRE_ROLL_US: u64 = 1_500_000;
 
 /// Velocity used when "hear the song" synthesises chart notes. Matches the TUI.
 pub const HEAR_VELOCITY: u8 = 80;
+
+/// Count-in click pitch (E5) and velocities — the editor metronome's
+/// (`core::composer` `CLICK_MIDI_VALUE` / `CLICK_VEL_*`), so both transports
+/// click alike. Played on the song bus.
+pub const CLICK_NOTE: u8 = 76;
+const CLICK_VEL_ACCENT: u8 = 110;
+const CLICK_VEL_NORMAL: u8 = 80;
+/// How long a count-in click sounds (play-clock µs).
+const CLICK_DUR_US: u64 = 50_000;
+
+/// Bar length used when a piece has no grid (120 BPM, 4/4).
+const DEFAULT_BAR_US: u64 = 2_000_000;
 
 /// Ceiling on undelivered per-note judgments (M14-B). At ~60 Hz a tick closes a
 /// handful of notes at most, so this only ever trips when nothing is draining
@@ -247,6 +260,43 @@ pub struct PlayStateEvent {
     pub backgrounds: Vec<BackgroundTransformView>,
     /// Set once the song (plus tail) has finished.
     pub finished: bool,
+    /// The bar under the playhead (0-based, tempo-map aware; the pre-roll is
+    /// bar 0) — what `[` / `]` / `l` act on (M17-A).
+    pub bar: u64,
+    /// The practice loop: the marked bars, and while it runs its phase, pass
+    /// and last pass score. `None` when nothing is marked (M17-A).
+    pub practice_loop: Option<LoopView>,
+}
+
+/// One finished *your turn* pass of the practice loop (M17-A).
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct PassSummary {
+    /// 1-based pass number.
+    pub pass: u32,
+    pub hits: usize,
+    pub misses: usize,
+    /// Accuracy in basis points (0..=10000), like [`PlaySummary::accuracy_bp`].
+    pub accuracy_bp: u32,
+}
+
+/// The practice loop as the webview / an agent sees it (M17-A). Bars are
+/// 0-based indices; the UI shows them 1-based.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct LoopView {
+    pub first_bar: u64,
+    pub last_bar: u64,
+    /// `[start_us, end_us)` of the marked bars, in play-clock µs — where the
+    /// highway draws the loop band.
+    pub start_us: u64,
+    pub end_us: u64,
+    /// Whether the loop is running (false: only marked).
+    pub running: bool,
+    /// `"count_in"` | `"demo"` | `"your_turn"`; `None` unless running.
+    pub phase: Option<&'static str>,
+    /// 1-based pass number (0 unless running).
+    pub pass: u32,
+    /// The last finished *your turn* pass, if any.
+    pub last_pass: Option<PassSummary>,
 }
 
 /// A complete read-only picture of the live take, for the agent-control socket.
@@ -296,6 +346,10 @@ pub struct PlayStatusView {
     pub beats_per_bar: u8,
     /// Total notes in the loaded chart, to sanity-check against the bundle.
     pub note_count: usize,
+    /// The bar under the playhead (0-based).
+    pub bar: u64,
+    /// The practice loop, or `None` when nothing is marked (M17-A).
+    pub practice_loop: Option<LoopView>,
 }
 
 /// The end-of-take summary returned by `play_finish`.
@@ -437,6 +491,40 @@ fn award(perfect: bool, combo: u32) -> u64 {
     }
 }
 
+/// A running practice loop (M17-A): the core phase machine plus the loop's own
+/// per-pass scoring state, kept apart from the whole-take `played`/`scored` so
+/// stopping the loop restores the take exactly.
+struct RunningLoop {
+    lp: PracticeLoop,
+    first_bar: u64,
+    last_bar: u64,
+    /// The practised hand as of the last phase boundary: hand changes mid-loop
+    /// take effect at the next boundary.
+    practice: Option<Hand>,
+    /// Strikes of the current *your turn* pass (its count-in included, so an
+    /// early first note counts).
+    played: Vec<NoteEvent>,
+    /// Loop spans already judged this pass.
+    scored: HashSet<usize>,
+}
+
+impl RunningLoop {
+    fn contains(&self, span: &NoteSpan) -> bool {
+        span.start_us >= self.lp.start_us() && span.start_us < self.lp.end_us()
+    }
+}
+
+/// Song-bus work the loop asks of the audio side, drained by [`tick_play`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct LoopAudio {
+    /// Song-bus notes still sounding at a jump: release them.
+    pub cut: Vec<u8>,
+    /// Count-in clicks due this tick (`true` = accented beat 1).
+    pub clicks: Vec<bool>,
+    /// Release the sounding click.
+    pub click_off: bool,
+}
+
 /// A live play session: bundle spans driven by an injected clock, gated by a
 /// wait gate, with incremental scoring. Pure state — no device, no wall clock.
 pub struct PlaySession {
@@ -515,6 +603,19 @@ pub struct PlaySession {
     /// "Hear the song" audition trigger bookkeeping (span indices fired).
     song_on_fired: HashSet<usize>,
     song_off_fired: HashSet<usize>,
+
+    /// Uniform bar length (µs) used when the piece has no tempo map.
+    bar_us: u64,
+    /// The player's wait-mode setting. Outside a loop the gate is armed exactly
+    /// when this is; inside one only during *your turn* (M17-A).
+    wait_mode: bool,
+    /// Marked loop bars (`[` / `]`), 0-based.
+    loop_marks: (Option<u64>, Option<u64>),
+    practice_loop: Option<RunningLoop>,
+    last_pass: Option<PassSummary>,
+    loop_audio: LoopAudio,
+    /// When the sounding count-in click is released (play-clock µs).
+    click_off_at: Option<u64>,
 }
 
 impl PlaySession {
@@ -587,6 +688,16 @@ impl PlaySession {
             audio_parked: false,
             song_on_fired: HashSet::new(),
             song_off_fired: HashSet::new(),
+            bar_us: grid
+                .map(|g| g.bar_us)
+                .filter(|&b| b > 0)
+                .unwrap_or(DEFAULT_BAR_US),
+            wait_mode: false,
+            loop_marks: (None, None),
+            practice_loop: None,
+            last_pass: None,
+            loop_audio: LoopAudio::default(),
+            click_off_at: None,
         }
     }
 
@@ -750,7 +861,7 @@ impl PlaySession {
 
     /// Is wait-mode armed?
     pub fn is_wait_mode(&self) -> bool {
-        self.wait.is_armed()
+        self.wait_mode
     }
 
     /// The backing track, if any.
@@ -760,7 +871,8 @@ impl PlaySession {
 
     /// Has the song (plus tail) finished?
     pub fn is_finished(&self) -> bool {
-        self.now_us() > self.duration_us + self.finished_pause_us
+        // A running loop keeps jumping back; it never ends the take.
+        self.practice_loop.is_none() && self.now_us() > self.duration_us + self.finished_pause_us
     }
 
     /// Forward a `NoteEvent`: update the held set and (on a real strike) collect
@@ -774,7 +886,22 @@ impl PlaySession {
         match ev.kind {
             NoteEventKind::On { velocity } if !velocity.is_note_off() => {
                 self.held.insert(ev.note.value());
-                self.played.push(ev);
+                match self.practice_loop.as_mut() {
+                    None => self.played.push(ev),
+                    // In a loop only *your turn* (and its count-in, for an early
+                    // first note) is scored; demo strikes just sound.
+                    Some(rl) => {
+                        if matches!(
+                            rl.lp.phase(),
+                            LoopPhase::YourTurn
+                                | LoopPhase::CountIn {
+                                    next: Pass::YourTurn
+                                }
+                        ) {
+                            rl.played.push(ev);
+                        }
+                    }
+                }
             }
             _ => {
                 self.held.remove(&ev.note.value());
@@ -796,6 +923,9 @@ impl PlaySession {
         } else {
             dt_us * self.rate_permille as u64 / PLAY_RATE_UNITY as u64
         };
+        // The loop wraps BEFORE the gate poll, so a step at exactly `end_us` (the
+        // next bar's first note) never freezes the loop.
+        self.tick_loop();
         self.wait.set_held(self.held.clone());
         let wait_frozen = self.wait.poll(self.clock.now_us()) == GateState::Frozen;
         // A manual pause freezes the transport just like an unsatisfied wait step.
@@ -823,7 +953,20 @@ impl PlaySession {
                 }
             }
         }
+        // Likewise land exactly on the loop's next boundary (loop start after a
+        // count-in, loop end after a pass), so phases switch on the downbeat.
+        if !frozen {
+            if let Some(boundary) = self.loop_boundary() {
+                let now = self.clock.now_us();
+                if boundary > now {
+                    step_us = step_us.min(boundary - now);
+                }
+            }
+        }
+        let prev_us = self.clock.now_us();
         self.clock.advance(step_us);
+        self.loop_clicks(prev_us, self.clock.now_us());
+        self.tick_loop();
         self.score_due();
         frozen
     }
@@ -835,26 +978,50 @@ impl PlaySession {
     /// figures match the final report exactly.
     fn score_due(&mut self) {
         let now = self.now_us();
-        let newly: Vec<usize> = self
-            .spans
-            .iter()
-            .enumerate()
-            .filter(|(i, s)| {
-                !self.scored.contains(i)
-                    && now >= s.start_us + self.cfg.good_us
-                    // When practicing one hand, the other hand auto-plays — don't score it.
-                    && !self
-                        .practice
-                        .is_some_and(|h| s.effective_hand(self.split_pitch) != h)
-            })
-            .map(|(i, _)| i)
-            .collect();
+        let split = self.split_pitch;
+        let newly: Vec<usize> = match &self.practice_loop {
+            None => self
+                .spans
+                .iter()
+                .enumerate()
+                .filter(|(i, s)| {
+                    !self.scored.contains(i)
+                        && now >= s.start_us + self.cfg.good_us
+                        // When practicing one hand, the other hand auto-plays — don't score it.
+                        && !self
+                            .practice
+                            .is_some_and(|h| s.effective_hand(split) != h)
+                })
+                .map(|(i, _)| i)
+                .collect(),
+            // In a loop only *your turn* scores, and only the loop's spans.
+            Some(rl) if rl.lp.phase() == LoopPhase::YourTurn => self
+                .spans
+                .iter()
+                .enumerate()
+                .filter(|(i, s)| {
+                    !rl.scored.contains(i)
+                        && rl.contains(s)
+                        && now >= s.start_us + self.cfg.good_us
+                        && rl.practice.is_none_or(|h| s.effective_hand(split) == h)
+                })
+                .map(|(i, _)| i)
+                .collect(),
+            Some(_) => return,
+        };
         if newly.is_empty() {
             return;
         }
-        self.scored.extend(newly.iter().copied());
+        match self.practice_loop.as_mut() {
+            None => self.scored.extend(newly.iter().copied()),
+            Some(rl) => rl.scored.extend(newly.iter().copied()),
+        }
         let judged = self.recompute_live();
+        self.queue_feedback(judged, &newly);
+    }
 
+    /// Queue a one-shot effect for each of `newly` in `judged`, bounded.
+    fn queue_feedback(&mut self, judged: Vec<(usize, NoteJudgment)>, newly: &[usize]) {
         // Queue a one-shot effect for each note that just became final — in the
         // time order `recompute_live` judged them, so the webview sees a chord's
         // notes together and successive notes in the order they were played.
@@ -882,18 +1049,23 @@ impl PlaySession {
     /// Returns `(span index, judgment)` in that same time order so the caller can
     /// attribute each judgment back to the note it belongs to (M14-B).
     fn recompute_live(&mut self) -> Vec<(usize, NoteJudgment)> {
+        // A running loop scores its own pass; otherwise the whole take.
+        let (scored, played) = match &self.practice_loop {
+            Some(rl) => (&rl.scored, &rl.played),
+            None => (&self.scored, &self.played),
+        };
         let mut closed: Vec<(usize, ExpectedNote)> = self
             .spans
             .iter()
             .enumerate()
-            .filter(|(i, _)| self.scored.contains(i))
+            .filter(|(i, _)| scored.contains(i))
             .filter_map(|(i, s)| {
                 MidiNote::new(s.note).map(|n| (i, ExpectedNote::new(n, s.start_us)))
             })
             .collect();
         closed.sort_by_key(|(_, e)| e.time_us);
         let expected: Vec<ExpectedNote> = closed.iter().map(|(_, e)| *e).collect();
-        let report = score(&expected, &self.played, self.cfg);
+        let report = score(&expected, played, self.cfg);
 
         self.score = 0;
         self.combo = 0;
@@ -957,8 +1129,14 @@ impl PlaySession {
 
     /// Set wait-mode (`w` key). Turning it off un-freezes immediately.
     pub fn set_wait_mode(&mut self, on: bool) {
+        self.wait_mode = on;
+        // In a loop the gate follows the phase: arming waits for the next *your
+        // turn*, while disarming applies at once (it can only un-trap).
+        if on && self.practice_loop.is_some() {
+            return;
+        }
         self.wait.set_armed(on);
-        if !on && !self.clock.is_running() {
+        if !on && !self.paused && !self.clock.is_running() {
             self.clock.resume();
         }
     }
@@ -1024,11 +1202,21 @@ impl PlaySession {
     /// long ago) and never advances, ignoring the notes the player is actually
     /// meant to play now.
     fn rebuild_wait_gate(&mut self) {
-        let armed = self.wait.is_armed();
+        // A running loop owns the gate; it re-reads hand/split at its next phase
+        // boundary.
+        if self.practice_loop.is_some() {
+            return;
+        }
+        self.reset_full_gate(self.clock.now_us());
+    }
+
+    /// The whole-song gate for the practised hand, armed per wait mode, seeked
+    /// to `at_us` — normal (non-loop) play.
+    fn reset_full_gate(&mut self, at_us: u64) {
         let steps = expected_steps_for(&self.spans, self.practice, self.split_pitch);
         self.wait = WaitGate::from_expected(&steps);
-        self.wait.set_armed(armed);
-        self.wait.seek_to(self.clock.now_us());
+        self.wait.set_armed(self.wait_mode);
+        self.wait.seek_to(at_us);
     }
 
     /// The file position the backing should be at for the current clock, or
@@ -1049,11 +1237,7 @@ impl PlaySession {
         for (i, span) in self.spans.iter().enumerate() {
             // A span auto-sounds if "hear the song" is on (all notes), OR we are
             // practicing one hand and this span is the OTHER hand (accompaniment).
-            let autoplay = self.hear_song
-                || self
-                    .practice
-                    .is_some_and(|h| span.effective_hand(self.split_pitch) != h);
-            if !autoplay {
+            if !self.autoplays(span) {
                 continue;
             }
             if now >= span.start_us && !self.song_on_fired.contains(&i) {
@@ -1064,6 +1248,23 @@ impl PlaySession {
             }
         }
         (need_on, need_off)
+    }
+
+    /// Whether the app sounds `span` right now ("hear the song", the other
+    /// hand's accompaniment, or — in a loop's demo — the target hand).
+    fn autoplays(&self, span: &NoteSpan) -> bool {
+        let hand = span.effective_hand(self.split_pitch);
+        match &self.practice_loop {
+            None => self.hear_song || self.practice.is_some_and(|h| hand != h),
+            Some(rl) => match rl.lp.phase() {
+                LoopPhase::CountIn { .. } => false,
+                // The demo plays the target hand only; the other hand is silent.
+                LoopPhase::Demo => rl.contains(span) && rl.practice.is_none_or(|h| hand == h),
+                LoopPhase::YourTurn => {
+                    rl.contains(span) && (self.hear_song || rl.practice.is_some_and(|h| hand != h))
+                }
+            },
+        }
     }
 
     /// The pitch for a span index (for the caller routing audition note_on/off).
@@ -1120,6 +1321,8 @@ impl PlaySession {
             bpm: self.bpm,
             beats_per_bar: self.beats_per_bar,
             note_count: self.spans.len(),
+            bar: self.current_bar(),
+            practice_loop: self.loop_view(),
         }
     }
 
@@ -1157,7 +1360,327 @@ impl PlaySession {
             judgments: std::mem::take(&mut self.pending_feedback),
             backgrounds: self.background_transforms(),
             finished: self.is_finished(),
+            bar: self.current_bar(),
+            practice_loop: self.loop_view(),
         }
+    }
+
+    // ── seeking + practice loop (M17-A) ──────────────────────────────────
+
+    /// Bar lookups over the piece's tempo map (play-clock µs), falling back to
+    /// uniform bars. The pre-roll shift is bar-aligned, so uniform bars start
+    /// at multiples of `bar_us`.
+    fn bar_map(&self) -> BarMap<'_> {
+        BarMap::new(&self.bar_starts_us, self.bar_us)
+    }
+
+    /// The bar under the playhead (0-based; the pre-roll is bar 0).
+    pub fn current_bar(&self) -> u64 {
+        self.bar_map().bar_at(self.now_us())
+    }
+
+    /// Is the practice loop running? Test-only; the live view is
+    /// [`loop_view`](Self::loop_view)'s `running`.
+    #[cfg(test)]
+    pub fn is_looping(&self) -> bool {
+        self.practice_loop.is_some()
+    }
+
+    /// Jump the playhead to `us`: seek the clock, cut the song bus, reset the
+    /// song triggers (pre-filling spans that end at or before `us`, as
+    /// `Composer::start_play` does) and — outside a loop — rewind the take's
+    /// scoring to `us` and re-seek the whole-song wait gate there. A running
+    /// loop re-points its own gate at the phase it enters. The backing follows
+    /// through `AudioState::sync_play_backing`'s jump detection.
+    pub fn seek_to(&mut self, us: u64) {
+        self.cut_song_bus();
+        self.clock.seek_us(us);
+        self.song_on_fired.clear();
+        self.song_off_fired.clear();
+        for (i, span) in self.spans.iter().enumerate() {
+            if span.end_us <= us {
+                self.song_on_fired.insert(i);
+                self.song_off_fired.insert(i);
+            }
+        }
+        if self.practice_loop.is_none() {
+            // Un-judge what lies ahead of the target so it is played afresh.
+            let good_us = self.cfg.good_us;
+            let spans = &self.spans;
+            self.scored.retain(|&i| spans[i].start_us + good_us <= us);
+            self.played.retain(|e| e.timestamp_us < us);
+            self.recompute_live();
+            self.reset_full_gate(us);
+        }
+    }
+
+    /// Release every song-bus note still sounding (and the count-in click):
+    /// the freeze fade may be mid-flight, so a jump must not leave notes hung.
+    fn cut_song_bus(&mut self) {
+        for (i, span) in self.spans.iter().enumerate() {
+            if self.song_on_fired.contains(&i) && !self.song_off_fired.contains(&i) {
+                self.loop_audio.cut.push(span.note);
+            }
+        }
+        if self.click_off_at.take().is_some() {
+            self.loop_audio.click_off = true;
+        }
+    }
+
+    /// `←` / `→`: pause, then jump to the start of the bar `delta` bars from
+    /// the one under the playhead (clamped to the song). Outside a loop only;
+    /// returns whether it moved.
+    pub fn step_bar(&mut self, delta: i32) -> bool {
+        if self.practice_loop.is_some() {
+            return false;
+        }
+        self.paused = true;
+        if self.clock.is_running() {
+            self.clock.pause();
+        }
+        let map = self.bar_map();
+        let last = map.bar_at(self.duration_us);
+        let bar = (map.bar_at(self.now_us()) as i64 + delta as i64).clamp(0, last as i64) as u64;
+        let target = map.bar_start(bar);
+        self.seek_to(target);
+        true
+    }
+
+    /// The marked bars as an ordered `(first, last)`: both marks, or the one
+    /// set mark as a single bar.
+    fn marked_range(&self) -> Option<(u64, u64)> {
+        match self.loop_marks {
+            (Some(a), Some(b)) => Some((a.min(b), a.max(b))),
+            (Some(a), None) | (None, Some(a)) => Some((a, a)),
+            (None, None) => None,
+        }
+    }
+
+    /// `[`: loop start = the bar under the playhead. Restarts a running loop on
+    /// the new range.
+    pub fn mark_loop_start(&mut self) {
+        self.loop_marks.0 = Some(self.current_bar());
+        self.restart_if_looping();
+    }
+
+    /// `]`: loop end = the bar under the playhead (inclusive). Restarts a
+    /// running loop on the new range.
+    pub fn mark_loop_end(&mut self) {
+        self.loop_marks.1 = Some(self.current_bar());
+        self.restart_if_looping();
+    }
+
+    fn restart_if_looping(&mut self) {
+        if self.practice_loop.is_some() {
+            if let Some((a, b)) = self.marked_range() {
+                self.start_loop(a, b);
+            }
+        }
+    }
+
+    /// Mark bars `first..=last` (swapped if reversed) and start the practice
+    /// loop over them from its count-in, unpausing the transport.
+    pub fn set_loop(&mut self, first_bar: u64, last_bar: u64) {
+        let (a, b) = (first_bar.min(last_bar), first_bar.max(last_bar));
+        self.loop_marks = (Some(a), Some(b));
+        self.start_loop(a, b);
+    }
+
+    fn start_loop(&mut self, first_bar: u64, last_bar: u64) {
+        let map = self.bar_map();
+        let (start_us, end_us) = map.bar_range_us(first_bar, last_bar);
+        let count_in_us = map.bar_len(first_bar);
+        let lp = PracticeLoop::new(start_us, end_us, count_in_us, self.beats_per_bar);
+        let entry_us = lp.entry_us();
+        self.practice_loop = Some(RunningLoop {
+            lp,
+            first_bar,
+            last_bar,
+            practice: self.practice,
+            played: Vec::new(),
+            scored: HashSet::new(),
+        });
+        self.last_pass = None;
+        self.seek_to(entry_us);
+        self.enter_phase(LoopPhase::CountIn { next: Pass::Demo });
+        self.recompute_live();
+        self.paused = false;
+        if !self.clock.is_running() {
+            self.clock.resume();
+        }
+    }
+
+    /// Stop the running loop: leave it paused at the loop start with normal
+    /// play restored (whole-song gate, triggers pre-filled, whole-take scoring
+    /// resumes from there). With no loop running, clear the marks instead.
+    pub fn clear_loop(&mut self) {
+        match self.practice_loop.take() {
+            Some(rl) => {
+                self.paused = true;
+                if self.clock.is_running() {
+                    self.clock.pause();
+                }
+                self.seek_to(rl.lp.start_us());
+            }
+            None => {
+                self.loop_marks = (None, None);
+                self.last_pass = None;
+            }
+        }
+    }
+
+    /// Apply a loop phase: snapshot the practised hand, and arm the loop's own
+    /// wait gate for *your turn* only (built from the loop's notes, so a step
+    /// at `end_us` is never in it). Count-in and demo run ungated.
+    fn enter_phase(&mut self, phase: LoopPhase) {
+        let practice = self.practice;
+        let split = self.split_pitch;
+        let Some(rl) = self.practice_loop.as_mut() else {
+            return;
+        };
+        rl.practice = practice;
+        if phase == LoopPhase::YourTurn {
+            let steps: Vec<(MidiNote, u64)> = spans_for(&self.spans, practice, split)
+                .filter(|s| rl.contains(s))
+                .filter_map(|s| MidiNote::new(s.note).map(|n| (n, s.start_us)))
+                .collect();
+            let start_us = rl.lp.start_us();
+            self.wait = WaitGate::from_expected(&steps);
+            self.wait.set_armed(self.wait_mode);
+            self.wait.seek_to(start_us);
+        } else {
+            self.wait.set_armed(false);
+        }
+    }
+
+    /// Step the loop's phase machine to the clock and act on it.
+    fn tick_loop(&mut self) {
+        let now = self.now_us();
+        let Some(rl) = self.practice_loop.as_mut() else {
+            return;
+        };
+        match rl.lp.tick(now) {
+            LoopStep::Stay => {}
+            LoopStep::Enter(phase) => self.enter_phase(phase),
+            LoopStep::JumpTo {
+                us,
+                phase,
+                pass_done,
+            } => {
+                if pass_done {
+                    self.finish_pass();
+                }
+                if let Some(rl) = self.practice_loop.as_mut() {
+                    rl.played.clear();
+                    rl.scored.clear();
+                }
+                self.recompute_live();
+                self.seek_to(us);
+                self.enter_phase(phase);
+            }
+        }
+    }
+
+    /// Score the *your turn* pass that just ended into `last_pass`, flushing
+    /// judgments for loop notes whose window was still open at the wrap.
+    fn finish_pass(&mut self) {
+        let split = self.split_pitch;
+        let Some(rl) = self.practice_loop.as_ref() else {
+            return;
+        };
+        let targets: Vec<usize> = self
+            .spans
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                rl.contains(s) && rl.practice.is_none_or(|h| s.effective_hand(split) == h)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let expected: Vec<ExpectedNote> = targets
+            .iter()
+            .filter_map(|&i| {
+                let s = &self.spans[i];
+                MidiNote::new(s.note).map(|n| ExpectedNote::new(n, s.start_us))
+            })
+            .collect();
+        let summary = Summary::from_report(&score(&expected, &rl.played, self.cfg));
+        let pass = rl.lp.pass().saturating_sub(1);
+        let newly: Vec<usize> = targets
+            .into_iter()
+            .filter(|i| !rl.scored.contains(i))
+            .collect();
+        if let Some(rl) = self.practice_loop.as_mut() {
+            rl.scored.extend(newly.iter().copied());
+        }
+        let judged = self.recompute_live();
+        self.queue_feedback(judged, &newly);
+        self.last_pass = Some(PassSummary {
+            pass,
+            hits: summary.hits,
+            misses: summary.misses,
+            accuracy_bp: (summary.accuracy() * 10_000.0).round() as u32,
+        });
+    }
+
+    /// The loop's next phase boundary: the loop start during a count-in, the
+    /// loop end during a pass.
+    fn loop_boundary(&self) -> Option<u64> {
+        let lp = &self.practice_loop.as_ref()?.lp;
+        Some(match lp.phase() {
+            LoopPhase::CountIn { .. } => lp.start_us(),
+            LoopPhase::Demo | LoopPhase::YourTurn => lp.end_us(),
+        })
+    }
+
+    /// Queue count-in clicks for beats in `[prev_us, now_us)`, and the release
+    /// of a click that has rung its length.
+    fn loop_clicks(&mut self, prev_us: u64, now_us: u64) {
+        if self.click_off_at.is_some_and(|t| now_us >= t) {
+            self.click_off_at = None;
+            self.loop_audio.click_off = true;
+        }
+        let Some(rl) = self.practice_loop.as_ref() else {
+            return;
+        };
+        if let Some(accent) = rl.lp.click_due(prev_us, now_us) {
+            self.loop_audio.clicks.push(accent);
+            self.click_off_at = Some(now_us + CLICK_DUR_US);
+        }
+    }
+
+    /// Drain the song-bus work the loop queued (cuts, clicks) for the audio
+    /// side.
+    pub fn take_loop_audio(&mut self) -> LoopAudio {
+        std::mem::take(&mut self.loop_audio)
+    }
+
+    /// The practice loop's view, or `None` when nothing is marked.
+    pub fn loop_view(&self) -> Option<LoopView> {
+        if let Some(rl) = &self.practice_loop {
+            return Some(LoopView {
+                first_bar: rl.first_bar,
+                last_bar: rl.last_bar,
+                start_us: rl.lp.start_us(),
+                end_us: rl.lp.end_us(),
+                running: true,
+                phase: Some(rl.lp.phase().name()),
+                pass: rl.lp.pass(),
+                last_pass: self.last_pass,
+            });
+        }
+        let (first_bar, last_bar) = self.marked_range()?;
+        let (start_us, end_us) = self.bar_map().bar_range_us(first_bar, last_bar);
+        Some(LoopView {
+            first_bar,
+            last_bar,
+            start_us,
+            end_us,
+            running: false,
+            phase: None,
+            pass: 0,
+            last_pass: self.last_pass,
+        })
     }
 
     /// The authoritative end-of-take report from `core::score` over every span
@@ -1284,34 +1807,84 @@ pub fn play_set_wait(state: tauri::State<'_, PlayState>, on: bool) -> bool {
 #[tauri::command]
 pub fn play_status(state: tauri::State<'_, PlayState>) -> PlayStatusView {
     let guard = state.0.lock().expect("play state mutex poisoned");
-    guard
-        .as_ref()
-        .map(|s| s.status())
-        .unwrap_or(PlayStatusView {
-            loaded: false,
-            title: String::new(),
-            time_us: 0,
-            duration_us: 0,
-            paused: false,
-            frozen: false,
-            finished: false,
-            wait_armed: false,
-            awaiting: Vec::new(),
-            held: Vec::new(),
-            practice: "both".to_string(),
-            split_pitch: DEFAULT_SPLIT,
-            rate_permille: PLAY_RATE_UNITY,
-            hear_song: false,
-            monitor: false,
-            score: 0,
-            combo: 0,
-            best_combo: 0,
-            hits: 0,
-            misses: 0,
-            bpm: 0,
-            beats_per_bar: 0,
-            note_count: 0,
-        })
+    status_of(guard.as_ref())
+}
+
+/// A session's status, or the `loaded: false` picture when there is none.
+fn status_of(session: Option<&PlaySession>) -> PlayStatusView {
+    session.map(|s| s.status()).unwrap_or(PlayStatusView {
+        loaded: false,
+        title: String::new(),
+        time_us: 0,
+        duration_us: 0,
+        paused: false,
+        frozen: false,
+        finished: false,
+        wait_armed: false,
+        awaiting: Vec::new(),
+        held: Vec::new(),
+        practice: "both".to_string(),
+        split_pitch: DEFAULT_SPLIT,
+        rate_permille: PLAY_RATE_UNITY,
+        hear_song: false,
+        monitor: false,
+        score: 0,
+        combo: 0,
+        best_combo: 0,
+        hits: 0,
+        misses: 0,
+        bpm: 0,
+        beats_per_bar: 0,
+        note_count: 0,
+        bar: 0,
+        practice_loop: None,
+    })
+}
+
+/// Run `f` on the active session (if any) and return the resulting status.
+fn with_session(state: &PlayState, f: impl FnOnce(&mut PlaySession)) -> PlayStatusView {
+    let mut guard = state.0.lock().expect("play state mutex poisoned");
+    if let Some(s) = guard.as_mut() {
+        f(s);
+    }
+    status_of(guard.as_ref())
+}
+
+/// `←` / `→`: pause and jump `delta` bars (`HostCommand::PlaySeekBar`).
+/// Returns the play status. No-op while a practice loop runs.
+#[tauri::command]
+pub fn play_seek_bar(state: tauri::State<'_, PlayState>, delta: i32) -> PlayStatusView {
+    with_session(&state, |s| {
+        s.step_bar(delta);
+    })
+}
+
+/// `[` / `]`: mark the loop's first / last bar at the playhead
+/// (`HostCommand::PlayMarkLoop`). Returns the play status.
+#[tauri::command]
+pub fn play_mark_loop(state: tauri::State<'_, PlayState>, edge: LoopEdge) -> PlayStatusView {
+    with_session(&state, |s| match edge {
+        LoopEdge::Start => s.mark_loop_start(),
+        LoopEdge::End => s.mark_loop_end(),
+    })
+}
+
+/// Mark bars `first_bar..=last_bar` and start the practice loop
+/// (`HostCommand::PlaySetLoop`). Returns the play status.
+#[tauri::command]
+pub fn play_set_loop(
+    state: tauri::State<'_, PlayState>,
+    first_bar: u32,
+    last_bar: u32,
+) -> PlayStatusView {
+    with_session(&state, |s| s.set_loop(first_bar as u64, last_bar as u64))
+}
+
+/// Stop the practice loop, or clear the marks when none is running
+/// (`HostCommand::PlayClearLoop`). Returns the play status.
+#[tauri::command]
+pub fn play_clear_loop(state: tauri::State<'_, PlayState>) -> PlayStatusView {
+    with_session(&state, PlaySession::clear_loop)
 }
 
 /// Set play-session speed in permille (1000 = 1x), clamped to 0.25x..=2x.
@@ -1507,6 +2080,31 @@ pub fn tick_play(
                 synth.fade_out(crate::audio::FREEZE_FADE);
             } else {
                 synth.fade_in(crate::audio::THAW_FADE);
+            }
+        }
+    }
+
+    // Practice-loop audio (M17-A): release what a jump left sounding, then the
+    // count-in clicks — both on the song bus, before this tick's triggers.
+    let loop_audio = session.take_loop_audio();
+    if let Some(synth) = &song_bus {
+        for note in loop_audio.cut.iter().filter_map(|&n| MidiNote::new(n)) {
+            synth.note_off(note);
+        }
+        let click = MidiNote::new(CLICK_NOTE);
+        if let Some(click) = click {
+            if loop_audio.click_off || !loop_audio.clicks.is_empty() {
+                synth.note_off(click);
+            }
+            for &accent in &loop_audio.clicks {
+                let vel = if accent {
+                    CLICK_VEL_ACCENT
+                } else {
+                    CLICK_VEL_NORMAL
+                };
+                if let Some(v) = rockcraft_core::Velocity::new(vel) {
+                    synth.note_on(click, v);
+                }
             }
         }
     }
@@ -2422,5 +3020,388 @@ mod tests {
         s.set_split(21); // ...and now everything reads right — except the pin
         assert_eq!(s.spans[0].effective_hand(21), Hand::Left);
         assert_eq!(s.spans[1].effective_hand(21), Hand::Right);
+    }
+
+    // ── practice loop (M17-A) ────────────────────────────────────────────
+
+    /// 120 BPM 4/4: bars are 2 s, and the 3.5 s lead-in rounds up to 4 s, so
+    /// song bar 0 is play-clock bar 2 = [4 s, 6 s). In it: right hand 72 on
+    /// every beat, left hand 48 on beats 1 and 3. Bar 3 opens with 74 at
+    /// exactly 6 s — the loop end.
+    fn loop_session() -> PlaySession {
+        let mut ev = Vec::new();
+        for k in 0..4u64 {
+            ev.push(on(72, k * 500_000));
+            ev.push(off(72, k * 500_000 + 400_000));
+        }
+        for k in [0u64, 2] {
+            ev.push(on(48, k * 500_000));
+            ev.push(off(48, k * 500_000 + 400_000));
+        }
+        ev.push(on(74, 2_000_000));
+        ev.push(off(74, 2_400_000));
+        ev.sort_by_key(|e| e.timestamp_us);
+        let grid = GridInfo {
+            bpm: 120,
+            beats_per_bar: 4,
+            bar_us: 2_000_000,
+            origin_us: 0,
+        };
+        let s = PlaySession::from_events_with_grid("loop".into(), &ev, Some(grid));
+        assert_eq!(s.shift_us(), 4_000_000, "fixture assumes a 4 s shift");
+        s
+    }
+
+    const LOOP_START: u64 = 4_000_000;
+    const LOOP_END: u64 = 6_000_000;
+    const TICK: u64 = 10_000;
+
+    fn phase(s: &PlaySession) -> Option<&'static str> {
+        s.loop_view().and_then(|v| v.phase)
+    }
+
+    /// One tick: advance, then fire (and return) the song note-ons due.
+    fn tick(s: &mut PlaySession) -> Vec<u8> {
+        s.advance(TICK);
+        let (on_idx, off_idx) = s.pending_song_triggers();
+        s.mark_song_fired(&on_idx, &off_idx);
+        on_idx.iter().filter_map(|&i| s.span_note(i)).collect()
+    }
+
+    /// Tick until the loop reaches `target` phase (bounded). Returns the song
+    /// notes fired, each labelled with the phase the tick ended in (the tick
+    /// that lands on a boundary enters the new phase and fires its notes).
+    fn tick_until(s: &mut PlaySession, target: &str) -> Vec<(&'static str, u8)> {
+        let mut fired = Vec::new();
+        for _ in 0..10_000 {
+            if phase(s) == Some(target) {
+                return fired;
+            }
+            let notes = tick(s);
+            let p = phase(s).unwrap();
+            fired.extend(notes.into_iter().map(|n| (p, n)));
+        }
+        panic!("never reached {target}; at {:?} t={}", phase(s), s.now_us());
+    }
+
+    /// Play every target note in the loop exactly on time (skipping the loop
+    /// span indices in `skip`), until the pass ends.
+    fn play_your_turn(s: &mut PlaySession, skip: &[usize]) {
+        assert_eq!(phase(s), Some("your_turn"));
+        let loop_spans: Vec<(usize, NoteSpan)> = s
+            .spans
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, sp)| sp.start_us >= LOOP_START && sp.start_us < LOOP_END)
+            .collect();
+        let mut struck = HashSet::new();
+        let mut released = HashSet::new();
+        while phase(s) == Some("your_turn") {
+            let now = s.now_us();
+            for (i, sp) in &loop_spans {
+                if skip.contains(i) {
+                    continue;
+                }
+                if now >= sp.start_us && struck.insert(*i) {
+                    s.ingest(on(sp.note, sp.start_us));
+                }
+                if now >= sp.end_us && released.insert(*i) {
+                    s.ingest(off(sp.note, sp.end_us));
+                }
+            }
+            tick(s);
+        }
+    }
+
+    #[test]
+    fn set_loop_enters_the_count_in_a_bar_before_the_loop() {
+        let mut s = loop_session();
+        s.set_loop(2, 2);
+        let v = s.loop_view().unwrap();
+        assert_eq!((v.first_bar, v.last_bar), (2, 2));
+        assert_eq!((v.start_us, v.end_us), (LOOP_START, LOOP_END));
+        assert!(v.running);
+        assert_eq!(v.phase, Some("count_in"));
+        assert_eq!(v.pass, 1);
+        assert_eq!(s.now_us(), 2_000_000, "count-in = one bar before the loop");
+        assert!(!s.is_paused());
+    }
+
+    #[test]
+    fn count_in_clicks_each_beat_with_the_accent_first() {
+        let mut s = loop_session();
+        s.set_loop(2, 2);
+        let mut clicks = Vec::new();
+        tick_until(&mut s, "demo");
+        // Re-run from a fresh loop, draining the audio each tick.
+        s.set_loop(2, 2);
+        s.take_loop_audio();
+        while phase(&s) == Some("count_in") {
+            tick(&mut s);
+            clicks.extend(s.take_loop_audio().clicks);
+        }
+        assert_eq!(clicks, vec![true, false, false, false]);
+    }
+
+    #[test]
+    fn demo_autoplays_only_the_target_hand_and_scores_nothing() {
+        let mut s = loop_session();
+        s.set_practice(Some(Hand::Right));
+        s.set_loop(2, 2);
+        let mut fired = tick_until(&mut s, "demo");
+        assert!(
+            fired.iter().all(|&(p, _)| p == "demo"),
+            "no song notes during the count-in: {fired:?}"
+        );
+        // A stray strike during the demo is ignored by scoring.
+        s.ingest(on(72, LOOP_START));
+        fired.extend(tick_until(&mut s, "count_in"));
+        let notes: Vec<u8> = fired.iter().map(|&(_, n)| n).collect();
+        assert_eq!(
+            notes,
+            vec![72, 72, 72, 72],
+            "demo plays the right hand only"
+        );
+        assert_eq!((s.live_hits, s.live_misses, s.score), (0, 0, 0));
+        assert!(s.pending_feedback.is_empty());
+    }
+
+    #[test]
+    fn demo_plays_both_hands_when_practising_both() {
+        let mut s = loop_session();
+        s.set_loop(2, 2);
+        let mut fired = tick_until(&mut s, "demo");
+        fired.extend(tick_until(&mut s, "count_in"));
+        let mut notes: Vec<u8> = fired.iter().map(|&(_, n)| n).collect();
+        notes.sort();
+        assert_eq!(notes, vec![48, 48, 72, 72, 72, 72]);
+    }
+
+    #[test]
+    fn your_turn_autoplays_the_other_hand_and_scores_a_perfect_pass() {
+        let mut s = loop_session();
+        s.set_practice(Some(Hand::Right));
+        s.set_loop(2, 2);
+        tick_until(&mut s, "demo");
+        tick_until(&mut s, "count_in");
+        let fired = tick_until(&mut s, "your_turn");
+        assert_eq!(
+            fired,
+            vec![("your_turn", 48)],
+            "count-in silent; the left hand accompanies your turn"
+        );
+        play_your_turn(&mut s, &[]);
+        let v = s.loop_view().unwrap();
+        assert_eq!(v.phase, Some("count_in"));
+        assert_eq!(v.pass, 2);
+        assert_eq!(
+            v.last_pass,
+            Some(PassSummary {
+                pass: 1,
+                hits: 4,
+                misses: 0,
+                accuracy_bp: 10_000
+            }),
+            "only the four right-hand loop notes are scored"
+        );
+        assert_eq!(
+            (s.live_hits, s.live_misses, s.score),
+            (0, 0, 0),
+            "live reset"
+        );
+        // The whole-take score is untouched by the loop.
+        assert!(s.played.is_empty() && s.scored.is_empty());
+    }
+
+    #[test]
+    fn a_pass_with_one_miss_is_scored_as_such() {
+        let mut s = loop_session();
+        s.set_loop(2, 2);
+        tick_until(&mut s, "demo");
+        tick_until(&mut s, "your_turn");
+        // Skip the second loop note.
+        let second = s
+            .spans
+            .iter()
+            .position(|sp| sp.start_us == LOOP_START + 500_000)
+            .unwrap();
+        play_your_turn(&mut s, &[second]);
+        let last = s.loop_view().unwrap().last_pass.unwrap();
+        assert_eq!((last.pass, last.hits, last.misses), (1, 5, 1));
+        assert_eq!(last.accuracy_bp, 8_333);
+    }
+
+    #[test]
+    fn wait_mode_freezes_in_your_turn_only() {
+        let mut s = loop_session();
+        s.set_wait_mode(true);
+        s.set_loop(2, 2);
+        // Count-in and demo run through with nothing held.
+        tick_until(&mut s, "demo");
+        assert!(!s.wait.is_armed());
+        tick_until(&mut s, "your_turn");
+        assert!(s.wait.is_armed());
+        for _ in 0..50 {
+            tick(&mut s);
+        }
+        assert_eq!(s.now_us(), LOOP_START, "frozen on the loop's first step");
+        assert!(s.status().frozen);
+    }
+
+    #[test]
+    fn a_step_at_exactly_the_loop_end_does_not_freeze_the_loop() {
+        let mut s = loop_session();
+        s.set_wait_mode(true);
+        s.set_loop(2, 2);
+        tick_until(&mut s, "your_turn");
+        play_your_turn(&mut s, &[]);
+        let v = s.loop_view().unwrap();
+        assert_eq!((v.phase, v.pass), (Some("count_in"), 2));
+        assert_eq!(s.now_us(), 2_000_000, "wrapped to the count-in");
+        assert_eq!(v.last_pass.unwrap().hits, 6);
+    }
+
+    #[test]
+    fn song_triggers_refire_every_pass_without_a_burst() {
+        let mut s = loop_session();
+        s.set_loop(2, 2);
+        for pass in 1..=2 {
+            let mut fired = tick_until(&mut s, "demo");
+            assert!(
+                fired.iter().all(|&(p, _)| p == "demo"),
+                "pass {pass}: no burst after the wrap: {fired:?}"
+            );
+            fired.extend(tick_until(&mut s, "count_in"));
+            assert_eq!(fired.len(), 6, "pass {pass}: every demo note fires once");
+            tick_until(&mut s, "your_turn");
+            play_your_turn(&mut s, &[]);
+        }
+    }
+
+    #[test]
+    fn a_wrap_cuts_the_notes_still_sounding() {
+        let mut s = loop_session();
+        s.set_loop(2, 2);
+        tick_until(&mut s, "demo");
+        s.take_loop_audio();
+        // Hold the release of the last demo notes back: none are marked off.
+        while phase(&s) == Some("demo") {
+            s.advance(TICK);
+            let (on_idx, _) = s.pending_song_triggers();
+            s.mark_song_fired(&on_idx, &[]);
+        }
+        let mut cut = s.take_loop_audio().cut;
+        cut.sort();
+        assert_eq!(cut, vec![48, 48, 72, 72, 72, 72]);
+    }
+
+    #[test]
+    fn clear_loop_pauses_at_the_loop_start_with_normal_play_restored() {
+        let mut s = loop_session();
+        s.set_wait_mode(true);
+        s.set_loop(2, 2);
+        tick_until(&mut s, "demo");
+        s.clear_loop();
+        assert!(!s.is_looping());
+        assert!(s.is_paused());
+        assert_eq!(s.now_us(), LOOP_START);
+        assert!(s.wait.is_armed(), "the whole-song gate is back, armed");
+        let v = s.loop_view().unwrap();
+        assert!(!v.running && v.phase.is_none());
+        assert_eq!((v.first_bar, v.last_bar), (2, 2), "marks survive a stop");
+        // Space plays on: the gate waits on the loop-start note...
+        s.toggle_pause();
+        for _ in 0..20 {
+            tick(&mut s);
+        }
+        assert_eq!(s.now_us(), LOOP_START);
+        // ...and a second clear drops the marks.
+        s.clear_loop();
+        assert!(s.loop_view().is_none());
+    }
+
+    #[test]
+    fn marks_select_the_bar_under_the_playhead() {
+        let mut s = loop_session();
+        s.advance(4_500_000);
+        assert_eq!(s.current_bar(), 2);
+        s.mark_loop_start();
+        let v = s.loop_view().unwrap();
+        assert_eq!((v.first_bar, v.last_bar, v.running), (2, 2, false));
+        s.advance(2_000_000);
+        s.mark_loop_end();
+        let v = s.loop_view().unwrap();
+        assert_eq!((v.first_bar, v.last_bar), (2, 3));
+        assert_eq!((v.start_us, v.end_us), (LOOP_START, 8_000_000));
+        // Reversed marks swap.
+        s.seek_to(0);
+        s.mark_loop_end();
+        let v = s.loop_view().unwrap();
+        assert_eq!((v.first_bar, v.last_bar), (0, 2));
+    }
+
+    #[test]
+    fn marking_while_looping_restarts_on_the_new_range() {
+        let mut s = loop_session();
+        s.set_loop(2, 2);
+        tick_until(&mut s, "demo");
+        s.advance(100_000);
+        s.mark_loop_end(); // still bar 2 → same range, restarted
+        let v = s.loop_view().unwrap();
+        assert_eq!(v.phase, Some("count_in"));
+        assert_eq!(s.now_us(), 2_000_000);
+    }
+
+    #[test]
+    fn step_bar_pauses_then_jumps_to_bar_starts() {
+        let mut s = loop_session();
+        s.toggle_pause(); // loaded unpaused in tests; make sure it runs
+        s.toggle_pause();
+        s.advance(4_700_000);
+        assert!(s.step_bar(-1));
+        assert!(s.is_paused());
+        assert_eq!(s.now_us(), 2_000_000);
+        assert!(s.step_bar(1));
+        assert!(s.step_bar(1));
+        assert_eq!(s.now_us(), 6_000_000);
+        assert!(s.step_bar(-100));
+        assert_eq!(s.now_us(), 0, "clamped at bar 0");
+        s.set_loop(2, 2);
+        assert!(!s.step_bar(1), "no bar steps inside a loop");
+    }
+
+    #[test]
+    fn seek_to_backwards_rearms_the_gate_at_the_target() {
+        let mut s = session();
+        s.set_wait_mode(true);
+        s.advance(SHIFT);
+        for k in 0..3 {
+            s.ingest(on(60 + [0, 2, 4][k], target_us(k as u64)));
+            s.advance(250_000);
+            s.ingest(off(60 + [0, 2, 4][k], target_us(k as u64) + 200_000));
+        }
+        assert!(s.now_us() > target_us(1));
+        let hits_before = s.live_hits;
+        assert!(hits_before > 0);
+        s.seek_to(target_us(1));
+        assert!(
+            s.live_hits < hits_before,
+            "the take rewinds with the playhead"
+        );
+        s.advance(0);
+        s.advance(TICK);
+        assert_eq!(s.now_us(), target_us(1), "gate waits on the target's note");
+        assert_eq!(s.status().awaiting, vec![62]);
+    }
+
+    #[test]
+    fn looping_never_finishes_the_take() {
+        let mut s = loop_session();
+        s.set_loop(3, 3);
+        for _ in 0..2_000 {
+            tick(&mut s);
+            assert!(!s.is_finished());
+        }
     }
 }
