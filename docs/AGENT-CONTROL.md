@@ -425,6 +425,11 @@ below is an at-a-glance convenience only.
 | `play_toggle_hear_song` | none | Toggle the audible song synth |
 | `play_toggle_pause` | none | Pause/resume the active play session, freezing/thawing the clock + backing at the current position. No-op with no active session |
 | `play_finish` | none | Finish the play session; returns the score summary |
+| `play_set_practice` | `{ hand: "left"\|"right"\|null }` | Set the practised hand (the other hand auto-plays and isn't scored); `null` = both. Returns `{ practice }` |
+| `play_seek_bar` | `{ delta: i32 }` | Pause and jump the playhead to the start of the bar `delta` bars from the one under it (`-1` previous, `1` next), clamped to the song. No-op while a practice loop runs. Returns play status |
+| `play_mark_loop` | `{ edge: "start"\|"end" }` | Mark the practice loop's first / last (inclusive) bar as the bar under the playhead. Doesn't pause; a running loop restarts on the new range. Returns play status |
+| `play_set_loop` | `{ first_bar: u32, last_bar: u32 }` | Mark bars `first_bar..=last_bar` (0-based, swapped if reversed) and start the practice loop — see below. Returns play status |
+| `play_clear_loop` | none | Stop a running practice loop, pausing at the loop start with normal play restored; with no loop running, clear the marks. Returns play status |
 | `record_start` | `{ backing: String? }` | Start a record session, optionally over a backing file |
 | `record_stop` | none | Stop recording without saving |
 | `record_save` | none | Save the session as a bundle. Returns the dir |
@@ -457,6 +462,30 @@ carries a loaded piece's movie and background layers through save/split
 untouched, so editing a chart there never destroys its backdrops. The Tauri
 desktop host backs the full set. Always discover
 the live set with `query help`.
+
+#### The practice loop (M17-A)
+
+`play_set_loop` drills a passage: **count-in** (one bar of clicks — the length of
+the loop's first bar — starting that far before the loop; nothing autoplays or
+is scored) → **demo** (the app plays the practised hand, or both; unscored, wait
+mode off) → **count-in** → **your turn** (you play it: the other hand autoplays,
+"hear the song" applies, wait mode applies to the loop's notes only, and only
+notes starting in the loop are scored) → back to the demo with the pass counter
+bumped. Speed (`play_set_rate`) applies at once; a practice-hand or wait-mode
+change takes effect at the next phase boundary. The loop never finishes the take.
+
+`play_status` (and every loop command's reply) carries `bar` — the bar under the
+playhead, 0-based — and `practice_loop`, `null` when nothing is marked, else:
+
+```json
+{ "first_bar": 4, "last_bar": 7, "start_us": 12000000, "end_us": 20000000,
+  "running": true, "phase": "your_turn", "pass": 3,
+  "last_pass": { "pass": 2, "hits": 11, "misses": 1, "accuracy_bp": 9167 } }
+```
+
+`phase` is `"count_in"`, `"demo"` or `"your_turn"` (`null` while only marked).
+`last_pass` is the most recent finished your-turn pass. The loop commands and
+`play_set_practice` are Tauri-only; the TUI answers `unsupported:`.
 
 The mixer commands work from any screen in either frontend — the synth is
 app-wide, not owned by a play session — so a level can be set before a bundle is

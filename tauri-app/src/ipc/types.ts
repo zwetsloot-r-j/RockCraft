@@ -481,6 +481,54 @@ export interface PlayStateEvent {
   backgrounds: BackgroundTransformView[];
   /** Set once the song (plus tail) has finished. */
   finished: boolean;
+  /** The bar under the playhead (0-based; the pre-roll is bar 0) — what `[`,
+   * `]` and `l` act on (M17-A). */
+  bar: number;
+  /** The practice loop, or `null` when nothing is marked (M17-A). */
+  practice_loop: LoopView | null;
+}
+
+/** Which end of the practice loop `play_mark_loop` sets. */
+export type LoopEdge = "start" | "end";
+
+/** Practice-loop phase wire names — mirror of `core::LoopPhase::name`. */
+export type LoopPhaseName = "count_in" | "demo" | "your_turn";
+
+/** One finished "your turn" pass — mirror of `play::PassSummary`. */
+export interface PassSummary {
+  /** 1-based pass number. */
+  pass: number;
+  hits: number;
+  misses: number;
+  /** Accuracy in basis points (0..=10000). */
+  accuracy_bp: number;
+}
+
+/** The practice loop — mirror of `play::LoopView`. Bars are 0-based. */
+export interface LoopView {
+  first_bar: number;
+  last_bar: number;
+  /** `[start_us, end_us)` of the marked bars, play-clock µs. */
+  start_us: number;
+  end_us: number;
+  /** Running (false: only marked). */
+  running: boolean;
+  /** `null` unless running. */
+  phase: LoopPhaseName | null;
+  /** 1-based pass number (0 unless running). */
+  pass: number;
+  last_pass: PassSummary | null;
+}
+
+/** The live take's status — mirror of `play::PlayStatusView` (the fields the
+ * webview reads). Returned by the practice-loop commands. */
+export interface PlayStatus {
+  loaded: boolean;
+  time_us: number;
+  paused: boolean;
+  frozen: boolean;
+  bar: number;
+  practice_loop: LoopView | null;
 }
 
 /**

@@ -16,6 +16,7 @@ import type { HitFeedback } from "../../ipc/types";
 import type { HighwayConfig, KeyInfo, KeyLayout, NoteSpan, SongData } from "./types";
 import { visibleRange } from "../cull";
 import { mappedGridLines, uniformGridLines } from "./gridLines";
+import { dimmedByLoop, type LoopBand } from "./practiceLoop";
 import { nextPerLane } from "./laneGuides";
 import {
   clamp,
@@ -164,6 +165,16 @@ export class HighwayCanvas {
     // right-hand note during right practice (and vice versa).
     const practiced: "L" | "R" = this.practiceMode === "left" ? "L" : "R";
     return nt.hand !== practiced;
+  }
+
+  // ── practice loop (M17-A) ─────────────────────────────────────────────────
+  // The marked bars draw as a faint band; while the loop runs, notes outside it
+  // dim so the passage being drilled stands out.
+  private loop: LoopBand | null = null;
+
+  /** Set (or clear, with `null`) the practice-loop band, in engine ms. */
+  setLoop(band: LoopBand | null): void {
+    this.loop = band;
   }
 
   // ── Background video backdrop (M9-G) ──────────────────────────────────────
@@ -402,6 +413,7 @@ export class HighwayCanvas {
     this.ctx.clearRect(0, 0, this.w, this.h);
     this.drawBackground();
     this.drawGrid(now);
+    this.drawLoopBand(now);
     if (c.laneGuides && this.live) this.drawLaneGuides(now);
     this.drawNotes(now);
     this.drawHitLine();
@@ -513,6 +525,31 @@ export class HighwayCanvas {
     }
   }
 
+  /** Loop band: a faint fill between the marked bars plus edge lines, brighter
+   * while the loop runs. */
+  private drawLoopBand(now: number): void {
+    const band = this.loop;
+    if (!band) return;
+    const yTop = clamp(this.yOf(band.endMs, now), 0, this.hitY);
+    const yBot = clamp(this.yOf(band.startMs, now), 0, this.hitY);
+    if (yBot <= yTop) return;
+    const ctx = this.ctx;
+    const half = this.boardW / 2;
+    ctx.fillStyle = band.running ? "rgba(143,182,255,0.07)" : "rgba(143,182,255,0.04)";
+    ctx.fillRect(this.centerX - half, yTop, this.boardW, yBot - yTop);
+    ctx.strokeStyle = band.running ? "rgba(143,182,255,0.45)" : "rgba(143,182,255,0.25)";
+    ctx.lineWidth = 1.5;
+    for (const t of [band.startMs, band.endMs]) {
+      const y = this.yOf(t, now);
+      if (y < 0 || y > this.hitY) continue;
+      const s = this.sAt(y);
+      ctx.beginPath();
+      ctx.moveTo(this.centerX - half * s, y);
+      ctx.lineTo(this.centerX + half * s, y);
+      ctx.stroke();
+    }
+  }
+
   private drawNotes(now: number): void {
     const c = this.cfg;
     const lead = c.lead;
@@ -594,6 +631,8 @@ export class HighwayCanvas {
     const cut = ksty.stroke && !c.perspective ? Math.min(7, (yBot - yTop) * 0.5) : 0;
 
     ctx.save();
+    // Outside a running practice loop: dimmed, so the drilled passage stands out.
+    if (dimmedByLoop(nt.start, this.loop)) ctx.globalAlpha *= 0.3;
     // glow
     if (c.glow) {
       ctx.shadowColor = col;
