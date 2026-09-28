@@ -929,8 +929,28 @@ pub fn run_loop<B: ratatui::backend::Backend>(
         // Drain MIDI and route to the active screen. Clone the synth handle out
         // first so we don't hold a borrow of `shell` across the screen match.
         let synth = shell.synth.clone();
-        let events = shell.input.events();
-        for ev in events {
+        let notes = shell.input.events();
+        let sustain = shell.input.sustain_events();
+        // Keys and pedal in played order: the pedal decides which released
+        // notes ring on, so it must land between the right note events.
+        for input in rockcraft_core::interleave_by_time(&notes, &sustain) {
+            let ev = match input {
+                rockcraft_core::InputEvent::Note(ev) => ev,
+                // The pedal only shapes how your own keys sound, on the
+                // screens that echo them.
+                rockcraft_core::InputEvent::Sustain(p) => {
+                    match &mut shell.screen {
+                        Screen::Play(play) => play.apply_sustain(&p),
+                        Screen::Edit(_) => {
+                            if let Some(s) = &synth {
+                                s.apply_sustain(&p);
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+            };
             match &mut shell.screen {
                 Screen::Play(play) => play.ingest(ev),
                 // The unified capture+edit screen (M9-A): in a record input mode

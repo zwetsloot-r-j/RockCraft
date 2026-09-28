@@ -25,10 +25,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use rockcraft_core::{
-    backing_position_us, hand::hand_of_pitch_value, score, song_shift_us, BackgroundImage, BarMap,
-    ExpectedNote, Feedback, GateState, Hand, HandOverride, LoopPhase, LoopStep, MidiNote,
-    NoteEvent, NoteEventKind, NoteJudgment, Pass, PlayClock, PracticeLoop, RecordingMeta,
-    ScoreConfig, ScoreReport, Summary, SynthBus, Timing, Transform, WaitGate, DEFAULT_SPLIT,
+    backing_position_us, hand::hand_of_pitch_value, interleave_by_time, score, song_shift_us,
+    BackgroundImage, BarMap, ExpectedNote, Feedback, GateState, Hand, HandOverride, LoopPhase,
+    LoopStep, MidiNote, NoteEvent, NoteEventKind, NoteJudgment, Pass, PlayClock, PracticeLoop,
+    RecordingMeta, ScoreConfig, ScoreReport, Summary, SustainEvent, SynthBus, Timing, Transform,
+    WaitGate, DEFAULT_SPLIT,
 };
 use rockcraft_midi::smf_bytes_to_events;
 use serde::Serialize;
@@ -250,6 +251,8 @@ pub struct PlayStateEvent {
     pub held: Vec<u8>,
     /// Notes the player must hold to un-freeze (empty unless `frozen`).
     pub awaiting: Vec<u8>,
+    /// Whether the piano's sustain pedal is down (as last reported).
+    pub sustain: bool,
     /// Notes judged since the previous snapshot, in song-time order (M14-B).
     /// One-shot: each judged note appears in exactly one `play_state`, so the
     /// webview can spawn a decaying effect per entry without de-duplicating.
@@ -547,6 +550,9 @@ pub struct PlaySession {
     /// themselves through the app synth. Independent of "hear the song" (which
     /// auditions the chart). Toggled at runtime; off by default.
     monitor: bool,
+    /// The sustain pedal, as last reported by the piano. Only shapes how the
+    /// monitored notes sound (and the header badge) — never scoring.
+    sustain: bool,
     /// Hand-practice mode: `None` = both hands; `Some(h)` = only hand `h` is
     /// waited-on/scored while the other hand auto-plays. A note's hand is its
     /// authored override (M14-E) when it has one, else its pitch relative to
@@ -668,6 +674,7 @@ impl PlaySession {
             backgrounds: Vec::new(),
             hear_song: false,
             monitor: false,
+            sustain: false,
             practice: None,
             split_pitch: DEFAULT_SPLIT,
             paused: false,
@@ -1166,6 +1173,16 @@ impl PlaySession {
         self.monitor
     }
 
+    /// Record the sustain pedal's latest state.
+    pub fn set_sustain(&mut self, down: bool) {
+        self.sustain = down;
+    }
+
+    /// Is the sustain pedal down?
+    pub fn is_sustain(&self) -> bool {
+        self.sustain
+    }
+
     /// Toggle input-monitor, returning the new state. When turning it off the
     /// caller silences the synth (any monitored notes still ringing).
     pub fn toggle_monitor(&mut self) -> bool {
@@ -1355,6 +1372,7 @@ impl PlaySession {
             misses: self.live_misses,
             held: self.held.iter().copied().collect(),
             awaiting,
+            sustain: self.sustain,
             // Drained: each judged note reaches the webview exactly once, so the
             // effect fires on the tick the judgment became final and never again.
             judgments: std::mem::take(&mut self.pending_feedback),
@@ -1953,6 +1971,10 @@ pub fn play_toggle_hear_song(
         if !on {
             if let Some(synth) = &audio.synth {
                 synth.all_off();
+                // `all_off` lifts the pedal; a foot still on it keeps sustaining.
+                if s.is_monitor() && s.is_sustain() {
+                    synth.sustain(true);
+                }
             }
         }
         on
@@ -1971,8 +1993,11 @@ pub fn play_toggle_monitor(
     let mut guard = state.0.lock().expect("play state mutex poisoned");
     if let Some(s) = guard.as_mut() {
         let on = s.toggle_monitor();
-        if !on {
-            if let Some(synth) = &audio.synth {
+        if let Some(synth) = &audio.synth {
+            if on {
+                // Pick up a pedal that was already down before monitoring.
+                synth.sustain(s.is_sustain());
+            } else {
                 synth.all_off();
             }
         }
@@ -2027,6 +2052,7 @@ pub fn tick_play(
     state: &PlayState,
     audio: &AudioState,
     midi_events: &[NoteEvent],
+    sustain_events: &[SustainEvent],
     dt_us: u64,
     throttle_due: bool,
 ) -> Option<PlayStateEvent> {
@@ -2049,17 +2075,18 @@ pub fn tick_play(
         };
         session.ingest(stamped);
     }
+    if let Some(last) = sustain_events.last() {
+        session.set_sustain(last.down);
+    }
     // Input monitor: synthesise the player's own key presses so they hear
     // themselves. Independent of "hear the song" (the chart audition below).
+    // Keys and pedal go in played order: the pedal decides which released
+    // notes ring on. The player bus carries only these notes, so the pedal
+    // never touches the song voice.
     if session.is_monitor() {
         if let Some(synth) = &audio.synth {
-            for &ev in midi_events {
-                match ev.kind {
-                    NoteEventKind::On { velocity } if !velocity.is_note_off() => {
-                        synth.note_on(ev.note, velocity);
-                    }
-                    _ => synth.note_off(ev.note),
-                }
+            for ev in interleave_by_time(midi_events, sustain_events) {
+                synth.apply_input(&ev);
             }
         }
     }
@@ -2499,6 +2526,36 @@ mod tests {
         assert_eq!(s.now_us(), SHIFT + 250_000);
     }
 
+    /// The pedal's latest state reaches the play snapshot (the header badge),
+    /// and never touches scoring.
+    #[test]
+    fn the_sustain_pedal_reaches_the_snapshot() {
+        let s = PlaySession::from_events("pedal".into(), &[on(60, 0), off(60, 250_000)]);
+        let state = PlayState(Mutex::new(Some(s)));
+        let audio = crate::audio::AudioState::silent();
+        let pedal = |down, at| SustainEvent::new(down, at);
+        let sustain = |state: &PlayState| state.0.lock().unwrap().as_mut().unwrap().live_state();
+
+        tick_play(&state, &audio, &[], &[pedal(true, 1)], 1_000, false);
+        let snap = sustain(&state);
+        assert!(snap.sustain);
+        assert_eq!((snap.hits, snap.misses), (0, 0));
+
+        // Several changes in one tick: the last one wins.
+        tick_play(
+            &state,
+            &audio,
+            &[],
+            &[pedal(true, 2), pedal(false, 3)],
+            1_000,
+            false,
+        );
+        assert!(!sustain(&state).sustain);
+        // A tick with no pedal news keeps the state.
+        tick_play(&state, &audio, &[], &[], 1_000, false);
+        assert!(!sustain(&state).sustain);
+    }
+
     /// A wait-mode freeze holds the song's releases (so the fade, not a damper,
     /// ends the sounding notes) and its next onsets (so the song re-enters with
     /// the awaited key). In legato the first note ends exactly where the
@@ -2523,8 +2580,8 @@ mod tests {
             (s.song_on_fired.clone(), s.song_off_fired.clone())
         };
 
-        tick_play(&state, &audio, &[], SHIFT, false);
-        tick_play(&state, &audio, &[], 1_000_000, false); // clamped: lands on step 2
+        tick_play(&state, &audio, &[], &[], SHIFT, false);
+        tick_play(&state, &audio, &[], &[], 1_000_000, false); // clamped: lands on step 2
         assert_eq!(
             state.0.lock().unwrap().as_ref().unwrap().now_us(),
             target_us(1)
@@ -2536,10 +2593,10 @@ mod tests {
             "step 2 isn't sounded before it's played"
         );
         assert!(offs.is_empty(), "note 1 isn't released at the freeze");
-        tick_play(&state, &audio, &[], 1_000_000, false); // still waiting
+        tick_play(&state, &audio, &[], &[], 1_000_000, false); // still waiting
         assert!(fired(&state).1.is_empty());
 
-        tick_play(&state, &audio, &[on(62, 0)], 4_000, false);
+        tick_play(&state, &audio, &[on(62, 0)], &[], 4_000, false);
         let (ons, offs) = fired(&state);
         assert_eq!(
             ons,

@@ -459,6 +459,9 @@ fn spawn_tick_thread(app: tauri::AppHandle) {
             // Scoring/wait/clock all run off the injected `dt_us`, never the
             // render loop. The composer path is skipped entirely this tick.
             let play_active = play_state.0.lock().expect("play state poisoned").is_some();
+            // The sustain pedal only colours the play screen's input monitor;
+            // elsewhere it is drained and dropped so it never piles up.
+            let sustain = crate::midi::drain_sustain(&midi_state);
             if play_active {
                 let raw = crate::midi::drain(&midi_state);
                 for ev in &raw {
@@ -468,7 +471,7 @@ fn spawn_tick_thread(app: tauri::AppHandle) {
                 }
                 let play_due = now.duration_since(last_play_emit) >= PLAY_STATE_EMIT_PERIOD;
                 if let Some(snapshot) =
-                    crate::play::tick_play(&play_state, &audio, &raw, dt_us, play_due)
+                    crate::play::tick_play(&play_state, &audio, &raw, &sustain, dt_us, play_due)
                 {
                     last_play_emit = now;
                     let _ = app.emit(EVENT_PLAY_STATE, &snapshot);

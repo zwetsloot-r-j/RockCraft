@@ -15,8 +15,8 @@ use ratatui::{
 };
 use rockcraft_audio::{play_file_at, BackingHandle, SynthHandle};
 use rockcraft_core::{
-    backing_position_us, Gain, GateState, MidiNote, NoteEvent, PlayClock, SynthBus, Velocity,
-    WaitGate,
+    backing_position_us, Gain, GateState, MidiNote, NoteEvent, PlayClock, SustainEvent, SynthBus,
+    Velocity, WaitGate,
 };
 use rockcraft_midi::smf_bytes_to_events;
 
@@ -338,6 +338,14 @@ impl PlayScreen {
         self.held.apply(&ev);
         if let Some(s) = &self.synth {
             s.apply(&ev);
+        }
+    }
+
+    /// Forward a sustain-pedal change to the player's synth voice, so your
+    /// own notes ring on while it is held. Scoring never sees the pedal.
+    pub fn apply_sustain(&mut self, ev: &SustainEvent) {
+        if let Some(s) = &self.synth {
+            s.apply_sustain(ev);
         }
     }
 

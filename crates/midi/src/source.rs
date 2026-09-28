@@ -9,7 +9,7 @@
 //! a device/keyboard, which is exactly the kind of I/O `core` must stay free of
 //! (see `CLAUDE.md`).
 
-use rockcraft_core::NoteEvent;
+use rockcraft_core::{NoteEvent, SustainEvent};
 
 /// Anything the frontend can pull note events from once per frame.
 ///
@@ -21,6 +21,12 @@ pub trait NoteSource {
     fn events(&mut self) -> Vec<NoteEvent>;
     /// Human-readable source name, shown in the menu header.
     fn port_name(&self) -> &str;
+
+    /// Sustain-pedal changes received since the last call (non-blocking, may
+    /// be empty). Only a real piano has a pedal, so the default is none.
+    fn sustain_events(&mut self) -> Vec<SustainEvent> {
+        Vec::new()
+    }
 
     /// Forward a typed computer-keyboard character to the source.
     ///
@@ -44,5 +50,9 @@ impl NoteSource for crate::LiveInput {
 
     fn port_name(&self) -> &str {
         crate::LiveInput::port_name(self)
+    }
+
+    fn sustain_events(&mut self) -> Vec<SustainEvent> {
+        crate::LiveInput::sustain_events(self).collect()
     }
 }

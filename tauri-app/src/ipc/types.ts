@@ -468,6 +468,8 @@ export interface PlayStateEvent {
   held: number[];
   /** Notes the player must hold to un-freeze (empty unless `frozen`). */
   awaiting: number[];
+  /** Whether the piano's sustain pedal is down. */
+  sustain: boolean;
   /**
    * Notes judged since the previous snapshot, in song-time order (M14-B).
    * One-shot: a judged note appears in exactly one `play_state`, so the screen

@@ -40,7 +40,9 @@ pub use bars::BarMap;
 pub use buffer::EventBuffer;
 pub use chord::{ChordKind, Key, Scale};
 pub use composer::{Composer, ComposerSnapshot, Cursor, InputMode, NoteView, SelectionView};
-pub use events::{MidiNote, NoteEvent, NoteEventKind, Velocity};
+pub use events::{
+    interleave_by_time, InputEvent, MidiNote, NoteEvent, NoteEventKind, SustainEvent, Velocity,
+};
 pub use grid::{Grid, Subdivision, TimeSig};
 pub use hand::{hand_of, Hand, HandOverride, HandSetting, DEFAULT_SPLIT};
 pub use history::History;
