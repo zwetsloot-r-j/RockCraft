@@ -106,9 +106,107 @@ impl NoteEvent {
     }
 }
 
+/// The sustain (damper) pedal going down or up — MIDI controller 64.
+///
+/// Kept separate from [`NoteEvent`] so the note contract (scoring, timelines,
+/// recording) is untouched: the pedal only shapes how the player's own notes
+/// *sound*. `timestamp_us` shares the note events' origin, so the two streams
+/// can be interleaved in the order they were played ([`interleave_by_time`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SustainEvent {
+    /// `true` while the pedal is held (controller value ≥ 64).
+    pub down: bool,
+    pub timestamp_us: u64,
+}
+
+impl SustainEvent {
+    pub const fn new(down: bool, timestamp_us: u64) -> Self {
+        Self { down, timestamp_us }
+    }
+}
+
+/// One live input event: a key or the sustain pedal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InputEvent {
+    Note(NoteEvent),
+    Sustain(SustainEvent),
+}
+
+impl InputEvent {
+    pub const fn timestamp_us(&self) -> u64 {
+        match self {
+            InputEvent::Note(ev) => ev.timestamp_us,
+            InputEvent::Sustain(ev) => ev.timestamp_us,
+        }
+    }
+}
+
+/// Merge key and pedal events, each already in time order, into the one order
+/// they were played in. On a timestamp tie the pedal goes first, so a pedal
+/// press stamped with a note-off catches that note (the forgiving choice).
+///
+/// Order matters because the pedal is stateful: a note released just *after*
+/// the pedal goes down must ring on, one released just before must not.
+pub fn interleave_by_time(notes: &[NoteEvent], sustain: &[SustainEvent]) -> Vec<InputEvent> {
+    let mut out = Vec::with_capacity(notes.len() + sustain.len());
+    let (mut n, mut s) = (notes.iter().peekable(), sustain.iter().peekable());
+    loop {
+        match (n.peek(), s.peek()) {
+            (Some(ne), Some(se)) if ne.timestamp_us < se.timestamp_us => {
+                out.push(InputEvent::Note(**ne));
+                n.next();
+            }
+            (_, Some(se)) => {
+                out.push(InputEvent::Sustain(**se));
+                s.next();
+            }
+            (Some(ne), None) => {
+                out.push(InputEvent::Note(**ne));
+                n.next();
+            }
+            (None, None) => return out,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interleave_orders_keys_and_pedal_by_time() {
+        let c4 = MidiNote::new(60).unwrap();
+        let v = Velocity::new(90).unwrap();
+        let notes = [NoteEvent::on(c4, v, 10), NoteEvent::off(c4, 30)];
+        let pedal = [SustainEvent::new(true, 20), SustainEvent::new(false, 40)];
+        let ts: Vec<u64> = interleave_by_time(&notes, &pedal)
+            .iter()
+            .map(InputEvent::timestamp_us)
+            .collect();
+        assert_eq!(ts, vec![10, 20, 30, 40]);
+    }
+
+    #[test]
+    fn interleave_puts_the_pedal_first_on_a_tie() {
+        let c4 = MidiNote::new(60).unwrap();
+        let notes = [NoteEvent::off(c4, 5)];
+        let pedal = [SustainEvent::new(true, 5)];
+        let merged = interleave_by_time(&notes, &pedal);
+        assert_eq!(merged[0], InputEvent::Sustain(pedal[0]));
+        assert_eq!(merged[1], InputEvent::Note(notes[0]));
+    }
+
+    #[test]
+    fn interleave_passes_either_stream_through_alone() {
+        let c4 = MidiNote::new(60).unwrap();
+        let notes = [NoteEvent::off(c4, 5)];
+        assert_eq!(interleave_by_time(&notes, &[]).len(), 1);
+        assert_eq!(
+            interleave_by_time(&[], &[SustainEvent::new(true, 1)]).len(),
+            1
+        );
+        assert!(interleave_by_time(&[], &[]).is_empty());
+    }
 
     #[test]
     fn midi_note_rejects_out_of_range() {

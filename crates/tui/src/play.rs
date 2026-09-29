@@ -18,7 +18,8 @@ use rockcraft_audio::{
 };
 use rockcraft_core::{
     backing_position_us, hand::hand_of_pitch_value, BarMap, Gain, GateState, Grid, Hand,
-    HandOverride, MidiNote, NoteEvent, PlayClock, SynthBus, Velocity, WaitGate, DEFAULT_SPLIT,
+    HandOverride, MidiNote, NoteEvent, PlayClock, SustainEvent, SynthBus, Velocity, WaitGate,
+    DEFAULT_SPLIT,
 };
 use rockcraft_midi::smf_bytes_to_events;
 
@@ -458,6 +459,14 @@ impl PlayScreen {
         self.held.apply(&ev);
         if let Some(s) = &self.synth {
             s.apply(&ev);
+        }
+    }
+
+    /// Forward a sustain-pedal change to the player's synth voice, so your
+    /// own notes ring on while it is held. Scoring never sees the pedal.
+    pub fn apply_sustain(&mut self, ev: &SustainEvent) {
+        if let Some(s) = &self.synth {
+            s.apply_sustain(ev);
         }
     }
 

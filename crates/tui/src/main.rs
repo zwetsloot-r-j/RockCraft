@@ -81,7 +81,7 @@ fn main() {
                 let (synth, echo) = (synth.clone(), echo.clone());
                 LiveInput::connect_with_echo(&filter, move |ev| {
                     if echo.load(Ordering::Relaxed) {
-                        synth.apply(ev);
+                        synth.apply_input(ev);
                     }
                 })
             }

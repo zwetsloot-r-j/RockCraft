@@ -11,7 +11,7 @@
 
 use std::sync::Mutex;
 
-use rockcraft_core::{Composer, NoteEvent, NoteEventKind};
+use rockcraft_core::{Composer, NoteEvent, NoteEventKind, SustainEvent};
 use rockcraft_midi::{LiveInput, MockKeyboard, NoteSource};
 use serde::Serialize;
 
@@ -31,6 +31,14 @@ impl InputSource {
         match self {
             InputSource::Live(l) => l.events(),
             InputSource::Mock(m) => m.events(),
+        }
+    }
+
+    /// Drain pending sustain-pedal changes (always empty for the mock).
+    pub fn drain_sustain(&mut self) -> Vec<SustainEvent> {
+        match self {
+            InputSource::Live(l) => NoteSource::sustain_events(l),
+            InputSource::Mock(m) => NoteSource::sustain_events(m),
         }
     }
 
@@ -184,6 +192,15 @@ pub fn drain(midi: &MidiState) -> Vec<NoteEvent> {
         .lock()
         .expect("midi source mutex poisoned")
         .drain_events()
+}
+
+/// Drain pending sustain-pedal changes. Drained every tick, on every screen,
+/// so they never pile up; only the play screen acts on them.
+pub fn drain_sustain(midi: &MidiState) -> Vec<SustainEvent> {
+    midi.source
+        .lock()
+        .expect("midi source mutex poisoned")
+        .drain_sustain()
 }
 
 /// Drain pending events, feed each one into the composer, and return

@@ -23,7 +23,10 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rockcraft_core::{Gain, Instrument, MidiNote, NoteEvent, NoteEventKind, SynthBus, Velocity};
+use rockcraft_core::{
+    Gain, InputEvent, Instrument, MidiNote, NoteEvent, NoteEventKind, SustainEvent, SynthBus,
+    Velocity,
+};
 use rodio::Source;
 use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
 
@@ -38,6 +41,9 @@ const CC_CHANNEL_VOLUME: i32 = 7;
 /// Controller 39: channel volume LSB. Paired with CC7 it gives a 14-bit volume,
 /// fine enough for a fade to glide instead of stepping audibly.
 const CC_CHANNEL_VOLUME_LSB: i32 = 39;
+/// Controller 64: the sustain (hold) pedal; `rustysynth` keeps a released
+/// note ringing while it reads ≥ 64.
+const CC_SUSTAIN: i32 = 64;
 /// MIDI channels a synth has; per-channel fade state is kept for each.
 const CHANNELS: usize = 16;
 /// The synthesizer's own initial channel volume (the MIDI default), until a
@@ -58,7 +64,13 @@ enum SynthCommand {
         channel: u8,
         note: u8,
     },
-    /// Release every note on every bus (panic button / screen change).
+    /// Press (`down`) or lift the sustain pedal on one bus.
+    Sustain {
+        channel: u8,
+        down: bool,
+    },
+    /// Release every note on every bus (panic button / screen change). Lifts
+    /// every sustain pedal too, or held-pedal notes would ring on.
     AllOff,
     /// Select a General MIDI program on one bus.
     Program {
@@ -144,7 +156,18 @@ impl SynthHandle {
         });
     }
 
+    /// Press (`down`) or lift the sustain pedal on this handle's bus: while it
+    /// is down, released notes keep ringing until it lifts.
+    pub fn sustain(&self, down: bool) {
+        let _ = self.tx.send(SynthCommand::Sustain {
+            channel: self.bus.midi_channel(),
+            down,
+        });
+    }
+
     /// Release everything, on **every** bus (panic button / screen change).
+    /// Also lifts the sustain pedal everywhere; the next pedal press from the
+    /// piano re-engages it.
     pub fn all_off(&self) {
         let _ = self.tx.send(SynthCommand::AllOff);
     }
@@ -202,6 +225,21 @@ impl SynthHandle {
             _ => self.note_off(ev.note),
         }
     }
+
+    /// Route a sustain-pedal change to this handle's bus.
+    pub fn apply_sustain(&self, ev: &SustainEvent) {
+        self.sustain(ev.down);
+    }
+
+    /// Route one live input event — a key or the pedal — to this handle's bus.
+    /// Feed events in played order ([`rockcraft_core::interleave_by_time`]):
+    /// the pedal is stateful, so order decides which notes it catches.
+    pub fn apply_input(&self, ev: &InputEvent) {
+        match ev {
+            InputEvent::Note(n) => self.apply(n),
+            InputEvent::Sustain(p) => self.apply_sustain(p),
+        }
+    }
 }
 
 /// The audio-thread half: owns the synthesizer and renders on demand.
@@ -241,7 +279,21 @@ impl SynthSource {
                 Ok(SynthCommand::NoteOff { channel, note }) => {
                     self.synth.note_off(channel as i32, note as i32);
                 }
+                Ok(SynthCommand::Sustain { channel, down }) => {
+                    self.synth.process_midi_message(
+                        channel as i32,
+                        CONTROL_CHANGE,
+                        CC_SUSTAIN,
+                        if down { 127 } else { 0 },
+                    );
+                }
                 Ok(SynthCommand::AllOff) => {
+                    // Lift the pedals first: a released note under a held
+                    // pedal would otherwise keep ringing.
+                    for ch in 0..CHANNELS {
+                        self.synth
+                            .process_midi_message(ch as i32, CONTROL_CHANGE, CC_SUSTAIN, 0);
+                    }
                     self.synth.note_off_all(false);
                     // A clean slate: nothing stays faded out.
                     for ch in 0..CHANNELS {
@@ -569,6 +621,41 @@ mod tests {
                     channel: SONG,
                     note: 60,
                     velocity: 80
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn sustain_addresses_the_handles_own_bus_in_played_order() {
+        let (h, rx) = handle();
+        let c4 = MidiNote::new(60).unwrap();
+        let played = rockcraft_core::interleave_by_time(
+            &[NoteEvent::off(c4, 20)],
+            &[SustainEvent::new(true, 10), SustainEvent::new(false, 30)],
+        );
+        for ev in &played {
+            h.apply_input(ev);
+        }
+        h.for_bus(SynthBus::Song).sustain(true);
+        assert_eq!(
+            drain(&rx),
+            vec![
+                SynthCommand::Sustain {
+                    channel: PLAYER,
+                    down: true
+                },
+                SynthCommand::NoteOff {
+                    channel: PLAYER,
+                    note: 60
+                },
+                SynthCommand::Sustain {
+                    channel: PLAYER,
+                    down: false
+                },
+                SynthCommand::Sustain {
+                    channel: SONG,
+                    down: true
                 },
             ]
         );

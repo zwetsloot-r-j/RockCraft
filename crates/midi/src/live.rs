@@ -12,7 +12,7 @@
 //! no device, so this crate stays testable in CI; only [`LiveInput::connect`]
 //! needs real hardware.
 
-use rockcraft_core::{MidiNote, NoteEvent, Velocity};
+use rockcraft_core::{InputEvent, MidiNote, NoteEvent, SustainEvent, Velocity};
 use std::sync::mpsc::{self, Receiver};
 
 use midir::{Ignore, MidiInput, MidiInputConnection};
@@ -21,6 +21,10 @@ use midir::{Ignore, MidiInput, MidiInputConnection};
 const STATUS_NOTE_OFF: u8 = 0x80;
 /// MIDI status nibble for note-on.
 const STATUS_NOTE_ON: u8 = 0x90;
+/// MIDI status nibble for a control change.
+const STATUS_CONTROL_CHANGE: u8 = 0xB0;
+/// Controller 64: the sustain (damper) pedal. Values ≥ 64 mean "down".
+const CC_SUSTAIN: u8 = 64;
 
 /// Errors from opening a live MIDI connection.
 #[derive(Debug)]
@@ -77,14 +81,27 @@ pub fn parse_note_message(data: &[u8], timestamp_us: u64) -> Option<NoteEvent> {
     }
 }
 
+/// Translate a raw MIDI message into a [`SustainEvent`], or `None` if it is not
+/// a sustain-pedal (controller 64) change. Per the MIDI spec a value ≥ 64 is
+/// "down"; a half-pedalling piano's in-between values fold onto on/off.
+pub fn parse_sustain_message(data: &[u8], timestamp_us: u64) -> Option<SustainEvent> {
+    match data {
+        [status, CC_SUSTAIN, value, ..] if status & 0xF0 == STATUS_CONTROL_CHANGE => {
+            Some(SustainEvent::new(*value >= 64, timestamp_us))
+        }
+        _ => None,
+    }
+}
+
 /// An open live MIDI input connection. Drop to disconnect.
 ///
 /// Hold onto this value: dropping it closes the port. Pull events with
-/// [`LiveInput::events`].
+/// [`LiveInput::events`] and the pedal with [`LiveInput::sustain_events`].
 pub struct LiveInput {
     // Kept alive so the connection (and its callback thread) stays open.
     _connection: MidiInputConnection<()>,
     receiver: Receiver<NoteEvent>,
+    sustain: Receiver<SustainEvent>,
     port_name: String,
 }
 
@@ -97,8 +114,9 @@ impl LiveInput {
         Self::connect_with_echo(name_filter, |_| {})
     }
 
-    /// Like [`connect`](LiveInput::connect), but also hand every parsed event to
-    /// `echo` right on the MIDI thread, before it is queued for the app.
+    /// Like [`connect`](LiveInput::connect), but also hand every parsed event —
+    /// key or sustain pedal, in arrival order — to `echo` right on the MIDI
+    /// thread, before it is queued for the app.
     ///
     /// This is the low-latency monitoring path: sounding a key from here skips
     /// the app loop (and whatever it is busy with, e.g. drawing a frame), so the
@@ -107,7 +125,7 @@ impl LiveInput {
     /// block, lock, or do I/O.
     pub fn connect_with_echo(
         name_filter: &str,
-        mut echo: impl FnMut(&NoteEvent) + Send + 'static,
+        mut echo: impl FnMut(&InputEvent) + Send + 'static,
     ) -> Result<Self, LiveInputError> {
         let mut midi_in =
             MidiInput::new("RockCraft").map_err(|e| LiveInputError::Init(e.to_string()))?;
@@ -134,6 +152,7 @@ impl LiveInput {
         let port_name = names[idx].clone();
 
         let (tx, receiver) = mpsc::channel::<NoteEvent>();
+        let (sustain_tx, sustain) = mpsc::channel::<SustainEvent>();
 
         let connection = midi_in
             .connect(
@@ -142,9 +161,12 @@ impl LiveInput {
                 move |stamp_us, message, _| {
                     // RUNS ON THE MIDI THREAD — keep it tiny, never block.
                     if let Some(ev) = parse_note_message(message, stamp_us) {
-                        echo(&ev);
+                        echo(&InputEvent::Note(ev));
                         // If the receiver is gone we're shutting down; ignore.
                         let _ = tx.send(ev);
+                    } else if let Some(ev) = parse_sustain_message(message, stamp_us) {
+                        echo(&InputEvent::Sustain(ev));
+                        let _ = sustain_tx.send(ev);
                     }
                 },
                 (),
@@ -154,6 +176,7 @@ impl LiveInput {
         Ok(Self {
             _connection: connection,
             receiver,
+            sustain,
             port_name,
         })
     }
@@ -166,6 +189,12 @@ impl LiveInput {
     /// Non-blocking iterator over note events received since the last call.
     pub fn events(&self) -> impl Iterator<Item = NoteEvent> + '_ {
         self.receiver.try_iter()
+    }
+
+    /// Non-blocking iterator over sustain-pedal changes received since the
+    /// last call. Stamped on the same clock as [`events`](LiveInput::events).
+    pub fn sustain_events(&self) -> impl Iterator<Item = SustainEvent> + '_ {
+        self.sustain.try_iter()
     }
 }
 
@@ -201,6 +230,24 @@ mod tests {
         // control change (0xB0) and active sensing (0xFE) are not notes
         assert!(parse_note_message(&[0xB0, 7, 127], 0).is_none());
         assert!(parse_note_message(&[0xFE], 0).is_none());
+    }
+
+    #[test]
+    fn parses_sustain_pedal() {
+        let down = parse_sustain_message(&[0xB0, 64, 127], 9).unwrap();
+        assert_eq!(down, SustainEvent::new(true, 9));
+        let up = parse_sustain_message(&[0xB0, 64, 0], 12).unwrap();
+        assert!(!up.down);
+        // The threshold is 64, and any channel counts.
+        assert!(parse_sustain_message(&[0xB3, 64, 64], 0).unwrap().down);
+        assert!(!parse_sustain_message(&[0xB3, 64, 63], 0).unwrap().down);
+    }
+
+    #[test]
+    fn sustain_ignores_other_messages() {
+        assert!(parse_sustain_message(&[0xB0, 7, 127], 0).is_none()); // volume
+        assert!(parse_sustain_message(&[0x90, 64, 127], 0).is_none()); // a note
+        assert!(parse_sustain_message(&[0xB0, 64], 0).is_none()); // truncated
     }
 
     #[test]

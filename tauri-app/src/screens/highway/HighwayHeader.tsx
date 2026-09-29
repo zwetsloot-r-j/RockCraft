@@ -163,6 +163,21 @@ export function HighwayHeader(props: HighwayHeaderProps) {
               "font-family": monoFont,
               padding: "2px 8px",
               "border-radius": "6px",
+              background: props.playState?.()?.sustain
+                ? "rgba(143,182,255,0.2)"
+                : "rgba(255,255,255,0.05)",
+              color: props.playState?.()?.sustain ? "#8fb6ff" : "#7c7f8e",
+            }}
+            title="sustain pedal (sustains your notes while input monitor is on)"
+          >
+            Ped
+          </span>
+          <span
+            style={{
+              "font-size": "11px",
+              "font-family": monoFont,
+              padding: "2px 8px",
+              "border-radius": "6px",
               background:
                 (props.practice?.() ?? "both") !== "both"
                   ? "rgba(199,146,234,0.2)"
