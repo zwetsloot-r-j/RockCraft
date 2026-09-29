@@ -24,7 +24,7 @@ for %%a in (%*) do (
 
 set "EXE=target-win\%PROFILE%\rockcraft-tauri.exe"
 if not exist "%EXE%" (
-  echo error: %EXE% not found — build it first:
+  echo error: %EXE% not found - build it first:
   echo          build-tauri.bat
   exit /b 1
 )
@@ -33,7 +33,7 @@ REM The app is single-instance: a second copy exits immediately. Say so plainly
 REM rather than letting it look like a silent failure.
 tasklist /FI "IMAGENAME eq rockcraft-tauri.exe" 2>nul | find /I "rockcraft-tauri.exe" >nul
 if not errorlevel 1 (
-  echo note: RockCraft is already running — not starting a second copy.
+  echo note: RockCraft is already running - not starting a second copy.
   exit /b 0
 )
 
@@ -47,7 +47,7 @@ if "%ROCKCRAFT_SF2%"=="" (
   if exist "crates\audio\assets\piano.sf2" (
     set "ROCKCRAFT_SF2=%CD%\crates\audio\assets\piano.sf2"
   ) else (
-    echo note: no SoundFont at crates\audio\assets\piano.sf2 — audio will be silent.
+    echo note: no SoundFont at crates\audio\assets\piano.sf2 - audio will be silent.
   )
 )
 
