@@ -139,6 +139,38 @@ impl AudioOut {
         track: &DecodedTrack,
         start: std::time::Duration,
     ) -> Result<BackingHandle, AudioError> {
+        self.backing_out().play_at(track, start)
+    }
+
+    /// A cloneable handle for starting backing tracks on this output stream
+    /// from wherever the playback logic lives — the [`play_backing_at`]
+    /// path without having to hold the (`!Send`, single-owner) `AudioOut`.
+    ///
+    /// [`play_backing_at`]: AudioOut::play_backing_at
+    pub fn backing_out(&self) -> BackingOut {
+        BackingOut {
+            stream_handle: self.stream_handle.clone(),
+        }
+    }
+}
+
+/// Starts backing tracks on an [`AudioOut`]'s device stream (see
+/// [`AudioOut::backing_out`]). Holds only a weak link to the stream: once the
+/// `AudioOut` is dropped, [`play_at`](BackingOut::play_at) fails instead of
+/// opening a new device.
+#[derive(Clone)]
+pub struct BackingOut {
+    stream_handle: OutputStreamHandle,
+}
+
+impl BackingOut {
+    /// Play `track` from `start` on the shared stream. Cheap: the samples are
+    /// already decoded, so this never touches the disk or blocks.
+    pub fn play_at(
+        &self,
+        track: &DecodedTrack,
+        start: std::time::Duration,
+    ) -> Result<BackingHandle, AudioError> {
         let (sink, fade) = backing_sink(&self.stream_handle, track, start)?;
         Ok(BackingHandle {
             _stream: None,
@@ -335,6 +367,25 @@ impl DecodedTrack {
         })
     }
 
+    /// Decode the file at `path` on a background thread. A full song takes a
+    /// noticeable moment to decode; poll the returned [`TrackLoader`] from the
+    /// app loop instead of stalling it.
+    pub fn load_in_background(path: &std::path::Path) -> TrackLoader {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = path.to_path_buf();
+        let spawned = std::thread::Builder::new()
+            .name("rockcraft-decode".into())
+            .spawn(move || {
+                let _ = tx.send(DecodedTrack::load(&path));
+            });
+        TrackLoader {
+            state: match spawned {
+                Ok(_) => LoadState::Loading(rx),
+                Err(e) => LoadState::Failed(AudioError::Io(e)),
+            },
+        }
+    }
+
     /// Length of the track.
     pub fn duration(&self) -> std::time::Duration {
         let frames = self.samples.len() / self.channels as usize;
@@ -348,6 +399,51 @@ impl DecodedTrack {
             fade: Arc::default(),
             ramp: Ramp::FULL,
             emitted: 0,
+        }
+    }
+}
+
+/// A [`DecodedTrack`] decoding on a background thread
+/// ([`DecodedTrack::load_in_background`]). Poll it once per app-loop tick.
+pub struct TrackLoader {
+    state: LoadState,
+}
+
+enum LoadState {
+    Loading(std::sync::mpsc::Receiver<Result<DecodedTrack, AudioError>>),
+    Ready(DecodedTrack),
+    Failed(AudioError),
+}
+
+/// Where a [`TrackLoader`] has got to.
+pub enum TrackStatus<'a> {
+    /// Still decoding.
+    Loading,
+    /// Decoded and ready to play.
+    Ready(&'a DecodedTrack),
+    /// The file could not be read or decoded.
+    Failed(&'a AudioError),
+}
+
+impl TrackLoader {
+    /// Check on the decode without blocking.
+    pub fn poll(&mut self) -> TrackStatus<'_> {
+        if let LoadState::Loading(rx) = &self.state {
+            match rx.try_recv() {
+                Ok(Ok(track)) => self.state = LoadState::Ready(track),
+                Ok(Err(e)) => self.state = LoadState::Failed(e),
+                Err(std::sync::mpsc::TryRecvError::Empty) => return TrackStatus::Loading,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.state = LoadState::Failed(AudioError::Decode(
+                        "decoder thread exited without a result".into(),
+                    ))
+                }
+            }
+        }
+        match &self.state {
+            LoadState::Loading(_) => TrackStatus::Loading,
+            LoadState::Ready(t) => TrackStatus::Ready(t),
+            LoadState::Failed(e) => TrackStatus::Failed(e),
         }
     }
 }
@@ -484,6 +580,38 @@ mod tests {
     /// Regression: rodio 0.20 can't seek Vorbis/FLAC streams, so an imported
     /// `backing.ogg` ignored every seek and drifted from the playhead. A decoded
     /// track seeks in memory — exactly, and independent of the file format.
+    /// Poll a loader until it settles (the decode runs on its own thread).
+    fn settle(loader: &mut TrackLoader) -> Result<std::time::Duration, String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match loader.poll() {
+                TrackStatus::Loading if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(5))
+                }
+                TrackStatus::Loading => return Err("timed out".into()),
+                TrackStatus::Ready(t) => return Ok(t.duration()),
+                TrackStatus::Failed(e) => return Err(e.to_string()),
+            }
+        }
+    }
+
+    #[test]
+    fn a_background_load_becomes_ready() {
+        let path = ramp_wav("bg", 2);
+        let mut loader = DecodedTrack::load_in_background(&path);
+        assert_eq!(settle(&mut loader), Ok(std::time::Duration::from_secs(2)));
+        // Settled stays settled.
+        assert!(matches!(loader.poll(), TrackStatus::Ready(_)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_background_load_of_a_missing_file_fails() {
+        let mut loader =
+            DecodedTrack::load_in_background(std::path::Path::new("/definitely/not/here.wav"));
+        assert!(settle(&mut loader).is_err());
+    }
+
     #[test]
     fn a_decoded_track_seeks_exactly() {
         let path = ramp_wav("seek", 3);

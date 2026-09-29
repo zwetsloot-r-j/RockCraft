@@ -12,6 +12,7 @@ pub mod key_source;
 pub mod keyboard;
 pub mod library;
 pub mod library_screen;
+pub mod palette;
 pub mod play;
 pub mod record;
 pub mod render;

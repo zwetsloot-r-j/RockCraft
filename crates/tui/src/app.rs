@@ -8,7 +8,9 @@
 
 use std::io;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crossterm::event::KeyCode;
 use ratatui::{
@@ -18,7 +20,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
     Frame, Terminal,
 };
-use rockcraft_audio::SynthHandle;
+use rockcraft_audio::{BackingOut, SynthHandle};
 use rockcraft_control::{QueryKind, RemoteCommand, Request, Response};
 use rockcraft_core::{
     Grid, HandOverride, Key, Mixer, RecordingMeta, Scale, SynthBus, Timeline, TrackOrigin,
@@ -37,7 +39,8 @@ use crate::import_screen::{
 use crate::key_source::{CrosstermKeys, KeySource};
 use crate::library::{default_scan_roots, library_root};
 use crate::library_screen::{LibraryOutcome, LibraryScreen};
-use crate::play::PlayScreen;
+use crate::palette::ColorMode;
+use crate::play::{PlayScreen, ScrollMode};
 
 // ---------------------------------------------------------------------------
 // Shell
@@ -97,6 +100,13 @@ pub struct Shell {
     input: Box<dyn NoteSource>,
     /// Piano synth, if audio started. `None` runs silently.
     synth: Option<SynthHandle>,
+    /// Plays backing tracks on the synth's output stream. `None` (no audio, or
+    /// headless tests) leaves every backing track silent.
+    backing_out: Option<BackingOut>,
+    /// Set when the live piano sounds its own keys from the MIDI thread
+    /// ([`AudioLinks::echo`]); the shell switches it per screen and must not
+    /// sound those keys again itself.
+    echo: Option<Arc<AtomicBool>>,
     pub(crate) screen: Screen,
     menu_state: ListState,
     status: String,
@@ -120,6 +130,11 @@ pub struct Shell {
     /// go straight at the synth, and the backing level is carried onto each new
     /// play screen (and its lazily-armed backing sink).
     mixer: Mixer,
+    /// How play-screen notes are coloured. Shell-wide so the choice carries
+    /// from one song to the next.
+    color_mode: ColorMode,
+    /// How the play highway scrolls; shell-wide like `color_mode`.
+    scroll_mode: ScrollMode,
 }
 
 impl Shell {
@@ -133,6 +148,8 @@ impl Shell {
         Self {
             input,
             synth,
+            backing_out: None,
+            echo: None,
             screen: Screen::Menu,
             menu_state,
             status: String::new(),
@@ -142,7 +159,26 @@ impl Shell {
             terminal_size: (80, 24),
             has_fetch_cmd: fetch_command_configured(),
             mixer: Mixer::new(),
+            color_mode: ColorMode::default(),
+            scroll_mode: ScrollMode::default(),
         }
+    }
+
+    /// Wire in the audio output beyond the synth: where backing tracks play,
+    /// and the live-key echo switch (see [`AudioLinks`]).
+    pub fn set_audio_links(
+        &mut self,
+        backing_out: Option<BackingOut>,
+        echo: Option<Arc<AtomicBool>>,
+    ) {
+        self.backing_out = backing_out;
+        self.echo = echo;
+    }
+
+    /// Whether live keys should be sounded on the current screen: the play and
+    /// edit screens echo what you play; the menus and pickers stay silent.
+    fn screen_sounds_keys(&self) -> bool {
+        matches!(self.screen, Screen::Play(_) | Screen::Edit(_))
     }
 
     /// Override the fetch-command capability flag — used in tests.
@@ -158,6 +194,8 @@ impl Shell {
     /// by the screen that owns it.
     fn tuned(&self, mut play: PlayScreen) -> PlayScreen {
         play.set_backing_gain(self.mixer.backing_gain);
+        play.set_color_mode(self.color_mode);
+        play.set_scroll_mode(self.scroll_mode);
         play
     }
 
@@ -398,6 +436,14 @@ impl Shell {
                 KeyCode::Char(' ') => play.toggle_pause(),
                 KeyCode::Char('m') => play.toggle_hear_song(),
                 KeyCode::Char('w') => play.toggle_wait_mode(),
+                KeyCode::Char('c') => {
+                    self.color_mode = self.color_mode.next();
+                    play.set_color_mode(self.color_mode);
+                }
+                KeyCode::Char('v') => {
+                    self.scroll_mode = self.scroll_mode.next();
+                    play.set_scroll_mode(self.scroll_mode);
+                }
                 KeyCode::Char(c) => {
                     self.input.forward_key(c);
                 }
@@ -895,13 +941,18 @@ impl rockcraft_control::HostServices for Shell {
 /// the loop also drains remote control commands from the control server.
 pub fn run(
     input: Box<dyn NoteSource>,
-    synth: Option<SynthHandle>,
+    audio: AudioLinks,
     backing_path: Option<PathBuf>,
     start_edit: bool,
     commands: Option<mpsc::Receiver<RemoteCommand>>,
 ) -> io::Result<()> {
+    // Frame pacing: Windows sleeps and waits in ~15.6 ms ticks by default,
+    // which spaces frames unevenly (15 ms, then 31 ms…) and makes scrolling
+    // judder. Ask for 1 ms timer resolution for the life of the app.
+    let _timer = precise_timer::Resolution::request();
     let mut terminal = ratatui::init();
-    let mut shell = Shell::new(input, synth, backing_path);
+    let mut shell = Shell::new(input, audio.synth, backing_path);
+    shell.set_audio_links(audio.backing_out, audio.echo);
     if start_edit {
         shell.activate_edit();
     }
@@ -914,6 +965,56 @@ pub fn run(
     res
 }
 
+/// Finer OS timer resolution while the app runs (Windows); a no-op elsewhere,
+/// where sleeps and waits are already precise.
+mod precise_timer {
+    /// Holds 1 ms timer resolution until dropped.
+    pub struct Resolution(());
+
+    impl Resolution {
+        pub fn request() -> Self {
+            #[cfg(windows)]
+            // SAFETY: plain Win32 calls with no pointers; paired with
+            // `timeEndPeriod` in `Drop`.
+            unsafe {
+                windows_sys::Win32::Media::timeBeginPeriod(1);
+            }
+            Resolution(())
+        }
+    }
+
+    impl Drop for Resolution {
+        fn drop(&mut self) {
+            #[cfg(windows)]
+            // SAFETY: undoes the `timeBeginPeriod(1)` from `request`.
+            unsafe {
+                windows_sys::Win32::Media::timeEndPeriod(1);
+            }
+        }
+    }
+}
+
+/// The app's handles onto the audio output, all `None` when audio is off.
+pub struct AudioLinks {
+    /// The piano synth.
+    pub synth: Option<SynthHandle>,
+    /// Where backing tracks play (the synth's output stream).
+    pub backing_out: Option<BackingOut>,
+    /// `Some` when the live input already sounds each key on the synth straight
+    /// from the MIDI thread, gated by this flag; the shell sets it per screen.
+    /// `None`: the shell sounds keys itself as it drains them.
+    pub echo: Option<Arc<AtomicBool>>,
+}
+
+/// Target redraw interval (~60 fps). The loop spins much faster than this to
+/// keep MIDI, song-synth, and backing timing tight, but only draws this often:
+/// a terminal redraw is slow, and nothing else happens while one is running.
+const FRAME: Duration = Duration::from_millis(16);
+
+/// Longest the loop waits on the keyboard between passes. Short, so a drained
+/// MIDI event or a due song note is never held up behind a key wait.
+const INPUT_WAIT: Duration = Duration::from_millis(2);
+
 /// The frame loop. Separated from `run` so tests can inject a `TestBackend`
 /// and a `ScriptedKeys` source without a real terminal or MIDI device.
 pub fn run_loop<B: ratatui::backend::Backend>(
@@ -921,6 +1022,8 @@ pub fn run_loop<B: ratatui::backend::Backend>(
     shell: &mut Shell,
     keys: &mut dyn KeySource,
 ) -> io::Result<()> {
+    let mut last_draw: Option<Instant> = None;
+    let mut needs_draw = true;
     loop {
         // Apply any remote control commands first, so a remote edit and a
         // keypress in the same frame both land before this iteration's redraw.
@@ -928,10 +1031,26 @@ pub fn run_loop<B: ratatui::backend::Backend>(
 
         // Drain MIDI and route to the active screen. Clone the synth handle out
         // first so we don't hold a borrow of `shell` across the screen match.
-        let synth = shell.synth.clone();
+        // Live keys already echo from the MIDI thread on screens that sound
+        // them (`echoed`); otherwise the shell sounds them here as it drains.
+        let echoed = match &shell.echo {
+            Some(flag) => {
+                let on = shell.screen_sounds_keys();
+                if flag.swap(on, Ordering::Relaxed) != on && !on {
+                    // Leaving a sounding screen with keys down: don't strand them.
+                    if let Some(s) = &shell.synth {
+                        s.all_off();
+                    }
+                }
+                true
+            }
+            None => false,
+        };
+        let synth = if echoed { None } else { shell.synth.clone() };
         let events = shell.input.events();
         for ev in events {
             match &mut shell.screen {
+                Screen::Play(play) if echoed => play.track_held(ev),
                 Screen::Play(play) => play.ingest(ev),
                 // The unified capture+edit screen (M9-A): in a record input mode
                 // the editor consumes played notes (step / live record); in
@@ -961,14 +1080,14 @@ pub fn run_loop<B: ratatui::backend::Backend>(
             // fire synth/backing for the resulting clock position.
             play.tick();
             play.tick_song_synth();
-            play.tick_backing();
+            play.tick_backing(shell.backing_out.as_ref());
         }
 
         // Tick editor transport audition and the backing track (clock-driven);
         // the backing arms on transport play and re-syncs on stop/seek/loop-wrap.
         if let Screen::Edit(edit) = &mut shell.screen {
             edit.tick_audition();
-            edit.tick_backing();
+            edit.tick_backing(shell.backing_out.as_ref());
         }
 
         // A finished song returns to the menu on its own.
@@ -982,11 +1101,18 @@ pub fn run_loop<B: ratatui::backend::Backend>(
         // Poll the import pipeline and handle completion.
         apply_import_outcome(shell);
 
-        let completed = terminal.draw(|f| draw(f, shell))?;
-        shell.terminal_size = (completed.area.width, completed.area.height);
+        // Redraw on the frame cadence, or at once after a key so it feels
+        // instant; skip it otherwise so the loop gets straight back to input.
+        if needs_draw || last_draw.is_none_or(|t| t.elapsed() >= FRAME) {
+            let completed = terminal.draw(|f| draw(f, shell))?;
+            shell.terminal_size = (completed.area.width, completed.area.height);
+            last_draw = Some(Instant::now());
+            needs_draw = false;
+        }
 
-        if let Some(code) = keys.poll_key(Duration::from_millis(16))? {
+        if let Some(code) = keys.poll_key(INPUT_WAIT)? {
             shell.on_key(code);
+            needs_draw = true;
         }
 
         if shell.should_quit {
@@ -1211,6 +1337,9 @@ fn load_play_screen(
     if let Some(dir) = midi_path.parent() {
         if let Ok(json) = std::fs::read_to_string(dir.join("meta.json")) {
             if let Ok(meta) = RecordingMeta::from_json(&json) {
+                play = play
+                    .with_hands(meta.split_or_default(), &meta.hand_overrides)
+                    .with_grid(meta.grid, &meta.bar_starts);
                 if let Some(backing) = meta.backing {
                     play = play.with_backing(dir.join(&backing.file), backing.audio_start_us);
                     has_backing = true;
@@ -1409,6 +1538,20 @@ mod tests {
             Gain::new(0.5).unwrap(),
             "the new take opens at the level the mixer is set to"
         );
+    }
+
+    #[test]
+    fn c_cycles_the_colour_mode_and_it_carries_to_the_next_song() {
+        let mut shell = make_shell();
+        let play = load_play_screen(&midi_only_fixture().join("song.mid"), None).unwrap();
+        shell.screen = Screen::Play(Box::new(shell.tuned(play)));
+        assert_eq!(play_screen(&shell).color_mode(), ColorMode::Hands);
+        shell.on_key(KeyCode::Char('c'));
+        assert_eq!(play_screen(&shell).color_mode(), ColorMode::Spectrum);
+        // A fresh take opens in the mode the player last chose.
+        let next = load_play_screen(&midi_only_fixture().join("song.mid"), None).unwrap();
+        shell.screen = Screen::Play(Box::new(shell.tuned(next)));
+        assert_eq!(play_screen(&shell).color_mode(), ColorMode::Spectrum);
     }
 
     /// The TUI drives import through its interactive screens, not the socket,
