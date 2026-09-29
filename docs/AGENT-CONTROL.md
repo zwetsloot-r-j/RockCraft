@@ -484,8 +484,14 @@ playhead, 0-based — and `practice_loop`, `null` when nothing is marked, else:
 ```
 
 `phase` is `"count_in"`, `"demo"` or `"your_turn"` (`null` while only marked).
-`last_pass` is the most recent finished your-turn pass. The loop commands and
-`play_set_practice` are Tauri-only; the TUI answers `unsupported:`.
+`last_pass` is the most recent finished your-turn pass.
+
+**In the TUI (M17-B)** the four loop commands work on the play screen (off it
+they fail with `failed:`) and reply `{ paused, bar, practice_loop }`. The TUI
+has no scoring, practice speed or practice hand, so its `practice_loop` has no
+`last_pass`, the demo plays both hands, and `play_set_practice` answers
+`unsupported:`. On the TUI play screen the same keys work: `←`/`→`, `[`, `]`
+and `l`.
 
 The mixer commands work from any screen in either frontend — the synth is
 app-wide, not owned by a play session — so a level can be set before a bundle is
