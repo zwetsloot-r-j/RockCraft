@@ -24,7 +24,7 @@ to the identical `core::Action`.
 
 ```bash
 # Terminal 1 — start the TUI with the control server
-cargo run --bin rockcraft-tui -- --control      # logs: Control server bound to 127.0.0.1:<PORT>
+cargo run -p rockcraft-tui -- --control      # logs: Control server bound to 127.0.0.1:<PORT>
 ```
 
 Then connect a WebSocket client to `ws://127.0.0.1:<PORT>` and send the

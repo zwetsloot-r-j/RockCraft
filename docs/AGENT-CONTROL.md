@@ -13,7 +13,7 @@ The control server is **localhost-only** and **unauthenticated** by design. It b
 ```bash
 # From the TUI (most common). The bound address is printed to STDERR, e.g.:
 #   Control server listening on ws://127.0.0.1:38473
-cargo run --bin rockcraft-tui -- --control
+cargo run -p rockcraft-tui -- --control
 ```
 
 You can pin a fixed `host:port` with the `ROCKCRAFT_CONTROL_ADDR` environment
@@ -22,7 +22,7 @@ optional — this is the recommended path for a scripted agent that needs a
 known, stable address:
 
 ```bash
-ROCKCRAFT_CONTROL_ADDR=127.0.0.1:9001 cargo run --bin rockcraft-tui
+ROCKCRAFT_CONTROL_ADDR=127.0.0.1:9001 cargo run -p rockcraft-tui
 ```
 
 If the address ends in `:0` (the default is `127.0.0.1:0`), the OS assigns the
@@ -509,7 +509,7 @@ To run the example:
 
 ```bash
 # Terminal 1: Start the TUI with control server
-cargo run --bin rockcraft-tui -- --control
+cargo run -p rockcraft-tui -- --control
 
 # Terminal 2: Run the example (replace PORT with the logged port)
 cargo run --example agent_session -- --port PORT

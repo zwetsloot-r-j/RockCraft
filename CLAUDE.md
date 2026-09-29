@@ -134,7 +134,7 @@ A running RockCraft exposes a **localhost WebSocket control interface** so an
 agent can edit the composer programmatically — the same `core::Action`s the
 keyboard triggers. To drive it:
 
-1. **Start it.** `cargo run --bin rockcraft-tui -- --control`. The bound address
+1. **Start it.** `cargo run -p rockcraft-tui -- --control`. The bound address
    is printed to **stderr** (`Control server listening on ws://127.0.0.1:<PORT>`).
    For a known, stable address, pin it — this also enables the server, so
    `--control` is then optional: `ROCKCRAFT_CONTROL_ADDR=127.0.0.1:9001`.
@@ -159,6 +159,12 @@ build flag (or the webview shows "localhost connection refused"), driving the
 control socket from WSL across the proxy/sandbox, and choosing the app cwd. The
 runbook is [`docs/RUN-ON-WINDOWS-HOST.md`](docs/RUN-ON-WINDOWS-HOST.md); the
 WSL-side driver is `scripts/drive-backing-movie.mjs`.
+
+On Windows, both apps have build/run scripts at the repo root (native builds
+into `target-win\`, so they never clobber the WSL `target/`):
+`build-tauri.bat` / `run-tauri.bat` for the desktop app, and `build-tui.bat` /
+`run-tui.bat` for the TUI (`run-tui.bat` passes its arguments through to
+`rockcraft.exe` in order; `--release` picks the optimised build).
 
 ### Agent-control API: single source of truth
 
