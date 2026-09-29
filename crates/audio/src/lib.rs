@@ -259,6 +259,14 @@ impl BackingHandle {
         self.sink.empty()
     }
 
+    /// Where playback is in the file, as the sink last reported it (updated
+    /// every few ms). It leads what is audible by the output buffer — a steady
+    /// offset — and stalls when the device underruns, which is what
+    /// `core::DriftGuard` watches for.
+    pub fn position(&self) -> std::time::Duration {
+        self.sink.get_pos()
+    }
+
     /// Jump to `pos` in the track. Exact and instant for every format, since
     /// the track is decoded in memory ([`DecodedTrack`]); a `pos` past the end
     /// just runs out. The paused/playing state is preserved across the seek.

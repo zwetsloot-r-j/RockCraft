@@ -17,8 +17,8 @@ use rockcraft_audio::{
     BackingHandle, BackingOut, DecodedTrack, SynthHandle, TrackLoader, TrackStatus,
 };
 use rockcraft_core::{
-    backing_position_us, hand::hand_of_pitch_value, BarMap, Gain, GateState, Grid, Hand,
-    HandOverride, MidiNote, NoteEvent, PlayClock, SustainEvent, SynthBus, Velocity, WaitGate,
+    backing_position_us, hand::hand_of_pitch_value, BarMap, DriftGuard, Gain, GateState, Grid,
+    Hand, HandOverride, MidiNote, NoteEvent, PlayClock, SustainEvent, SynthBus, Velocity, WaitGate,
     DEFAULT_SPLIT,
 };
 use rockcraft_midi::smf_bytes_to_events;
@@ -104,6 +104,11 @@ pub struct PlayScreen {
     /// the first tick, so it is usually ready by the end of the lead-in; kept
     /// across `restart` so a replay starts instantly.
     backing_track: Option<TrackLoader>,
+    /// Keeps the playing backing in step with the clock: an audio underrun
+    /// delays the stream for good, so it is re-seeked when it drifts.
+    backing_drift: DriftGuard,
+    /// How many times the backing was re-seeked this take (status line).
+    backing_resyncs: u32,
     /// Whether the "hear the song" feature is active.
     hear_song: bool,
     /// Manual pause (the `Space` key / `HostCommand::PlayTogglePause`). Freezes
@@ -173,6 +178,8 @@ impl PlayScreen {
             backing: None,
             backing_handle: None,
             backing_track: None,
+            backing_drift: DriftGuard::new(),
+            backing_resyncs: 0,
             hear_song: false,
             paused: false,
             song_on_fired: HashSet::new(),
@@ -283,6 +290,7 @@ impl PlayScreen {
         if let Some(h) = self.backing_handle.take() {
             h.stop();
         }
+        self.backing_resyncs = 0;
     }
 
     /// The file position the backing track should be at for clock `now_us`, or
@@ -305,6 +313,7 @@ impl PlayScreen {
     /// so it joins in step rather than trailing the notes.
     pub fn tick_backing(&mut self, out: Option<&BackingOut>) {
         if self.backing_handle.is_some() {
+            self.keep_backing_in_step();
             return;
         }
         let (Some(out), Some(b)) = (out, &self.backing) else {
@@ -337,11 +346,30 @@ impl PlayScreen {
                 // A fresh sink starts at unity — carry the fader onto it.
                 h.set_gain(self.backing_gain);
                 self.backing_handle = Some(h);
+                self.backing_drift.restart(self.now_us());
             }
             Err(_) => {
                 self.backing = None;
                 self.backing_track = None;
             }
+        }
+    }
+
+    /// Re-seek the playing backing when it has drifted from the clock (see
+    /// `core::DriftGuard`). Only while both run: a frozen clock pauses the
+    /// backing, and the guard would read that as drift.
+    fn keep_backing_in_step(&mut self) {
+        let now = self.now_us();
+        let (Some(h), Some(target)) = (&self.backing_handle, self.backing_target_us(now)) else {
+            return;
+        };
+        if !self.clock.is_running() || h.is_paused() {
+            return;
+        }
+        let position = h.position().as_micros() as u64;
+        if let Some(seek) = self.backing_drift.check(now, target, position) {
+            h.seek(Duration::from_micros(seek));
+            self.backing_resyncs += 1;
         }
     }
 
@@ -664,10 +692,13 @@ impl PlayScreen {
             Span::raw(format!("[v] {}  ", self.scroll_mode.label())),
         ];
         if self.backing_playing() {
-            spans.push(Span::styled(
-                "♪ backing  ",
-                Style::default().fg(Color::Green),
-            ));
+            // How often the backing had to be pulled back in step: a count
+            // that keeps climbing points at audio underruns on this machine.
+            let label = match self.backing_resyncs {
+                0 => "♪ backing  ".to_string(),
+                n => format!("♪ backing (resynced {n}×)  "),
+            };
+            spans.push(Span::styled(label, Style::default().fg(Color::Green)));
         }
         // While frozen, tell the player exactly what to hold to continue.
         if let Some(notes) = self.awaiting_notes() {
