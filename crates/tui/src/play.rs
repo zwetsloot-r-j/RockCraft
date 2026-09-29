@@ -13,15 +13,22 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
-use rockcraft_audio::{play_file_at, BackingHandle, SynthHandle};
+use rockcraft_audio::{
+    BackingHandle, BackingOut, DecodedTrack, SynthHandle, TrackLoader, TrackStatus,
+};
 use rockcraft_core::{
-    backing_position_us, Gain, GateState, MidiNote, NoteEvent, PlayClock, SustainEvent, SynthBus,
-    Velocity, WaitGate,
+    backing_position_us, hand::hand_of_pitch_value, BarMap, Gain, GateState, Grid, Hand,
+    HandOverride, MidiNote, NoteEvent, PlayClock, SustainEvent, SynthBus, Velocity, WaitGate,
+    DEFAULT_SPLIT,
 };
 use rockcraft_midi::smf_bytes_to_events;
 
-use crate::highway::{build_spans, project, song_duration_us, NoteSpan};
+use crate::highway::{
+    build_spans, cells_of_extent, grid_rows, line_cell, lower_block, next_per_lane,
+    song_duration_us, span_extent8, step_to_sixteenth, CellFill, NoteSpan, SUB,
+};
 use crate::keyboard::{black_key_col, is_black_key, white_index, HeldNotes, Scale};
+use crate::palette::{note_color, ColorMode, Rgb, BACKGROUND};
 use crate::render::{draw_keyboard, HELD_COLOR, MATCH_COLOR, TARGET_COLOR};
 
 /// How far into the future the top of the highway represents (microseconds).
@@ -45,6 +52,22 @@ struct Backing {
 
 pub struct PlayScreen {
     spans: Vec<NoteSpan>,
+    /// The hand playing each span (parallel to `spans`): the piece's per-note
+    /// override, else its split line. Drives the "hands" colouring.
+    hands: Vec<Hand>,
+    /// How the highway colours its notes (`c` cycles it).
+    color_mode: ColorMode,
+    /// How the highway scrolls (`v` toggles it).
+    scroll_mode: ScrollMode,
+    /// The piece's tempo map (bar downbeats, play-clock µs) for the highway's
+    /// bar lines; empty → uniform `bar_us` bars from `bar_origin_us`.
+    bar_starts_us: Vec<u64>,
+    /// Uniform bar length (the grid's, or 120 BPM 4/4 without one).
+    bar_us: u64,
+    /// Play-clock time of the uniform grid's first downbeat.
+    bar_origin_us: u64,
+    /// Beats per bar, for the beat lines.
+    beats_per_bar: u8,
     duration_us: u64,
     held: HeldNotes,
     /// Pausable song-time clock (M5-A). Replaces the old free-running `Instant`
@@ -77,6 +100,10 @@ pub struct PlayScreen {
     /// Live playback handle once the backing track has started; `None` until the
     /// clock reaches `shift_us` (and again after `restart` re-arms it).
     backing_handle: Option<BackingHandle>,
+    /// The backing track decoding (then decoded) in the background. Started on
+    /// the first tick, so it is usually ready by the end of the lead-in; kept
+    /// across `restart` so a replay starts instantly.
+    backing_track: Option<TrackLoader>,
     /// Whether the "hear the song" feature is active.
     hear_song: bool,
     /// Manual pause (the `Space` key / `HostCommand::PlayTogglePause`). Freezes
@@ -116,11 +143,22 @@ impl PlayScreen {
             .collect();
         let duration_us = song_duration_us(&spans);
         let wait = WaitGate::from_expected(&expected_steps(&spans));
+        let hands = spans
+            .iter()
+            .map(|s| hand_of_pitch_value(s.note, DEFAULT_SPLIT))
+            .collect();
 
         let song_synth = synth.as_ref().map(|s| s.for_bus(SynthBus::Song));
 
         Ok(Self {
             spans,
+            hands,
+            color_mode: ColorMode::default(),
+            scroll_mode: ScrollMode::default(),
+            bar_starts_us: Vec::new(),
+            bar_us: Grid::default_120().bar_us(),
+            bar_origin_us: offset,
+            beats_per_bar: Grid::default_120().time_sig.beats_per_bar,
             duration_us,
             held: HeldNotes::new(),
             clock: PlayClock::new(),
@@ -134,6 +172,7 @@ impl PlayScreen {
             shift_us: offset,
             backing: None,
             backing_handle: None,
+            backing_track: None,
             hear_song: false,
             paused: false,
             song_on_fired: HashSet::new(),
@@ -150,6 +189,68 @@ impl PlayScreen {
     pub fn with_hear_song(mut self, on: bool) -> Self {
         self.hear_song = on;
         self
+    }
+
+    /// Assign each note its hand from the piece's split line and per-note
+    /// overrides (`meta.json`, M14-E). Overrides are keyed by the note's
+    /// position in the *file*, before the lead-in shift.
+    pub fn with_hands(mut self, split: u8, overrides: &[HandOverride]) -> Self {
+        let shift = self.shift_us;
+        self.hands = self
+            .spans
+            .iter()
+            .map(|s| {
+                let file_start = s.start_us.saturating_sub(shift);
+                overrides
+                    .iter()
+                    .find(|o| o.pitch == s.note && o.start_us == file_start)
+                    .map(|o| o.hand)
+                    .unwrap_or_else(|| hand_of_pitch_value(s.note, split))
+            })
+            .collect();
+        self
+    }
+
+    /// Adopt the piece's grid (tempo + metre) and tempo map (`meta.grid`,
+    /// `meta.bar_starts`, in file µs) for the highway's bar and beat lines,
+    /// shifted into play-clock time alongside the notes so they stay on them.
+    pub fn with_grid(mut self, grid: Option<Grid>, bar_starts: &[u64]) -> Self {
+        let grid = grid.unwrap_or_else(Grid::default_120);
+        self.bar_us = grid.bar_us().max(1);
+        self.bar_origin_us = grid.origin_us + self.shift_us;
+        self.beats_per_bar = grid.time_sig.beats_per_bar.max(1);
+        self.bar_starts_us = bar_starts.iter().map(|b| b + self.shift_us).collect();
+        self
+    }
+
+    /// The bar lookup for the highway grid.
+    fn bar_map(&self) -> BarMap<'_> {
+        BarMap::new(&self.bar_starts_us, self.bar_us).with_origin(self.bar_origin_us)
+    }
+
+    /// The hand assigned to each note, in span order.
+    pub fn hands(&self) -> &[Hand] {
+        &self.hands
+    }
+
+    /// How the highway colours its notes.
+    pub fn color_mode(&self) -> ColorMode {
+        self.color_mode
+    }
+
+    /// How the highway scrolls.
+    pub fn scroll_mode(&self) -> ScrollMode {
+        self.scroll_mode
+    }
+
+    /// Set how the highway scrolls.
+    pub fn set_scroll_mode(&mut self, mode: ScrollMode) {
+        self.scroll_mode = mode;
+    }
+
+    /// Set how the highway colours its notes.
+    pub fn set_color_mode(&mut self, mode: ColorMode) {
+        self.color_mode = mode;
     }
 
     /// Attach a backing audio track from the loaded bundle. `audio_start_us` is
@@ -196,18 +297,37 @@ impl PlayScreen {
     /// Start the backing track once the clock first reaches `shift_us`, seeking
     /// the file to the matching position. Call once per event-loop iteration
     /// (clock-driven, like [`Self::tick_song_synth`]). A no-op when there is no
-    /// backing track or it is already playing. Never blocks the audio thread.
-    pub fn tick_backing(&mut self) {
+    /// backing track, no audio output (`out`), or it is already playing.
+    ///
+    /// Never blocks: the file decodes on a background thread, kicked off on the
+    /// first call. Should it still be decoding when the lead-in ends, the track
+    /// starts once it is ready — at the position the clock has reached by then,
+    /// so it joins in step rather than trailing the notes.
+    pub fn tick_backing(&mut self, out: Option<&BackingOut>) {
         if self.backing_handle.is_some() {
             return;
         }
+        let (Some(out), Some(b)) = (out, &self.backing) else {
+            return;
+        };
+        let loader = self
+            .backing_track
+            .get_or_insert_with(|| DecodedTrack::load_in_background(&b.path));
+        let track = match loader.poll() {
+            TrackStatus::Loading => return,
+            TrackStatus::Ready(t) => t.clone(),
+            // A missing/undecodable file: drop the track rather than retry
+            // every frame; the song still plays without it.
+            TrackStatus::Failed(_) => {
+                self.backing = None;
+                self.backing_track = None;
+                return;
+            }
+        };
         let Some(pos_us) = self.backing_target_us(self.now_us()) else {
             return;
         };
-        let Some(b) = &self.backing else {
-            return;
-        };
-        match play_file_at(&b.path, Duration::from_micros(pos_us)) {
+        match out.play_at(&track, Duration::from_micros(pos_us)) {
             Ok(h) => {
                 // If the highway is frozen by wait-mode at the moment the
                 // backing arms, start it paused so it never gets ahead.
@@ -218,9 +338,10 @@ impl PlayScreen {
                 h.set_gain(self.backing_gain);
                 self.backing_handle = Some(h);
             }
-            // On a persistent failure (missing/undecodable file), drop the track
-            // rather than retry every frame; the song still plays silently.
-            Err(_) => self.backing = None,
+            Err(_) => {
+                self.backing = None;
+                self.backing_track = None;
+            }
         }
     }
 
@@ -349,6 +470,12 @@ impl PlayScreen {
         }
     }
 
+    /// Track a live `NoteEvent` for scoring/wait-mode only, without sounding
+    /// it — for when the MIDI thread has already echoed it to the synth.
+    pub fn track_held(&mut self, ev: NoteEvent) {
+        self.held.apply(&ev);
+    }
+
     /// Toggle the "hear the song" feature. Turning it off silences any playing
     /// song notes and resets the trigger bookkeeping.
     pub fn toggle_hear_song(&mut self) {
@@ -436,12 +563,26 @@ impl PlayScreen {
     }
 
     /// Notes the song wants held at the current instant (target set).
-    fn targets_now(&self, now: u64) -> Vec<u8> {
+    /// The notes sounding at `now`, each with the colour its highway note has
+    /// right now, so the key it lands on lights in the same colour.
+    fn targets_now(&self, now: u64) -> Vec<(u8, Color)> {
         self.spans
             .iter()
-            .filter(|s| s.start_us <= now && now < s.end_us)
-            .map(|s| s.note)
+            .zip(&self.hands)
+            .filter(|(s, _)| s.start_us <= now && now < s.end_us)
+            .map(|(s, &hand)| {
+                (
+                    s.note,
+                    note_style(self.color_mode, s.note, hand, true).color,
+                )
+            })
             .collect()
+    }
+
+    /// The legend's "target" swatch: the right hand's sounding colour in
+    /// hands mode, the accent otherwise (spectrum has no single colour).
+    fn legend_target_color(&self) -> Color {
+        note_style(self.color_mode, 60, Hand::Right, true).color
     }
 
     pub fn draw(&self, f: &mut Frame, area: Rect) {
@@ -466,13 +607,13 @@ impl PlayScreen {
         let held = &self.held;
         let target_set = &targets;
         let layout = draw_keyboard(f, kb_inner, &|note| {
-            let is_target = target_set.contains(&note);
+            let target = target_set.iter().find(|(n, _)| *n == note).map(|t| t.1);
             let is_held = held.is_held(note);
-            match (is_target, is_held) {
-                (true, true) => Some(MATCH_COLOR),   // hitting the right note
-                (true, false) => Some(TARGET_COLOR), // song wants this now
-                (false, true) => Some(HELD_COLOR),   // you're playing this
-                (false, false) => None,
+            match (target, is_held) {
+                (Some(_), true) => Some(MATCH_COLOR), // hitting the right note
+                (Some(c), false) => Some(c),          // song wants this now
+                (None, true) => Some(HELD_COLOR),     // you're playing this
+                (None, false) => None,
             }
         });
 
@@ -519,6 +660,8 @@ impl PlayScreen {
             Span::styled("[Space] pause  ", Style::default().fg(pause_color)),
             Span::styled("[m] music  ", Style::default().fg(music_color)),
             Span::styled("[w] wait  ", Style::default().fg(wait_color)),
+            Span::raw(format!("[c] {}  ", self.color_mode.label())),
+            Span::raw(format!("[v] {}  ", self.scroll_mode.label())),
         ];
         if self.backing_playing() {
             spans.push(Span::styled(
@@ -539,92 +682,230 @@ impl PlayScreen {
             ));
         }
         spans.extend([
-            Span::styled("● target ", Style::default().fg(TARGET_COLOR)),
+            Span::styled("● target ", Style::default().fg(self.legend_target_color())),
             Span::styled("● you ", Style::default().fg(HELD_COLOR)),
             Span::styled("● match", Style::default().fg(MATCH_COLOR)),
         ]);
         f.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
+    /// Draw the highway in layers, back to front: the background with a faint
+    /// tint on alternate white-key lanes; a lane guide under each lane's next
+    /// note (a column of its colour, strengthening toward the keys, marking
+    /// where it lands); the bar and beat lines; then the notes themselves.
     fn draw_highway(&self, f: &mut Frame, area: Rect, scale: Scale, x0: u16, now: u64) {
         if area.height == 0 {
             return;
         }
+        let view = self.view_us(now);
         let w = scale.white_width();
-        // Column for a note's left edge on the highway, matching keyboard layout.
-        let note_col = |note: u8| -> Option<u16> {
+        let board = Rect::new(x0, area.y, scale.total_width(), area.height).intersection(area);
+        // A note's lane: its left column and width, matching the keyboard.
+        let lane = |note: u8| -> Option<(u16, u16)> {
             if let Some(wi) = white_index(note) {
-                Some(x0 + wi as u16 * w)
+                Some((x0 + wi as u16 * w, w))
             } else if is_black_key(note) {
-                black_key_col(note, scale).map(|c| x0 + c)
+                black_key_col(note, scale).map(|c| (x0 + c, 1))
             } else {
                 None
             }
         };
+        let buf = f.buffer_mut();
 
-        for span in &self.spans {
-            let Some(rs) = project(span, now, LEAD_US, area.height) else {
-                continue;
-            };
-            let Some(col) = note_col(span.note) else {
-                continue;
-            };
-            let cell_w = if is_black_key(span.note) { 1 } else { w };
-            let active = span.start_us <= now && now < span.end_us;
-            let style = note_style(span.note, active);
-            let glyph = style.glyph.to_string().repeat(cell_w as usize);
-            // `body_rows` (not the raw extent) leaves the trailing edge blank so
-            // repeated notes on one pitch read as separate blocks.
-            for row in rs.body_rows() {
-                let y = area.y + row;
-                if y >= area.y + area.height {
-                    break;
-                }
-                let rect = Rect::new(col, y, cell_w, 1);
-                f.render_widget(
-                    Paragraph::new(glyph.clone()).style(Style::default().fg(style.color)),
-                    rect,
-                );
+        // 1. Background + lane tint.
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                buf[(x, y)].set_bg(BACKGROUND.into());
             }
+        }
+        for note in 21u8..=108 {
+            if white_index(note).is_none_or(|wi| wi % 2 != 0) {
+                continue;
+            }
+            let Some((col, cw)) = lane(note) else {
+                continue;
+            };
+            for y in area.top()..area.bottom() {
+                for x in col..col + cw {
+                    if area.contains((x, y).into()) {
+                        buf[(x, y)].set_bg(LANE_TINT.into());
+                    }
+                }
+            }
+        }
+
+        // 2. Lane guides: black-key lanes last so they sit over the white ones,
+        //    as on the keyboard. A guide runs from the first full row under
+        //    its note's onset down to the keys.
+        let mut guides = next_per_lane(&self.spans, view, LEAD_US);
+        guides.sort_by_key(|&i| is_black_key(self.spans[i].note));
+        for i in guides {
+            let span = &self.spans[i];
+            let (Some((_, onset8)), Some((col, cw))) = (
+                span_extent8(span, view, LEAD_US, area.height),
+                lane(span.note),
+            ) else {
+                continue;
+            };
+            let color = note_style(self.color_mode, span.note, self.hands[i], false).rgb;
+            let (from, to) = ((onset8 + SUB - 1).div_euclid(SUB) as u16, area.height);
+            for row in from..to {
+                // Faint under the note, strongest at the keys.
+                let t = (row - from + 1) as f32 / (to - from).max(1) as f32;
+                let strength = GUIDE_AT_NOTE + (GUIDE_AT_KEYS - GUIDE_AT_NOTE) * t;
+                let y = area.y + row;
+                for x in col..col + cw {
+                    if area.contains((x, y).into()) {
+                        let under = bg_rgb(&buf[(x, y)]);
+                        buf[(x, y)].set_bg(under.mix(color, strength).into());
+                    }
+                }
+            }
+        }
+
+        // 3. Bar and beat lines across the keyboard's width, each at its
+        //    height within its row.
+        for g in grid_rows(
+            &self.bar_map(),
+            self.beats_per_bar,
+            view,
+            LEAD_US,
+            area.height,
+        ) {
+            let (row, glyph) = line_cell(g.y8);
+            let fg = if g.bar { BAR_LINE } else { BEAT_LINE };
+            let y = area.y + row as u16;
+            for x in board.left()..board.right() {
+                buf[(x, y)].set_symbol(glyph).set_fg(fg.into());
+            }
+        }
+
+        // 4. Notes, their edges to the eighth of a row: a partial top or
+        //    bottom cell is a lower-block glyph (for a top edge, drawn inverted:
+        //    the cell's background as the glyph, the note as the cell). The
+        //    onset (bottom) edge is exact, so a note on a downbeat meets its
+        //    bar line. Whether a note is *sounding* follows the real clock.
+        for (span, &hand) in self.spans.iter().zip(&self.hands) {
+            let (Some((top8, bottom8)), Some((col, cw))) = (
+                span_extent8(span, view, LEAD_US, area.height),
+                lane(span.note),
+            ) else {
+                continue;
+            };
+            let active = span.start_us <= now && now < span.end_us;
+            let color = note_style(self.color_mode, span.note, hand, active).color;
+            for (row, fill) in cells_of_extent(top8, bottom8) {
+                let y = area.y + row;
+                for x in col..col + cw {
+                    if !area.contains((x, y).into()) {
+                        continue;
+                    }
+                    let cell = &mut buf[(x, y)];
+                    match fill {
+                        CellFill::Full => {
+                            cell.set_symbol(lower_block(8)).set_fg(color);
+                        }
+                        CellFill::Bottom(n) => {
+                            cell.set_symbol(lower_block(n)).set_fg(color);
+                        }
+                        CellFill::Top(n) => {
+                            let under = bg_rgb(cell);
+                            cell.set_symbol(lower_block(8 - n))
+                                .set_fg(under.into())
+                                .set_bg(color);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The song time the highway is drawn at: the clock itself when scrolling
+    /// smoothly, or snapped back to the latest 16th in rhythm-step mode.
+    fn view_us(&self, now: u64) -> u64 {
+        match self.scroll_mode {
+            ScrollMode::Smooth => now,
+            ScrollMode::Sixteenths => step_to_sixteenth(&self.bar_map(), self.beats_per_bar, now),
         }
     }
 }
 
-/// Visual style for one highway note block: the colour to paint it and the fill
-/// glyph to repeat across its width.
+/// A cell's background as RGB (the highway paints every cell's background, so
+/// anything else is the plain highway background).
+fn bg_rgb(cell: &ratatui::buffer::Cell) -> Rgb {
+    match cell.bg {
+        Color::Rgb(r, g, b) => Rgb(r, g, b),
+        _ => BACKGROUND,
+    }
+}
+
+/// How the highway scrolls. Cycled with `v` on the play screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScrollMode {
+    /// Continuously, to the eighth of a row.
+    #[default]
+    Smooth,
+    /// In steps of one 16th note, on the rhythm of the bar grid.
+    Sixteenths,
+}
+
+impl ScrollMode {
+    /// The other mode.
+    pub const fn next(self) -> Self {
+        match self {
+            ScrollMode::Smooth => ScrollMode::Sixteenths,
+            ScrollMode::Sixteenths => ScrollMode::Smooth,
+        }
+    }
+
+    /// Short label for the status line.
+    pub const fn label(self) -> &'static str {
+        match self {
+            ScrollMode::Smooth => "smooth",
+            ScrollMode::Sixteenths => "16th steps",
+        }
+    }
+}
+
+/// Background of the tinted (alternate white-key) lanes.
+const LANE_TINT: Rgb = Rgb(0x17, 0x18, 0x20);
+/// Bar (downbeat) line colour — clearly visible, still behind the notes.
+const BAR_LINE: Rgb = Rgb(0x55, 0x58, 0x68);
+/// Beat line colour — a quieter version of the bar line.
+const BEAT_LINE: Rgb = Rgb(0x2c, 0x2e, 0x3a);
+/// Lane-guide strength (mix toward the note colour) just under the note…
+const GUIDE_AT_NOTE: f32 = 0.06;
+/// …and at the keyboard, where the eye should land.
+const GUIDE_AT_KEYS: f32 = 0.22;
+
+/// Visual style for one highway note block: the colour to paint it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NoteStyle {
     pub color: Color,
-    pub glyph: char,
+    /// `color` as RGB, for blending (lane guides).
+    pub rgb: Rgb,
 }
 
 /// Choose the [`NoteStyle`] for a single highway note block.
 ///
-/// Two signals are layered, so the highway stays readable even on terminals
-/// with a poor colour palette:
+/// The colour comes from the [`ColorMode`] (by hand, pitch class, or one
+/// accent — see [`crate::palette`]). Two cues layer on top, so the highway
+/// stays readable in every mode:
 ///
-/// 1. **active vs upcoming** — an `active` note (sounding at the current clock
-///    position) reads in the bright play-along target hue; an upcoming note
-///    reads in a calm blue. This is the pre-existing highway signal, preserved.
-/// 2. **white key vs black key** — a black-key (accidental) note is drawn in a
-///    *dimmer* variant of whichever colour above, **and** with a lighter-shaded
-///    fill glyph (`▒`) instead of the white-key `▓`. Together with the existing
-///    1-column width for black keys, that gives three redundant cues.
+/// 1. **active vs upcoming** — a note sounding at the current clock position is
+///    lifted brighter than one still falling.
+/// 2. **white key vs black key** — a black-key (accidental) note is *dimmer*,
+///    on top of being drawn one column wide.
 ///
-/// Concrete palette (256-colour indices):
-/// - white active: yellow (`TARGET_COLOR`); black active: dim amber `Indexed(136)`
-/// - white upcoming: blue `Indexed(33)`; black upcoming: dim blue `Indexed(25)`
-pub fn note_style(note: u8, active: bool) -> NoteStyle {
-    let black = is_black_key(note);
-    let color = match (active, black) {
-        (true, false) => TARGET_COLOR,        // white key, sounding now
-        (true, true) => Color::Indexed(136),  // black key, sounding now — dim amber
-        (false, false) => Color::Indexed(33), // white key, upcoming — calm blue
-        (false, true) => Color::Indexed(25),  // black key, upcoming — dim blue
-    };
-    // Lighter shade block for accidentals so the cue survives monochrome.
-    let glyph = if black { '▒' } else { '▓' };
-    NoteStyle { color, glyph }
+/// Notes are solid blocks: their edges are drawn to the eighth of a row with
+/// the lower-block glyphs (smooth scrolling), which a shaded fill (the former
+/// `▓`/`▒` accidental cue) could not match.
+pub fn note_style(mode: ColorMode, note: u8, hand: Hand, active: bool) -> NoteStyle {
+    let rgb = note_color(mode, note, hand, active, is_black_key(note));
+    NoteStyle {
+        color: rgb.into(),
+        rgb,
+    }
 }
 
 /// Expected `(pitch, start_us)` pairs feeding the [`WaitGate`]: every span's
@@ -1071,17 +1352,158 @@ mod tests {
         assert_eq!(play.now_us(), 1_000_000, "clock runs again after restart");
     }
 
+    // ── note colouring by hand ────────────────────────────────────────────────
+
+    #[test]
+    fn hands_default_to_the_middle_c_split() {
+        // C4 (60) and D4 (62) are both at/above middle C: right hand.
+        let play = two_note_screen();
+        assert_eq!(play.hands(), &[Hand::Right, Hand::Right]);
+    }
+
+    #[test]
+    fn with_hands_applies_the_split_and_per_note_overrides() {
+        let play = two_note_screen();
+        // Split above both notes: both left…
+        let split_only = two_note_screen().with_hands(64, &[]);
+        assert_eq!(split_only.hands(), &[Hand::Left, Hand::Left]);
+        // …except D, pinned right by an override keyed at its file position
+        // (the span's start before the lead-in shift).
+        let d_file_start = play.spans[1].start_us - play.shift_us;
+        let overrides = [HandOverride {
+            pitch: 62,
+            start_us: d_file_start,
+            hand: Hand::Right,
+        }];
+        let pinned = two_note_screen().with_hands(64, &overrides);
+        assert_eq!(pinned.hands(), &[Hand::Left, Hand::Right]);
+    }
+
+    #[test]
+    fn sounding_targets_carry_their_hand_colour() {
+        let play = two_note_screen().with_hands(61, &[]); // C left, D right
+        let c_on = play.spans[0].start_us;
+        let targets = play.targets_now(c_on);
+        assert_eq!(
+            targets,
+            vec![(60, note_style(ColorMode::Hands, 60, Hand::Left, true).color)]
+        );
+    }
+
+    // ── lanes + bar lines ─────────────────────────────────────────────────────
+
+    #[test]
+    fn with_grid_moves_the_tempo_map_into_play_time() {
+        let play = one_note_screen();
+        let shift = play.shift_us;
+        let play = play.with_grid(None, &[0, 1_000_000, 2_500_000]);
+        let map = play.bar_map();
+        assert_eq!(map.bar_start(0), shift);
+        assert_eq!(map.bar_start(2), 2_500_000 + shift);
+    }
+
+    #[test]
+    fn without_a_grid_bars_are_120_bpm_from_the_first_note() {
+        let play = one_note_screen().with_grid(None, &[]);
+        let map = play.bar_map();
+        // 120 BPM 4/4 = 2 s bars, bar 0 on the (shifted) first note.
+        assert_eq!(map.bar_start(0), play.shift_us);
+        assert_eq!(map.bar_len(0), 2_000_000);
+    }
+
+    /// Render `play` at `now` into a `width`×`height` test terminal.
+    fn render(play: &mut PlayScreen, now: u64, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        play.advance(now - play.now_us());
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        term.draw(|f| play.draw(f, f.area())).unwrap();
+        term.backend().buffer().clone()
+    }
+
+    /// Each row of `buf` as a string of its cell symbols.
+    fn rows(buf: &ratatui::buffer::Buffer) -> Vec<String> {
+        (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    /// The first highway row drawn as a line (a run of one line glyph).
+    fn line_row(rows: &[String]) -> Option<usize> {
+        rows.iter().position(|r| {
+            // Inside the highway box: a border row starts with a corner.
+            r.starts_with('│')
+                && ["▔", "⎺", "─", "⎽", "▁"]
+                    .iter()
+                    .any(|g| r.contains(&g.repeat(6)))
+        })
+    }
+
+    #[test]
+    fn a_note_on_a_downbeat_meets_its_bar_line_and_casts_a_lane_guide() {
+        // Bar 0 is on the first note; 1.5 s before it, both sit up the highway.
+        let mut play = one_note_screen();
+        let first = play.spans[0].start_us;
+        for now in [first - 1_500_000, first - 1_234_567] {
+            let buf = render(&mut play, now, 120, 30);
+            let rows = rows(&buf);
+            let bar_row = line_row(&rows).expect("a bar line is drawn") as u16;
+            // The note's onset edge is in the bar line's row: that row holds a
+            // cell painted in the note colour (as glyph or, at a top edge, as
+            // the cell background).
+            let note = note_style(ColorMode::Hands, 60, Hand::Right, false).color;
+            let note_x = (0..buf.area.width)
+                .find(|&x| buf[(x, bar_row)].fg == note || buf[(x, bar_row)].bg == note)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "note on its bar line (now = {now}): {}",
+                        rows[bar_row as usize]
+                    )
+                });
+            // Below it, its lane carries a guide that strengthens toward the keys.
+            let highway_bottom = (bar_row..buf.area.height)
+                .take_while(|&y| rows[y as usize].starts_with('│'))
+                .last()
+                .unwrap();
+            let near = buf[(note_x, bar_row + 2)].bg;
+            let keys = buf[(note_x, highway_bottom)].bg;
+            assert_ne!(near, keys, "the guide strengthens toward the keys");
+        }
+    }
+
+    #[test]
+    fn smooth_mode_moves_within_a_row_sixteenth_mode_holds_until_the_next_step() {
+        // 120 BPM 4/4 (no grid): a 16th is 125 ms; 1.5 s before bar 0 is a step.
+        let first = one_note_screen().spans[0].start_us;
+        let at = |mode: ScrollMode, now: u64| {
+            let mut play = one_note_screen();
+            play.set_scroll_mode(mode);
+            // The highway and keyboard only: the status line shows the clock.
+            rows(&render(&mut play, now, 120, 30)).split_off(1)
+        };
+        let a = at(ScrollMode::Smooth, first - 1_500_000);
+        let b = at(ScrollMode::Smooth, first - 1_470_000); // 30 ms later, same 16th
+        assert_ne!(a, b, "smooth: 30 ms (~2.8 eighths here) is visible");
+
+        let a = at(ScrollMode::Sixteenths, first - 1_500_000);
+        let b = at(ScrollMode::Sixteenths, first - 1_380_000); // same 16th step
+        let c = at(ScrollMode::Sixteenths, first - 1_375_000); // the next step
+        assert_eq!(a, b, "16th steps: holds within a step");
+        assert_ne!(b, c, "16th steps: moves on the step");
+    }
+
     // ── highway key-note distinction (M11-A, issue #229) ─────────────────────
 
     #[test]
-    fn black_and_white_keys_differ_in_color_and_glyph() {
+    fn black_and_white_keys_differ_in_color() {
         // C (60, white) vs C# (61, black) at the same `active` value differ in
-        // BOTH cues, so neither colour nor glyph alone is the only signal.
-        for active in [true, false] {
-            let white = note_style(60, active);
-            let black = note_style(61, active);
-            assert_ne!(white.color, black.color, "active={active}: colour cue");
-            assert_ne!(white.glyph, black.glyph, "active={active}: glyph cue");
+        // colour (black-key notes are also one column narrow). The former
+        // shaded-glyph cue gave way to solid blocks for sub-row edges.
+        for mode in [ColorMode::Hands, ColorMode::Spectrum, ColorMode::Accent] {
+            for active in [true, false] {
+                let white = note_style(mode, 60, Hand::Right, active);
+                let black = note_style(mode, 61, Hand::Right, active);
+                assert_ne!(white.color, black.color, "{mode:?} active={active}");
+            }
         }
     }
 
@@ -1089,22 +1511,9 @@ mod tests {
     fn active_and_upcoming_differ_for_a_given_pitch() {
         // The pre-existing active/upcoming signal survives for both key kinds.
         for note in [60u8, 61] {
-            let on = note_style(note, true);
-            let off = note_style(note, false);
+            let on = note_style(ColorMode::Hands, note, Hand::Right, true);
+            let off = note_style(ColorMode::Hands, note, Hand::Right, false);
             assert_ne!(on.color, off.color, "note={note}: active vs upcoming");
-        }
-    }
-
-    #[test]
-    fn note_style_agrees_with_is_black_key_over_an_octave() {
-        // Across a full octave the helper's glyph choice tracks `is_black_key`.
-        for note in 60u8..72 {
-            let style = note_style(note, true);
-            if is_black_key(note) {
-                assert_eq!(style.glyph, '▒', "note={note} is black");
-            } else {
-                assert_eq!(style.glyph, '▓', "note={note} is white");
-            }
         }
     }
 }

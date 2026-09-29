@@ -12,7 +12,7 @@
 //! no device, so this crate stays testable in CI; only [`LiveInput::connect`]
 //! needs real hardware.
 
-use rockcraft_core::{MidiNote, NoteEvent, SustainEvent, Velocity};
+use rockcraft_core::{InputEvent, MidiNote, NoteEvent, SustainEvent, Velocity};
 use std::sync::mpsc::{self, Receiver};
 
 use midir::{Ignore, MidiInput, MidiInputConnection};
@@ -111,6 +111,22 @@ impl LiveInput {
     ///
     /// The PX-150 enumerates as `CASIO USB-MIDI`, so `"casio"` selects it.
     pub fn connect(name_filter: &str) -> Result<Self, LiveInputError> {
+        Self::connect_with_echo(name_filter, |_| {})
+    }
+
+    /// Like [`connect`](LiveInput::connect), but also hand every parsed event —
+    /// key or sustain pedal, in arrival order — to `echo` right on the MIDI
+    /// thread, before it is queued for the app.
+    ///
+    /// This is the low-latency monitoring path: sounding a key from here skips
+    /// the app loop (and whatever it is busy with, e.g. drawing a frame), so the
+    /// note is heard as soon as the piano sends it. `echo` runs on the real-time
+    /// thread, so it must be as cheap as the channel send — enqueue, never
+    /// block, lock, or do I/O.
+    pub fn connect_with_echo(
+        name_filter: &str,
+        mut echo: impl FnMut(&InputEvent) + Send + 'static,
+    ) -> Result<Self, LiveInputError> {
         let mut midi_in =
             MidiInput::new("RockCraft").map_err(|e| LiveInputError::Init(e.to_string()))?;
         // Drop active-sensing, timing clock, and sysex at the source — the
@@ -145,9 +161,11 @@ impl LiveInput {
                 move |stamp_us, message, _| {
                     // RUNS ON THE MIDI THREAD — keep it tiny, never block.
                     if let Some(ev) = parse_note_message(message, stamp_us) {
+                        echo(&InputEvent::Note(ev));
                         // If the receiver is gone we're shutting down; ignore.
                         let _ = tx.send(ev);
                     } else if let Some(ev) = parse_sustain_message(message, stamp_us) {
+                        echo(&InputEvent::Sustain(ev));
                         let _ = sustain_tx.send(ev);
                     }
                 },

@@ -37,6 +37,10 @@ tokio = { workspace = true }
 # Optional screenshot deps (M4-H) — never pulled into the default build.
 image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
 
+# 1 ms timer resolution for even frame pacing (`app::precise_timer`).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Media"] }
+
 [dev-dependencies]
 rockcraft-core.workspace = true
 rockcraft-midi.workspace = true

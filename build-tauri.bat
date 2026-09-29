@@ -11,25 +11,27 @@ REM
 REM  1. It is a TWO-step build. `custom-protocol` embeds the frontend into the
 REM     exe at *compile* time, so a frontend-only change needs `vite build` AND a
 REM     Rust recompile. Cargo will not redo the embed unless a .rs file changed,
-REM     so we bump lib.rs's timestamp — without that the exe silently keeps the
+REM     so we bump lib.rs's timestamp - without that the exe silently keeps the
 REM     OLD frontend, which looks exactly like your change not working.
 REM  2. Without --features tauri/custom-protocol the webview loads from a dev
 REM     server that isn't running, and the window shows "localhost refused to
 REM     connect".
-setlocal
+setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
 set "PROFILE=debug"
 set "CARGO_ARGS="
-for %%a in (%*) do (
-  if "%%a"=="--release" (
-    set "PROFILE=release"
-    set "CARGO_ARGS=!CARGO_ARGS! --release"
-  ) else (
-    set "CARGO_ARGS=!CARGO_ARGS! %%a"
-  )
-)
-setlocal enabledelayedexpansion
+REM Collect the args with shift, not `for %%a in (%*)`: a for block is
+REM expanded once, so accumulating into a variable there loses all but the
+REM last argument (or, before delayed expansion is on, keeps a literal
+REM "!CARGO_ARGS!").
+:args
+if "%~1"=="" goto args_done
+if "%~1"=="--release" set "PROFILE=release"
+set "CARGO_ARGS=!CARGO_ARGS! %1"
+shift
+goto args
+:args_done
 
 where cargo >nul 2>&1
 if errorlevel 1 (
@@ -53,7 +55,7 @@ copy /b lib.rs +,, >nul
 popd
 
 echo [3/3] Windows binary ^(%PROFILE%^)
-cargo build -p rockcraft-tauri --features tauri/custom-protocol --target-dir target-win %CARGO_ARGS%
+cargo build -p rockcraft-tauri --features tauri/custom-protocol --target-dir target-win !CARGO_ARGS!
 if errorlevel 1 (
   echo error: cargo build failed.
   echo        If it says the exe is locked, close RockCraft first.
