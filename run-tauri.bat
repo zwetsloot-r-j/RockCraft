@@ -9,18 +9,24 @@ REM
 REM The control socket defaults on at 127.0.0.1:9001 so an agent (or
 REM scripts\local\rc.mjs) can drive the app. Set ROCKCRAFT_CONTROL_ADDR yourself
 REM to move it, or NO_CONTROL=1 to start without it.
-setlocal
+setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
 set "PROFILE=debug"
 set "APP_ARGS="
-for %%a in (%*) do (
-  if "%%a"=="--release" (
-    set "PROFILE=release"
-  ) else (
-    set "APP_ARGS=%APP_ARGS% %%a"
-  )
+REM Collect the args with shift, not `for %%a in (%*)`: a for block is
+REM expanded once, so accumulating into a variable there keeps only the last
+REM argument.
+:args
+if "%~1"=="" goto args_done
+if "%~1"=="--release" (
+  set "PROFILE=release"
+) else (
+  set "APP_ARGS=!APP_ARGS! %1"
 )
+shift
+goto args
+:args_done
 
 set "EXE=target-win\%PROFILE%\rockcraft-tauri.exe"
 if not exist "%EXE%" (
@@ -53,5 +59,5 @@ if "%ROCKCRAFT_SF2%"=="" (
 
 echo Starting %EXE%
 if not "%ROCKCRAFT_CONTROL_ADDR%"=="" echo   control socket: ws://%ROCKCRAFT_CONTROL_ADDR%
-"%EXE%" %APP_ARGS%
+"%EXE%" !APP_ARGS!
 endlocal
