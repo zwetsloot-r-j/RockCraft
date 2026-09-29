@@ -60,3 +60,7 @@ claxon = { opt-level = 3 }
 hound = { opt-level = 3 }
 symphonia-core = { opt-level = 3 }
 symphonia-bundle-mp3 = { opt-level = 3 }
+# The SoundFont synth: unoptimized, parsing a full GM bank at startup takes
+# seconds and rendering eats into the audio thread's deadline (glitches, and a
+# fuller output buffer — i.e. late notes). Same fix as the decoders.
+rustysynth = { opt-level = 3 }

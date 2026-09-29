@@ -11,7 +11,7 @@ REM
 REM  1. It is a TWO-step build. `custom-protocol` embeds the frontend into the
 REM     exe at *compile* time, so a frontend-only change needs `vite build` AND a
 REM     Rust recompile. Cargo will not redo the embed unless a .rs file changed,
-REM     so we bump lib.rs's timestamp — without that the exe silently keeps the
+REM     so we bump lib.rs's timestamp - without that the exe silently keeps the
 REM     OLD frontend, which looks exactly like your change not working.
 REM  2. Without --features tauri/custom-protocol the webview loads from a dev
 REM     server that isn't running, and the window shows "localhost refused to

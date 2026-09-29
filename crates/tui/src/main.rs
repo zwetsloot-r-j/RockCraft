@@ -4,6 +4,8 @@
 //! of this crate) so integration tests in `tests/` can access it.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use rockcraft_audio::AudioOut;
 use rockcraft_control::{CommandServer, RemoteCommand};
@@ -48,25 +50,6 @@ fn main() {
     // When provided, entering Record plays it alongside your performance.
     let backing_path = std::env::args().nth(2).map(std::path::PathBuf::from);
 
-    // Source selection: explicit `--mock`, otherwise the live piano — and when
-    // no port matches, fall back to the mock so the app always launches.
-    let input: Box<dyn NoteSource> = if force_mock {
-        eprintln!(
-            "Using MockKeyboard (--mock): type the number row 1-0 to play notes (C-major scale)."
-        );
-        Box::new(MockKeyboard::new())
-    } else {
-        match LiveInput::connect(&filter) {
-            Ok(i) => Box::new(i),
-            Err(e) => {
-                eprintln!(
-                    "No MIDI input ({e}); falling back to MockKeyboard — type to play notes."
-                );
-                Box::new(MockKeyboard::new())
-            }
-        }
-    };
-
     // Audio is optional: if there's no SoundFont / output device, run silently.
     // `audio` is bound for the whole run so the output stream stays open.
     let audio = match AudioOut::new() {
@@ -77,6 +60,46 @@ fn main() {
         }
     };
     let synth = audio.as_ref().map(AudioOut::synth);
+    let backing_out = audio.as_ref().map(AudioOut::backing_out);
+
+    // Live keys are sounded straight from the MIDI thread (the low-latency
+    // monitor path) rather than after the app loop gets round to them; the app
+    // flips `echo` off on screens that should stay silent.
+    let echo = Arc::new(AtomicBool::new(false));
+
+    // Source selection: explicit `--mock`, otherwise the live piano — and when
+    // no port matches, fall back to the mock so the app always launches.
+    let mut echo_live = false;
+    let input: Box<dyn NoteSource> = if force_mock {
+        eprintln!(
+            "Using MockKeyboard (--mock): type the number row 1-0 to play notes (C-major scale)."
+        );
+        Box::new(MockKeyboard::new())
+    } else {
+        let connected = match &synth {
+            Some(synth) => {
+                let (synth, echo) = (synth.clone(), echo.clone());
+                LiveInput::connect_with_echo(&filter, move |ev| {
+                    if echo.load(Ordering::Relaxed) {
+                        synth.apply(ev);
+                    }
+                })
+            }
+            None => LiveInput::connect(&filter),
+        };
+        match connected {
+            Ok(i) => {
+                echo_live = synth.is_some();
+                Box::new(i)
+            }
+            Err(e) => {
+                eprintln!(
+                    "No MIDI input ({e}); falling back to MockKeyboard — type to play notes."
+                );
+                Box::new(MockKeyboard::new())
+            }
+        }
+    };
 
     // Start the control server on its own thread (tokio stays off the terminal/
     // MIDI loop). `None` keeps normal runs socket-free.
@@ -100,7 +123,12 @@ fn main() {
         None => (None, None),
     };
 
-    let result = app::run(input, synth, backing_path, start_edit, commands);
+    let audio_links = app::AudioLinks {
+        synth,
+        backing_out,
+        echo: echo_live.then_some(echo),
+    };
+    let result = app::run(input, audio_links, backing_path, start_edit, commands);
 
     // Signal the server to stop and join its thread before exiting.
     if let Some((shutdown, thread)) = shutdown {

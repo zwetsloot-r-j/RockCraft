@@ -39,7 +39,9 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
-use rockcraft_audio::{play_file_at, BackingHandle, SynthHandle};
+use rockcraft_audio::{
+    BackingHandle, BackingOut, DecodedTrack, SynthHandle, TrackLoader, TrackStatus,
+};
 use rockcraft_control::SegmentSpec;
 use rockcraft_core::{
     backing_position_us, segments_from_splits, slice_segment, Action, BackgroundImage,
@@ -417,6 +419,9 @@ pub struct EditScreen {
     /// Live playback handle once the backing track has started; `None` until the
     /// transport first plays. Paused (not torn down) when the transport stops.
     backing_handle: Option<BackingHandle>,
+    /// The attached backing file decoding (then decoded) in the background,
+    /// started on the first tick after attaching so play starts instantly.
+    backing_track: Option<TrackLoader>,
     /// Whether the transport was playing at the previous `poll_backing`, to
     /// detect the stop↔play transitions that start/pause the backing.
     prev_playing: bool,
@@ -484,6 +489,7 @@ impl EditScreen {
             bpm_prompt: None,
             backing: None,
             backing_handle: None,
+            backing_track: None,
             prev_playing: false,
             prev_playhead_us: 0,
             prev_offset_us: 0,
@@ -520,6 +526,7 @@ impl EditScreen {
     /// 0; M5-E makes it adjustable). Builder form, mirroring `PlayScreen`.
     pub fn with_backing(mut self, path: PathBuf, audio_start_us: i64) -> Self {
         self.backing = Some(Backing { path });
+        self.backing_track = None;
         // The offset is composer state (editable + snapshot-visible); seed it
         // from the loaded value so a reopened bundle restores its alignment.
         self.composer.set_backing_offset_us(audio_start_us);
@@ -575,6 +582,7 @@ impl EditScreen {
     /// nudge; callers seed it via [`with_backing`] when loading a bundle).
     pub fn set_backing(&mut self, path: PathBuf) {
         self.backing = Some(Backing { path });
+        self.backing_track = None;
         if let Some(h) = self.backing_handle.take() {
             h.stop();
         }
@@ -585,6 +593,7 @@ impl EditScreen {
     /// the timeline dirty so the next save drops `meta.backing`.
     pub fn clear_backing(&mut self) {
         self.backing = None;
+        self.backing_track = None;
         if let Some(h) = self.backing_handle.take() {
             h.stop();
         }
@@ -1307,34 +1316,54 @@ impl EditScreen {
     }
 
     /// Sync the live backing handle to the transport. Call once per run-loop
-    /// iteration right after [`tick_audition`](Self::tick_audition). Never blocks
-    /// the audio thread; a persistent file failure drops the track so editing
-    /// continues silently.
-    pub fn tick_backing(&mut self) {
-        match self.poll_backing() {
-            BackingCmd::PlayAt(pos) => {
-                let Some(b) = &self.backing else { return };
-                if let Some(h) = &self.backing_handle {
-                    // Resume an existing (paused) stream from the new position.
-                    h.seek(Duration::from_micros(pos));
-                    h.resume();
-                } else {
-                    match play_file_at(&b.path, Duration::from_micros(pos)) {
+    /// iteration right after [`tick_audition`](Self::tick_audition); `out` is the
+    /// audio output to play on (`None`: no audio, backing stays silent).
+    ///
+    /// Never blocks: the file decodes on a background thread, started on the
+    /// first tick after attaching. If the transport is playing when the decode
+    /// finishes, the track starts at the playhead then, in step. A persistent
+    /// file failure drops the track so editing continues silently.
+    pub fn tick_backing(&mut self, out: Option<&BackingOut>) {
+        let cmd = self.poll_backing();
+        let (Some(out), Some(b)) = (out, &self.backing) else {
+            return;
+        };
+        let loader = self
+            .backing_track
+            .get_or_insert_with(|| DecodedTrack::load_in_background(&b.path));
+        let track = match loader.poll() {
+            TrackStatus::Loading => return,
+            TrackStatus::Ready(t) => t.clone(),
+            TrackStatus::Failed(_) => {
+                self.backing = None;
+                self.backing_track = None;
+                return;
+            }
+        };
+        let Some(h) = &self.backing_handle else {
+            // Not started yet: the first play (or a decode that finished mid-
+            // play) starts it at the playhead.
+            if self.is_playing() {
+                if let Some(pos) = self.backing_target_us() {
+                    match out.play_at(&track, Duration::from_micros(pos)) {
                         Ok(h) => self.backing_handle = Some(h),
-                        Err(_) => self.backing = None,
+                        Err(_) => {
+                            self.backing = None;
+                            self.backing_track = None;
+                        }
                     }
                 }
             }
-            BackingCmd::Seek(pos) => {
-                if let Some(h) = &self.backing_handle {
-                    h.seek(Duration::from_micros(pos));
-                }
+            return;
+        };
+        match cmd {
+            BackingCmd::PlayAt(pos) => {
+                // Resume the existing (paused) stream from the new position.
+                h.seek(Duration::from_micros(pos));
+                h.resume();
             }
-            BackingCmd::Pause => {
-                if let Some(h) = &self.backing_handle {
-                    h.pause();
-                }
-            }
+            BackingCmd::Seek(pos) => h.seek(Duration::from_micros(pos)),
+            BackingCmd::Pause => h.pause(),
             BackingCmd::None => {}
         }
     }
