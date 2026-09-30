@@ -468,6 +468,12 @@ impl Shell {
                 KeyCode::Char(' ') => play.toggle_pause(),
                 KeyCode::Char('m') => play.toggle_hear_song(),
                 KeyCode::Char('w') => play.toggle_wait_mode(),
+                KeyCode::Char('-') => {
+                    play.step_rate(false);
+                }
+                KeyCode::Char('=') => {
+                    play.step_rate(true);
+                }
                 // The practice loop (M17-B): step bars, mark, loop.
                 KeyCode::Left => {
                     play.step_bar(-1);
@@ -876,7 +882,13 @@ impl rockcraft_control::HostServices for Shell {
             HostCommand::LoadBundle { .. } => Err(HostError::Unsupported("load_bundle".into())),
             HostCommand::SplitBundle { .. } => Err(HostError::Unsupported("split_bundle".into())),
             HostCommand::PlaySetWait { .. } => Err(HostError::Unsupported("play_set_wait".into())),
-            HostCommand::PlaySetRate { .. } => Err(HostError::Unsupported("play_set_rate".into())),
+            HostCommand::PlaySetRate { rate_permille } => {
+                let mut applied = 0;
+                self.with_play("play_set_rate", |play| {
+                    applied = play.set_rate(rate_permille)
+                })?;
+                Ok(json!({ "rate_permille": applied }))
+            }
             HostCommand::PlayStatus => Err(HostError::Unsupported("play_status".into())),
             HostCommand::PlayToggleHearSong => {
                 Err(HostError::Unsupported("play_toggle_hear_song".into()))
@@ -1591,6 +1603,28 @@ mod tests {
             rockcraft_core::DEFAULT_INSTRUMENT
         );
         assert_eq!(shell.mixer().player.gain, rockcraft_core::Gain::UNITY);
+    }
+
+    /// `-` / `=` and `play_set_rate` reach the play screen; the command fails
+    /// cleanly off it.
+    #[test]
+    fn speed_keys_and_play_set_rate_reach_the_play_screen() {
+        let mut shell = make_shell();
+        let err = shell
+            .dispatch(HostCommand::PlaySetRate { rate_permille: 500 })
+            .unwrap_err();
+        assert!(matches!(err, rockcraft_control::HostError::Failed { .. }));
+        let play = load_play_screen(&midi_only_fixture().join("song.mid"), None)
+            .expect("load MIDI-only bundle");
+        shell.screen = Screen::Play(Box::new(shell.tuned(play)));
+        shell.on_key(KeyCode::Char('-'));
+        assert_eq!(play_screen(&shell).rate_permille(), 875);
+        shell.on_key(KeyCode::Char('='));
+        assert_eq!(play_screen(&shell).rate_permille(), 1000);
+        let v = shell
+            .dispatch(HostCommand::PlaySetRate { rate_permille: 100 })
+            .unwrap();
+        assert_eq!(v["rate_permille"], 250);
     }
 
     /// The backing fader set between takes reaches the play screen opened

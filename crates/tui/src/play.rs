@@ -64,6 +64,13 @@ const FREEZE_FADE: Duration = Duration::from_millis(250);
 /// click, short enough to feel instant.
 const THAW_FADE: Duration = Duration::from_millis(15);
 
+/// Practice speed: unity, the bounds `play_set_rate` clamps to (as the desktop
+/// app's), and the steps the `-` / `=` keys walk.
+pub const RATE_UNITY: u16 = 1000;
+pub const RATE_MIN: u16 = 250;
+pub const RATE_MAX: u16 = 2000;
+pub const RATE_STEPS: [u16; 5] = [500, 625, 750, 875, 1000];
+
 /// A backing audio track attached to a bundle, plus the file position that
 /// lines up with recording time 0 (`audio_start_us`, from Task C).
 struct Backing {
@@ -135,6 +142,9 @@ pub struct PlayScreen {
     audio_parked: bool,
     /// Whether the "hear the song" feature is active.
     hear_song: bool,
+    /// Practice speed in permille (1000 = 1x). Scaled into the time entering
+    /// the session in `advance`, never into the chart.
+    rate_permille: u16,
     /// Manual pause (the `Space` key / `HostCommand::PlayTogglePause`). Freezes
     /// the clock + backing independently of wait-mode; while set the highway,
     /// playhead, and scoring clock hold their position.
@@ -238,6 +248,7 @@ impl PlayScreen {
             synth,
             song_synth,
             backing_gain: Gain::UNITY,
+            rate_permille: RATE_UNITY,
             shift_us: offset,
             backing: None,
             backing_handle: None,
@@ -417,7 +428,7 @@ impl PlayScreen {
                     h.fade_out(Duration::ZERO);
                 }
                 // A fresh sink starts at unity — carry the fader onto it.
-                h.set_gain(self.backing_gain);
+                h.set_gain(self.applied_backing_gain());
                 self.backing_handle = Some(h);
                 self.backing_drift.restart(self.now_us());
             }
@@ -509,6 +520,11 @@ impl PlayScreen {
     /// while frozen. With wait-mode disarmed the gate is always `Running`, so
     /// this is exactly the old free-running advance (no regression).
     pub fn advance(&mut self, dt_us: u64) {
+        let dt_us = if self.rate_permille == RATE_UNITY {
+            dt_us
+        } else {
+            dt_us * u64::from(self.rate_permille) / u64::from(RATE_UNITY)
+        };
         // The loop wraps BEFORE the gate poll, so a step at exactly `end_us`
         // (the next bar's first note) never freezes the loop.
         self.tick_loop();
@@ -659,13 +675,64 @@ impl PlayScreen {
         self.backing_gain
     }
 
+    /// The level the backing actually plays at: the mixer's, except silent
+    /// while the speed is not 1x (the recording cannot follow a changed rate).
+    pub fn applied_backing_gain(&self) -> Gain {
+        if self.rate_permille == RATE_UNITY {
+            self.backing_gain
+        } else {
+            Gain::SILENT
+        }
+    }
+
+    /// The current practice speed in permille.
+    pub fn rate_permille(&self) -> u16 {
+        self.rate_permille
+    }
+
+    /// Set the practice speed, clamped to `RATE_MIN..=RATE_MAX`; returns the
+    /// applied value. Leaving 1x mutes the backing; returning to 1x restarts
+    /// it at the clock's position (it ran on at full speed while muted).
+    pub fn set_rate(&mut self, rate_permille: u16) -> u16 {
+        let was_unity = self.rate_permille == RATE_UNITY;
+        self.rate_permille = rate_permille.clamp(RATE_MIN, RATE_MAX);
+        let is_unity = self.rate_permille == RATE_UNITY;
+        if was_unity && !is_unity {
+            if let Some(h) = &self.backing_handle {
+                h.set_gain(Gain::SILENT);
+            }
+        } else if !was_unity && is_unity {
+            // Drop the drifted handle; `tick_backing` re-arms it at the clock.
+            if let Some(h) = self.backing_handle.take() {
+                h.stop();
+            }
+        }
+        self.rate_permille
+    }
+
+    /// One step slower (`-`) or faster (`=`) through [`RATE_STEPS`]; from a
+    /// value off the steps, the nearest step in that direction. Never past
+    /// 1x, and it stays put when no step lies that way.
+    pub fn step_rate(&mut self, faster: bool) -> u16 {
+        let r = self.rate_permille;
+        let next = if faster {
+            RATE_STEPS.iter().copied().find(|&s| s > r)
+        } else {
+            RATE_STEPS.iter().rev().copied().find(|&s| s < r)
+        };
+        match next {
+            Some(s) => self.set_rate(s),
+            None => r,
+        }
+    }
+
     /// Set the backing track's level (M14-C). Applies to the live handle when
     /// the track is already playing, and is carried onto the sink the next
     /// [`tick_backing`](Self::tick_backing) creates.
     pub fn set_backing_gain(&mut self, gain: Gain) {
         self.backing_gain = gain;
         if let Some(h) = &self.backing_handle {
-            h.set_gain(gain);
+            h.set_gain(self.applied_backing_gain());
         }
     }
 
@@ -1132,7 +1199,16 @@ impl PlayScreen {
             Span::styled("[w] wait  ", Style::default().fg(wait_color)),
             Span::raw(format!("[c] {}  ", self.color_mode.label())),
             Span::raw(format!("[v] {}  ", self.scroll_mode.label())),
+            Span::raw("[-/=] speed  "),
         ];
+        if self.rate_permille != RATE_UNITY {
+            let badge = format!(" {:.2}× ", f64::from(self.rate_permille) / 1000.0);
+            spans.insert(
+                2,
+                Span::styled(badge, Style::default().fg(Color::Black).bg(Color::Cyan)),
+            );
+            spans.insert(3, Span::raw("  "));
+        }
         // The loop badge sits by the clock, where a narrow terminal still
         // shows it; with nothing marked, a key hint joins the others instead.
         match self.loop_view() {
@@ -2182,6 +2258,72 @@ mod tests {
         assert_eq!(play.now_us(), SHIFT, "one bar before the loop");
         assert_eq!(phase(&play), Some(LoopPhase::CountIn { next: Pass::Demo }));
         assert_eq!(loop_badge(&view), " Loop 2–3 · COUNT-IN · pass 1 ");
+    }
+
+    #[test]
+    fn advance_scales_by_the_rate() {
+        let mut play = loop_screen();
+        play.set_rate(500);
+        play.advance(1_000_000);
+        assert_eq!(play.now_us(), 500_000);
+        let mut play = loop_screen();
+        play.advance(1_000_000);
+        assert_eq!(play.now_us(), 1_000_000);
+    }
+
+    #[test]
+    fn rate_steps_walk_the_ladder_and_never_pass_unity() {
+        let mut play = loop_screen();
+        for _ in 0..5 {
+            play.step_rate(false);
+        }
+        assert_eq!(play.rate_permille(), 500);
+        assert_eq!(play.step_rate(true), 625);
+        play.set_rate(700);
+        assert_eq!(play.step_rate(false), 625);
+        play.set_rate(700);
+        assert_eq!(play.step_rate(true), 750);
+        play.set_rate(1000);
+        assert_eq!(play.step_rate(true), 1000);
+    }
+
+    #[test]
+    fn set_rate_clamps() {
+        let mut play = loop_screen();
+        assert_eq!(play.set_rate(100), 250);
+        assert_eq!(play.set_rate(5000), 2000);
+    }
+
+    #[test]
+    fn a_slowed_loop_count_in_takes_twice_the_wall_time() {
+        let mut play = loop_screen();
+        play.set_rate(500);
+        play.set_loop(1, 1);
+        assert_eq!(phase(&play), Some(LoopPhase::CountIn { next: Pass::Demo }));
+        // One count-in bar is 2 s of song time: 4 s of wall time at half speed.
+        for _ in 0..39 {
+            play.advance(100_000);
+        }
+        assert_eq!(phase(&play), Some(LoopPhase::CountIn { next: Pass::Demo }));
+        play.advance(100_000);
+        assert_eq!(phase(&play), Some(LoopPhase::Demo));
+        assert_eq!(play.now_us(), SHIFT + BAR);
+    }
+
+    #[test]
+    fn backing_is_muted_off_unity_and_restored_on_return() {
+        let mut play = loop_screen();
+        let mixer = Gain::new(0.6).unwrap();
+        play.set_backing_gain(mixer);
+        assert_eq!(play.applied_backing_gain(), mixer);
+        play.set_rate(750);
+        assert_eq!(play.applied_backing_gain(), Gain::SILENT);
+        assert_eq!(play.backing_gain(), mixer, "the mixer level is kept");
+        play.set_backing_gain(Gain::UNITY);
+        assert_eq!(play.applied_backing_gain(), Gain::SILENT);
+        play.set_backing_gain(mixer);
+        play.set_rate(1000);
+        assert_eq!(play.applied_backing_gain(), mixer);
     }
 
     #[test]
