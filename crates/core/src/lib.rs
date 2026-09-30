@@ -15,6 +15,7 @@ pub mod bars;
 pub mod buffer;
 pub mod chord;
 pub mod composer;
+pub mod drift;
 pub mod events;
 pub mod grid;
 pub mod hand;
@@ -40,6 +41,7 @@ pub use bars::BarMap;
 pub use buffer::EventBuffer;
 pub use chord::{ChordKind, Key, Scale};
 pub use composer::{Composer, ComposerSnapshot, Cursor, InputMode, NoteView, SelectionView};
+pub use drift::DriftGuard;
 pub use events::{
     interleave_by_time, InputEvent, MidiNote, NoteEvent, NoteEventKind, SustainEvent, Velocity,
 };
