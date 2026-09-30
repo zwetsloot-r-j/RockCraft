@@ -230,6 +230,38 @@ impl Shell {
         Ok(rockcraft_core::MixerReport::from(self.mixer))
     }
 
+    /// Apply a practice-loop change to the live play screen (M17-B) and report
+    /// `{ paused, bar, practice_loop }`. Fails cleanly off the play screen.
+    fn with_play(
+        &mut self,
+        command: &str,
+        change: impl FnOnce(&mut PlayScreen),
+    ) -> Result<serde_json::Value, rockcraft_control::HostError> {
+        let Screen::Play(play) = &mut self.screen else {
+            return Err(rockcraft_control::HostError::Failed {
+                command: command.into(),
+                detail: "no active play session".into(),
+            });
+        };
+        change(play);
+        let practice_loop = play.loop_view().map(|v| {
+            serde_json::json!({
+                "first_bar": v.first_bar,
+                "last_bar": v.last_bar,
+                "start_us": v.start_us,
+                "end_us": v.end_us,
+                "running": v.running,
+                "phase": v.phase.map(|p| p.name()),
+                "pass": v.pass,
+            })
+        });
+        Ok(serde_json::json!({
+            "paused": play.is_paused(),
+            "bar": play.current_bar(),
+            "practice_loop": practice_loop,
+        }))
+    }
+
     /// Build the current menu item list, injecting URL import when configured.
     fn menu_items(&self) -> Vec<&str> {
         let mut items: Vec<&str> = MENU_ITEMS_BASE.to_vec();
@@ -436,6 +468,16 @@ impl Shell {
                 KeyCode::Char(' ') => play.toggle_pause(),
                 KeyCode::Char('m') => play.toggle_hear_song(),
                 KeyCode::Char('w') => play.toggle_wait_mode(),
+                // The practice loop (M17-B): step bars, mark, loop.
+                KeyCode::Left => {
+                    play.step_bar(-1);
+                }
+                KeyCode::Right => {
+                    play.step_bar(1);
+                }
+                KeyCode::Char('[') => play.mark_loop_start(),
+                KeyCode::Char(']') => play.mark_loop_end(),
+                KeyCode::Char('l') => play.toggle_loop(),
                 KeyCode::Char('c') => {
                     self.color_mode = self.color_mode.next();
                     play.set_color_mode(self.color_mode);
@@ -853,13 +895,26 @@ impl rockcraft_control::HostServices for Shell {
                 }
             }
             HostCommand::PlayFinish => Err(HostError::Unsupported("play_finish".into())),
-            // The practice loop (M17-A) is a Tauri play-screen feature.
-            HostCommand::PlaySeekBar { .. } => Err(HostError::Unsupported("play_seek_bar".into())),
-            HostCommand::PlayMarkLoop { .. } => {
-                Err(HostError::Unsupported("play_mark_loop".into()))
+            // The practice loop (M17-B), mirroring the play-screen keys.
+            HostCommand::PlaySeekBar { delta } => self.with_play("play_seek_bar", |play| {
+                play.step_bar(delta);
+            }),
+            HostCommand::PlayMarkLoop { edge } => {
+                self.with_play("play_mark_loop", |play| match edge {
+                    rockcraft_control::LoopEdge::Start => play.mark_loop_start(),
+                    rockcraft_control::LoopEdge::End => play.mark_loop_end(),
+                })
             }
-            HostCommand::PlaySetLoop { .. } => Err(HostError::Unsupported("play_set_loop".into())),
-            HostCommand::PlayClearLoop => Err(HostError::Unsupported("play_clear_loop".into())),
+            HostCommand::PlaySetLoop {
+                first_bar,
+                last_bar,
+            } => self.with_play("play_set_loop", |play| {
+                play.set_loop(first_bar as u64, last_bar as u64);
+            }),
+            HostCommand::PlayClearLoop => self.with_play("play_clear_loop", |play| {
+                play.clear_loop();
+            }),
+            // The TUI has no practice-hand mode.
             HostCommand::PlaySetPractice { .. } => {
                 Err(HostError::Unsupported("play_set_practice".into()))
             }
@@ -1590,11 +1645,21 @@ mod tests {
         );
     }
 
-    /// The practice loop is Tauri-only: the TUI reports its commands
-    /// Unsupported (M17-A).
+    /// The TUI has no practice-hand mode: `play_set_practice` stays
+    /// Unsupported (M17-B).
     #[test]
-    fn practice_loop_commands_are_unsupported_in_the_tui() {
-        for cmd in [
+    fn play_set_practice_is_unsupported_in_the_tui() {
+        let mut shell = make_shell();
+        assert_eq!(
+            shell.dispatch(HostCommand::PlaySetPractice { hand: None }),
+            Err(rockcraft_control::HostError::Unsupported(
+                "play_set_practice".into()
+            ))
+        );
+    }
+
+    fn loop_commands() -> Vec<HostCommand> {
+        vec![
             HostCommand::PlaySeekBar { delta: -1 },
             HostCommand::PlayMarkLoop {
                 edge: rockcraft_control::LoopEdge::End,
@@ -1604,16 +1669,111 @@ mod tests {
                 last_bar: 3,
             },
             HostCommand::PlayClearLoop,
-            HostCommand::PlaySetPractice { hand: None },
-        ] {
+        ]
+    }
+
+    /// The practice-loop commands fail cleanly off the play screen (M17-B).
+    #[test]
+    fn practice_loop_commands_need_a_play_session() {
+        for cmd in loop_commands() {
             let name = cmd.name();
             let mut shell = make_shell();
-            assert_eq!(
-                shell.dispatch(cmd),
-                Err(rockcraft_control::HostError::Unsupported(name.into())),
+            assert!(
+                matches!(
+                    shell.dispatch(cmd),
+                    Err(rockcraft_control::HostError::Failed { .. })
+                ),
                 "{name}"
             );
         }
+    }
+
+    /// The shell on a play screen over a 16 s song (eight 2 s bars at the
+    /// default 120 BPM), long enough to step and loop bars.
+    fn shell_on_play() -> Shell {
+        use rockcraft_core::{MidiNote, NoteEvent, Velocity};
+        let v = Velocity::new(80).unwrap();
+        let events: Vec<NoteEvent> = (0..16u64)
+            .flat_map(|i| {
+                let n = MidiNote::new(60 + (i % 12) as u8).unwrap();
+                [
+                    NoteEvent::on(n, v, i * 1_000_000),
+                    NoteEvent::off(n, i * 1_000_000 + 500_000),
+                ]
+            })
+            .collect();
+        let bytes = rockcraft_midi::events_to_smf_bytes(&events);
+        let play = PlayScreen::from_smf_bytes("loop".into(), &bytes, None).expect("load song");
+        let mut shell = make_shell();
+        shell.screen = Screen::Play(Box::new(shell.tuned(play)));
+        shell
+    }
+
+    /// On the play screen the loop commands drive the loop and report it
+    /// (M17-B).
+    #[test]
+    fn practice_loop_commands_drive_the_play_screen() {
+        let mut shell = shell_on_play();
+        let set = shell
+            .dispatch(HostCommand::PlaySetLoop {
+                first_bar: 3,
+                last_bar: 2,
+            })
+            .expect("set loop");
+        let lp = &set["practice_loop"];
+        assert_eq!(
+            (lp["first_bar"].as_u64(), lp["last_bar"].as_u64()),
+            (Some(2), Some(3))
+        );
+        assert_eq!(lp["running"], true);
+        assert_eq!(lp["phase"], "count_in");
+        assert_eq!(lp["pass"], 1);
+        assert_eq!(set["paused"], false);
+
+        // Seeking is refused while looping; stopping pauses at the loop start.
+        let seek = shell
+            .dispatch(HostCommand::PlaySeekBar { delta: 1 })
+            .expect("seek");
+        assert_eq!(seek["practice_loop"]["running"], true);
+        let stop = shell.dispatch(HostCommand::PlayClearLoop).expect("stop");
+        assert_eq!(stop["practice_loop"]["running"], false);
+        assert_eq!(stop["paused"], true);
+        assert_eq!(stop["bar"], 2);
+
+        // With no loop running, clearing again drops the marks.
+        let cleared = shell.dispatch(HostCommand::PlayClearLoop).expect("clear");
+        assert!(cleared["practice_loop"].is_null());
+
+        // Marking an edge marks the bar under the playhead.
+        let marked = shell
+            .dispatch(HostCommand::PlayMarkLoop {
+                edge: rockcraft_control::LoopEdge::Start,
+            })
+            .expect("mark");
+        assert_eq!(marked["practice_loop"]["first_bar"], 2);
+        assert_eq!(marked["practice_loop"]["running"], false);
+    }
+
+    /// The loop keys reach the play screen (M17-B).
+    #[test]
+    fn loop_keys_drive_the_play_screen() {
+        let mut shell = shell_on_play();
+        shell.on_key(KeyCode::Right);
+        shell.on_key(KeyCode::Right);
+        assert!(play_screen(&shell).is_paused(), "→ pauses");
+        assert_eq!(play_screen(&shell).current_bar(), 2);
+        shell.on_key(KeyCode::Char('['));
+        shell.on_key(KeyCode::Right);
+        shell.on_key(KeyCode::Char(']'));
+        shell.on_key(KeyCode::Left);
+        let view = play_screen(&shell).loop_view().expect("marked");
+        assert_eq!((view.first_bar, view.last_bar, view.running), (2, 3, false));
+        assert_eq!(play_screen(&shell).current_bar(), 2, "← steps back");
+
+        shell.on_key(KeyCode::Char('l'));
+        assert!(play_screen(&shell).loop_view().unwrap().running);
+        shell.on_key(KeyCode::Char('l'));
+        assert!(!play_screen(&shell).loop_view().unwrap().running);
     }
 
     /// `play_toggle_pause` off the play screen is a clean no-op error, not a
