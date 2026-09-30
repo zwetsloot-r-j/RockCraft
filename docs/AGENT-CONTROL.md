@@ -453,6 +453,8 @@ below is an at-a-glance convenience only.
 | `detect_tempo_map` | `{ beats_per_bar?: u8, anchor_us?: u64, tempo_hint_bpm?: f64 }` | Detect a per-bar tempo map from the loaded piece's backing audio (`tools/tempo-map`, python3 + numpy) and install it via `set_bar_starts` — bar lines follow a performance whose tempo breathes. `anchor_us` is a known downbeat in song time; `tempo_hint_bpm` resolves half/double time. Grid-only: no note moves. Returns `{ bars, bpm, pulse_bpm, anchor_us, snapshot }` |
 | `app_quit` | none | Shut the app down gracefully (exit 0); the socket closes as the process exits |
 
+The TUI remembers the mix: every change (from its `x` mixer overlay or from `set_instrument` / `set_bus_gain` over the socket) is saved to `tui-settings.json` (`$ROCKCRAFT_CONFIG_DIR`, else the platform config dir) and loaded on the next start.
+
 Not every frontend supports every command: the TUI's record/import/backing
 flows are interactive screen state machines, so it returns `unsupported:` for
 those (it wires `scan_library`, `query_dirty`, `play_load`, the mixer trio, and

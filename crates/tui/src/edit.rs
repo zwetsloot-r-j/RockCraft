@@ -1953,7 +1953,7 @@ impl EditScreen {
             ),
             vel_span,
             Span::styled(
-                "[a/x] add/del  [A/Z] insert/cut bar  [Q/W] bar -/+ step  [e/r] bar faster/slower  []/[] size  [+/-] vel  [(/)] tempo  [T] set BPM  [:/\"] origin  [I/O] origin±  [m] grab  [n] hand  [c] chord  [v] select  [y/p/D] yank/paste/del  [u/U] undo/redo  [R] rec  [t] step/live  [C] count-in  [Space] play/stop  [P] play-start  [o] loop  [{/}] loop in/out  [M] metro  [>/<] subdiv  [hjkl] pitch/time  [H/L] bar  [w/b] oct  [g/G] timeline ends  [0/$] pitch ends  [s] save  [S] save to library  [X] split  [Tab] menu",
+                "[a/d] add/del  [A/Z] insert/cut bar  [Q/W] bar -/+ step  [e/r] bar faster/slower  []/[] size  [+/-] vel  [(/)] tempo  [T] set BPM  [:/\"] origin  [I/O] origin±  [m] grab  [n] hand  [c] chord  [v] select  [y/p/D] yank/paste/del  [u/U] undo/redo  [R] rec  [t] step/live  [C] count-in  [Space] play/stop  [P] play-start  [o] loop  [{/}] loop in/out  [M] metro  [>/<] subdiv  [hjkl] pitch/time  [H/L] bar  [w/b] oct  [g/G] timeline ends  [0/$] pitch ends  [s] save  [S] save to library  [X] split  [x] mix  [Tab] menu",
                 Style::default().fg(Color::DarkGray),
             ),
         ]);

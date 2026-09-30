@@ -10,7 +10,7 @@ use std::sync::Arc;
 use rockcraft_audio::AudioOut;
 use rockcraft_control::{CommandServer, RemoteCommand};
 use rockcraft_midi::{LiveInput, MockKeyboard, NoteSource};
-use rockcraft_tui::app;
+use rockcraft_tui::{app, settings};
 use tokio::sync::{mpsc, oneshot};
 
 /// Default control-server bind address: an OS-assigned loopback port. Override
@@ -60,6 +60,17 @@ fn main() {
         }
     };
     let synth = audio.as_ref().map(AudioOut::synth);
+
+    // The remembered mix (M18-A). A bad file never stops startup: warn once
+    // here, before the terminal UI takes over, and use defaults per bad field.
+    let settings_path = settings::settings_path();
+    let saved_mixer = settings_path.as_deref().map(|path| {
+        let (loaded, warnings) = settings::load(path);
+        for w in &warnings {
+            eprintln!("Settings: {w}");
+        }
+        loaded.mixer
+    });
     let backing_out = audio.as_ref().map(AudioOut::backing_out);
 
     // Live keys are sounded straight from the MIDI thread (the low-latency
@@ -128,7 +139,17 @@ fn main() {
         backing_out,
         echo: echo_live.then_some(echo),
     };
-    let result = app::run(input, audio_links, backing_path, start_edit, commands);
+    let result = app::run(
+        input,
+        audio_links,
+        backing_path,
+        start_edit,
+        commands,
+        app::Remembered {
+            path: settings_path,
+            mixer: saved_mixer,
+        },
+    );
 
     // Signal the server to stop and join its thread before exiting.
     if let Some((shutdown, thread)) = shutdown {
