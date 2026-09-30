@@ -56,6 +56,14 @@ const CLICK_VEL_NORMAL: u8 = 80;
 /// How long a click rings before it is released.
 const CLICK_DUR_US: u64 = 50_000;
 
+/// How long the song voice and the backing take to fade out when the
+/// transport stops (a wait-mode freeze or a pause) — soft, not a dead stop.
+/// The same as the desktop app's.
+const FREEZE_FADE: Duration = Duration::from_millis(250);
+/// How long they take to come back when it resumes: just enough to avoid a
+/// click, short enough to feel instant.
+const THAW_FADE: Duration = Duration::from_millis(15);
+
 /// A backing audio track attached to a bundle, plus the file position that
 /// lines up with recording time 0 (`audio_start_us`, from Task C).
 struct Backing {
@@ -122,6 +130,9 @@ pub struct PlayScreen {
     backing_drift: DriftGuard,
     /// How many times the backing was re-seeked this take (status line).
     backing_resyncs: u32,
+    /// Whether the song voice and the backing are faded out for a stopped
+    /// transport (see [`sync_parked_audio`](Self::sync_parked_audio)).
+    audio_parked: bool,
     /// Whether the "hear the song" feature is active.
     hear_song: bool,
     /// Manual pause (the `Space` key / `HostCommand::PlayTogglePause`). Freezes
@@ -233,6 +244,7 @@ impl PlayScreen {
             backing_track: None,
             backing_drift: DriftGuard::new(),
             backing_resyncs: 0,
+            audio_parked: false,
             hear_song: false,
             paused: false,
             song_on_fired: HashSet::new(),
@@ -349,6 +361,8 @@ impl PlayScreen {
             h.stop();
         }
         self.backing_resyncs = 0;
+        // `all_off` above brought every synth bus back to full level.
+        self.audio_parked = false;
     }
 
     /// The file position the backing track should be at for clock `now_us`, or
@@ -370,6 +384,7 @@ impl PlayScreen {
     /// starts once it is ready — at the position the clock has reached by then,
     /// so it joins in step rather than trailing the notes.
     pub fn tick_backing(&mut self, out: Option<&BackingOut>) {
+        self.sync_parked_audio();
         if self.backing_handle.is_some() {
             self.keep_backing_in_step();
             return;
@@ -396,10 +411,10 @@ impl PlayScreen {
         };
         match out.play_at(&track, Duration::from_micros(pos_us)) {
             Ok(h) => {
-                // If the highway is frozen by wait-mode at the moment the
-                // backing arms, start it paused so it never gets ahead.
-                if !self.clock.is_running() {
-                    h.pause();
+                // If the transport is stopped at the moment the backing arms,
+                // start it silent and held; the thaw re-seeks and fades it in.
+                if self.audio_parked {
+                    h.fade_out(Duration::ZERO);
                 }
                 // A fresh sink starts at unity — carry the fader onto it.
                 h.set_gain(self.backing_gain);
@@ -414,20 +429,63 @@ impl PlayScreen {
     }
 
     /// Re-seek the playing backing when it has drifted from the clock (see
-    /// `core::DriftGuard`). Only while both run: a frozen clock pauses the
-    /// backing, and the guard would read that as drift.
+    /// `core::DriftGuard`). Only while both run: a stopped transport fades the
+    /// backing out and holds it, and the guard would read that as drift.
     fn keep_backing_in_step(&mut self) {
         let now = self.now_us();
         let (Some(h), Some(target)) = (&self.backing_handle, self.backing_target_us(now)) else {
             return;
         };
-        if !self.clock.is_running() || h.is_paused() {
+        if !self.clock.is_running() || self.audio_parked {
             return;
         }
         let position = h.position().as_micros() as u64;
         if let Some(seek) = self.backing_drift.check(now, target, position) {
             h.seek(Duration::from_micros(seek));
             self.backing_resyncs += 1;
+        }
+    }
+
+    /// Whether the transport is held at the clock's *current* position: paused,
+    /// or parked on an unsatisfied wait step. Unlike the state going into
+    /// [`advance`](Self::advance), this is already true on the very tick the
+    /// clock lands on the step's onset. Re-polls the gate — an idempotent read.
+    pub fn parked(&mut self) -> bool {
+        self.paused || self.wait.poll(self.clock.now_us()) == GateState::Frozen
+    }
+
+    /// Fade the song voice and the backing out when the transport stops, and
+    /// back in when it resumes — the desktop app's freeze fade. Acts only on a
+    /// change, so it is cheap to call every tick.
+    ///
+    /// Keyed off [`parked`](Self::parked) rather than the clock: in legato
+    /// music the notes before a wait step end exactly at its onset, on the very
+    /// tick the clock lands there, and must fade with the rest rather than be
+    /// released a tick before the freeze is seen. The backing keeps running
+    /// (silent) through its fade, so the thaw re-seeks it to the clock.
+    fn sync_parked_audio(&mut self) {
+        let parked = self.parked();
+        if parked == self.audio_parked {
+            return;
+        }
+        self.audio_parked = parked;
+        if parked {
+            if let Some(s) = &self.song_synth {
+                s.fade_out(FREEZE_FADE);
+            }
+            if let Some(h) = &self.backing_handle {
+                h.fade_out(FREEZE_FADE);
+            }
+        } else {
+            if let Some(s) = &self.song_synth {
+                s.fade_in(THAW_FADE);
+            }
+            let now = self.now_us();
+            if let (Some(h), Some(target)) = (&self.backing_handle, self.backing_target_us(now)) {
+                h.seek(Duration::from_micros(target));
+                h.fade_in(THAW_FADE);
+                self.backing_drift.restart(now);
+            }
         }
     }
 
@@ -459,22 +517,26 @@ impl PlayScreen {
         let wait_frozen = self.wait.poll(self.clock.now_us()) == GateState::Frozen;
         // A manual pause freezes the transport just like an unsatisfied wait step.
         let frozen = self.paused || wait_frozen;
-        // Only act on the running↔frozen transition so we don't spam the audio
-        // thread with pause/resume commands every frame.
+        // The audio follows in `sync_parked_audio` (a fade, not a dead stop).
         if frozen && self.clock.is_running() {
             self.clock.pause();
-            if let Some(h) = &self.backing_handle {
-                h.pause();
-            }
         } else if !frozen && !self.clock.is_running() {
             self.clock.resume();
-            if let Some(h) = &self.backing_handle {
-                h.resume();
+        }
+        // Land exactly on the next wait step's onset rather than past it, so
+        // the freeze is seen on that same tick — before the song releases the
+        // notes ending there — and the note sits on the keyboard line.
+        let mut step_us = dt_us;
+        if !frozen && self.wait.is_armed() {
+            if let Some(next) = self.wait.next_step_time() {
+                let now = self.clock.now_us();
+                if next > now {
+                    step_us = step_us.min(next - now);
+                }
             }
         }
-        // Land exactly on the loop's next boundary (loop start after a
-        // count-in, loop end after a pass), so phases switch on the downbeat.
-        let mut step_us = dt_us;
+        // Likewise the loop's next boundary (loop start after a count-in, loop
+        // end after a pass), so phases switch on the downbeat.
         if !frozen {
             if let Some(boundary) = self.loop_boundary() {
                 let now = self.clock.now_us();
@@ -498,12 +560,9 @@ impl PlayScreen {
     pub fn toggle_pause(&mut self) {
         self.paused = !self.paused;
         if self.paused {
-            // Freeze now so audio stops on the keystroke, not a frame later.
+            // Freeze now so audio fades on the keystroke, not a frame later.
             if self.clock.is_running() {
                 self.clock.pause();
-                if let Some(h) = &self.backing_handle {
-                    h.pause();
-                }
             }
         } else {
             // Resume immediately — unless wait-mode is currently holding an
@@ -513,11 +572,9 @@ impl PlayScreen {
             let wait_frozen = self.wait.poll(self.clock.now_us()) == GateState::Frozen;
             if !wait_frozen && !self.clock.is_running() {
                 self.clock.resume();
-                if let Some(h) = &self.backing_handle {
-                    h.resume();
-                }
             }
         }
+        self.sync_parked_audio();
     }
 
     /// Is the session manually paused? (For the play HUD / control snapshot.)
@@ -541,12 +598,10 @@ impl PlayScreen {
             .as_ref()
             .is_none_or(|rl| rl.lp.phase() == LoopPhase::YourTurn);
         self.wait.set_armed(on && gated);
-        if !on && !self.clock.is_running() {
+        if !on && !self.paused && !self.clock.is_running() {
             self.clock.resume();
-            if let Some(h) = &self.backing_handle {
-                h.resume();
-            }
         }
+        self.sync_parked_audio();
     }
 
     /// Is wait-mode armed? (For the status line / control snapshot.)
@@ -625,6 +680,14 @@ impl PlayScreen {
     /// Call this once per event-loop iteration (not per render frame) to keep
     /// audio timing driven by the clock rather than the frame rate.
     pub fn tick_song_synth(&mut self) {
+        // While the transport is stopped, hold the song back: its releases, so
+        // the fade carries the sounding notes out instead of a damper cutting
+        // them; its onsets, so it comes back in with the key you are waiting
+        // on rather than before it.
+        self.sync_parked_audio();
+        if self.audio_parked {
+            return;
+        }
         let now = self.now_us();
         let (need_on, need_off) =
             pending_triggers(&self.spans, now, &self.song_on_fired, &self.song_off_fired);
@@ -751,10 +814,8 @@ impl PlayScreen {
         self.paused = true;
         if self.clock.is_running() {
             self.clock.pause();
-            if let Some(h) = &self.backing_handle {
-                h.pause();
-            }
         }
+        self.sync_parked_audio();
     }
 
     /// `←` / `→`: pause, then jump to the start of the bar `delta` bars from
@@ -1612,6 +1673,87 @@ mod tests {
 
     fn note_off(play: &mut PlayScreen, pitch: u8) {
         play.ingest(NoteEvent::off(MidiNote::new(pitch).unwrap(), 0));
+    }
+
+    // ── freeze fade ──────────────────────────────────────────────────────
+
+    /// Legato: C over 0–1 s, then D over 1–2 s, so C ends exactly where D (a
+    /// wait step) begins. Shifted: C at `SHIFT`, D at `SHIFT + 1 s`.
+    fn legato_screen() -> PlayScreen {
+        let c = MidiNote::new(60).unwrap();
+        let d = MidiNote::new(62).unwrap();
+        let v = Velocity::new(80).unwrap();
+        let events = vec![
+            NoteEvent::on(c, v, 0),
+            NoteEvent::off(c, 1_000_000),
+            NoteEvent::on(d, v, 1_000_000),
+            NoteEvent::off(d, 2_000_000),
+        ];
+        PlayScreen::from_smf_bytes("legato".into(), &events_to_smf_bytes(&events), None)
+            .unwrap()
+            .with_hear_song(true)
+    }
+
+    #[test]
+    fn a_long_tick_lands_on_the_wait_step_and_parks_there() {
+        let mut play = two_note_screen();
+        play.set_wait_mode(true);
+        // One long tick from the top would overshoot C's onset; it stops on it.
+        play.advance(SHIFT + 400_000);
+        assert_eq!(play.now_us(), SHIFT);
+        assert!(play.parked(), "parked on the very tick it lands");
+    }
+
+    #[test]
+    fn a_wait_freeze_fades_the_song_instead_of_releasing_it() {
+        let mut play = legato_screen();
+        play.set_wait_mode(true);
+        note_on(&mut play, 60);
+        play.advance(SHIFT);
+        play.tick_song_synth();
+        let c = 0;
+        assert!(play.song_on_fired.contains(&c), "C sounds");
+        // One long tick reaches D's onset, where C ends: the freeze is seen
+        // on that tick, so C's release is held for the fade to carry out.
+        note_off(&mut play, 60);
+        play.advance(2_000_000);
+        assert_eq!(play.now_us(), SHIFT + 1_000_000);
+        play.tick_song_synth();
+        assert!(play.audio_parked);
+        assert!(!play.song_off_fired.contains(&c), "C fades, not cut");
+        // Play D: the song comes back with it.
+        note_on(&mut play, 62);
+        play.advance(10_000);
+        play.tick_song_synth();
+        assert!(!play.audio_parked);
+        assert!(play.song_off_fired.contains(&c));
+        assert!(play.song_on_fired.contains(&1), "D sounds on the thaw");
+    }
+
+    #[test]
+    fn pausing_fades_at_once_and_resuming_brings_it_back() {
+        let mut play = legato_screen();
+        play.advance(SHIFT + 100_000);
+        play.tick_song_synth();
+        play.toggle_pause();
+        assert!(play.audio_parked, "on the keystroke, not a tick later");
+        // Nothing fires while paused, even past a note boundary on resume's
+        // side of things.
+        let fired = play.song_on_fired.len();
+        play.advance(2_000_000);
+        play.tick_song_synth();
+        assert_eq!(play.song_on_fired.len(), fired);
+        play.toggle_pause();
+        assert!(!play.audio_parked);
+    }
+
+    #[test]
+    fn restart_clears_the_parked_audio() {
+        let mut play = legato_screen();
+        play.toggle_pause();
+        assert!(play.audio_parked);
+        play.restart();
+        assert!(!play.audio_parked);
     }
 
     /// C at t=0 then D at t=1s. After the whole-song shift the steps fall at
