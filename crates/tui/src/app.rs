@@ -23,7 +23,7 @@ use ratatui::{
 use rockcraft_audio::{BackingOut, SynthHandle};
 use rockcraft_control::{QueryKind, RemoteCommand, Request, Response};
 use rockcraft_core::{
-    Grid, HandOverride, Key, Mixer, RecordingMeta, Scale, SynthBus, Timeline, TrackOrigin,
+    Grid, Hand, HandOverride, Key, Mixer, RecordingMeta, Scale, SynthBus, Timeline, TrackOrigin,
     DEFAULT_SPLIT,
 };
 use rockcraft_import::{fetch_command_configured, ImportInput};
@@ -468,6 +468,8 @@ impl Shell {
                 KeyCode::Char(' ') => play.toggle_pause(),
                 KeyCode::Char('m') => play.toggle_hear_song(),
                 KeyCode::Char('w') => play.toggle_wait_mode(),
+                // Practise one hand (M18-C): both → right → left.
+                KeyCode::Char('h') => play.cycle_practice(),
                 // The practice loop (M17-B): step bars, mark, loop.
                 KeyCode::Left => {
                     play.step_bar(-1);
@@ -914,9 +916,16 @@ impl rockcraft_control::HostServices for Shell {
             HostCommand::PlayClearLoop => self.with_play("play_clear_loop", |play| {
                 play.clear_loop();
             }),
-            // The TUI has no practice-hand mode.
-            HostCommand::PlaySetPractice { .. } => {
-                Err(HostError::Unsupported("play_set_practice".into()))
+            // Practise one hand (M18-C), mirroring the `h` key.
+            HostCommand::PlaySetPractice { hand } => {
+                let Screen::Play(play) = &mut self.screen else {
+                    return Err(HostError::Failed {
+                        command: "play_set_practice".into(),
+                        detail: "no active play session".into(),
+                    });
+                };
+                play.set_practice(hand);
+                Ok(serde_json::json!({ "practice": practice_name(play.practice()) }))
             }
             HostCommand::RecordStart { .. } => Err(HostError::Unsupported("record_start".into())),
             HostCommand::RecordStop => Err(HostError::Unsupported("record_stop".into())),
@@ -1426,6 +1435,15 @@ fn load_play_screen(
     Ok(play.with_hear_song(!has_backing))
 }
 
+/// The practised hand as `play_set_practice` reports it (M18-C).
+fn practice_name(practice: Option<Hand>) -> &'static str {
+    match practice {
+        None => "both",
+        Some(Hand::Left) => "left",
+        Some(Hand::Right) => "right",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1645,17 +1663,45 @@ mod tests {
         );
     }
 
-    /// The TUI has no practice-hand mode: `play_set_practice` stays
-    /// Unsupported (M17-B).
+    /// `play_set_practice` fails cleanly off the play screen (M18-C).
     #[test]
-    fn play_set_practice_is_unsupported_in_the_tui() {
+    fn play_set_practice_needs_a_play_session() {
         let mut shell = make_shell();
-        assert_eq!(
-            shell.dispatch(HostCommand::PlaySetPractice { hand: None }),
-            Err(rockcraft_control::HostError::Unsupported(
-                "play_set_practice".into()
-            ))
-        );
+        assert!(matches!(
+            shell.dispatch(HostCommand::PlaySetPractice {
+                hand: Some(Hand::Left)
+            }),
+            Err(rockcraft_control::HostError::Failed { .. })
+        ));
+    }
+
+    /// On the play screen `play_set_practice` sets the hand and reports it
+    /// (M18-C).
+    #[test]
+    fn play_set_practice_drives_the_play_screen() {
+        let mut shell = shell_on_play();
+        for (hand, name) in [
+            (Some(Hand::Left), "left"),
+            (Some(Hand::Right), "right"),
+            (None, "both"),
+        ] {
+            let out = shell
+                .dispatch(HostCommand::PlaySetPractice { hand })
+                .expect("set practice");
+            assert_eq!(out["practice"], name);
+            assert_eq!(play_screen(&shell).practice(), hand);
+        }
+    }
+
+    /// `h` cycles the practised hand: both → right → left → both (M18-C).
+    #[test]
+    fn h_cycles_the_practised_hand() {
+        let mut shell = shell_on_play();
+        assert_eq!(play_screen(&shell).practice(), None);
+        for want in [Some(Hand::Right), Some(Hand::Left), None] {
+            shell.on_key(KeyCode::Char('h'));
+            assert_eq!(play_screen(&shell).practice(), want);
+        }
     }
 
     fn loop_commands() -> Vec<HostCommand> {
