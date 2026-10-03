@@ -104,8 +104,8 @@ pub struct Shell {
     /// headless tests) leaves every backing track silent.
     backing_out: Option<BackingOut>,
     /// Set when the live piano sounds its own keys from the MIDI thread
-    /// ([`AudioLinks::echo`]); the shell switches it per screen and must not
-    /// sound those keys again itself.
+    /// ([`AudioLinks::echo`]); the shell must not sound those keys again
+    /// itself.
     echo: Option<Arc<AtomicBool>>,
     pub(crate) screen: Screen,
     menu_state: ListState,
@@ -175,14 +175,13 @@ impl Shell {
         backing_out: Option<BackingOut>,
         echo: Option<Arc<AtomicBool>>,
     ) {
+        // Every screen sounds your keys — menus and pickers included — so
+        // the echo is on for the whole run.
+        if let Some(flag) = &echo {
+            flag.store(true, Ordering::Relaxed);
+        }
         self.backing_out = backing_out;
         self.echo = echo;
-    }
-
-    /// Whether live keys should be sounded on the current screen: the play and
-    /// edit screens echo what you play; the menus and pickers stay silent.
-    fn screen_sounds_keys(&self) -> bool {
-        matches!(self.screen, Screen::Play(_) | Screen::Edit(_))
     }
 
     /// Override the fetch-command capability flag — used in tests.
@@ -1109,21 +1108,9 @@ pub fn run_loop<B: ratatui::backend::Backend>(
 
         // Drain MIDI and route to the active screen. Clone the synth handle out
         // first so we don't hold a borrow of `shell` across the screen match.
-        // Live keys already echo from the MIDI thread on screens that sound
-        // them (`echoed`); otherwise the shell sounds them here as it drains.
-        let echoed = match &shell.echo {
-            Some(flag) => {
-                let on = shell.screen_sounds_keys();
-                if flag.swap(on, Ordering::Relaxed) != on && !on {
-                    // Leaving a sounding screen with keys down: don't strand them.
-                    if let Some(s) = &shell.synth {
-                        s.all_off();
-                    }
-                }
-                true
-            }
-            None => false,
-        };
+        // Live keys already echo from the MIDI thread (`echoed`); otherwise the
+        // shell sounds them here as it drains, on every screen.
+        let echoed = shell.echo.is_some();
         let synth = if echoed { None } else { shell.synth.clone() };
         let notes = shell.input.events();
         let sustain = shell.input.sustain_events();
@@ -1132,18 +1119,16 @@ pub fn run_loop<B: ratatui::backend::Backend>(
         for input in rockcraft_core::interleave_by_time(&notes, &sustain) {
             let ev = match input {
                 rockcraft_core::InputEvent::Note(ev) => ev,
-                // The pedal only shapes how your own keys sound, on the
-                // screens that echo them — and when the MIDI thread echoes,
-                // it has already sounded the pedal too.
+                // The pedal only shapes how your own keys sound — and when the
+                // MIDI thread echoes, it has already sounded the pedal too.
                 rockcraft_core::InputEvent::Sustain(p) => {
                     match &mut shell.screen {
                         Screen::Play(play) if !echoed => play.apply_sustain(&p),
-                        Screen::Edit(_) => {
+                        _ => {
                             if let Some(s) = &synth {
                                 s.apply_sustain(&p);
                             }
                         }
-                        _ => {}
                     }
                     continue;
                 }
@@ -1161,13 +1146,18 @@ pub fn run_loop<B: ratatui::backend::Backend>(
                         s.apply(&ev);
                     }
                 }
-                // These screens ignore live MIDI input.
+                // These screens ignore live MIDI input, but still sound it so
+                // the piano is never mute while you browse.
                 Screen::Menu
                 | Screen::BackingPicker { .. }
                 | Screen::SourcePicker(_)
                 | Screen::UrlInput(_)
                 | Screen::Importing(_)
-                | Screen::Library(_) => {}
+                | Screen::Library(_) => {
+                    if let Some(s) = &synth {
+                        s.apply(&ev);
+                    }
+                }
             }
         }
 
