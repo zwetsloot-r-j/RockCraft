@@ -18,6 +18,26 @@ export const noteName = (n: number): string =>
 // 12-hue spectrum by pitch class (Spectrum prototype). Even wheel, fixed L/C.
 export const spectrumHue = (n: number): number => (pitchClass(n) * 30 + 8) % 360;
 
+// C and B are neighbours on the wheel (8° vs 338°) and read alike, so pull them
+// apart: C to a deeper, clearer red, B to a softer pink. Mirrors
+// `spectrum_tone` in crates/tui/src/palette.rs.
+function spectrumTone(n: number, l: number, c: number): [number, number, number] {
+  switch (pitchClass(n)) {
+    case 0:
+      return [clamp(l - 0.12, 0, 1), c + 0.03, 25];
+    case 11:
+      return [clamp(l + 0.1, 0, 1), c * 0.5, 350];
+    default:
+      return [l, c, spectrumHue(n)];
+  }
+}
+
+// The spectrum colour of a note as CSS `oklch()`, from a base lightness/chroma.
+export function spectrumColor(n: number, l: number, c: number): string {
+  const [tl, tc, th] = spectrumTone(n, l, c);
+  return `oklch(${tl.toFixed(3)} ${tc.toFixed(3)} ${th})`;
+}
+
 export const lerp = (a: number, b: number, t: number): number => a + (b - a) * t;
 export const clamp = (v: number, a: number, b: number): number =>
   Math.max(a, Math.min(b, v));
