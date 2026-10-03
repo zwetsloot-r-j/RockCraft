@@ -28,7 +28,7 @@ import {
   noteName,
   roundRect,
   shade,
-  spectrumHue,
+  spectrumColor,
   tailGapPx,
   withAlpha,
 } from "./utils";
@@ -231,7 +231,7 @@ export class HighwayCanvas {
       // keeps the judgment red — its point is that no note landed.
       const laneCol =
         this.cfg.colorMode === "spectrum" && j.level !== "subtle"
-          ? `oklch(0.78 0.16 ${spectrumHue(j.note)})`
+          ? spectrumColor(j.note, 0.78, 0.16)
           : fx.color;
       this.spawnFx(lane, laneCol, fx.sparks, fx.flashAlpha, fx.flashSpread, fx.flashMs);
     }
@@ -396,8 +396,7 @@ export class HighwayCanvas {
   private noteColor(nt: NoteSpan, light = 0): string {
     const c = this.cfg;
     if (c.colorMode === "spectrum") {
-      const h = spectrumHue(nt.note);
-      return `oklch(${0.7 + light * 0.12} 0.16 ${h})`;
+      return spectrumColor(nt.note, 0.7 + light * 0.12, 0.16);
     }
     if (c.colorMode === "accent") return c.accent;
     return c.handColors[nt.hand] || c.accent;
@@ -813,8 +812,7 @@ export class HighwayCanvas {
   private keyTint(note: number, hand: "L" | "R", black = false): string {
     const c = this.cfg;
     if (c.colorMode === "spectrum") {
-      const h = spectrumHue(note);
-      return `oklch(${black ? 0.55 : 0.78} 0.15 ${h})`;
+      return spectrumColor(note, black ? 0.55 : 0.78, 0.15);
     }
     const base = c.colorMode === "accent" ? c.accent : c.handColors[hand] || c.accent;
     return black ? shade(base, -0.15) : base;
