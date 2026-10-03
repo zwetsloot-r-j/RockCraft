@@ -135,6 +135,9 @@ pub struct Shell {
     color_mode: ColorMode,
     /// How the play highway scrolls; shell-wide like `color_mode`.
     scroll_mode: ScrollMode,
+    /// Practice speed in permille; shell-wide like `color_mode`, so a slowed
+    /// piece stays slowed when you come back to it.
+    rate_permille: u16,
 }
 
 impl Shell {
@@ -161,6 +164,7 @@ impl Shell {
             mixer: Mixer::new(),
             color_mode: ColorMode::default(),
             scroll_mode: ScrollMode::default(),
+            rate_permille: crate::play::PLAY_RATE_UNITY,
         }
     }
 
@@ -196,6 +200,7 @@ impl Shell {
         play.set_backing_gain(self.mixer.backing_gain);
         play.set_color_mode(self.color_mode);
         play.set_scroll_mode(self.scroll_mode);
+        play.set_rate(self.rate_permille);
         play
     }
 
@@ -468,11 +473,12 @@ impl Shell {
                 KeyCode::Char(' ') => play.toggle_pause(),
                 KeyCode::Char('m') => play.toggle_hear_song(),
                 KeyCode::Char('w') => play.toggle_wait_mode(),
-                KeyCode::Char('-') => {
-                    play.step_rate(false);
+                // Practice speed, one step slower / faster (never past 1×).
+                KeyCode::Char('-') | KeyCode::Char('_') => {
+                    self.rate_permille = play.nudge_rate(false);
                 }
-                KeyCode::Char('=') => {
-                    play.step_rate(true);
+                KeyCode::Char('=') | KeyCode::Char('+') => {
+                    self.rate_permille = play.nudge_rate(true);
                 }
                 // The practice loop (M17-B): step bars, mark, loop.
                 KeyCode::Left => {
@@ -883,11 +889,16 @@ impl rockcraft_control::HostServices for Shell {
             HostCommand::SplitBundle { .. } => Err(HostError::Unsupported("split_bundle".into())),
             HostCommand::PlaySetWait { .. } => Err(HostError::Unsupported("play_set_wait".into())),
             HostCommand::PlaySetRate { rate_permille } => {
-                let mut applied = 0;
-                self.with_play("play_set_rate", |play| {
-                    applied = play.set_rate(rate_permille)
-                })?;
-                Ok(json!({ "rate_permille": applied }))
+                if let Screen::Play(play) = &mut self.screen {
+                    let applied = play.set_rate(rate_permille);
+                    self.rate_permille = applied;
+                    Ok(json!({ "rate_permille": applied }))
+                } else {
+                    Err(HostError::Failed {
+                        command: "play_set_rate".into(),
+                        detail: "no active play session".into(),
+                    })
+                }
             }
             HostCommand::PlayStatus => Err(HostError::Unsupported("play_status".into())),
             HostCommand::PlayToggleHearSong => {
@@ -1605,28 +1616,6 @@ mod tests {
         assert_eq!(shell.mixer().player.gain, rockcraft_core::Gain::UNITY);
     }
 
-    /// `-` / `=` and `play_set_rate` reach the play screen; the command fails
-    /// cleanly off it.
-    #[test]
-    fn speed_keys_and_play_set_rate_reach_the_play_screen() {
-        let mut shell = make_shell();
-        let err = shell
-            .dispatch(HostCommand::PlaySetRate { rate_permille: 500 })
-            .unwrap_err();
-        assert!(matches!(err, rockcraft_control::HostError::Failed { .. }));
-        let play = load_play_screen(&midi_only_fixture().join("song.mid"), None)
-            .expect("load MIDI-only bundle");
-        shell.screen = Screen::Play(Box::new(shell.tuned(play)));
-        shell.on_key(KeyCode::Char('-'));
-        assert_eq!(play_screen(&shell).rate_permille(), 875);
-        shell.on_key(KeyCode::Char('='));
-        assert_eq!(play_screen(&shell).rate_permille(), 1000);
-        let v = shell
-            .dispatch(HostCommand::PlaySetRate { rate_permille: 100 })
-            .unwrap();
-        assert_eq!(v["rate_permille"], 250);
-    }
-
     /// The backing fader set between takes reaches the play screen opened
     /// after it — the mix is shell state, not per-session state.
     #[test]
@@ -1725,6 +1714,15 @@ mod tests {
     /// The shell on a play screen over a 16 s song (eight 2 s bars at the
     /// default 120 BPM), long enough to step and loop bars.
     fn shell_on_play() -> Shell {
+        let play =
+            PlayScreen::from_smf_bytes("loop".into(), &song_bytes(), None).expect("load song");
+        let mut shell = make_shell();
+        shell.screen = Screen::Play(Box::new(shell.tuned(play)));
+        shell
+    }
+
+    /// A 16-note, 16-second song as `.mid` bytes.
+    fn song_bytes() -> Vec<u8> {
         use rockcraft_core::{MidiNote, NoteEvent, Velocity};
         let v = Velocity::new(80).unwrap();
         let events: Vec<NoteEvent> = (0..16u64)
@@ -1736,11 +1734,7 @@ mod tests {
                 ]
             })
             .collect();
-        let bytes = rockcraft_midi::events_to_smf_bytes(&events);
-        let play = PlayScreen::from_smf_bytes("loop".into(), &bytes, None).expect("load song");
-        let mut shell = make_shell();
-        shell.screen = Screen::Play(Box::new(shell.tuned(play)));
-        shell
+        rockcraft_midi::events_to_smf_bytes(&events)
     }
 
     /// On the play screen the loop commands drive the loop and report it
@@ -1808,6 +1802,43 @@ mod tests {
         assert!(play_screen(&shell).loop_view().unwrap().running);
         shell.on_key(KeyCode::Char('l'));
         assert!(!play_screen(&shell).loop_view().unwrap().running);
+    }
+
+    #[test]
+    fn speed_keys_drive_the_play_screen_and_carry_to_the_next_song() {
+        let mut shell = shell_on_play();
+        shell.on_key(KeyCode::Char('-'));
+        shell.on_key(KeyCode::Char('-'));
+        assert_eq!(play_screen(&shell).rate_permille(), 750);
+        shell.on_key(KeyCode::Char('='));
+        assert_eq!(play_screen(&shell).rate_permille(), 875);
+        // A newly loaded song keeps the chosen speed.
+        let next = PlayScreen::from_smf_bytes("next".into(), &song_bytes(), None).unwrap();
+        shell.screen = Screen::Play(Box::new(shell.tuned(next)));
+        assert_eq!(play_screen(&shell).rate_permille(), 875);
+    }
+
+    #[test]
+    fn play_set_rate_works_on_the_play_screen_and_fails_off_it() {
+        let mut shell = shell_on_play();
+        let reply = shell
+            .dispatch(HostCommand::PlaySetRate {
+                rate_permille: 5000,
+            })
+            .unwrap();
+        assert_eq!(reply["rate_permille"], 2000, "clamped");
+        assert_eq!(play_screen(&shell).rate_permille(), 2000);
+
+        let mut shell = make_shell();
+        match shell
+            .dispatch(HostCommand::PlaySetRate { rate_permille: 500 })
+            .unwrap_err()
+        {
+            rockcraft_control::HostError::Failed { command, .. } => {
+                assert_eq!(command, "play_set_rate")
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 
     /// `play_toggle_pause` off the play screen is a clean no-op error, not a
