@@ -249,21 +249,10 @@ impl Shell {
             });
         };
         change(play);
-        let practice_loop = play.loop_view().map(|v| {
-            serde_json::json!({
-                "first_bar": v.first_bar,
-                "last_bar": v.last_bar,
-                "start_us": v.start_us,
-                "end_us": v.end_us,
-                "running": v.running,
-                "phase": v.phase.map(|p| p.name()),
-                "pass": v.pass,
-            })
-        });
         Ok(serde_json::json!({
             "paused": play.is_paused(),
             "bar": play.current_bar(),
-            "practice_loop": practice_loop,
+            "practice_loop": play.loop_view().map(|v| loop_json(&v)),
         }))
     }
 
@@ -464,6 +453,15 @@ impl Shell {
             //
             // `r`/`m` precedence on Play: reserved controls; the mock
             // turns the number row into note presses (other keys are no-ops).
+            // The summary screen at the song end: play again or leave.
+            Screen::Play(play) if play.summary().is_some() => match code {
+                KeyCode::Tab | KeyCode::Esc => {
+                    play.leave();
+                    self.screen = Screen::Menu;
+                }
+                KeyCode::Char('r') => play.restart(),
+                _ => {}
+            },
             Screen::Play(play) => match code {
                 KeyCode::Tab | KeyCode::Esc => {
                     play.leave();
@@ -900,7 +898,14 @@ impl rockcraft_control::HostServices for Shell {
                     })
                 }
             }
-            HostCommand::PlayStatus => Err(HostError::Unsupported("play_status".into())),
+            // The live take (M18-D), with the desktop's field names.
+            HostCommand::PlayStatus => match &self.screen {
+                Screen::Play(play) => Ok(status_json(&play.status())),
+                _ => Err(HostError::Failed {
+                    command: "play_status".into(),
+                    detail: "no active play session".into(),
+                }),
+            },
             HostCommand::PlayToggleHearSong => {
                 Err(HostError::Unsupported("play_toggle_hear_song".into()))
             }
@@ -917,7 +922,19 @@ impl rockcraft_control::HostServices for Shell {
                     })
                 }
             }
-            HostCommand::PlayFinish => Err(HostError::Unsupported("play_finish".into())),
+            // End the take and return its summary, like the desktop.
+            HostCommand::PlayFinish => {
+                let Screen::Play(play) = &self.screen else {
+                    return Err(HostError::Failed {
+                        command: "play_finish".into(),
+                        detail: "no active play session".into(),
+                    });
+                };
+                let summary = play.finish();
+                play.leave();
+                self.screen = Screen::Menu;
+                Ok(summary_json(&summary))
+            }
             // The practice loop (M17-B), mirroring the play-screen keys.
             HostCommand::PlaySeekBar { delta } => self.with_play("play_seek_bar", |play| {
                 play.step_bar(delta);
@@ -1189,14 +1206,6 @@ pub fn run_loop<B: ratatui::backend::Backend>(
             edit.tick_backing(shell.backing_out.as_ref());
         }
 
-        // A finished song returns to the menu on its own.
-        if let Screen::Play(play) = &shell.screen {
-            if play.is_finished() {
-                shell.status = "song finished".into();
-                shell.screen = Screen::Menu;
-            }
-        }
-
         // Poll the import pipeline and handle completion.
         apply_import_outcome(shell);
 
@@ -1218,6 +1227,68 @@ pub fn run_loop<B: ratatui::backend::Backend>(
             return Ok(());
         }
     }
+}
+
+/// A practice loop as the control socket reports it (desktop field names).
+fn loop_json(v: &crate::play::LoopView) -> serde_json::Value {
+    serde_json::json!({
+        "first_bar": v.first_bar,
+        "last_bar": v.last_bar,
+        "start_us": v.start_us,
+        "end_us": v.end_us,
+        "running": v.running,
+        "phase": v.phase.map(|p| p.name()),
+        "pass": v.pass,
+        "last_pass": v.last_pass.map(|p| serde_json::json!({
+            "pass": p.pass,
+            "hits": p.hits,
+            "misses": p.misses,
+            "accuracy_bp": p.accuracy_bp,
+        })),
+    })
+}
+
+/// `play_status`: the desktop's `PlayStatusView` fields the TUI has.
+fn status_json(s: &crate::play::PlayStatus) -> serde_json::Value {
+    serde_json::json!({
+        "loaded": true,
+        "title": s.title,
+        "time_us": s.time_us,
+        "duration_us": s.duration_us,
+        "paused": s.paused,
+        "frozen": s.frozen,
+        "finished": s.finished,
+        "wait_armed": s.wait_armed,
+        "awaiting": s.awaiting,
+        "held": s.held,
+        "rate_permille": s.rate_permille,
+        "hear_song": s.hear_song,
+        "score": s.score,
+        "combo": s.combo,
+        "best_combo": s.best_combo,
+        "hits": s.hits,
+        "misses": s.misses,
+        "beats_per_bar": s.beats_per_bar,
+        "note_count": s.note_count,
+        "bar": s.bar,
+        "practice_loop": s.practice_loop.as_ref().map(loop_json),
+    })
+}
+
+/// `play_finish`: the desktop's `PlaySummary`.
+fn summary_json(s: &crate::play::PlaySummary) -> serde_json::Value {
+    serde_json::json!({
+        "total_expected": s.total_expected,
+        "hits": s.hits,
+        "misses": s.misses,
+        "extras": s.extras,
+        "perfect": s.perfect,
+        "early": s.early,
+        "late": s.late,
+        "accuracy_bp": s.accuracy_bp,
+        "best_combo": s.best_combo,
+        "score": s.score,
+    })
 }
 
 fn draw(f: &mut Frame, shell: &Shell) {
@@ -1839,6 +1910,77 @@ mod tests {
             }
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    /// Run the shell's play screen past the song end.
+    fn finish_song(shell: &mut Shell) {
+        if let Screen::Play(play) = &mut shell.screen {
+            for _ in 0..40 {
+                play.advance(1_000_000);
+            }
+        }
+    }
+
+    #[test]
+    fn the_song_end_shows_the_summary_where_r_replays_and_tab_leaves() {
+        let mut shell = shell_on_play();
+        finish_song(&mut shell);
+        assert_eq!(shell.screen_name(), "play", "the summary stays on play");
+        let summary = *play_screen(&shell).summary().expect("summary shown");
+        assert_eq!(summary.misses, 16, "nothing was played");
+        let frame = shell.render_to_string(100, 30);
+        assert!(frame.contains("song finished"), "{frame}");
+        assert!(frame.contains("Accuracy  0%"), "{frame}");
+        // Only r / Tab / Esc act on the summary.
+        shell.on_key(KeyCode::Char(' '));
+        assert!(!play_screen(&shell).is_paused());
+        shell.on_key(KeyCode::Char('r'));
+        assert!(play_screen(&shell).summary().is_none(), "r plays again");
+        finish_song(&mut shell);
+        shell.on_key(KeyCode::Tab);
+        assert_eq!(shell.screen_name(), "menu");
+    }
+
+    #[test]
+    fn play_status_reports_the_live_take_and_fails_off_the_play_screen() {
+        let mut shell = shell_on_play();
+        let st = shell.dispatch(HostCommand::PlayStatus).unwrap();
+        for key in [
+            "score",
+            "combo",
+            "hits",
+            "misses",
+            "rate_permille",
+            "practice_loop",
+        ] {
+            assert!(st.get(key).is_some(), "missing {key}: {st}");
+        }
+        assert_eq!(st["note_count"], 16);
+        finish_song(&mut shell);
+        let st = shell.dispatch(HostCommand::PlayStatus).unwrap();
+        assert_eq!(
+            (st["finished"].as_bool(), st["misses"].as_u64()),
+            (Some(true), Some(16))
+        );
+
+        let mut shell = make_shell();
+        assert!(matches!(
+            shell.dispatch(HostCommand::PlayStatus).unwrap_err(),
+            rockcraft_control::HostError::Failed { .. }
+        ));
+    }
+
+    #[test]
+    fn play_finish_returns_the_summary_and_ends_the_take() {
+        let mut shell = shell_on_play();
+        let summary = shell.dispatch(HostCommand::PlayFinish).unwrap();
+        assert_eq!(summary["total_expected"], 16);
+        assert_eq!(summary["accuracy_bp"], 0);
+        assert_eq!(shell.screen_name(), "menu");
+        assert!(matches!(
+            shell.dispatch(HostCommand::PlayFinish).unwrap_err(),
+            rockcraft_control::HostError::Failed { .. }
+        ));
     }
 
     /// `play_toggle_pause` off the play screen is a clean no-op error, not a
