@@ -319,7 +319,8 @@ impl SynthSource {
                 }
                 Ok(SynthCommand::Fade { channel, out, ms }) => {
                     let rate = self.sample_rate as f64 / self.left.len().max(1) as f64;
-                    if let Some(f) = self.fade.get_mut(channel as usize) {
+                    let ch = channel as usize;
+                    if let Some(f) = self.fade.get_mut(ch) {
                         // Back in from full silence: the voices were cut, so
                         // there is nothing to ramp — jump, and new notes start
                         // at their true level.
@@ -329,6 +330,11 @@ impl SynthSource {
                             steps_for(ms as u32, rate)
                         };
                         f.fade(out, steps);
+                        // A jump lands the ramp on its target at once, and
+                        // `step_fades` skips steady ramps — so push the level
+                        // here, or the channel stays at the volume the
+                        // fade-out left it on (silent).
+                        self.apply_volume(ch);
                     }
                 }
                 // Nothing pending, or the handle was dropped: stop draining and
@@ -694,6 +700,43 @@ mod tests {
         let (player, rx) = handle();
         player.for_bus(SynthBus::Song).all_off();
         assert_eq!(drain(&rx), vec![SynthCommand::AllOff]);
+    }
+
+    /// Peak absolute sample over the next `samples` samples `source` renders.
+    fn peak(source: &mut SynthSource, samples: usize) -> f32 {
+        source
+            .by_ref()
+            .take(samples)
+            .fold(0.0, |m, s| m.max(s.abs()))
+    }
+
+    /// A bus faded fully out and then back in must sound again. The fade-in
+    /// from silence jumps rather than ramps, and the jump used to leave the
+    /// channel volume at zero — every later note on the bus rendered silent.
+    ///
+    /// Needs a real SoundFont, which is not committed (`assets/NOTICE.md`), so
+    /// this is skipped where `assets/piano.sf2` is absent (CI).
+    #[test]
+    fn a_bus_faded_out_to_silence_sounds_again_after_fade_in() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/piano.sf2");
+        let Ok(bytes) = std::fs::read(&path) else {
+            eprintln!("skipped: no SoundFont at {}", path.display());
+            return;
+        };
+        let rate = 44_100;
+        let (mut source, player) = synth_from_sf2_bytes(&bytes, rate).unwrap();
+        let song = player.for_bus(SynthBus::Song);
+        let c4 = MidiNote::new(60).unwrap();
+        let vel = Velocity::new(100).unwrap();
+
+        song.fade_out(Duration::from_millis(10));
+        peak(&mut source, rate as usize / 2); // well past the fade: silent
+        song.fade_in(Duration::from_millis(10));
+        song.note_on(c4, vel);
+        assert!(
+            peak(&mut source, rate as usize / 4) > 0.01,
+            "song bus stayed silent after fading back in"
+        );
     }
 
     #[test]
