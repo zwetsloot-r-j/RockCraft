@@ -64,7 +64,7 @@ fn main() {
 
     // Live keys are sounded straight from the MIDI thread (the low-latency
     // monitor path) rather than after the app loop gets round to them; the app
-    // flips `echo` off on screens that should stay silent.
+    // turns `echo` on once it has wired up the audio.
     let echo = Arc::new(AtomicBool::new(false));
 
     // Source selection: explicit `--mock`, otherwise the live piano — and when

@@ -459,8 +459,8 @@ fn spawn_tick_thread(app: tauri::AppHandle) {
             // Scoring/wait/clock all run off the injected `dt_us`, never the
             // render loop. The composer path is skipped entirely this tick.
             let play_active = play_state.0.lock().expect("play state poisoned").is_some();
-            // The sustain pedal only colours the play screen's input monitor;
-            // elsewhere it is drained and dropped so it never piles up.
+            // The sustain pedal colours the play screen's input monitor, and
+            // elsewhere the keys the player sounds (below).
             let sustain = crate::midi::drain_sustain(&midi_state);
             if play_active {
                 let raw = crate::midi::drain(&midi_state);
@@ -489,6 +489,13 @@ fn spawn_tick_thread(app: tauri::AppHandle) {
             // are preserved for backing-offset calculation.
             for ev in &raw_events {
                 record_state.push(*ev);
+            }
+            // Outside a play session every screen — menus, library, editor —
+            // sounds the keys you play, pedal included, in played order.
+            if let Some(synth) = &audio.synth {
+                for input in rockcraft_core::interleave_by_time(&raw_events, &sustain) {
+                    synth.apply_input(&input);
+                }
             }
             for ev in &midi_events {
                 let _ = app.emit(EVENT_MIDI, ev);

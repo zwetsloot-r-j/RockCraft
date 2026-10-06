@@ -87,6 +87,18 @@ pub fn spectrum_hue(note: u8) -> f32 {
     ((note % 12) as f32 * 30.0 + 8.0) % 360.0
 }
 
+/// The OKLCH lightness, chroma and hue of a note on the spectrum wheel, from a
+/// base lightness and chroma. C and B are neighbours on the wheel (8° vs 338°)
+/// and read alike, so they are pulled apart: C to a deeper, clearer red, B to a
+/// softer pink. Mirrors the desktop's `spectrumTone` (`utils.ts`).
+pub fn spectrum_tone(note: u8, l: f32, c: f32) -> (f32, f32, f32) {
+    match note % 12 {
+        0 => ((l - 0.12).clamp(0.0, 1.0), c + 0.03, 25.0),
+        11 => ((l + 0.10).clamp(0.0, 1.0), c * 0.5, 350.0),
+        _ => (l, c, spectrum_hue(note)),
+    }
+}
+
 /// The colour of a highway note: by `mode`, lifted when `active` (sounding
 /// now), dimmed for a black key.
 pub fn note_color(mode: ColorMode, note: u8, hand: Hand, active: bool, black_key: bool) -> Rgb {
@@ -95,7 +107,8 @@ pub fn note_color(mode: ColorMode, note: u8, hand: Hand, active: bool, black_key
         // the hue stays saturated.
         ColorMode::Spectrum => {
             let l = if active { 0.82 } else { 0.70 };
-            oklch_to_rgb(l, 0.16, spectrum_hue(note))
+            let (l, c, h) = spectrum_tone(note, l, 0.16);
+            oklch_to_rgb(l, c, h)
         }
         ColorMode::Hands | ColorMode::Accent => {
             let c = match (mode, hand) {
@@ -182,6 +195,17 @@ mod tests {
         let d4 = note_color(ColorMode::Spectrum, 62, Hand::Right, false, false);
         assert_eq!(c4, c5);
         assert_ne!(c4, d4);
+    }
+
+    #[test]
+    fn spectrum_sets_c_apart_from_b() {
+        let c = note_color(ColorMode::Spectrum, 60, Hand::Right, false, false);
+        let b = note_color(ColorMode::Spectrum, 59, Hand::Right, false, false);
+        let luma = |Rgb(r, g, b): Rgb| 0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32;
+        // C is the darker, redder one (red well above blue); B the lighter pink.
+        assert!(luma(c) + 40.0 < luma(b), "C {c:?} vs B {b:?}");
+        assert!(c.0 as i32 - c.2 as i32 > 100, "C should read red: {c:?}");
+        assert!(b.2 as i32 > c.2 as i32, "B should be the bluer pink: {b:?}");
     }
 
     #[test]
