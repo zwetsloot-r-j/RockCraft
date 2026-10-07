@@ -12,10 +12,12 @@ pub mod key_source;
 pub mod keyboard;
 pub mod library;
 pub mod library_screen;
+pub mod mixer_ui;
 pub mod palette;
 pub mod play;
 pub mod record;
 pub mod render;
+pub mod settings;
 
 #[cfg(feature = "screenshot")]
 pub mod screenshot;
