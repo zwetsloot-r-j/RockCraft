@@ -160,6 +160,9 @@ pub struct PlayScreen {
     loop_marks: (Option<u64>, Option<u64>),
     /// The running practice loop, if any.
     practice_loop: Option<RunningLoop>,
+    /// The practised hand (`h`, M18-C): `None` = both hands. The app plays the
+    /// other hand, and only this hand's notes are waited on.
+    practice: Option<Hand>,
     /// When the sounding count-in click is released (play-clock µs).
     click_off_at: Option<u64>,
     /// Practice speed in permille ([`PLAY_RATE_UNITY`] = 1×). Scales the time
@@ -190,6 +193,9 @@ struct RunningLoop {
     lp: PracticeLoop,
     first_bar: u64,
     last_bar: u64,
+    /// The practised hand as of the last phase boundary: a change mid-loop
+    /// takes effect at the next one (M18-C).
+    practice: Option<Hand>,
     /// Strikes of the current *your turn* pass (its count-in included, so an
     /// early first note counts). Kept apart from the whole take's, so stopping
     /// the loop restores the take exactly.
@@ -363,6 +369,7 @@ impl PlayScreen {
             wait_mode: false,
             loop_marks: (None, None),
             practice_loop: None,
+            practice: None,
             click_off_at: None,
             rate_permille: PLAY_RATE_UNITY,
             cfg: ScoreConfig::default(),
@@ -866,10 +873,15 @@ impl PlayScreen {
         }
     }
 
-    /// M18-C hook: whether span `i` is the player's to play (and so scored).
-    /// Every note is, until a practice hand narrows it to one hand.
-    fn practised(&self, _i: usize) -> bool {
-        true
+    /// Whether span `i` is the player's to play (and so scored): every note
+    /// with both hands practised, else only the practised hand's (in a loop,
+    /// the hand as of the phase boundary). The other hand autoplays unscored.
+    fn practised(&self, i: usize) -> bool {
+        let practice = match &self.practice_loop {
+            Some(rl) => rl.practice,
+            None => self.practice,
+        };
+        practice.is_none_or(|h| self.hands[i] == h)
     }
 
     /// Judge every span whose good window has closed since the last call,
@@ -1055,13 +1067,12 @@ impl PlayScreen {
         let now = self.now_us();
         let (need_on, need_off) =
             pending_triggers(&self.spans, now, &self.song_on_fired, &self.song_off_fired);
-        let need_on: Vec<usize> = need_on
-            .into_iter()
-            .filter(|&i| self.autoplays(&self.spans[i]))
-            .collect();
+        let need_on: Vec<usize> = need_on.into_iter().filter(|&i| self.autoplays(i)).collect();
+        // A note already sounding is always released — even when a hand
+        // change stopped it autoplaying mid-note.
         let need_off: Vec<usize> = need_off
             .into_iter()
-            .filter(|&i| self.autoplays(&self.spans[i]))
+            .filter(|&i| self.autoplays(i) || self.song_on_fired.contains(&i))
             .collect();
         let velocity = Velocity::new(HEAR_VELOCITY).unwrap();
         for i in need_on {
@@ -1107,19 +1118,64 @@ impl PlayScreen {
 
     // ── seeking + practice loop (M17-B) ──────────────────────────────────
 
-    /// Whether the app sounds `span` right now: "hear the song" outside a
-    /// loop; in one, the loop's notes during the demo (whatever "hear the
-    /// song" says) and during *your turn* with "hear the song" on, never in a
-    /// count-in.
-    fn autoplays(&self, span: &NoteSpan) -> bool {
+    /// Whether the app sounds span `i` right now. Outside a loop: every note
+    /// with "hear the song" on, and the *other* hand's whenever one hand is
+    /// practised. In a loop (hand as of the phase boundary): never in a
+    /// count-in; the demo plays the practised hand's loop notes (whatever
+    /// "hear the song" says); *your turn* plays the other hand's, plus the
+    /// practised hand's with "hear the song" on.
+    fn autoplays(&self, i: usize) -> bool {
+        let span = &self.spans[i];
+        let hand = self.hands[i];
         match &self.practice_loop {
-            None => self.hear_song,
+            None => self.hear_song || self.practice.is_some_and(|h| hand != h),
             Some(rl) => match rl.lp.phase() {
                 LoopPhase::CountIn { .. } => false,
-                LoopPhase::Demo => rl.contains(span),
-                LoopPhase::YourTurn => rl.contains(span) && self.hear_song,
+                LoopPhase::Demo => rl.contains(span) && rl.practice.is_none_or(|h| hand == h),
+                LoopPhase::YourTurn => {
+                    rl.contains(span) && (self.hear_song || rl.practice.is_some_and(|h| hand != h))
+                }
             },
         }
+    }
+
+    /// The practised hand (`None` = both).
+    pub fn practice(&self) -> Option<Hand> {
+        self.practice
+    }
+
+    /// Practise one hand (`None` = both). Outside a loop the wait gate is
+    /// rebuilt at the playhead from that hand's notes; a running loop picks
+    /// the change up at its next phase boundary.
+    pub fn set_practice(&mut self, practice: Option<Hand>) {
+        self.practice = practice;
+        if self.practice_loop.is_none() {
+            self.reset_full_gate(self.now_us());
+        }
+    }
+
+    /// `h`: both → right → left → both.
+    pub fn cycle_practice(&mut self) {
+        self.set_practice(match self.practice {
+            None => Some(Hand::Right),
+            Some(Hand::Right) => Some(Hand::Left),
+            Some(Hand::Left) => None,
+        });
+    }
+
+    /// Wait-gate steps for the notes of `practice` (every note when `None`)
+    /// that `keep` accepts.
+    fn steps_for(
+        &self,
+        practice: Option<Hand>,
+        keep: impl Fn(&NoteSpan) -> bool,
+    ) -> Vec<(MidiNote, u64)> {
+        self.spans
+            .iter()
+            .zip(&self.hands)
+            .filter(|&(s, &hand)| practice.is_none_or(|h| hand == h) && keep(s))
+            .filter_map(|(s, _)| MidiNote::new(s.note).map(|n| (n, s.start_us)))
+            .collect()
     }
 
     /// The bar under the playhead (0-based; the pre-roll is bar 0).
@@ -1127,10 +1183,10 @@ impl PlayScreen {
         self.bar_map().bar_at(self.now_us())
     }
 
-    /// Rebuild the whole-song wait gate, positioned at `us`, armed per the
-    /// player's wait-mode setting.
+    /// Rebuild the whole-song wait gate from the practised hand's notes,
+    /// positioned at `us`, armed per the player's wait-mode setting.
     fn reset_full_gate(&mut self, us: u64) {
-        self.wait = WaitGate::from_expected(&expected_steps(&self.spans));
+        self.wait = WaitGate::from_expected(&self.steps_for(self.practice, |_| true));
         self.wait.set_armed(self.wait_mode);
         self.wait.seek_to(us);
     }
@@ -1268,6 +1324,7 @@ impl PlayScreen {
             lp,
             first_bar,
             last_bar,
+            practice: self.practice,
             played: Vec::new(),
             scored: HashSet::new(),
         });
@@ -1297,20 +1354,19 @@ impl PlayScreen {
         }
     }
 
-    /// Apply a loop phase: arm the loop's own wait gate for *your turn* only
-    /// (built from the loop's notes, so a step at `end_us` is never in it).
-    /// Count-in and demo run ungated.
+    /// Apply a loop phase: snapshot the practised hand, and arm the loop's
+    /// own wait gate for *your turn* only (built from the practised hand's
+    /// loop notes, so a step at `end_us` is never in it). Count-in and demo
+    /// run ungated.
     fn enter_phase(&mut self, phase: LoopPhase) {
-        let Some(rl) = self.practice_loop.as_ref() else {
+        let practice = self.practice;
+        let Some(rl) = self.practice_loop.as_mut() else {
             return;
         };
+        rl.practice = practice;
         if phase == LoopPhase::YourTurn {
-            let steps: Vec<(MidiNote, u64)> = self
-                .spans
-                .iter()
-                .filter(|s| rl.contains(s))
-                .filter_map(|s| MidiNote::new(s.note).map(|n| (n, s.start_us)))
-                .collect();
+            let rl = self.practice_loop.as_ref().expect("loop running");
+            let steps = self.steps_for(practice, |s| rl.contains(s));
             let start_us = rl.lp.start_us();
             self.wait = WaitGate::from_expected(&steps);
             self.wait.set_armed(self.wait_mode);
@@ -1524,6 +1580,11 @@ impl PlayScreen {
         } else {
             Color::DarkGray
         };
+        let (hand_label, hand_color) = match self.practice {
+            None => ("both", Color::DarkGray),
+            Some(Hand::Right) => ("right", Color::Green),
+            Some(Hand::Left) => ("left", Color::Green),
+        };
         let pause_color = if self.paused {
             Color::Green
         } else {
@@ -1555,6 +1616,10 @@ impl PlayScreen {
             Span::styled("[Space] pause  ", Style::default().fg(pause_color)),
             Span::styled("[m] music  ", Style::default().fg(music_color)),
             Span::styled("[w] wait  ", Style::default().fg(wait_color)),
+            Span::styled(
+                format!("[h] {hand_label}  "),
+                Style::default().fg(hand_color),
+            ),
             Span::raw("[-/=] speed  "),
             Span::raw(format!("[c] {}  ", self.color_mode.label())),
             Span::raw(format!("[v] {}  ", self.scroll_mode.label())),
@@ -1727,12 +1792,17 @@ impl PlayScreen {
             };
             let active = span.start_us <= now && now < span.end_us;
             let style = note_style(self.color_mode, span.note, hand, active);
-            // While a loop runs, notes outside it fade back.
-            let color = match &self.practice_loop {
-                Some(rl) if !rl.contains(span) => {
-                    style.rgb.mix(BACKGROUND, OUTSIDE_LOOP_FADE).into()
-                }
-                _ => style.color,
+            // While a loop runs, notes outside it fade back; so does the
+            // other hand's while one hand is practised.
+            let outside_loop = self
+                .practice_loop
+                .as_ref()
+                .is_some_and(|rl| !rl.contains(span));
+            let other_hand = self.practice.is_some_and(|h| hand != h);
+            let color = if outside_loop || other_hand {
+                style.rgb.mix(BACKGROUND, OUTSIDE_LOOP_FADE).into()
+            } else {
+                style.color
             };
             for (row, fill) in cells_of_extent(top8, bottom8) {
                 let y = area.y + row;
@@ -2864,6 +2934,189 @@ mod tests {
         play.toggle_pause();
         play.advance(10 * BAR);
         assert!(play.is_finished(), "normal play ends again");
+    }
+
+    // ── practice hand (M18-C) ────────────────────────────────────────────
+
+    /// A two-hand chart, split at middle C: a note every second, even seconds
+    /// left (48 + i), odd seconds right (72 + i) — so bar 1 holds left 50 at
+    /// `SHIFT + 2 s` and right 75 at `SHIFT + 3 s`. The left-range note at
+    /// 6 s (54) carries a per-note override to the right hand.
+    fn two_hand_screen() -> PlayScreen {
+        let v = Velocity::new(80).unwrap();
+        let events: Vec<NoteEvent> = (0..8u64)
+            .flat_map(|i| {
+                let pitch = if i % 2 == 0 { 48 + i } else { 72 + i } as u8;
+                let n = MidiNote::new(pitch).unwrap();
+                [
+                    NoteEvent::on(n, v, i * 1_000_000),
+                    NoteEvent::off(n, i * 1_000_000 + 500_000),
+                ]
+            })
+            .collect();
+        let overrides = [HandOverride {
+            pitch: 54,
+            start_us: 6_000_000,
+            hand: Hand::Right,
+        }];
+        PlayScreen::from_smf_bytes("hands".into(), &events_to_smf_bytes(&events), None)
+            .unwrap()
+            .with_hands(60, &overrides)
+    }
+
+    fn pitches(steps: &[(MidiNote, u64)]) -> Vec<u8> {
+        steps.iter().map(|(n, _)| n.value()).collect()
+    }
+
+    #[test]
+    fn only_the_practised_hand_is_scored() {
+        let mut play = two_hand_screen();
+        assert_eq!(play.finish().total_expected, 8, "both hands: every note");
+        play.set_practice(Some(Hand::Right));
+        // 73, 75, 77, 79 plus the 54 pinned to the right hand.
+        assert_eq!(play.finish().total_expected, 5);
+        play.set_practice(Some(Hand::Left));
+        assert_eq!(play.finish().total_expected, 3);
+    }
+
+    #[test]
+    fn right_hand_practice_waits_for_right_and_autoplays_left() {
+        let mut play = two_hand_screen();
+        assert!(!play.is_hear_song());
+        play.set_wait_mode(true);
+        play.set_practice(Some(Hand::Right));
+        // The gate holds the right hand's notes, the override among them.
+        assert_eq!(
+            pitches(&play.steps_for(play.practice(), |_| true)),
+            vec![73, 75, 77, 54, 79]
+        );
+        let overridden = span_at(&play, SHIFT + 6_000_000);
+        assert!(!play.autoplays(overridden), "the override follows its hand");
+        // The left note at SHIFT neither freezes the clock nor stays silent.
+        play.advance(SHIFT);
+        play.advance(500_000);
+        assert_eq!(
+            play.now_us(),
+            SHIFT + 500_000,
+            "left notes are not waited on"
+        );
+        play.tick_song_synth();
+        assert!(play.song_on_fired.contains(&span_at(&play, SHIFT)));
+        // The right note at SHIFT + 1 s freezes it until played.
+        play.advance(5_000_000);
+        play.advance(5_000_000);
+        assert_eq!(play.now_us(), SHIFT + 1_000_000);
+        assert_eq!(play.awaiting_notes(), Some(vec![73]));
+        play.tick_song_synth();
+        let held_back = span_at(&play, SHIFT + 1_000_000);
+        assert!(!play.song_on_fired.contains(&held_back));
+        note_on(&mut play, 73);
+        play.advance(100_000);
+        assert!(play.now_us() > SHIFT + 1_000_000);
+    }
+
+    #[test]
+    fn both_hands_autoplay_nothing_without_hear_the_song() {
+        let mut play = two_hand_screen();
+        assert_eq!(play.practice(), None);
+        for _ in 0..20 {
+            play.advance(1_000_000);
+            play.tick_song_synth();
+        }
+        assert!(play.song_on_fired.is_empty());
+    }
+
+    #[test]
+    fn changing_the_hand_mid_song_rebuilds_the_gate_at_the_playhead() {
+        let mut play = two_hand_screen();
+        play.set_wait_mode(true);
+        play.set_practice(Some(Hand::Left));
+        play.advance(SHIFT);
+        play.advance(5_000_000);
+        assert_eq!(play.now_us(), SHIFT, "frozen on the left step");
+        assert_eq!(play.awaiting_notes(), Some(vec![48]));
+        play.set_practice(Some(Hand::Right));
+        play.advance(500_000);
+        assert_eq!(play.now_us(), SHIFT + 500_000, "un-frozen by the switch");
+        play.advance(5_000_000);
+        play.advance(5_000_000);
+        assert_eq!(play.awaiting_notes(), Some(vec![73]), "the next right step");
+    }
+
+    #[test]
+    fn a_loop_demos_the_practised_hand_and_accompanies_your_turn() {
+        let mut play = two_hand_screen();
+        play.set_wait_mode(true);
+        play.set_practice(Some(Hand::Right));
+        play.set_loop(1, 1);
+        let (left, right) = (
+            span_at(&play, SHIFT + BAR),
+            span_at(&play, SHIFT + BAR + 1_000_000),
+        );
+        // Demo: the right note sounds, the left one doesn't.
+        play.advance(BAR);
+        assert_eq!(phase(&play), Some(LoopPhase::Demo));
+        play.advance(1_000_000);
+        play.tick_song_synth();
+        assert!(play.song_on_fired.contains(&right));
+        assert!(!play.song_on_fired.contains(&left));
+        // Your turn: the left note autoplays, the gate waits for the right.
+        play.advance(BAR); // wrap to the count-in
+        play.advance(BAR); // → your turn
+        assert_eq!(phase(&play), Some(LoopPhase::YourTurn));
+        play.tick_song_synth();
+        assert_eq!(play.song_on_fired, HashSet::from([left]));
+        play.advance(5_000_000);
+        play.advance(5_000_000);
+        assert_eq!(play.now_us(), SHIFT + BAR + 1_000_000, "waits on the right");
+        assert_eq!(play.awaiting_notes(), Some(vec![75]));
+        play.tick_song_synth();
+        assert!(!play.song_on_fired.contains(&right), "your turn is yours");
+    }
+
+    #[test]
+    fn a_hand_change_mid_loop_applies_from_the_next_count_in() {
+        let mut play = two_hand_screen();
+        play.set_wait_mode(true);
+        play.set_practice(Some(Hand::Right));
+        play.set_loop(1, 1);
+        let (left, right) = (
+            span_at(&play, SHIFT + BAR),
+            span_at(&play, SHIFT + BAR + 1_000_000),
+        );
+        play.advance(BAR);
+        assert_eq!(phase(&play), Some(LoopPhase::Demo));
+        play.set_practice(Some(Hand::Left));
+        // The rest of this demo still plays the right hand.
+        play.advance(1_000_000);
+        play.tick_song_synth();
+        assert!(play.song_on_fired.contains(&right));
+        assert!(!play.song_on_fired.contains(&left));
+        // From the count-in on, the left hand is practised.
+        play.advance(BAR);
+        play.advance(BAR);
+        assert_eq!(phase(&play), Some(LoopPhase::YourTurn));
+        play.advance(100_000);
+        assert_eq!(play.now_us(), SHIFT + BAR, "waits on the left");
+        assert_eq!(play.awaiting_notes(), Some(vec![50]));
+        note_on(&mut play, 50);
+        play.advance(1_000_000);
+        play.tick_song_synth();
+        assert!(play.song_on_fired.contains(&right), "right accompanies");
+        assert!(!play.song_on_fired.contains(&left));
+    }
+
+    #[test]
+    fn the_status_line_shows_the_practised_hand_and_restart_keeps_it() {
+        let mut play = two_hand_screen();
+        let status = rows(&render(&mut play, 0, 200, 12))[0].clone();
+        assert!(status.contains("[h] both"), "{status}");
+        play.cycle_practice();
+        let now = play.now_us();
+        let status = rows(&render(&mut play, now, 200, 12))[0].clone();
+        assert!(status.contains("[h] right"), "{status}");
+        play.restart();
+        assert_eq!(play.practice(), Some(Hand::Right));
     }
 
     // ── practice speed (M18-B) ───────────────────────────────────────────

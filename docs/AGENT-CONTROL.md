@@ -494,10 +494,10 @@ playhead, 0-based — and `practice_loop`, `null` when nothing is marked, else:
 
 **In the TUI (M17-B)** the four loop commands work on the play screen (off it
 they fail with `failed:`) and reply `{ paused, bar, practice_loop }`. The TUI
-has no practice hand, so the demo plays both hands and `play_set_practice`
-answers `unsupported:`; each *your turn* pass is scored into `last_pass` as on
-the desktop. On the TUI play screen the same keys work: `←`/`→`, `[`, `]`
-and `l`.
+scores each *your turn* pass into `last_pass` as on the desktop. On the TUI
+play screen the same keys work: `←`/`→`, `[`, `]` and `l`.
+`play_set_practice` (M18-C) works on the TUI play screen too — `h` cycles
+both → right → left — and fails with `failed:` off it.
 
 The mixer commands work from any screen in either frontend — the synth is
 app-wide, not owned by a play session — so a level can be set before a bundle is
