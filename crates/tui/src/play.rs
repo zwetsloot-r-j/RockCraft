@@ -1612,7 +1612,7 @@ impl PlayScreen {
                 speed_badge(self.rate_permille),
                 Style::default().fg(Color::Yellow),
             ),
-            Span::raw("[r] restart  [Tab] menu  "),
+            Span::raw("[r] restart  [Tab] menu  [x] mix  "),
             Span::styled("[Space] pause  ", Style::default().fg(pause_color)),
             Span::styled("[m] music  ", Style::default().fg(music_color)),
             Span::styled("[w] wait  ", Style::default().fg(wait_color)),

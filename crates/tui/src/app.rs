@@ -39,6 +39,7 @@ use crate::import_screen::{
 use crate::key_source::{CrosstermKeys, KeySource};
 use crate::library::{default_scan_roots, library_root};
 use crate::library_screen::{LibraryOutcome, LibraryScreen};
+use crate::mixer_ui::{MixChange, MixerOverlay};
 use crate::palette::ColorMode;
 use crate::play::{PlayScreen, ScrollMode};
 
@@ -135,6 +136,15 @@ pub struct Shell {
     color_mode: ColorMode,
     /// How the play highway scrolls; shell-wide like `color_mode`.
     scroll_mode: ScrollMode,
+    /// The open mixer overlay (M18-A), if any. While `Some` it owns the keys.
+    mixer_ui: Option<MixerOverlay>,
+    /// Where the mix is remembered; `None` (the default, and in tests) saves
+    /// nothing. `main` sets it from `settings::settings_path`.
+    settings_path: Option<PathBuf>,
+    /// A failed save is reported once, not on every later change.
+    save_warned: bool,
+    /// The last save failure, shown inside the overlay.
+    save_error: String,
     /// Practice speed in permille; shell-wide like `color_mode`, so a slowed
     /// piece stays slowed when you come back to it.
     rate_permille: u16,
@@ -164,8 +174,23 @@ impl Shell {
             mixer: Mixer::new(),
             color_mode: ColorMode::default(),
             scroll_mode: ScrollMode::default(),
+            mixer_ui: None,
+            settings_path: None,
+            save_warned: false,
+            save_error: String::new(),
             rate_permille: crate::play::PLAY_RATE_UNITY,
         }
+    }
+
+    /// Start from a remembered mix (M18-A): adopt it and push it at the synth.
+    pub fn set_mixer(&mut self, mixer: Mixer) {
+        self.mixer = mixer;
+        self.push_mixer();
+    }
+
+    /// Remember the mix at `path` after every change from now on.
+    pub fn set_settings_path(&mut self, path: Option<PathBuf>) {
+        self.settings_path = path;
     }
 
     /// Wire in the audio output beyond the synth: where backing tracks play,
@@ -203,9 +228,8 @@ impl Shell {
         play
     }
 
-    /// The shell's current mix. The TUI has no mixer UI — it is driven over the
-    /// control socket (M14-C's picker lives in the desktop app) — so this is
-    /// the read path for tests and for anything that wants to display it.
+    /// The shell's current mix: set from the mixer overlay (`x`) or over the
+    /// control socket, and remembered between runs.
     pub fn mixer(&self) -> &Mixer {
         &self.mixer
     }
@@ -220,6 +244,13 @@ impl Shell {
         F: FnOnce(&mut Mixer) -> Result<(), rockcraft_core::MixerError>,
     {
         change(&mut self.mixer).map_err(|e| e.to_string())?;
+        self.push_mixer();
+        self.persist_mixer();
+        Ok(rockcraft_core::MixerReport::from(self.mixer))
+    }
+
+    /// Push the whole mix at the audio it controls.
+    fn push_mixer(&mut self) {
         if let Some(synth) = &self.synth {
             for &bus in SynthBus::all() {
                 let settings = self.mixer.bus(bus);
@@ -231,7 +262,52 @@ impl Shell {
         if let Screen::Play(play) = &mut self.screen {
             play.set_backing_gain(self.mixer.backing_gain);
         }
-        Ok(rockcraft_core::MixerReport::from(self.mixer))
+    }
+
+    /// Write the mix to the settings file, if one is configured. Runs on the
+    /// app thread after a change; a failure shows once in the status bar.
+    fn persist_mixer(&mut self) {
+        let Some(path) = &self.settings_path else {
+            return;
+        };
+        let settings = crate::settings::TuiSettings { mixer: self.mixer };
+        if let Err(e) = crate::settings::save(path, &settings) {
+            if !self.save_warned {
+                self.save_warned = true;
+                self.save_error = format!("could not save settings: {e}");
+                self.status = format!("could not save mixer settings: {e}");
+            }
+        }
+    }
+
+    /// Whether `x` may open the mixer now: on the play screen, or on the edit
+    /// screen when no prompt or mode there is collecting keys.
+    fn mixer_can_open(&self) -> bool {
+        match &self.screen {
+            Screen::Play(_) => true,
+            Screen::Edit(e) => {
+                !(e.is_naming()
+                    || e.is_prompting_exit()
+                    || e.is_setting_bpm()
+                    || e.is_renaming_segment()
+                    || e.in_split_mode()
+                    || e.in_chord_mode())
+            }
+            _ => false,
+        }
+    }
+
+    /// Route a key to the open mixer overlay.
+    fn on_mixer_key(&mut self, code: KeyCode) {
+        let Some(mut ui) = self.mixer_ui else { return };
+        let (close, change) = ui.on_key(code, &self.mixer);
+        if let Some(change) = change {
+            let _ = self.apply_mixer(|m| match change {
+                MixChange::Gain(bus, v) => m.set_gain(bus, v).map(|_| ()),
+                MixChange::Instrument(bus, id) => m.set_instrument(bus, id).map(|_| ()),
+            });
+        }
+        self.mixer_ui = if close { None } else { Some(ui) };
     }
 
     /// Apply a practice-loop change to the live play screen (M17-B) and report
@@ -434,6 +510,14 @@ impl Shell {
 
     /// Handle a key press; returns to the menu on Tab/Esc from a screen.
     pub(crate) fn on_key(&mut self, code: KeyCode) {
+        if self.mixer_ui.is_some() {
+            self.on_mixer_key(code);
+            return;
+        }
+        if code == KeyCode::Char('x') && self.mixer_can_open() {
+            self.mixer_ui = Some(MixerOverlay::new());
+            return;
+        }
         match &mut self.screen {
             Screen::Menu => match code {
                 KeyCode::Up | KeyCode::Char('k') => self.menu_move(-1),
@@ -1037,6 +1121,13 @@ impl rockcraft_control::HostServices for Shell {
 // Run loop
 // ---------------------------------------------------------------------------
 
+/// The settings file and the mix loaded from it, handed to [`run`].
+#[derive(Debug, Default)]
+pub struct Remembered {
+    pub path: Option<PathBuf>,
+    pub mixer: Option<Mixer>,
+}
+
 /// Run the app shell until the user quits.
 ///
 /// If `start_edit` is true the shell boots directly into the composer (the
@@ -1048,6 +1139,7 @@ pub fn run(
     backing_path: Option<PathBuf>,
     start_edit: bool,
     commands: Option<mpsc::Receiver<RemoteCommand>>,
+    remembered: Remembered,
 ) -> io::Result<()> {
     // Frame pacing: Windows sleeps and waits in ~15.6 ms ticks by default,
     // which spaces frames unevenly (15 ms, then 31 ms…) and makes scrolling
@@ -1056,6 +1148,10 @@ pub fn run(
     let mut terminal = ratatui::init();
     let mut shell = Shell::new(input, audio.synth, backing_path);
     shell.set_audio_links(audio.backing_out, audio.echo);
+    if let Some(mixer) = remembered.mixer {
+        shell.set_mixer(mixer);
+    }
+    shell.set_settings_path(remembered.path);
     if start_edit {
         shell.activate_edit();
     }
@@ -1291,6 +1387,13 @@ fn summary_json(s: &crate::play::PlaySummary) -> serde_json::Value {
 }
 
 fn draw(f: &mut Frame, shell: &Shell) {
+    draw_screen(f, shell);
+    if let Some(ui) = &shell.mixer_ui {
+        ui.draw(f, f.area(), &shell.mixer, &shell.save_error);
+    }
+}
+
+fn draw_screen(f: &mut Frame, shell: &Shell) {
     match &shell.screen {
         Screen::Menu => draw_menu(f, f.area(), shell),
         Screen::Play(play) => play.draw(f, f.area()),
@@ -3179,5 +3282,154 @@ mod tests {
             via_library.is_hear_song(),
             "import and library loads must agree"
         );
+    }
+
+    // ── M18-A: mixer overlay + remembered mix ───────────────────────────────
+
+    fn shell_with_play() -> Shell {
+        let mut shell = make_shell();
+        let play = load_play_screen(&midi_only_fixture().join("song.mid"), None).unwrap();
+        shell.screen = Screen::Play(Box::new(shell.tuned(play)));
+        shell
+    }
+
+    #[test]
+    fn mixer_overlay_edits_levels_and_instruments() {
+        use rockcraft_core::Gain;
+        let mut shell = shell_with_play();
+        shell.on_key(KeyCode::Char('x'));
+        assert!(shell.mixer_ui.is_some(), "x opens the overlay");
+
+        shell.on_key(KeyCode::Down);
+        shell.on_key(KeyCode::Right); // Song level 1.0 stays clamped
+        assert_eq!(shell.mixer().song.gain, Gain::UNITY);
+        shell.on_key(KeyCode::Home);
+        assert_eq!(shell.mixer().song.gain, Gain::SILENT);
+        shell.on_key(KeyCode::Left);
+        assert_eq!(shell.mixer().song.gain, Gain::SILENT, "clamped at 0.0");
+        shell.on_key(KeyCode::Right);
+        assert_eq!(shell.mixer().song.gain.value(), 0.05);
+        shell.on_key(KeyCode::End);
+        assert_eq!(shell.mixer().song.gain, Gain::UNITY);
+
+        // Backing level reaches the live play screen.
+        shell.on_key(KeyCode::Down);
+        shell.on_key(KeyCode::Left);
+        assert_eq!(shell.mixer().backing_gain.value(), 0.95);
+        assert_eq!(play_screen(&shell).backing_gain().value(), 0.95);
+
+        // Instruments cycle and wrap.
+        shell.on_key(KeyCode::Down);
+        shell.on_key(KeyCode::Left);
+        let last = rockcraft_core::instruments().last().unwrap().id;
+        assert_eq!(shell.mixer().player.instrument.id, last, "wraps back");
+        shell.on_key(KeyCode::Right);
+        assert_eq!(shell.mixer().player.instrument.id, "grand_piano");
+        shell.on_key(KeyCode::Right);
+        assert_eq!(shell.mixer().player.instrument.id, "bright_piano");
+
+        shell.on_key(KeyCode::Esc);
+        assert!(shell.mixer_ui.is_none(), "Esc closes");
+        assert!(matches!(shell.screen, Screen::Play(_)), "still on play");
+    }
+
+    #[test]
+    fn mixer_overlay_swallows_other_keys() {
+        let mut shell = shell_with_play();
+        shell.on_key(KeyCode::Char('x'));
+        shell.on_key(KeyCode::Char('['));
+        shell.on_key(KeyCode::Char('m'));
+        shell.on_key(KeyCode::Char(' '));
+        assert!(play_screen(&shell).loop_view().is_none(), "[ did nothing");
+        assert!(!play_screen(&shell).is_paused(), "space did nothing");
+        shell.on_key(KeyCode::Char('x'));
+        assert!(shell.mixer_ui.is_none(), "x closes");
+    }
+
+    #[test]
+    fn mixer_overlay_is_not_offered_on_the_menu() {
+        let mut shell = make_shell();
+        shell.on_key(KeyCode::Char('x'));
+        assert!(shell.mixer_ui.is_none());
+    }
+
+    #[test]
+    fn mixer_overlay_fits_80x24_and_shows_the_hint() {
+        let mut shell = shell_with_play();
+        shell.on_key(KeyCode::Char('x'));
+        let text = shell.render_to_string(80, 24);
+        assert!(text.contains("mixer"), "{text}");
+        assert!(text.contains("You   "), "{text}");
+        assert!(text.contains("████"), "{text}");
+        assert!(text.contains("Song sound"), "{text}");
+        assert!(text.contains("Grand Piano"), "{text}");
+        // And on a cramped terminal it still renders without panicking.
+        let _ = shell.render_to_string(30, 6);
+    }
+
+    #[test]
+    fn play_status_line_advertises_the_mixer() {
+        let shell = shell_with_play();
+        assert!(shell.render_to_string(120, 24).contains("[x] mix"));
+    }
+
+    #[test]
+    fn mixer_changes_are_saved_and_reloaded() {
+        use rockcraft_core::MixerBus;
+        let dir = std::env::temp_dir().join(format!("rockcraft-mixer-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("tui-settings.json");
+
+        let mut shell = shell_with_play();
+        shell.set_settings_path(Some(path.clone()));
+        // From the overlay…
+        shell.on_key(KeyCode::Char('x'));
+        shell.on_key(KeyCode::Down);
+        shell.on_key(KeyCode::Left);
+        // …and over the socket.
+        shell
+            .dispatch(HostCommand::SetBusGain {
+                bus: MixerBus::Backing,
+                gain: 0.25,
+            })
+            .unwrap();
+
+        let (loaded, warnings) = crate::settings::load(&path);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(&loaded.mixer, shell.mixer());
+        assert_eq!(loaded.mixer.song.gain.value(), 0.95);
+        assert_eq!(loaded.mixer.backing_gain.value(), 0.25);
+
+        let mut fresh = make_shell();
+        fresh.set_mixer(loaded.mixer);
+        assert_eq!(fresh.mixer(), shell.mixer(), "a new shell starts with it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_save_is_reported_once() {
+        use rockcraft_core::MixerBus;
+        let dir = std::env::temp_dir().join(format!("rockcraft-mixer-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A plain file where the directory should be: create_dir_all fails.
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, "x").unwrap();
+        let mut shell = make_shell();
+        shell.set_settings_path(Some(blocker.join("tui-settings.json")));
+        let set = |shell: &mut Shell, g| {
+            shell
+                .dispatch(HostCommand::SetBusGain {
+                    bus: MixerBus::Song,
+                    gain: g,
+                })
+                .unwrap()
+        };
+        set(&mut shell, 0.5);
+        assert!(shell.status.contains("could not save"), "{}", shell.status);
+        shell.status.clear();
+        set(&mut shell, 0.4);
+        assert!(shell.status.is_empty(), "reported only once");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
