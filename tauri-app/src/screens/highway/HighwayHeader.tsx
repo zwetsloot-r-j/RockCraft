@@ -10,6 +10,7 @@ import type { HighwayCanvas } from "./HighwayCanvas";
 import type { PlayStateEvent } from "../../ipc/types";
 import type { SongData } from "./types";
 import { loopBadgeText } from "./practiceLoop";
+import { spectrumColor } from "./utils";
 
 interface HighwayHeaderProps {
   eng: () => HighwayCanvas | null;
@@ -30,10 +31,7 @@ interface HighwayHeaderProps {
 }
 
 // 12-dot pitch-class color wheel.
-const WHEEL = Array.from(
-  { length: 12 },
-  (_, i) => `oklch(0.72 0.16 ${(i * 30 + 8) % 360})`,
-);
+const WHEEL = Array.from({ length: 12 }, (_, i) => spectrumColor(i, 0.72, 0.16));
 
 const monoFont = "'IBM Plex Mono', monospace";
 
