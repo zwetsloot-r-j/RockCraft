@@ -457,8 +457,12 @@ The TUI remembers the mix: every change (from its `x` mixer overlay or from `set
 
 Not every frontend supports every command: the TUI's record/import/backing
 flows are interactive screen state machines, so it returns `unsupported:` for
-those (it wires `scan_library`, `query_dirty`, `play_load`, the mixer trio, and
-`play_toggle_pause`). A terminal also cannot draw a picture, so the video and
+those (it wires `scan_library`, `query_dirty`, `play_load`, the mixer trio,
+`play_toggle_pause`, `play_set_rate` — replying `{ rate_permille }`; the play
+screen's `-` / `=` keys step the same speed — and `play_status` / `play_finish`,
+with the desktop's field names minus the practice hand, split, monitor and bpm.
+The play commands work on the play screen and answer `failed:` off it;
+`play_finish` returns the summary and drops back to the menu). A terminal also cannot draw a picture, so the video and
 background-image commands are `unsupported:` there too — though the TUI still
 carries a loaded piece's movie and background layers through save/split
 untouched, so editing a chart there never destroys its backdrops. The Tauri
@@ -490,9 +494,9 @@ playhead, 0-based — and `practice_loop`, `null` when nothing is marked, else:
 
 **In the TUI (M17-B)** the four loop commands work on the play screen (off it
 they fail with `failed:`) and reply `{ paused, bar, practice_loop }`. The TUI
-has no scoring, practice speed or practice hand, so its `practice_loop` has no
-`last_pass`, the demo plays both hands, and `play_set_practice` answers
-`unsupported:`. On the TUI play screen the same keys work: `←`/`→`, `[`, `]`
+has no practice hand, so the demo plays both hands and `play_set_practice`
+answers `unsupported:`; each *your turn* pass is scored into `last_pass` as on
+the desktop. On the TUI play screen the same keys work: `←`/`→`, `[`, `]`
 and `l`.
 
 The mixer commands work from any screen in either frontend — the synth is

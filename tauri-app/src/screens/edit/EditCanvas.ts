@@ -23,7 +23,7 @@ import {
   pitchClass,
   roundRect,
   shade,
-  spectrumHue,
+  spectrumColor,
   tailGapPx,
   withAlpha,
 } from "../highway/utils";
@@ -766,13 +766,12 @@ export class EditCanvas {
     for (const p of pitches) {
       if (!vp.pitchVisible(p)) continue;
       const x = vp.xOf(p);
-      const hue = spectrumHue(p);
       ctx.globalAlpha = 0.5;
-      ctx.fillStyle = `oklch(0.72 0.16 ${hue})`;
+      ctx.fillStyle = spectrumColor(p, 0.72, 0.16);
       roundRect(ctx, x + pad, y, vp.laneW - pad * 2, h, 3);
       ctx.fill();
       ctx.globalAlpha = 0.9;
-      ctx.strokeStyle = `oklch(0.85 0.16 ${hue})`;
+      ctx.strokeStyle = spectrumColor(p, 0.85, 0.16);
       ctx.lineWidth = 1;
       roundRect(ctx, x + pad + 0.5, y + 0.5, vp.laneW - pad * 2 - 1, h - 1, 3);
       ctx.stroke();

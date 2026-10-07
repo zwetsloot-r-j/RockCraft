@@ -105,8 +105,8 @@ pub struct Shell {
     /// headless tests) leaves every backing track silent.
     backing_out: Option<BackingOut>,
     /// Set when the live piano sounds its own keys from the MIDI thread
-    /// ([`AudioLinks::echo`]); the shell switches it per screen and must not
-    /// sound those keys again itself.
+    /// ([`AudioLinks::echo`]); the shell must not sound those keys again
+    /// itself.
     echo: Option<Arc<AtomicBool>>,
     pub(crate) screen: Screen,
     menu_state: ListState,
@@ -145,6 +145,9 @@ pub struct Shell {
     save_warned: bool,
     /// The last save failure, shown inside the overlay.
     save_error: String,
+    /// Practice speed in permille; shell-wide like `color_mode`, so a slowed
+    /// piece stays slowed when you come back to it.
+    rate_permille: u16,
 }
 
 impl Shell {
@@ -175,6 +178,7 @@ impl Shell {
             settings_path: None,
             save_warned: false,
             save_error: String::new(),
+            rate_permille: crate::play::PLAY_RATE_UNITY,
         }
     }
 
@@ -196,14 +200,13 @@ impl Shell {
         backing_out: Option<BackingOut>,
         echo: Option<Arc<AtomicBool>>,
     ) {
+        // Every screen sounds your keys — menus and pickers included — so
+        // the echo is on for the whole run.
+        if let Some(flag) = &echo {
+            flag.store(true, Ordering::Relaxed);
+        }
         self.backing_out = backing_out;
         self.echo = echo;
-    }
-
-    /// Whether live keys should be sounded on the current screen: the play and
-    /// edit screens echo what you play; the menus and pickers stay silent.
-    fn screen_sounds_keys(&self) -> bool {
-        matches!(self.screen, Screen::Play(_) | Screen::Edit(_))
     }
 
     /// Override the fetch-command capability flag — used in tests.
@@ -221,6 +224,7 @@ impl Shell {
         play.set_backing_gain(self.mixer.backing_gain);
         play.set_color_mode(self.color_mode);
         play.set_scroll_mode(self.scroll_mode);
+        play.set_rate(self.rate_permille);
         play
     }
 
@@ -320,21 +324,10 @@ impl Shell {
             });
         };
         change(play);
-        let practice_loop = play.loop_view().map(|v| {
-            serde_json::json!({
-                "first_bar": v.first_bar,
-                "last_bar": v.last_bar,
-                "start_us": v.start_us,
-                "end_us": v.end_us,
-                "running": v.running,
-                "phase": v.phase.map(|p| p.name()),
-                "pass": v.pass,
-            })
-        });
         Ok(serde_json::json!({
             "paused": play.is_paused(),
             "bar": play.current_bar(),
-            "practice_loop": practice_loop,
+            "practice_loop": play.loop_view().map(|v| loop_json(&v)),
         }))
     }
 
@@ -543,6 +536,15 @@ impl Shell {
             //
             // `r`/`m` precedence on Play: reserved controls; the mock
             // turns the number row into note presses (other keys are no-ops).
+            // The summary screen at the song end: play again or leave.
+            Screen::Play(play) if play.summary().is_some() => match code {
+                KeyCode::Tab | KeyCode::Esc => {
+                    play.leave();
+                    self.screen = Screen::Menu;
+                }
+                KeyCode::Char('r') => play.restart(),
+                _ => {}
+            },
             Screen::Play(play) => match code {
                 KeyCode::Tab | KeyCode::Esc => {
                     play.leave();
@@ -552,6 +554,13 @@ impl Shell {
                 KeyCode::Char(' ') => play.toggle_pause(),
                 KeyCode::Char('m') => play.toggle_hear_song(),
                 KeyCode::Char('w') => play.toggle_wait_mode(),
+                // Practice speed, one step slower / faster (never past 1×).
+                KeyCode::Char('-') | KeyCode::Char('_') => {
+                    self.rate_permille = play.nudge_rate(false);
+                }
+                KeyCode::Char('=') | KeyCode::Char('+') => {
+                    self.rate_permille = play.nudge_rate(true);
+                }
                 // The practice loop (M17-B): step bars, mark, loop.
                 KeyCode::Left => {
                     play.step_bar(-1);
@@ -960,8 +969,26 @@ impl rockcraft_control::HostServices for Shell {
             HostCommand::LoadBundle { .. } => Err(HostError::Unsupported("load_bundle".into())),
             HostCommand::SplitBundle { .. } => Err(HostError::Unsupported("split_bundle".into())),
             HostCommand::PlaySetWait { .. } => Err(HostError::Unsupported("play_set_wait".into())),
-            HostCommand::PlaySetRate { .. } => Err(HostError::Unsupported("play_set_rate".into())),
-            HostCommand::PlayStatus => Err(HostError::Unsupported("play_status".into())),
+            HostCommand::PlaySetRate { rate_permille } => {
+                if let Screen::Play(play) = &mut self.screen {
+                    let applied = play.set_rate(rate_permille);
+                    self.rate_permille = applied;
+                    Ok(json!({ "rate_permille": applied }))
+                } else {
+                    Err(HostError::Failed {
+                        command: "play_set_rate".into(),
+                        detail: "no active play session".into(),
+                    })
+                }
+            }
+            // The live take (M18-D), with the desktop's field names.
+            HostCommand::PlayStatus => match &self.screen {
+                Screen::Play(play) => Ok(status_json(&play.status())),
+                _ => Err(HostError::Failed {
+                    command: "play_status".into(),
+                    detail: "no active play session".into(),
+                }),
+            },
             HostCommand::PlayToggleHearSong => {
                 Err(HostError::Unsupported("play_toggle_hear_song".into()))
             }
@@ -978,7 +1005,19 @@ impl rockcraft_control::HostServices for Shell {
                     })
                 }
             }
-            HostCommand::PlayFinish => Err(HostError::Unsupported("play_finish".into())),
+            // End the take and return its summary, like the desktop.
+            HostCommand::PlayFinish => {
+                let Screen::Play(play) = &self.screen else {
+                    return Err(HostError::Failed {
+                        command: "play_finish".into(),
+                        detail: "no active play session".into(),
+                    });
+                };
+                let summary = play.finish();
+                play.leave();
+                self.screen = Screen::Menu;
+                Ok(summary_json(&summary))
+            }
             // The practice loop (M17-B), mirroring the play-screen keys.
             HostCommand::PlaySeekBar { delta } => self.with_play("play_seek_bar", |play| {
                 play.step_bar(delta);
@@ -1182,21 +1221,9 @@ pub fn run_loop<B: ratatui::backend::Backend>(
 
         // Drain MIDI and route to the active screen. Clone the synth handle out
         // first so we don't hold a borrow of `shell` across the screen match.
-        // Live keys already echo from the MIDI thread on screens that sound
-        // them (`echoed`); otherwise the shell sounds them here as it drains.
-        let echoed = match &shell.echo {
-            Some(flag) => {
-                let on = shell.screen_sounds_keys();
-                if flag.swap(on, Ordering::Relaxed) != on && !on {
-                    // Leaving a sounding screen with keys down: don't strand them.
-                    if let Some(s) = &shell.synth {
-                        s.all_off();
-                    }
-                }
-                true
-            }
-            None => false,
-        };
+        // Live keys already echo from the MIDI thread (`echoed`); otherwise the
+        // shell sounds them here as it drains, on every screen.
+        let echoed = shell.echo.is_some();
         let synth = if echoed { None } else { shell.synth.clone() };
         let notes = shell.input.events();
         let sustain = shell.input.sustain_events();
@@ -1205,18 +1232,16 @@ pub fn run_loop<B: ratatui::backend::Backend>(
         for input in rockcraft_core::interleave_by_time(&notes, &sustain) {
             let ev = match input {
                 rockcraft_core::InputEvent::Note(ev) => ev,
-                // The pedal only shapes how your own keys sound, on the
-                // screens that echo them — and when the MIDI thread echoes,
-                // it has already sounded the pedal too.
+                // The pedal only shapes how your own keys sound — and when the
+                // MIDI thread echoes, it has already sounded the pedal too.
                 rockcraft_core::InputEvent::Sustain(p) => {
                     match &mut shell.screen {
                         Screen::Play(play) if !echoed => play.apply_sustain(&p),
-                        Screen::Edit(_) => {
+                        _ => {
                             if let Some(s) = &synth {
                                 s.apply_sustain(&p);
                             }
                         }
-                        _ => {}
                     }
                     continue;
                 }
@@ -1234,13 +1259,18 @@ pub fn run_loop<B: ratatui::backend::Backend>(
                         s.apply(&ev);
                     }
                 }
-                // These screens ignore live MIDI input.
+                // These screens ignore live MIDI input, but still sound it so
+                // the piano is never mute while you browse.
                 Screen::Menu
                 | Screen::BackingPicker { .. }
                 | Screen::SourcePicker(_)
                 | Screen::UrlInput(_)
                 | Screen::Importing(_)
-                | Screen::Library(_) => {}
+                | Screen::Library(_) => {
+                    if let Some(s) = &synth {
+                        s.apply(&ev);
+                    }
+                }
             }
         }
 
@@ -1260,14 +1290,6 @@ pub fn run_loop<B: ratatui::backend::Backend>(
         if let Screen::Edit(edit) = &mut shell.screen {
             edit.tick_audition();
             edit.tick_backing(shell.backing_out.as_ref());
-        }
-
-        // A finished song returns to the menu on its own.
-        if let Screen::Play(play) = &shell.screen {
-            if play.is_finished() {
-                shell.status = "song finished".into();
-                shell.screen = Screen::Menu;
-            }
         }
 
         // Poll the import pipeline and handle completion.
@@ -1291,6 +1313,68 @@ pub fn run_loop<B: ratatui::backend::Backend>(
             return Ok(());
         }
     }
+}
+
+/// A practice loop as the control socket reports it (desktop field names).
+fn loop_json(v: &crate::play::LoopView) -> serde_json::Value {
+    serde_json::json!({
+        "first_bar": v.first_bar,
+        "last_bar": v.last_bar,
+        "start_us": v.start_us,
+        "end_us": v.end_us,
+        "running": v.running,
+        "phase": v.phase.map(|p| p.name()),
+        "pass": v.pass,
+        "last_pass": v.last_pass.map(|p| serde_json::json!({
+            "pass": p.pass,
+            "hits": p.hits,
+            "misses": p.misses,
+            "accuracy_bp": p.accuracy_bp,
+        })),
+    })
+}
+
+/// `play_status`: the desktop's `PlayStatusView` fields the TUI has.
+fn status_json(s: &crate::play::PlayStatus) -> serde_json::Value {
+    serde_json::json!({
+        "loaded": true,
+        "title": s.title,
+        "time_us": s.time_us,
+        "duration_us": s.duration_us,
+        "paused": s.paused,
+        "frozen": s.frozen,
+        "finished": s.finished,
+        "wait_armed": s.wait_armed,
+        "awaiting": s.awaiting,
+        "held": s.held,
+        "rate_permille": s.rate_permille,
+        "hear_song": s.hear_song,
+        "score": s.score,
+        "combo": s.combo,
+        "best_combo": s.best_combo,
+        "hits": s.hits,
+        "misses": s.misses,
+        "beats_per_bar": s.beats_per_bar,
+        "note_count": s.note_count,
+        "bar": s.bar,
+        "practice_loop": s.practice_loop.as_ref().map(loop_json),
+    })
+}
+
+/// `play_finish`: the desktop's `PlaySummary`.
+fn summary_json(s: &crate::play::PlaySummary) -> serde_json::Value {
+    serde_json::json!({
+        "total_expected": s.total_expected,
+        "hits": s.hits,
+        "misses": s.misses,
+        "extras": s.extras,
+        "perfect": s.perfect,
+        "early": s.early,
+        "late": s.late,
+        "accuracy_bp": s.accuracy_bp,
+        "best_combo": s.best_combo,
+        "score": s.score,
+    })
 }
 
 fn draw(f: &mut Frame, shell: &Shell) {
@@ -1794,6 +1878,15 @@ mod tests {
     /// The shell on a play screen over a 16 s song (eight 2 s bars at the
     /// default 120 BPM), long enough to step and loop bars.
     fn shell_on_play() -> Shell {
+        let play =
+            PlayScreen::from_smf_bytes("loop".into(), &song_bytes(), None).expect("load song");
+        let mut shell = make_shell();
+        shell.screen = Screen::Play(Box::new(shell.tuned(play)));
+        shell
+    }
+
+    /// A 16-note, 16-second song as `.mid` bytes.
+    fn song_bytes() -> Vec<u8> {
         use rockcraft_core::{MidiNote, NoteEvent, Velocity};
         let v = Velocity::new(80).unwrap();
         let events: Vec<NoteEvent> = (0..16u64)
@@ -1805,11 +1898,7 @@ mod tests {
                 ]
             })
             .collect();
-        let bytes = rockcraft_midi::events_to_smf_bytes(&events);
-        let play = PlayScreen::from_smf_bytes("loop".into(), &bytes, None).expect("load song");
-        let mut shell = make_shell();
-        shell.screen = Screen::Play(Box::new(shell.tuned(play)));
-        shell
+        rockcraft_midi::events_to_smf_bytes(&events)
     }
 
     /// On the play screen the loop commands drive the loop and report it
@@ -1877,6 +1966,114 @@ mod tests {
         assert!(play_screen(&shell).loop_view().unwrap().running);
         shell.on_key(KeyCode::Char('l'));
         assert!(!play_screen(&shell).loop_view().unwrap().running);
+    }
+
+    #[test]
+    fn speed_keys_drive_the_play_screen_and_carry_to_the_next_song() {
+        let mut shell = shell_on_play();
+        shell.on_key(KeyCode::Char('-'));
+        shell.on_key(KeyCode::Char('-'));
+        assert_eq!(play_screen(&shell).rate_permille(), 750);
+        shell.on_key(KeyCode::Char('='));
+        assert_eq!(play_screen(&shell).rate_permille(), 875);
+        // A newly loaded song keeps the chosen speed.
+        let next = PlayScreen::from_smf_bytes("next".into(), &song_bytes(), None).unwrap();
+        shell.screen = Screen::Play(Box::new(shell.tuned(next)));
+        assert_eq!(play_screen(&shell).rate_permille(), 875);
+    }
+
+    #[test]
+    fn play_set_rate_works_on_the_play_screen_and_fails_off_it() {
+        let mut shell = shell_on_play();
+        let reply = shell
+            .dispatch(HostCommand::PlaySetRate {
+                rate_permille: 5000,
+            })
+            .unwrap();
+        assert_eq!(reply["rate_permille"], 2000, "clamped");
+        assert_eq!(play_screen(&shell).rate_permille(), 2000);
+
+        let mut shell = make_shell();
+        match shell
+            .dispatch(HostCommand::PlaySetRate { rate_permille: 500 })
+            .unwrap_err()
+        {
+            rockcraft_control::HostError::Failed { command, .. } => {
+                assert_eq!(command, "play_set_rate")
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// Run the shell's play screen past the song end.
+    fn finish_song(shell: &mut Shell) {
+        if let Screen::Play(play) = &mut shell.screen {
+            for _ in 0..40 {
+                play.advance(1_000_000);
+            }
+        }
+    }
+
+    #[test]
+    fn the_song_end_shows_the_summary_where_r_replays_and_tab_leaves() {
+        let mut shell = shell_on_play();
+        finish_song(&mut shell);
+        assert_eq!(shell.screen_name(), "play", "the summary stays on play");
+        let summary = *play_screen(&shell).summary().expect("summary shown");
+        assert_eq!(summary.misses, 16, "nothing was played");
+        let frame = shell.render_to_string(100, 30);
+        assert!(frame.contains("song finished"), "{frame}");
+        assert!(frame.contains("Accuracy  0%"), "{frame}");
+        // Only r / Tab / Esc act on the summary.
+        shell.on_key(KeyCode::Char(' '));
+        assert!(!play_screen(&shell).is_paused());
+        shell.on_key(KeyCode::Char('r'));
+        assert!(play_screen(&shell).summary().is_none(), "r plays again");
+        finish_song(&mut shell);
+        shell.on_key(KeyCode::Tab);
+        assert_eq!(shell.screen_name(), "menu");
+    }
+
+    #[test]
+    fn play_status_reports_the_live_take_and_fails_off_the_play_screen() {
+        let mut shell = shell_on_play();
+        let st = shell.dispatch(HostCommand::PlayStatus).unwrap();
+        for key in [
+            "score",
+            "combo",
+            "hits",
+            "misses",
+            "rate_permille",
+            "practice_loop",
+        ] {
+            assert!(st.get(key).is_some(), "missing {key}: {st}");
+        }
+        assert_eq!(st["note_count"], 16);
+        finish_song(&mut shell);
+        let st = shell.dispatch(HostCommand::PlayStatus).unwrap();
+        assert_eq!(
+            (st["finished"].as_bool(), st["misses"].as_u64()),
+            (Some(true), Some(16))
+        );
+
+        let mut shell = make_shell();
+        assert!(matches!(
+            shell.dispatch(HostCommand::PlayStatus).unwrap_err(),
+            rockcraft_control::HostError::Failed { .. }
+        ));
+    }
+
+    #[test]
+    fn play_finish_returns_the_summary_and_ends_the_take() {
+        let mut shell = shell_on_play();
+        let summary = shell.dispatch(HostCommand::PlayFinish).unwrap();
+        assert_eq!(summary["total_expected"], 16);
+        assert_eq!(summary["accuracy_bp"], 0);
+        assert_eq!(shell.screen_name(), "menu");
+        assert!(matches!(
+            shell.dispatch(HostCommand::PlayFinish).unwrap_err(),
+            rockcraft_control::HostError::Failed { .. }
+        ));
     }
 
     /// `play_toggle_pause` off the play screen is a clean no-op error, not a
