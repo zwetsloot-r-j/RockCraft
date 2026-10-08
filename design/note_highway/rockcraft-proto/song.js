@@ -66,6 +66,20 @@
     notes.push({ note: ch.rh[2] + 12, start: bar0, end: bar0 + BEAT * 1.5, hand: "R", vel: 104 });
   }
 
+  // Chromatic accents — sharps/flats so black-key notes appear in the highway.
+  // (Not musically "correct" — added purely to exercise the black-key visuals.)
+  const SHARPS = [
+    { note: 66, start: 0 * BAR + BEAT * 2.5, end: 0 * BAR + BEAT * 3, hand: "R" }, // F#4
+    { note: 68, start: 0 * BAR + BEAT * 3.0, end: 0 * BAR + BEAT * 3.5, hand: "R" }, // G#4
+    { note: 70, start: 1 * BAR + BEAT * 1.0, end: 1 * BAR + BEAT * 1.5, hand: "R" }, // A#4
+    { note: 61, start: 1 * BAR + BEAT * 2.5, end: 1 * BAR + BEAT * 3.0, hand: "L" }, // C#3
+    { note: 75, start: 2 * BAR + BEAT * 0.5, end: 2 * BAR + BEAT * 1.0, hand: "R" }, // D#5
+    { note: 73, start: 2 * BAR + BEAT * 2.5, end: 2 * BAR + BEAT * 3.0, hand: "R" }, // C#5
+    { note: 68, start: 3 * BAR + BEAT * 1.0, end: 3 * BAR + BEAT * 1.5, hand: "R" }, // G#4
+    { note: 70, start: 3 * BAR + BEAT * 3.0, end: 3 * BAR + BEAT * 3.5, hand: "R" }, // A#4
+  ];
+  for (const s of SHARPS) notes.push(Object.assign({ vel: 88 }, s));
+
   window.RC = {
     LOWEST, HIGHEST, isBlack, pitchClass, noteName, keyLayout,
     SONG: {

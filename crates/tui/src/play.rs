@@ -661,7 +661,7 @@ impl PlayScreen {
         // (the next bar's first note) never freezes the loop.
         self.tick_loop();
         let held: BTreeSet<u8> = self.held.iter().collect();
-        self.wait.set_held(held);
+        self.wait.set_held(held, self.clock.now_us());
         let wait_frozen = self.wait.poll(self.clock.now_us()) == GateState::Frozen;
         // A manual pause freezes the transport just like an unsatisfied wait step.
         let frozen = self.paused || wait_frozen;
@@ -725,7 +725,7 @@ impl PlayScreen {
             // Resume immediately — unless wait-mode is currently holding an
             // unsatisfied step, in which case the next `advance` re-freezes.
             let held: BTreeSet<u8> = self.held.iter().collect();
-            self.wait.set_held(held);
+            self.wait.set_held(held, self.clock.now_us());
             let wait_frozen = self.wait.poll(self.clock.now_us()) == GateState::Frozen;
             if !wait_frozen && !self.clock.is_running() {
                 self.clock.resume();
@@ -2281,8 +2281,10 @@ mod tests {
     fn a_wait_freeze_fades_the_song_instead_of_releasing_it() {
         let mut play = legato_screen();
         play.set_wait_mode(true);
-        note_on(&mut play, 60);
+        // Strike C at its onset (a key held down through the lead-in is stale).
         play.advance(SHIFT);
+        note_on(&mut play, 60);
+        play.advance(0);
         play.tick_song_synth();
         let c = 0;
         assert!(play.song_on_fired.contains(&c), "C sounds");
@@ -2464,8 +2466,8 @@ mod tests {
     fn restart_rearms_wait_tracker_from_the_top() {
         let mut play = two_note_screen();
         play.set_wait_mode(true);
-        note_on(&mut play, 60);
         play.advance(SHIFT);
+        note_on(&mut play, 60); // strike C at its onset
         play.advance(1_000_000); // past the C step
         assert_eq!(play.now_us(), SHIFT + 1_000_000);
         // Restart resets the clock and the tracker; wait-mode stays armed and the
