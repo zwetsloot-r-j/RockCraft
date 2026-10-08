@@ -776,7 +776,7 @@ impl Composer {
         // the highway, video, and backing — the "pause on note" behaviour.
         if self.wait_enabled {
             if let Some(gate) = self.wait.as_mut() {
-                gate.set_held(self.held.clone());
+                gate.set_held(self.held.clone(), self.transport_us);
                 if gate.poll(self.transport_us) == GateState::Frozen {
                     self.wait_frozen = true;
                     return Vec::new();

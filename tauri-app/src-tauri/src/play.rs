@@ -933,7 +933,7 @@ impl PlaySession {
         // The loop wraps BEFORE the gate poll, so a step at exactly `end_us` (the
         // next bar's first note) never freezes the loop.
         self.tick_loop();
-        self.wait.set_held(self.held.clone());
+        self.wait.set_held(self.held.clone(), self.clock.now_us());
         let wait_frozen = self.wait.poll(self.clock.now_us()) == GateState::Frozen;
         // A manual pause freezes the transport just like an unsatisfied wait step.
         let frozen = self.paused || wait_frozen;
@@ -1116,7 +1116,7 @@ impl PlaySession {
         } else {
             // Resume unless wait-mode is holding an unsatisfied step; the next
             // `advance` re-freezes in that case.
-            self.wait.set_held(self.held.clone());
+            self.wait.set_held(self.held.clone(), self.clock.now_us());
             let wait_frozen = self.wait.poll(self.clock.now_us()) == GateState::Frozen;
             if !wait_frozen && !self.clock.is_running() {
                 self.clock.resume();
@@ -2571,7 +2571,6 @@ mod tests {
         ];
         let mut s = PlaySession::from_events("legato".into(), &legato).with_hear_song(true);
         s.set_wait_mode(true);
-        s.ingest(on(60, SHIFT)); // play the first note; wait for the second
         let state = PlayState(Mutex::new(Some(s)));
         let audio = crate::audio::AudioState::silent();
         let fired = |state: &PlayState| {
@@ -2581,6 +2580,15 @@ mod tests {
         };
 
         tick_play(&state, &audio, &[], &[], SHIFT, false);
+        // Play the first note at its onset (a key held through the lead-in is
+        // stale); then wait for the second.
+        state
+            .0
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .ingest(on(60, SHIFT));
         tick_play(&state, &audio, &[], &[], 1_000_000, false); // clamped: lands on step 2
         assert_eq!(
             state.0.lock().unwrap().as_ref().unwrap().now_us(),
