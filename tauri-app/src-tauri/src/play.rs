@@ -2581,14 +2581,8 @@ mod tests {
 
         tick_play(&state, &audio, &[], &[], SHIFT, false);
         // Play the first note at its onset (a key held through the lead-in is
-        // stale); then wait for the second.
-        state
-            .0
-            .lock()
-            .unwrap()
-            .as_mut()
-            .unwrap()
-            .ingest(on(60, SHIFT));
+        // stale) — the song re-enters with it — then wait for the second.
+        tick_play(&state, &audio, &[on(60, 0)], &[], 4_000, false);
         tick_play(&state, &audio, &[], &[], 1_000_000, false); // clamped: lands on step 2
         assert_eq!(
             state.0.lock().unwrap().as_ref().unwrap().now_us(),

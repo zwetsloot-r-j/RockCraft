@@ -184,7 +184,7 @@ const cfgFusion = {
   colorMode: "spectrum", perspective: 0, glow: 0.32, gridlines: "soft",
   keyboard: "flat", labels: true, pitchRuler: true, kbRatio: 0.2, lead: 3000,
   bg: "#0f1016", hitLine: "#aab2d0", noteGap: 0.2, radius: 3, scoring: true,
-  laneTint: "rgba(255,255,255,0.012)",
+  laneTint: "rgba(255,255,255,0.012)", distinguishBlack: true,
 };
 function FusionProto() {
   const { canvasRef, engRef } = useEngine(cfgFusion);
@@ -199,6 +199,16 @@ function FusionProto() {
           <div style={{ fontSize: 15, fontWeight: 600 }}>{SONG.title}</div>
           <span style={{ fontSize: 11, fontFamily: "'IBM Plex Mono', monospace", padding: "2px 8px", borderRadius: 6, background: "rgba(255,255,255,0.07)", color: "#b9bccb" }}>{SONG.key}</span>
           <div style={{ display: "flex", gap: 2, marginLeft: 2 }}>{wheel.map((cc, i) => <span key={i} style={{ width: 7, height: 7, borderRadius: 2, background: cc }} />)}</div>
+          <div style={{ display: "flex", alignItems: "center", gap: 9, marginLeft: 6 }}>
+            <span style={{ display: "flex", alignItems: "center", gap: 4 }} title="White-key notes: solid">
+              <span style={{ width: 10, height: 14, borderRadius: 2, background: "oklch(0.74 0.16 150)" }} />
+              <span style={{ fontSize: 8.5, letterSpacing: 1.5, color: "#7c7f8e", fontFamily: "'IBM Plex Mono', monospace" }}>WHITE</span>
+            </span>
+            <span style={{ display: "flex", alignItems: "center", gap: 4 }} title="Black-key notes (sharps/flats): slim, dark, outlined">
+              <span style={{ width: 8, height: 14, borderRadius: 2, background: "oklch(0.5 0.13 150)", clipPath: "polygon(0 34%, 100% 0, 100% 100%, 0 100%)" }} />
+              <span style={{ fontSize: 8.5, letterSpacing: 1.5, color: "#7c7f8e", fontFamily: "'IBM Plex Mono', monospace" }}>BLACK ♯</span>
+            </span>
+          </div>
         </div>
         <div style={{ flex: 1 }} />
         <div style={{ textAlign: "center" }}>
@@ -248,7 +258,7 @@ function Brief() {
         <Row k="A" c="#46c4bb" title="Studio" body="Clean studio app. Two-hand color (L teal / R amber), realistic shaded keys, soft beat grid, transport + progress." />
         <Row k="B" c="#ff3df0" title="Neon Arcade" body="Rocksmith energy: tapered perspective lane, neon glow, live score / combo / accuracy HUD with judgment popups." />
         <Row k="C" c="oklch(0.78 0.15 150)" title="Spectrum" body="Learner's tool: notes colored by pitch class with note-name labels, octave ruler, bar:beat + chord readout. Flat, calm." />
-        <Row k="D" c="#67e3c4" title="Spectrum Live" body="C's readable pitch lanes + labels, with B's dynamics: per-key flashes, spark bursts, centered Great / Perfect judgment." />
+        <Row k="D" c="#67e3c4" title="Spectrum Live" body="C's readable pitch lanes + labels, with B's dynamics + flashes. Black-key notes (sharps/flats) render slim with a diagonal rear cutoff, tinted from the neighboring white key but darker." />
       </div>
       <div style={{ marginTop: "auto", fontSize: 11, color: "#6b6f7e", fontFamily: "'IBM Plex Mono', monospace", borderTop: "1px solid rgba(255,255,255,0.06)", paddingTop: 12 }}>
         Mix &amp; match — perspective, glow, color logic, keyboard realism and HUD are independent knobs. Scoring values in B are simulated for the mock.

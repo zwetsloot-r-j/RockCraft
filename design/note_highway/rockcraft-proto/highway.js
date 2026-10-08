@@ -200,13 +200,18 @@
       let yTop = clamp(this.yOf(en, now), -40, this.hitY);
       let yBot = clamp(this.yOf(st, now), -40, this.hitY);
       if (yBot - yTop < 3) yBot = yTop + 3; // min visible height
-      const gap = lane.black ? 0.06 : c.noteGap;
+      const distinct = lane.black && c.distinguishBlack; // slim, darker, rear-cut
+      const gap = lane.black ? (distinct ? 0.36 : 0.06) : c.noteGap;
       const halfW = (lane.w * (1 - gap)) / 2;
       const L = lane.cx - halfW, R = lane.cx + halfW;
       const sT = this.sAt(yTop), sB = this.sAt(yBot);
       const depth = 1 - clamp(yBot / this.hitY, 0, 1); // 0 far, 1 near hit
       const light = depth * 0.5;
-      const col = this.noteColor(nt, light);
+      let col = this.noteColor(nt, light);
+      if (distinct) {
+        // tint from the adjacent (lower) white key, turned darker
+        col = shade(this.noteColor({ note: nt.note - 1, hand: nt.hand }, light), -0.18);
+      }
 
       ctx.save();
       // glow
@@ -215,7 +220,16 @@
         ctx.shadowBlur = (8 + depth * 22) * c.glow;
       }
       ctx.beginPath();
-      if (!c.perspective) {
+      if (distinct && !c.perspective) {
+        // slim black-key note with a diagonal cutoff on the rear (top) edge
+        const x0 = this.xP(L, 1), x1 = this.xP(R, 1);
+        const cut = Math.min(x1 - x0, (yBot - yTop) * 0.7);
+        ctx.moveTo(x0, yBot);
+        ctx.lineTo(x0, yTop + cut);
+        ctx.lineTo(x1, yTop);
+        ctx.lineTo(x1, yBot);
+        ctx.closePath();
+      } else if (!c.perspective) {
         roundRect(ctx, this.xP(L, 1), yTop, halfW * 2, yBot - yTop, c.radius);
       } else {
         ctx.moveTo(this.xP(L, sT), yTop);
