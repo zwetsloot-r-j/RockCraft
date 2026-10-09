@@ -324,6 +324,9 @@ export function EditScreen(props: Props): JSX.Element {
 
   // Set-BPM prompt: digits typed so far (seeded with the current tempo on open).
   const [bpmText, setBpmText] = createSignal("");
+  // Whether the set-BPM prompt applies from the cursor's bar on (`Alt+T`,
+  // set_tempo_from) rather than to the whole piece (`T`, set_bpm).
+  const [bpmFromCursor, setBpmFromCursor] = createSignal(false);
 
   // One-shot save-confirmation toast, cleared after 2.5 s.
   const [saveFlash, setSaveFlash] = createSignal<string | null>(null);
@@ -1327,7 +1330,8 @@ export function EditScreen(props: Props): JSX.Element {
         setBpmText("");
         if (Number.isFinite(bpm)) {
           // core clamps to 20..=300; we just forward the typed value.
-          void runAction("set_bpm", { bpm }).then((reply) => {
+          const name = bpmFromCursor() ? "set_tempo_from" : "set_bpm";
+          void runAction(name, { bpm }).then((reply) => {
             setDirty(reply.dirty);
           });
         }
@@ -1515,9 +1519,29 @@ export function EditScreen(props: Props): JSX.Element {
         setOverlay("save-as");
         return;
       }
+      // Tempo from a checkpoint: Alt + the tempo keys apply from the cursor's
+      // bar to the end. Matched on `code` — Alt can change `key` on some layouts.
+      if (e.altKey && !e.ctrlKey && !e.metaKey) {
+        if (e.code === "KeyT") {
+          e.preventDefault();
+          setBpmFromCursor(true);
+          setBpmText(String(Math.round(s.bar_bpm ?? s.bpm)));
+          setOverlay("set-bpm");
+          return;
+        }
+        if (e.code === "KeyE" || e.code === "KeyR") {
+          e.preventDefault();
+          const delta = e.code === "KeyE" ? -1 : 1;
+          void runAction("adjust_tempo_from", { delta }).then((reply) => {
+            setDirty(reply.dirty);
+          });
+          return;
+        }
+      }
       // `T` opens the absolute set-BPM prompt, seeded with the current tempo.
       if (e.key === "T") {
         e.preventDefault();
+        setBpmFromCursor(false);
         setBpmText(String(Math.round(s.bpm)));
         setOverlay("set-bpm");
         return;
@@ -2073,7 +2097,14 @@ export function EditScreen(props: Props): JSX.Element {
 
       {/* Set-BPM overlay */}
       <Show when={overlay() === "set-bpm"}>
-        <SetBpmPrompt text={bpmText()} />
+        <SetBpmPrompt
+          text={bpmText()}
+          title={
+            bpmFromCursor()
+              ? "Set tempo (BPM) from this bar to the end"
+              : "Set tempo (BPM)"
+          }
+        />
       </Show>
     </div>
   );
@@ -2789,6 +2820,9 @@ function HelpOverlay(props: { onClose: () => void }): JSX.Element {
         "-             Velocity −8",
         "( / )         Tempo −/+ 5 BPM",
         "T             Set BPM (type a value, Enter to apply)",
+        "Alt+T         Set BPM from the cursor's bar to the end (a tempo",
+        "              change at a checkpoint; earlier bars keep theirs)",
+        "Alt+e / Alt+r Tempo −/+ 1 BPM from the cursor's bar to the end",
         "I             Infer a per-bar tempo map from the backing audio,",
         "              with the cursor as a downbeat (bar lines only — no note moves)",
         "m             Toggle grab (move note with h/j/k/l)",
@@ -3119,7 +3153,7 @@ function SaveAsPrompt(props: { name: string }): JSX.Element {
  * TUI's `draw_bpm_prompt`; key routing is in the parent `onKeydown`. The typed
  * value is forwarded to `set_bpm`, which clamps to 20..=300 in `core`.
  */
-function SetBpmPrompt(props: { text: string }): JSX.Element {
+function SetBpmPrompt(props: { text: string; title: string }): JSX.Element {
   return (
     <div
       style={{
@@ -3144,7 +3178,7 @@ function SetBpmPrompt(props: { text: string }): JSX.Element {
         }}
       >
         <div style={{ color: "#f5c542", "font-size": "13px", "margin-bottom": "10px" }}>
-          Set tempo (BPM)
+          {props.title}
         </div>
         <div
           style={{

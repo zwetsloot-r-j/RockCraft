@@ -123,6 +123,14 @@ export function StatusBar(props: Props): JSX.Element {
       </Show>
 
       <Field label="bpm" value={String(props.snapshot.bpm)} />
+      <Show
+        when={
+          props.snapshot.bar_bpm !== undefined &&
+          Math.abs(props.snapshot.bar_bpm - props.snapshot.bpm) >= 0.05
+        }
+      >
+        <Field label="bar bpm" value={(props.snapshot.bar_bpm ?? 0).toFixed(1)} />
+      </Show>
       <Field
         label="sig"
         value={`${props.snapshot.time_sig.beats_per_bar}/${props.snapshot.time_sig.beat_unit}`}

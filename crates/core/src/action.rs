@@ -272,6 +272,21 @@ pub enum Action {
     NudgeBarTempo {
         delta: i32,
     },
+    /// Set the tempo from the **cursor's bar to the end** to `bpm` (clamped to
+    /// the grid's BPM range): the cursor's bar gets exactly `bpm`, and every
+    /// later bar is scaled by the same factor, so per-bar tweaks after it keep
+    /// their relative differences. Notes from the bar on re-time to stay on
+    /// their beats; everything before it is untouched. A tempo change at a
+    /// checkpoint, where [`SetBpm`](Action::SetBpm) re-times the whole piece.
+    SetTempoFrom {
+        bpm: u32,
+    },
+    /// Nudge the tempo from the cursor's bar to the end by `delta` BPM (signed,
+    /// clamped to the grid's BPM range), relative to the cursor bar's current
+    /// tempo. The rest behaves as [`SetTempoFrom`](Action::SetTempoFrom).
+    AdjustTempoFrom {
+        delta: i32,
+    },
     /// Change the length of the bar the cursor sits in by `delta_steps` grid
     /// steps (at the live subdivision), sliding every **bar line after it** by
     /// that amount. Purely a grid edit — **no note is moved and no time is added
@@ -375,6 +390,8 @@ impl Action {
             Action::RemoveBar => "remove_bar",
             Action::NudgeTail { .. } => "nudge_tail",
             Action::NudgeBarTempo { .. } => "nudge_bar_tempo",
+            Action::SetTempoFrom { .. } => "set_tempo_from",
+            Action::AdjustTempoFrom { .. } => "adjust_tempo_from",
             Action::NudgeBarLength { .. } => "nudge_bar_length",
             Action::SetBarStarts { .. } => "set_bar_starts",
             Action::Undo => "undo",
@@ -539,6 +556,8 @@ pub fn action_names() -> &'static [&'static str] {
         "remove_bar",
         "nudge_tail",
         "nudge_bar_tempo",
+        "set_tempo_from",
+        "adjust_tempo_from",
         "nudge_bar_length",
         "set_bar_starts",
         "undo",
@@ -669,6 +688,8 @@ static ACTION_HELP: &[ActionInfo] = {
         ActionInfo { name: "remove_bar", params: &[], description: "Cut the bar the cursor sits in: delete the notes starting in it and slide everything after one bar earlier so no gap is left (ripple)." },
         ActionInfo { name: "nudge_tail", params: &[p("delta_steps", "i32")], description: "Ripple-shift every note at or after the cursor by delta_steps grid steps (signed) — re-phases the rest of the song in one move to fix a constant timing offset that starts at a point. Notes before the cursor are untouched." },
         ActionInfo { name: "nudge_bar_tempo", params: &[p("delta", "i32")], description: "Slow (delta>0) or speed (delta<0) the bar the cursor sits in by delta grid steps of length; the notes inside re-time to stay on their beats and everything after ripples. Uses the per-bar tempo map so untouched bars stay put." },
+        ActionInfo { name: "set_tempo_from", params: &[p("bpm", "u32")], description: "Set the tempo from the cursor's bar to the end to bpm: that bar gets exactly bpm and every later bar scales by the same factor (keeping per-bar differences). Notes from the bar on re-time to stay on their beats; earlier bars are untouched. A tempo change at a checkpoint — set_bpm re-times the whole piece." },
+        ActionInfo { name: "adjust_tempo_from", params: &[p("delta", "i32")], description: "Nudge the tempo from the cursor's bar to the end by delta BPM (signed), relative to that bar's current tempo. Otherwise as set_tempo_from." },
         ActionInfo { name: "nudge_bar_length", params: &[p("delta_steps", "i32")], description: "Change the length of the cursor's bar by delta_steps grid steps (at the live subdivision) and slide every bar line after it by that amount. Grid-only: NO note moves and NO time is added/removed — for fixing an odd-length measure so bar lines land back on the fixed notes. Use </> to change the subdivision for finer/coarser steps (down to 1/32)." },
         ActionInfo { name: "set_bar_starts", params: &[p("bars_us", "Vec<u64>")], description: "Install a whole per-bar tempo map: bars_us = song time (µs) of every bar's downbeat, strictly ascending, >= 2 entries (the last closes the final bar). [] clears it back to the uniform grid; a malformed list is a no-op. Grid-only: no note moves. The grid origin becomes the first downbeat and the BPM the median bar's tempo. See the detect_tempo_map host command to fill it from the backing audio." },
         // ── history ─────────────────────────────────────────────────────
@@ -781,6 +802,8 @@ mod tests {
             Action::RemoveBar,
             Action::NudgeTail { delta_steps: -2 },
             Action::NudgeBarTempo { delta: 1 },
+            Action::SetTempoFrom { bpm: 96 },
+            Action::AdjustTempoFrom { delta: -1 },
             Action::NudgeBarLength { delta_steps: -1 },
             Action::SetBarStarts {
                 bars_us: vec![0, 2_000_000, 4_100_000],

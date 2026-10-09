@@ -82,6 +82,11 @@ export interface ComposerSnapshot {
   cursor: Cursor;
   bpm: number;
   /**
+   * Tempo (BPM) of the bar under the cursor — differs from `bpm` once a per-bar
+   * tempo map exists (e.g. after a tempo change from a checkpoint).
+   */
+  bar_bpm?: number;
+  /**
    * Grid phase origin (µs): the song time bar 1 / beat 1 / step 0 lands on.
    * Absent/0 for a grid that starts at song time 0. Bar/beat gridlines and the
    * cursor position are phased by this so they align to the performance.
@@ -330,6 +335,8 @@ export type ActionName =
   | "remove_bar"
   | "nudge_tail"
   | "nudge_bar_tempo"
+  | "set_tempo_from"
+  | "adjust_tempo_from"
   | "nudge_bar_length"
   // ── history ─────────────────────────────────────────────────────────
   | "undo"

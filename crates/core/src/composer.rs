@@ -545,6 +545,26 @@ impl Composer {
             Action::RemoveBar => self.remove_bar(),
             Action::NudgeTail { delta_steps } => self.nudge_tail(delta_steps),
             Action::NudgeBarTempo { delta } => self.nudge_bar_tempo(delta),
+            Action::SetTempoFrom { bpm } => {
+                let ts = self.grid.time_sig;
+                let bpm = bpm.clamp(Grid::MIN_BPM, Grid::MAX_BPM) as u128;
+                // bar_us = beats_per_bar · 240 s / (bpm · beat_unit)
+                let bar_us =
+                    240_000_000u128 * ts.beats_per_bar as u128 / (bpm * ts.beat_unit as u128);
+                self.retempo_from_cursor_bar(|_| bar_us as u64)
+            }
+            Action::AdjustTempoFrom { delta } => {
+                let ts = self.grid.time_sig;
+                // In "bar_us per BPM" units: bpm = k / (bar_us · beat_unit), so
+                // the target bar length is k / ((bpm + delta) · beat_unit).
+                let k = 240_000_000f64 * ts.beats_per_bar as f64;
+                let bu = ts.beat_unit as f64;
+                self.retempo_from_cursor_bar(|old_us| {
+                    let bpm = k / (old_us as f64 * bu) + delta as f64;
+                    let bpm = bpm.clamp(Grid::MIN_BPM as f64, Grid::MAX_BPM as f64);
+                    (k / (bpm * bu)).round() as u64
+                })
+            }
             Action::NudgeBarLength { delta_steps } => self.nudge_bar_length(delta_steps),
             Action::SetBarStarts { bars_us } => {
                 self.install_bar_starts(bars_us);
@@ -868,6 +888,7 @@ impl Composer {
             notes,
             cursor: self.cursor,
             bpm: self.grid.bpm as f64,
+            bar_bpm: self.cursor_bar_bpm(),
             grid_origin_us: self.grid.origin_us,
             time_sig: self.grid.time_sig,
             subdivision: self.grid.subdivision,
@@ -1054,6 +1075,51 @@ impl Composer {
             }
         }
         Vec::new()
+    }
+
+    /// Re-time from the cursor's bar to the end: that bar's length becomes
+    /// `new_len(old_len)` and every later bar line, note, and loop marker after
+    /// its downbeat scales about that downbeat by the same factor. Backs
+    /// [`Action::SetTempoFrom`] / [`Action::AdjustTempoFrom`]. Like the other
+    /// tempo edits it re-times the whole history rather than adding an undo step.
+    fn retempo_from_cursor_bar(&mut self, new_len: impl FnOnce(u64) -> u64) -> Vec<Effect> {
+        self.ensure_bar_map();
+        let bar = self.bar_at_us(self.cursor_us());
+        // Past the map's end bars extrapolate from the last one; extend the map
+        // through the cursor's bar so its length is a real entry to scale.
+        while (self.bar_starts.len() as u64) <= bar + 1 {
+            let next = self.bar_start_us(self.bar_starts.len() as u64);
+            self.bar_starts.push(next);
+        }
+        let bstart = self.bar_start_us(bar);
+        let old = self.bar_dur_us(bar);
+        let new = new_len(old).max(1);
+        if new == old {
+            return Vec::new();
+        }
+        let (n, d) = (new as u128, old as u128);
+        let sc = |t: u64| {
+            if t > bstart {
+                bstart + (((t - bstart) as u128 * n + d / 2) / d) as u64
+            } else {
+                t
+            }
+        };
+        self.history.retempo_from_all(bstart, new, old);
+        for t in self.bar_starts.iter_mut() {
+            *t = sc(*t);
+        }
+        self.loop_start_us = sc(self.loop_start_us);
+        self.loop_end_us = sc(self.loop_end_us);
+        Vec::new()
+    }
+
+    /// Tempo (quarter-note BPM) of the bar under the cursor, from its length and
+    /// the metre — the tempo map's local tempo, where `grid.bpm` is the piece's.
+    fn cursor_bar_bpm(&self) -> f64 {
+        let ts = self.grid.time_sig;
+        let bar_us = self.bar_dur_us(self.bar_at_us(self.cursor_us()));
+        240_000_000f64 * ts.beats_per_bar as f64 / (bar_us as f64 * ts.beat_unit as f64)
     }
 
     /// Change the length of the cursor's bar by `delta_steps` grid steps (at the
@@ -2180,6 +2246,10 @@ pub struct ComposerSnapshot {
     pub notes: Vec<NoteView>,
     pub cursor: Cursor,
     pub bpm: f64,
+    /// Tempo (BPM) of the bar under the cursor. Differs from `bpm` once a
+    /// per-bar tempo map exists — e.g. after a tempo change from a checkpoint.
+    #[serde(default)]
+    pub bar_bpm: f64,
     /// Grid phase origin (µs): the song time bar 1 / beat 1 / step 0 lands on.
     /// `0` for a piece whose grid starts at song time 0. Frontends phase their
     /// bar/beat gridlines by this so the lines match the performance.
@@ -2677,6 +2747,93 @@ mod tests {
         assert_eq!(s(&c, 64), 4_500_000, "everything after ripples too");
         // The tempo map now marks bar 1 starting at 2.5s.
         assert_eq!(c.bar_starts()[1], 2_500_000);
+    }
+
+    /// 4/4 at 120 BPM (2 s bars) with notes at 1 s (bar 0), 2 s (bar 1
+    /// downbeat), 3 s (bar 1 beat 3), 4 s (bar 2) and 6 s (bar 3); cursor in bar 1.
+    fn tempo_from_fixture() -> Composer {
+        let grid = Grid {
+            bpm: 120,
+            time_sig: TimeSig {
+                beats_per_bar: 4,
+                beat_unit: 4,
+            },
+            subdivision: Subdivision::Quarter,
+            origin_us: 0,
+        };
+        let mut tl = Timeline::new();
+        for (p, t) in [
+            (60, 1_000_000),
+            (62, 2_000_000),
+            (64, 3_000_000),
+            (65, 4_000_000),
+            (67, 6_000_000),
+        ] {
+            tl.insert(note(p, t, 100_000));
+        }
+        let mut c = Composer::from_timeline(tl, grid);
+        apply(&mut c, Action::SetCursor { pitch: 60, step: 5 }); // bar 1, beat 2
+        c
+    }
+
+    fn start_of(c: &Composer, p: u8) -> u64 {
+        c.timeline()
+            .notes()
+            .find(|(_, n)| n.pitch.value() == p)
+            .unwrap()
+            .1
+            .start_us
+    }
+
+    #[test]
+    fn set_tempo_from_retimes_only_from_the_cursor_bar_on() {
+        let mut c = tempo_from_fixture();
+        assert_eq!(c.snapshot().bar_bpm, 120.0);
+        // 120 → 100 BPM from bar 1: bars there become 2.4 s (×1.2).
+        apply(&mut c, Action::SetTempoFrom { bpm: 100 });
+        assert_eq!(
+            start_of(&c, 60),
+            1_000_000,
+            "before the checkpoint: untouched"
+        );
+        assert_eq!(start_of(&c, 62), 2_000_000, "the checkpoint downbeat stays");
+        assert_eq!(start_of(&c, 64), 3_200_000, "in-bar note keeps its beat");
+        assert_eq!(start_of(&c, 65), 4_400_000);
+        assert_eq!(
+            start_of(&c, 67),
+            6_800_000,
+            "later bars take the new tempo too"
+        );
+        assert_eq!(&c.bar_starts()[..4], &[0, 2_000_000, 4_400_000, 6_800_000]);
+        assert_eq!(c.snapshot().bar_bpm, 100.0);
+        // The bar before the checkpoint keeps the old tempo.
+        apply(&mut c, Action::SetCursor { pitch: 60, step: 1 });
+        assert_eq!(c.snapshot().bar_bpm, 120.0);
+    }
+
+    #[test]
+    fn adjust_tempo_from_is_relative_to_the_cursor_bar() {
+        let mut c = tempo_from_fixture();
+        apply(&mut c, Action::AdjustTempoFrom { delta: -20 }); // 120 → 100
+        assert_eq!(start_of(&c, 60), 1_000_000);
+        assert_eq!(start_of(&c, 67), 6_800_000);
+        assert_eq!(c.snapshot().bar_bpm, 100.0);
+        apply(&mut c, Action::AdjustTempoFrom { delta: 20 }); // back to 120
+        assert_eq!(start_of(&c, 67), 6_000_000);
+        assert_eq!(c.snapshot().bar_bpm, 120.0);
+    }
+
+    #[test]
+    fn tempo_from_keeps_later_per_bar_differences() {
+        let mut c = tempo_from_fixture();
+        // Make bar 2 one beat (0.5 s) longer, then halve the tempo from bar 1:
+        // bar 1 doubles to 4 s and bar 2 doubles to 5 s — still a beat longer.
+        apply(&mut c, Action::SetCursor { pitch: 60, step: 9 }); // bar 2
+        apply(&mut c, Action::NudgeBarTempo { delta: 1 });
+        apply(&mut c, Action::SetCursor { pitch: 60, step: 5 }); // bar 1
+        apply(&mut c, Action::SetTempoFrom { bpm: 60 });
+        assert_eq!(&c.bar_starts()[..4], &[0, 2_000_000, 6_000_000, 11_000_000]);
+        assert_eq!(start_of(&c, 60), 1_000_000);
     }
 
     #[test]
