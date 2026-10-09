@@ -889,6 +889,11 @@ impl Composer {
             cursor: self.cursor,
             bpm: self.grid.bpm as f64,
             bar_bpm: self.cursor_bar_bpm(),
+            tempo_changes: crate::bars::tempo_changes(
+                &self.bar_starts,
+                self.grid.time_sig.beats_per_bar,
+                self.grid.time_sig.beat_unit,
+            ),
             grid_origin_us: self.grid.origin_us,
             time_sig: self.grid.time_sig,
             subdivision: self.grid.subdivision,
@@ -2250,6 +2255,10 @@ pub struct ComposerSnapshot {
     /// per-bar tempo map exists — e.g. after a tempo change from a checkpoint.
     #[serde(default)]
     pub bar_bpm: f64,
+    /// The tempo map's change points (see [`crate::bars::tempo_changes`]), for
+    /// frontends to mark checkpoints. Empty for a uniform-tempo piece.
+    #[serde(default)]
+    pub tempo_changes: Vec<crate::bars::TempoChange>,
     /// Grid phase origin (µs): the song time bar 1 / beat 1 / step 0 lands on.
     /// `0` for a piece whose grid starts at song time 0. Frontends phase their
     /// bar/beat gridlines by this so the lines match the performance.

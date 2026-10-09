@@ -77,6 +77,13 @@ export interface SelectionView {
  * A read-only snapshot of the composer — mirror of `composer::ComposerSnapshot`.
  * Everything the frontend needs to draw, without exposing core internals.
  */
+/** A tempo checkpoint in the composer's tempo map (see `tempo_changes`). */
+export interface TempoChange {
+  at_us: number;
+  bpm: number;
+  prev_bpm: number;
+}
+
 export interface ComposerSnapshot {
   notes: NoteView[];
   cursor: Cursor;
@@ -86,6 +93,11 @@ export interface ComposerSnapshot {
    * tempo map exists (e.g. after a tempo change from a checkpoint).
    */
   bar_bpm?: number;
+  /**
+   * The tempo map's change points: the downbeat where a new tempo starts, with
+   * the tempo before it (quarter-note BPM). Empty for a uniform-tempo piece.
+   */
+  tempo_changes?: TempoChange[];
   /**
    * Grid phase origin (µs): the song time bar 1 / beat 1 / step 0 lands on.
    * Absent/0 for a grid that starts at song time 0. Bar/beat gridlines and the
