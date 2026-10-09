@@ -205,6 +205,24 @@ impl Timeline {
         }
     }
 
+    /// Re-time everything from `from_us` on by `num / den`: a note starting at or
+    /// after `from_us` moves to `from_us + (start - from_us)·num/den` and its
+    /// duration scales by the same factor (rounded, 1 µs floor). Notes starting
+    /// earlier are untouched. Backs the "change the tempo from here on" edit.
+    pub fn retempo_from(&mut self, from_us: u64, num: u64, den: u64) {
+        if num == den || den == 0 {
+            return;
+        }
+        let (n, d) = (num as u128, den as u128);
+        for note in self.notes.values_mut() {
+            if note.start_us >= from_us {
+                let rel = (note.start_us - from_us) as u128;
+                note.start_us = from_us + ((rel * n + d / 2) / d) as u64;
+                note.dur_us = (((note.dur_us as u128 * n + d / 2) / d) as u64).max(1);
+            }
+        }
+    }
+
     /// Scale every note's `start_us` and `dur_us` by `num / den` (rounded), so a
     /// note on beat *b* stays on beat *b* when the tempo changes. Durations keep a
     /// 1 µs floor. A no-op when `num == den`. Backs the "re-time on tempo change"

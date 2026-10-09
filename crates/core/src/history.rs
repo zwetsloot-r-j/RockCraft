@@ -85,6 +85,18 @@ impl History {
         }
     }
 
+    /// Apply a re-time from a point on (see [`Timeline::retempo_from`]) across
+    /// the **entire** history, like [`retempo_bar_all`](Self::retempo_bar_all).
+    pub fn retempo_from_all(&mut self, from_us: u64, num: u64, den: u64) {
+        for tl in self.past.iter_mut() {
+            tl.retempo_from(from_us, num, den);
+        }
+        self.current.retempo_from(from_us, num, den);
+        for tl in self.future.iter_mut() {
+            tl.retempo_from(from_us, num, den);
+        }
+    }
+
     /// Save the current state as a checkpoint *before* a mutation, clearing
     /// the redo stack. If the undo stack would exceed `capacity`, the oldest
     /// entry is silently dropped.

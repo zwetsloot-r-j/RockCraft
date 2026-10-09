@@ -37,7 +37,7 @@ pub use background::{
     BackgroundImage, BackgroundStack, BackgroundView, Easing, Keyframe, Transform, MAX_SCALE,
     MIN_SCALE, POS_LIMIT,
 };
-pub use bars::BarMap;
+pub use bars::{tempo_changes, BarMap, TempoChange, TEMPO_CHANGE_MIN_BPM};
 pub use buffer::EventBuffer;
 pub use chord::{ChordKind, Key, Scale};
 pub use composer::{Composer, ComposerSnapshot, Cursor, InputMode, NoteView, SelectionView};

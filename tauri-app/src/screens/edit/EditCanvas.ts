@@ -96,6 +96,14 @@ function stepIndexOf(us: number, bars: number[], g: GridTiming, originUs: number
 const BG = "#0f1016";
 /** Translucent dim used over a video backdrop (lets the frame read through). */
 const BG_BACKDROP = "rgba(15,16,22,0.45)";
+/** Tempo-checkpoint line + new-BPM label, and the dimmer previous-BPM label. */
+const TEMPO_MARK = "#4fd1c5";
+const TEMPO_MARK_PREV = "rgba(79,209,197,0.45)";
+
+/** A BPM for a checkpoint label: whole numbers bare, otherwise one decimal. */
+function fmtBpm(bpm: number): string {
+  return Math.abs(bpm - Math.round(bpm)) < 0.05 ? String(Math.round(bpm)) : bpm.toFixed(1);
+}
 /**
  * How far (s) the backdrop element's `currentTime` may sit from the frame we
  * asked for and still count as showing it. Comfortably wider than a frame at
@@ -404,6 +412,7 @@ export class EditCanvas {
     this.drawLanes(vp);
     this.drawLoopRegion(snapshot, vp);
     this.drawGridlines(g, vp, gridOriginUs, bars);
+    this.drawTempoChangeLines(snapshot, vp);
     // Crosshair guides sit under the notes so a note on the cursor's column /
     // row stays fully legible, but over the gridlines so the selected timeslot
     // reads at a glance even on a sparse grid.
@@ -416,6 +425,7 @@ export class EditCanvas {
     this.drawCursor(snapshot, vp, cursorUs, cursorStepUs);
     this.drawPlayhead(snapshot, vp, reviewing ? scrollAnchorUs : playheadUs, reviewing);
     this.drawLaneLabels(vp);
+    this.drawTempoChangeLabels(snapshot, vp);
     // The piano keyboard strip sits on top of everything at the bottom edge,
     // aligned 1:1 with the pitch lanes so a falling note descends into its key.
     this.drawKeyboard(snapshot, vp);
@@ -583,6 +593,48 @@ export class EditCanvas {
       ctx.lineTo(this.w, y + 0.5);
       ctx.stroke();
     }
+  }
+
+  // ── tempo checkpoints ───────────────────────────────────────────────────
+  // A coloured line on every downbeat where the tempo map changes tempo. Time
+  // runs upward, so the new BPM is labelled above the line (the section it
+  // starts) and the previous one, dimmer, below it. Lines sit under the notes;
+  // the labels are drawn last so notes never cover them.
+
+  private drawTempoChangeLines(snapshot: ComposerSnapshot, vp: Viewport): void {
+    const ctx = this.ctx;
+    ctx.save();
+    ctx.strokeStyle = TEMPO_MARK;
+    ctx.lineWidth = 2;
+    for (const c of snapshot.tempo_changes ?? []) {
+      const y = vp.yOf(c.at_us);
+      if (y < 0 || y > this.h) continue;
+      ctx.beginPath();
+      ctx.moveTo(0, y);
+      ctx.lineTo(this.w, y);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  private drawTempoChangeLabels(snapshot: ComposerSnapshot, vp: Viewport): void {
+    const ctx = this.ctx;
+    const x = this.w - 8;
+    ctx.save();
+    ctx.textAlign = "right";
+    for (const c of snapshot.tempo_changes ?? []) {
+      const y = vp.yOf(c.at_us);
+      if (y < -20 || y > this.h + 20) continue;
+      ctx.font = "600 12px 'IBM Plex Mono', ui-monospace, monospace";
+      ctx.fillStyle = TEMPO_MARK;
+      ctx.textBaseline = "bottom";
+      ctx.fillText(`${fmtBpm(c.bpm)} BPM`, x, y - 3);
+      ctx.font = "11px 'IBM Plex Mono', ui-monospace, monospace";
+      ctx.fillStyle = TEMPO_MARK_PREV;
+      ctx.textBaseline = "top";
+      ctx.fillText(`${fmtBpm(c.prev_bpm)} BPM`, x, y + 3);
+    }
+    ctx.restore();
   }
 
   // ── notes ───────────────────────────────────────────────────────────────

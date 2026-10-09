@@ -89,9 +89,84 @@ impl<'a> BarMap<'a> {
     }
 }
 
+/// A point where a tempo map changes tempo: the downbeat of the first bar at
+/// the new tempo, with the tempo before it. Both in quarter-note BPM.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TempoChange {
+    pub at_us: u64,
+    pub bpm: f64,
+    pub prev_bpm: f64,
+}
+
+/// Smallest tempo difference (BPM) [`tempo_changes`] reports; finer per-bar
+/// jitter (an audio-detected map, rounding) is not a checkpoint.
+pub const TEMPO_CHANGE_MIN_BPM: f64 = 0.5;
+
+/// The tempo checkpoints of a map (`starts[b]` = downbeat of bar `b`, µs) in a
+/// metre of `beats_per_bar` / `beat_unit`: every bar whose tempo differs from
+/// the running section tempo by at least [`TEMPO_CHANGE_MIN_BPM`]. Comparing
+/// against the section (the tempo at the last checkpoint) rather than the
+/// previous bar means a gradual drift still surfaces, once it adds up. Empty
+/// for a map with fewer than two bars' lengths.
+pub fn tempo_changes(starts: &[u64], beats_per_bar: u8, beat_unit: u8) -> Vec<TempoChange> {
+    let k = 240_000_000f64 * beats_per_bar as f64 / beat_unit.max(1) as f64;
+    let mut out = Vec::new();
+    let mut section: Option<f64> = None;
+    for w in starts.windows(2) {
+        let len = w[1].saturating_sub(w[0]).max(1);
+        let bpm = k / len as f64;
+        match section {
+            None => section = Some(bpm),
+            Some(prev) if (bpm - prev).abs() >= TEMPO_CHANGE_MIN_BPM => {
+                out.push(TempoChange {
+                    at_us: w[0],
+                    bpm,
+                    prev_bpm: prev,
+                });
+                section = Some(bpm);
+            }
+            Some(_) => {}
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tempo_changes_marks_checkpoints_not_jitter() {
+        // 4/4: 2 s bars = 120 BPM, 2.4 s = 100 BPM. One µs of jitter is ignored.
+        let starts = [0, 2_000_000, 4_000_001, 6_000_000, 8_400_000, 10_800_000];
+        let ch = tempo_changes(&starts, 4, 4);
+        assert_eq!(ch.len(), 1);
+        assert_eq!(ch[0].at_us, 6_000_000);
+        assert!((ch[0].bpm - 100.0).abs() < 1e-9);
+        assert!((ch[0].prev_bpm - 120.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn tempo_changes_surfaces_a_gradual_drift() {
+        // Each bar 0.2 BPM slower than the last: no single step counts, but the
+        // drift is reported once it reaches the threshold against the section.
+        let k = 240_000_000f64;
+        let mut starts = vec![0u64];
+        for i in 0..6 {
+            let bpm = 120.0 - 0.2 * i as f64;
+            starts.push(starts[i] + (k / bpm).round() as u64);
+        }
+        let ch = tempo_changes(&starts, 4, 4);
+        assert_eq!(ch.len(), 1, "{ch:?}");
+        assert!((ch[0].prev_bpm - 120.0).abs() < 1e-3);
+        assert!((ch[0].bpm - 119.4).abs() < 1e-3);
+    }
+
+    #[test]
+    fn tempo_changes_empty_without_a_map() {
+        assert!(tempo_changes(&[], 4, 4).is_empty());
+        assert!(tempo_changes(&[0, 2_000_000], 4, 4).is_empty());
+    }
 
     const MAP: [u64; 4] = [1_000, 3_000, 4_000, 6_000];
 
