@@ -79,6 +79,8 @@ import { useRouter } from "../../shell/Router";
 // ── Video backdrop (M7-tauri-N) ────────────────────────────────────────────
 
 /** Fine backdrop-offset nudge (10 ms), bound to `,` / `.` while attached. */
+/** Physical keys of the Alt tempo shortcuts (matched on `code`, see onKeydown). */
+const ALT_TEMPO_CODES = new Set(["KeyT", "KeyE", "KeyR"]);
 const BACKDROP_NUDGE_FINE_US = 10_000;
 /** Coarse backdrop-offset nudge (250 ms), bound to `;` / `'` while attached. */
 const BACKDROP_NUDGE_COARSE_US = 250_000;
@@ -1277,7 +1279,10 @@ export function EditScreen(props: Props): JSX.Element {
 
   function onKeydown(e: KeyboardEvent): void {
     const s = store.snap;
-    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    if (e.ctrlKey || e.metaKey) return;
+    // Alt combos are left to the webview, except the tempo-from-checkpoint
+    // keys (Alt+T / Alt+e / Alt+r), handled with the other tempo keys below.
+    if (e.altKey && !ALT_TEMPO_CODES.has(e.code)) return;
 
     // Let native text editing own the keyboard while a real text field is
     // focused (the split editor's segment-name inputs). Without this the editor
