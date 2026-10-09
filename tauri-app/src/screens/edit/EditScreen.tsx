@@ -495,7 +495,10 @@ export function EditScreen(props: Props): JSX.Element {
     // the note, then we leave the element alone so WebView2 can finish decoding
     // and hold it. Re-seeking every frame would keep it in a permanent seek-stall
     // (readyState→1 → black), the "backdrop invisible while frozen" bug.
-    if (s.frozen) {
+    // Also hold while the playhead is before the clip's start (a negative
+    // offset delays it): `want` is pinned at frame 0, and native playback would
+    // run the clip ahead of it.
+    if (s.frozen || anchorUsOf(s) + offsetUs() < 0) {
       if (!v.paused) v.pause();
       if (v.playbackRate !== 1) v.playbackRate = 1;
       // Hold the note's frame. Retry the seek (throttled) until it actually
@@ -1136,6 +1139,14 @@ export function EditScreen(props: Props): JSX.Element {
         /* backend down — UI state still reflects the offset */
       });
     }
+    // An attached backing moves in lock-step: an imported bundle's backing is
+    // the video's own soundtrack, so nudging one alone would put the picture
+    // out of sync with its sound.
+    if (backingName() !== null) {
+      void runAction("nudge_backing_offset", { delta_us: deltaUs }).then((reply) =>
+        setDirty(reply.dirty),
+      );
+    }
   }
 
   // Bind the `<video>` src to the attached path (via the asset protocol) and
@@ -1558,8 +1569,8 @@ export function EditScreen(props: Props): JSX.Element {
         return;
       }
       // While a backdrop is attached, the backing-align nudge keys realign the
-      // *video* offset instead (they don't collide with backing-offset because
-      // they only divert here when a video is present).
+      // *video* offset — and the backing with it, if one is attached (see
+      // nudgeOffset), so picture and sound stay together.
       if (videoPath() !== null) {
         // Backtick opens the alignment overlay (keyboard X, density/hit-line Y,
         // time, review speed) for registering the movie under the grid.
@@ -1818,9 +1829,14 @@ export function EditScreen(props: Props): JSX.Element {
     };
     raf = requestAnimationFrame(loop);
 
-    window.addEventListener("keydown", onKeydown);
+    // Capture phase: the Router's global Esc→menu listener was registered on
+    // `window` first, so in the bubble phase it ran before this handler and left
+    // the editor before Esc could clear a selection or raise the unsaved-edits
+    // prompt. Capturing runs this first; its stopPropagation then keeps the
+    // Router out whenever the editor consumes the key.
+    window.addEventListener("keydown", onKeydown, true);
     onCleanup(() => {
-      window.removeEventListener("keydown", onKeydown);
+      window.removeEventListener("keydown", onKeydown, true);
       cancelAnimationFrame(raf);
       clearTimeout(flashTimeout);
       if (scrubTimer !== undefined) clearTimeout(scrubTimer);
@@ -2830,8 +2846,9 @@ function HelpOverlay(props: { onClose: () => void }): JSX.Element {
       title: "Video backdrop",
       rows: [
         "V             Attach / detach a video backdrop",
-        ", / .         Realign −/+ 10 ms (while attached)",
-        "; / '         Realign −/+ 250 ms (while attached)",
+        ", / .         Realign −/+ 10 ms (while attached; moves the",
+        "              backing audio along with it)",
+        "; / '         Realign −/+ 250 ms (while attached; ditto)",
       ],
     },
     {

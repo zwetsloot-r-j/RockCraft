@@ -399,12 +399,13 @@ export function HighwayScreen() {
     if (!v || meta === null || backdrop() === "off") return;
     const dur = v.duration;
     if (!Number.isFinite(dur) || dur <= 0) return; // metadata not ready yet
-    const want = Math.min(
-      Math.max((timeUs - shiftUs + meta.offset_us) / 1e6, 0),
-      dur,
-    );
+    const rawS = (timeUs - shiftUs + meta.offset_us) / 1e6;
+    const want = Math.min(Math.max(rawS, 0), dur);
 
-    if (frozen || !started()) {
+    // Before the clip's start (a negative offset delays it), hold its first
+    // frame like a freeze; playing natively would run the clip ahead of a
+    // target pinned at 0.
+    if (frozen || !started() || rawS < 0) {
       if (!v.paused) v.pause();
       if (v.playbackRate !== 1) v.playbackRate = 1;
       prevVideoWant = -1; // resuming re-seats without a false back-jump
