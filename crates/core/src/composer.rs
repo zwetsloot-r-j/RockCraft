@@ -1159,20 +1159,24 @@ impl Composer {
 
     /// The id of the note at the cursor's `(pitch, step)`, if any.
     ///
-    /// Prefers a note whose span *covers* the cursor's grid line, then falls back
-    /// to a note that *starts within* the cursor's one-step-wide cell. The
-    /// fallback matters for imported charts: their onsets sit at true fractional
-    /// microsecond times while the grid's `step_us` is integer-floored, so a short
-    /// note can start a few µs past the grid line and be missed by the exact-point
-    /// query — the cursor looks like it is on the note but edits (hand, move,
-    /// delete) find nothing. See [`Timeline::find_starting_in`].
+    /// Prefers a note that *starts within* the cursor's one-step-wide cell, then
+    /// falls back to a note whose span *covers* the cursor's grid line (so the
+    /// tail of a long held note stays editable).
+    ///
+    /// Onset-first matters for off-grid (imported/recorded) charts in two ways:
+    /// - a short note can start a few µs past the integer-floored grid line, so
+    ///   an exact-point query at the line misses it entirely;
+    /// - an earlier same-pitch note that starts just *before* the line and is
+    ///   still sounding would otherwise shadow the note drawn in the cell, so
+    ///   edits land on "the key below" instead of the one under the cursor.
+    ///
+    /// See [`Timeline::find_starting_in`] and [`Timeline::find_at`].
     pub fn note_under_cursor(&self) -> Option<NoteId> {
         let us = self.cursor_us();
         let cell_end = self.pos_us_of_step(self.cursor.step + 1);
-        self.timeline().find_at(self.cursor.pitch, us).or_else(|| {
-            self.timeline()
-                .find_starting_in(self.cursor.pitch, us, cell_end)
-        })
+        self.timeline()
+            .find_starting_in(self.cursor.pitch, us, cell_end)
+            .or_else(|| self.timeline().find_at(self.cursor.pitch, us))
     }
 
     /// Look up note data by id.
@@ -2614,6 +2618,42 @@ mod tests {
         assert_eq!(c.get_note(a).unwrap().dur_us, 510_000);
         apply(&mut c, Action::Undo);
         assert_eq!(c.get_note(a).unwrap().dur_us, 250_000);
+    }
+
+    /// Regression: a same-pitch note that starts just *before* the cursor's grid
+    /// line and is still sounding must not shadow the note whose onset is in the
+    /// cursor's cell — edits used to land on that earlier note ("the key below").
+    #[test]
+    fn note_under_cursor_prefers_onset_in_cell_over_earlier_sounding_note() {
+        // 120 BPM 4/4 sixteenths: step = 125_000 µs; step 8 = [1_000_000, 1_125_000).
+        let grid = Grid {
+            bpm: 120,
+            time_sig: TimeSig {
+                beats_per_bar: 4,
+                beat_unit: 4,
+            },
+            subdivision: Subdivision::Sixteenth,
+            origin_us: 0,
+        };
+        let mut tl = Timeline::new();
+        // A: off-grid onset 10 ms early, still sounding across the line.
+        let a = tl.insert(note(60, 990_000, 120_000));
+        // B: onset inside the cursor's cell — the note the user sees there.
+        let b = tl.insert(note(60, 1_030_000, 200_000));
+        let mut c = Composer::from_timeline(tl, grid);
+        apply(&mut c, Action::SetCursor { pitch: 60, step: 8 });
+        assert_eq!(c.note_under_cursor(), Some(b));
+        // And a real edit lands on B, not A.
+        apply(&mut c, Action::DeleteNote);
+        assert!(c.get_note(b).is_none());
+        assert!(c.get_note(a).is_some());
+
+        // With nothing starting in the cell, the covering note is still found.
+        assert_eq!(
+            c.note_under_cursor(),
+            Some(a),
+            "falls back to covering note"
+        );
     }
 
     /// Regression: an imported note whose onset sits a few µs past the
