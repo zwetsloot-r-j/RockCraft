@@ -28,6 +28,10 @@ interface HighwayHeaderProps {
   /** Practice speed in permille (1000 = 1x), stepped with `-` / `=`. */
   rate?: () => number;
   splitName?: () => string;
+  /** Restart the take from the top (the ↻ button; also the `r` key). */
+  onRestart?: () => void;
+  /** Whether the ↻ button shows — only once a take is running. */
+  canRestart?: () => boolean;
 }
 
 // 12-dot pitch-class color wheel.
@@ -110,6 +114,29 @@ export function HighwayHeader(props: HighwayHeaderProps) {
 
       <Show when={props.live}>
         <div style={{ display: "flex", "align-items": "center", gap: "8px" }}>
+          <Show when={props.onRestart && (props.canRestart?.() ?? true)}>
+            <button
+              type="button"
+              // Never take focus: a focused button would re-fire on Space,
+              // which the screen uses for play/pause.
+              tabIndex={-1}
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => props.onRestart?.()}
+              style={{
+                "font-size": "11px",
+                "font-family": monoFont,
+                padding: "2px 8px",
+                "border-radius": "6px",
+                border: "none",
+                cursor: "pointer",
+                background: "rgba(255,255,255,0.08)",
+                color: "#b9bccb",
+              }}
+              title="r — restart from the top"
+            >
+              ↻ r
+            </button>
+          </Show>
           <span
             style={{
               "font-size": "11px",
