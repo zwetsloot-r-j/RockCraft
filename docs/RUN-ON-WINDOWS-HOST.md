@@ -112,7 +112,8 @@ nothing to watch/hear):
 
 - `DELAY_MS` — pause between beats (e.g. `2500`) so each step is visible.
 - `HOLD_MS` — hold the end state before `app_quit`.
-- `PLAY_MS` — in playback, turn on **`play_toggle_hear_song`** and hold a window
+- `PLAY_MS` — in playback, switch the song audio to the synth
+  (**`play_set_song_audio {mode:"synth"}`**) and hold a window
   so the chart notes synthesise through the SoundFont (audible).
 - `BACKING` — Windows path to an **audio** backing track. The driver
   `attach_backing`s it and runs `play_from_start` in the edit view so the backing

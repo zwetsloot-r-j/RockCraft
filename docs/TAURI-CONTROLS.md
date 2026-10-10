@@ -38,7 +38,7 @@ intercepts `Esc` before the shell's global `Esc`→menu handler
 
 | Control | Where | Status | Keybinding | Notes |
 |---|---|---|---|---|
-| Hear-song `♪ m` | HighwayHeader | **real** | `m` | `play_toggle_hear_song`; chip reflects state |
+| Song audio `♪ bg/piano/off` | HighwayHeader | **real** | `m` | `play_cycle_song_audio` (backing → piano → off; no backing: piano ↔ off); chip shows the mode |
 | Wait `⏸ w` | HighwayHeader | **real** | `w` | `play_set_wait`; chip reflects state |
 
 These are status indicators, not buttons — they reflect the keyboard toggles.

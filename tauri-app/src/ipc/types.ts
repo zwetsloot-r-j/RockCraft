@@ -401,6 +401,13 @@ export interface PlaySpan {
 }
 
 /**
+ * What the play screen sounds of the song itself, cycled with `m` — never both
+ * at once: `"backing"` (the backing recording), `"synth"` (the synth replays the
+ * song's notes) or `"off"`. Mirror of `rockcraft_core::SongAudio`.
+ */
+export type SongAudio = "backing" | "synth" | "off";
+
+/**
  * Static song info returned by `play_load` — mirror of `play::PlayInfo`.
  * Source of truth: `tauri-app/src-tauri/src/play.rs`.
  */
@@ -425,7 +432,8 @@ export interface PlayInfo {
    * {@link PlayStateEvent}. Mirror of `play::BackgroundLayerView`.
    */
   backgrounds: BackgroundLayerView[];
-  hear_song: boolean;
+  /** The song-audio mode the take starts in (`m` cycles it). */
+  song_audio: SongAudio;
   /** Piece tempo (BPM) for the highway bar/beat grid; 120 when no grid. */
   bpm: number;
   /** Beats per bar (time-signature numerator); 4 when no grid. */

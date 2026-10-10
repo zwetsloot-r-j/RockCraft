@@ -28,8 +28,8 @@ use rockcraft_core::{
     backing_position_us, hand::hand_of_pitch_value, interleave_by_time, score, song_shift_us,
     BackgroundImage, BarMap, ExpectedNote, Feedback, GateState, Hand, HandOverride, LoopPhase,
     LoopStep, MidiNote, NoteEvent, NoteEventKind, NoteJudgment, Pass, PlayClock, PracticeLoop,
-    RecordingMeta, ScoreConfig, ScoreReport, Summary, SustainEvent, SynthBus, Timing, Transform,
-    WaitGate, DEFAULT_SPLIT,
+    RecordingMeta, ScoreConfig, ScoreReport, SongAudio, Summary, SustainEvent, SynthBus, Timing,
+    Transform, WaitGate, DEFAULT_SPLIT,
 };
 use rockcraft_midi::smf_bytes_to_events;
 use serde::Serialize;
@@ -161,8 +161,9 @@ pub struct PlayInfo {
     /// Background image layers to render behind the highway, back-to-front, or
     /// empty when the piece has none (M14-D).
     pub backgrounds: Vec<BackgroundLayerView>,
-    /// Whether "hear the song" starts on.
-    pub hear_song: bool,
+    /// The song-audio mode the take starts in (`m` cycles it): `"backing"`,
+    /// `"synth"` or `"off"`.
+    pub song_audio: SongAudio,
     /// Piece tempo (BPM) so the highway draws its bar/beat grid at the right
     /// spacing; defaults to 120 when the bundle has no grid.
     pub bpm: u32,
@@ -338,7 +339,8 @@ pub struct PlayStatusView {
     pub practice: String,
     pub split_pitch: u8,
     pub rate_permille: u16,
-    pub hear_song: bool,
+    /// Song-audio mode (`"backing"` / `"synth"` / `"off"`).
+    pub song_audio: SongAudio,
     pub monitor: bool,
     pub score: u64,
     pub combo: u32,
@@ -545,7 +547,9 @@ pub struct PlaySession {
     video: Option<BackgroundVideoSession>,
     /// Background image layers resolved from the bundle's `meta.json` (M14-D).
     backgrounds: Vec<BackgroundLayerSession>,
-    hear_song: bool,
+    /// What the play screen sounds of the song itself (`m`): the backing
+    /// recording, the synth replay of the chart, or neither — never both.
+    song_audio: SongAudio,
     /// Input monitor: synthesise the player's own key presses so they hear
     /// themselves through the app synth. Independent of "hear the song" (which
     /// auditions the chart). Toggled at runtime; off by default.
@@ -672,7 +676,7 @@ impl PlaySession {
             backing: None,
             video: None,
             backgrounds: Vec::new(),
-            hear_song: false,
+            song_audio: SongAudio::Off,
             monitor: false,
             sustain: false,
             practice: None,
@@ -796,13 +800,13 @@ impl PlaySession {
             .collect()
     }
 
-    /// Start with "hear the song" on or off. Bundle loading passes
-    /// `meta.backing.is_none()` here (#247): a MIDI-only piece auditions itself
-    /// so it isn't silent without a live piano, while a piece with a backing
-    /// track leaves it off so the synth doesn't double the recording.
-    /// `play_toggle_hear_song` still flips it at runtime either way.
-    pub fn with_hear_song(mut self, on: bool) -> Self {
-        self.hear_song = on;
+    /// Start in song-audio mode `mode`. Bundle loading passes
+    /// [`SongAudio::default_for`] here (#247): a MIDI-only piece auditions
+    /// itself with the synth so it isn't silent without a live piano, while a
+    /// piece with a backing track plays the recording and leaves the synth off
+    /// so it doesn't double it. `play_cycle_song_audio` changes it at runtime.
+    pub fn with_song_audio(mut self, mode: SongAudio) -> Self {
+        self.song_audio = mode;
         self
     }
 
@@ -846,7 +850,7 @@ impl PlaySession {
                     path: b.path.to_string_lossy().into_owned(),
                 })
                 .collect(),
-            hear_song: self.hear_song,
+            song_audio: self.song_audio,
             split_pitch: self.split_pitch,
             bpm: self.bpm,
             beats_per_bar: self.beats_per_bar,
@@ -1157,15 +1161,45 @@ impl PlaySession {
         next
     }
 
-    /// Toggle "hear the song", returning the new state. Turning it off clears the
-    /// audition trigger bookkeeping (the caller silences the synth).
-    pub fn toggle_hear_song(&mut self) -> bool {
-        self.hear_song = !self.hear_song;
-        if !self.hear_song {
+    /// The current song-audio mode.
+    pub fn song_audio(&self) -> SongAudio {
+        self.song_audio
+    }
+
+    /// Cycle the song-audio mode (`m`), returning the new one. See
+    /// [`SongAudio::next`]: `Backing` is skipped without a backing track.
+    pub fn cycle_song_audio(&mut self) -> SongAudio {
+        let next = self.song_audio.next(self.backing.is_some());
+        self.apply_song_audio(next);
+        next
+    }
+
+    /// Set the song-audio mode directly. `Backing` on a piece with no backing
+    /// track is rejected and the current mode kept.
+    pub fn set_song_audio(&mut self, mode: SongAudio) -> Result<SongAudio, String> {
+        if !mode.is_valid_for(self.backing.is_some()) {
+            return Err("this piece has no backing track".into());
+        }
+        self.apply_song_audio(mode);
+        Ok(mode)
+    }
+
+    /// Switch modes. Leaving `Synth` clears the audition trigger bookkeeping
+    /// (the caller silences the synth).
+    fn apply_song_audio(&mut self, mode: SongAudio) {
+        self.song_audio = mode;
+        if !mode.synth_on() {
             self.song_on_fired.clear();
             self.song_off_fired.clear();
         }
-        self.hear_song
+    }
+
+    /// Whether the backing recording should be muted right now: it is audible
+    /// only in [`SongAudio::Backing`] **and** at 1× speed (it cannot follow a
+    /// slowed transport). Both conditions feed this one answer, so neither
+    /// unmutes what the other silenced.
+    pub fn backing_muted(&self) -> bool {
+        !self.song_audio.backing_on() || self.rate_permille != PLAY_RATE_UNITY
     }
 
     /// Is input-monitor on (synthesise the player's own key presses)?
@@ -1246,7 +1280,7 @@ impl PlaySession {
     /// Indices whose `note_on` / `note_off` should fire for the song audition at
     /// the current clock but haven't yet. Caller routes these to the synth and
     /// then calls [`mark_song_fired`](Self::mark_song_fired). Empty unless
-    /// `hear_song` is on.
+    /// the song-audio mode is `Synth`.
     pub fn pending_song_triggers(&self) -> (Vec<usize>, Vec<usize>) {
         let now = self.now_us();
         let mut need_on = Vec::new();
@@ -1272,13 +1306,14 @@ impl PlaySession {
     fn autoplays(&self, span: &NoteSpan) -> bool {
         let hand = span.effective_hand(self.split_pitch);
         match &self.practice_loop {
-            None => self.hear_song || self.practice.is_some_and(|h| hand != h),
+            None => self.song_audio.synth_on() || self.practice.is_some_and(|h| hand != h),
             Some(rl) => match rl.lp.phase() {
                 LoopPhase::CountIn { .. } => false,
                 // The demo plays the target hand only; the other hand is silent.
                 LoopPhase::Demo => rl.contains(span) && rl.practice.is_none_or(|h| hand == h),
                 LoopPhase::YourTurn => {
-                    rl.contains(span) && (self.hear_song || rl.practice.is_some_and(|h| hand != h))
+                    rl.contains(span)
+                        && (self.song_audio.synth_on() || rl.practice.is_some_and(|h| hand != h))
                 }
             },
         }
@@ -1328,7 +1363,7 @@ impl PlaySession {
             },
             split_pitch: self.split_pitch,
             rate_permille: self.rate_permille,
-            hear_song: self.hear_song,
+            song_audio: self.song_audio,
             monitor: self.monitor,
             score: self.score,
             combo: self.combo,
@@ -1743,8 +1778,8 @@ pub struct PlayState(pub Mutex<Option<PlaySession>>);
 /// track relative to the bundle dir when `meta.json` declares one. The backing
 /// path stays absolute (resolved against the dir) so the bundle is movable.
 ///
-/// "Hear the song" defaults to on exactly when the piece has no backing track
-/// (#247), so a MIDI-only bundle isn't silent without a live piano.
+/// The song audio defaults to the backing when the piece has one, else the
+/// synth (#247), so a MIDI-only bundle isn't silent without a live piano.
 fn load_session_from_dir(dir: &Path) -> Result<PlaySession, String> {
     let midi_path = dir.join("song.mid");
     let bytes = std::fs::read(&midi_path).map_err(|e| format!("read song.mid failed: {e}"))?;
@@ -1782,7 +1817,9 @@ fn load_session_from_dir(dir: &Path) -> Result<PlaySession, String> {
             session = session.with_backgrounds(dir, meta.backgrounds);
         }
     }
-    Ok(session.with_hear_song(!has_backing).start_paused())
+    Ok(session
+        .with_song_audio(SongAudio::default_for(has_backing))
+        .start_paused())
 }
 
 // ── Tauri commands ───────────────────────────────────────────────────────────
@@ -1799,8 +1836,11 @@ pub fn play_load(
 ) -> Result<PlayInfo, String> {
     let session = load_session_from_dir(Path::new(&dir))?;
     let info = session.info();
-    // Stop any backing from a previous take before swapping sessions.
+    // Stop any backing from a previous take before swapping sessions, and
+    // reset its mute to the new take's (a previous take may have left it muted
+    // by `m` or a slowed speed).
     audio.stop_backing();
+    audio.set_backing_muted(session.backing_muted());
     if let Some(synth) = &audio.synth {
         synth.all_off();
     }
@@ -1844,7 +1884,7 @@ fn status_of(session: Option<&PlaySession>) -> PlayStatusView {
         practice: "both".to_string(),
         split_pitch: DEFAULT_SPLIT,
         rate_permille: PLAY_RATE_UNITY,
-        hear_song: false,
+        song_audio: SongAudio::Off,
         monitor: false,
         score: 0,
         combo: 0,
@@ -1911,7 +1951,8 @@ pub fn play_clear_loop(state: tauri::State<'_, PlayState>) -> PlayStatusView {
 /// Slowing scales the time injected into the session, so the highway, wait gate
 /// and scoring windows all stretch together — the chart is untouched, only the
 /// wall-clock pace changes. The backing *recording* cannot follow without
-/// resampling, so it is muted off-tempo and restored at 1x.
+/// resampling, so it is muted off-tempo and restored at 1x (unless the song
+/// audio mode has it off — see [`PlaySession::backing_muted`]).
 #[tauri::command]
 pub fn play_set_rate(
     state: tauri::State<'_, PlayState>,
@@ -1923,7 +1964,7 @@ pub fn play_set_rate(
         return PLAY_RATE_UNITY;
     };
     let applied = s.set_rate(rate_permille);
-    audio.set_backing_muted(applied != PLAY_RATE_UNITY);
+    audio.set_backing_muted(s.backing_muted());
     applied
 }
 
@@ -1958,28 +1999,52 @@ pub fn play_set_split(state: tauri::State<'_, PlayState>, pitch: u8) -> u8 {
     pitch
 }
 
-/// Toggle "hear the song" (`m` key). Returns the new state; silences the synth
-/// when turning off.
+/// Cycle the song audio (`m` key): backing → synth → off (backing skipped
+/// without a backing track). Returns the new mode; see [`apply_song_audio`].
 #[tauri::command]
-pub fn play_toggle_hear_song(
+pub fn play_cycle_song_audio(
     state: tauri::State<'_, PlayState>,
     audio: tauri::State<'_, AudioState>,
-) -> bool {
+) -> SongAudio {
     let mut guard = state.0.lock().expect("play state mutex poisoned");
-    if let Some(s) = guard.as_mut() {
-        let on = s.toggle_hear_song();
-        if !on {
-            if let Some(synth) = &audio.synth {
-                synth.all_off();
-                // `all_off` lifts the pedal; a foot still on it keeps sustaining.
-                if s.is_monitor() && s.is_sustain() {
-                    synth.sustain(true);
-                }
+    match guard.as_mut() {
+        Some(s) => {
+            let mode = s.cycle_song_audio();
+            apply_song_audio(s, &audio);
+            mode
+        }
+        None => SongAudio::Off,
+    }
+}
+
+/// Set the song audio directly. `backing` on a piece without a backing track
+/// is an error (the mode is kept). Returns the applied mode.
+#[tauri::command]
+pub fn play_set_song_audio(
+    state: tauri::State<'_, PlayState>,
+    audio: tauri::State<'_, AudioState>,
+    mode: SongAudio,
+) -> Result<SongAudio, String> {
+    let mut guard = state.0.lock().expect("play state mutex poisoned");
+    let s = guard.as_mut().ok_or("no active play session")?;
+    let mode = s.set_song_audio(mode)?;
+    apply_song_audio(s, &audio);
+    Ok(mode)
+}
+
+/// Push a session's song-audio mode at the audio engine: mute/unmute the
+/// backing (combined with the off-tempo mute) and, unless the synth now
+/// replays the song, silence any song notes it was holding.
+fn apply_song_audio(s: &PlaySession, audio: &AudioState) {
+    audio.set_backing_muted(s.backing_muted());
+    if !s.song_audio().synth_on() {
+        if let Some(synth) = &audio.synth {
+            synth.all_off();
+            // `all_off` lifts the pedal; a foot still on it keeps sustaining.
+            if s.is_monitor() && s.is_sustain() {
+                synth.sustain(true);
             }
         }
-        on
-    } else {
-        false
     }
 }
 
@@ -2569,7 +2634,8 @@ mod tests {
             on(62, 250_000),
             off(62, 500_000),
         ];
-        let mut s = PlaySession::from_events("legato".into(), &legato).with_hear_song(true);
+        let mut s =
+            PlaySession::from_events("legato".into(), &legato).with_song_audio(SongAudio::Synth);
         s.set_wait_mode(true);
         let state = PlayState(Mutex::new(Some(s)));
         let audio = crate::audio::AudioState::silent();
@@ -2610,8 +2676,8 @@ mod tests {
 
     /// "Hear the song" audition fires note_on at the shifted span start, once.
     #[test]
-    fn hear_song_triggers_at_shifted_start() {
-        let mut s = session().with_hear_song(true);
+    fn synth_song_audio_triggers_at_shifted_start() {
+        let mut s = session().with_song_audio(SongAudio::Synth);
         s.advance(SHIFT);
         let (on_idx, _off) = s.pending_song_triggers();
         assert_eq!(on_idx, vec![0], "first span due to sound at SHIFT");
@@ -2776,55 +2842,102 @@ mod tests {
         assert!(s.live_state().backgrounds.is_empty());
     }
 
-    /// A MIDI-only piece would open silent without a live piano, so the synth
-    /// audition defaults ON at load — and the webview sees it in `PlayInfo`.
+    /// A MIDI-only piece would open silent without a live piano, so the song
+    /// audio defaults to the synth at load — and the webview sees it in
+    /// `PlayInfo`.
     #[test]
-    fn hear_song_defaults_on_for_midi_only_bundle() {
+    fn song_audio_defaults_to_synth_for_midi_only_bundle() {
         let s = load_session_from_dir(&midi_only_fixture()).expect("load fixture bundle");
-        assert!(
-            s.info().hear_song,
+        assert_eq!(
+            s.info().song_audio,
+            SongAudio::Synth,
             "a bundle with no backing track must audition itself"
         );
+        assert!(s.backing_muted(), "no backing to hear");
     }
 
-    /// A piece with a real recording behind it doesn't need the synth doubling
-    /// the melody, so the audition defaults OFF.
+    /// A piece with a real recording behind it plays the recording, with the
+    /// synth off so it doesn't double the melody.
     #[test]
-    fn hear_song_defaults_off_when_bundle_has_backing() {
+    fn song_audio_defaults_to_backing_when_bundle_has_backing() {
         let tmp = tempfile::tempdir().unwrap();
         let s = load_session_from_dir(&backed_bundle(&tmp)).expect("load backed bundle");
-        assert!(
-            !s.info().hear_song,
-            "a bundle with a backing track must not audition over it"
-        );
+        assert_eq!(s.info().song_audio, SongAudio::Backing);
+        assert!(!s.backing_muted(), "the backing is audible at load");
     }
 
-    /// The toggle still flips in both directions from whichever default applied,
-    /// and turning it off still clears the audition bookkeeping.
+    /// Without a backing, `m` cycles synth → off → synth, and leaving the synth
+    /// clears the audition bookkeeping so coming back re-arms it.
     #[test]
-    fn toggle_hear_song_works_from_either_default() {
+    fn cycle_song_audio_without_backing_skips_backing() {
         let mut s = load_session_from_dir(&midi_only_fixture()).unwrap();
         s.toggle_pause(); // loads paused (start_paused); un-pause to "press Start"
         s.advance(SHIFT);
         let (on_idx, _) = s.pending_song_triggers();
         assert_eq!(on_idx, vec![0], "MIDI-only starts auditioning");
         s.mark_song_fired(&on_idx, &[]);
-        assert!(!s.toggle_hear_song(), "toggling off reports off");
+        assert_eq!(s.cycle_song_audio(), SongAudio::Off);
         assert!(
             s.pending_song_triggers().0.is_empty(),
             "no triggers while off"
         );
-        assert!(s.toggle_hear_song(), "toggling back on reports on");
+        assert_eq!(s.cycle_song_audio(), SongAudio::Synth, "backing skipped");
         assert_eq!(
             s.pending_song_triggers().0,
             vec![0],
             "cleared bookkeeping re-arms the sounding span"
         );
+        assert!(
+            s.set_song_audio(SongAudio::Backing).is_err(),
+            "backing is rejected without a backing track"
+        );
+        assert_eq!(s.song_audio(), SongAudio::Synth, "rejected set keeps mode");
+    }
 
+    /// With a backing, `m` cycles backing → synth → off → backing; the synth
+    /// sounds only in `Synth` and the backing only in `Backing`.
+    #[test]
+    fn cycle_song_audio_with_backing_is_mutually_exclusive() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut backed = load_session_from_dir(&backed_bundle(&tmp)).unwrap();
-        assert!(!backed.info().hear_song, "backed starts off");
-        assert!(backed.toggle_hear_song(), "toggle lights it");
+        let mut s = load_session_from_dir(&backed_bundle(&tmp)).unwrap();
+        s.toggle_pause();
+        s.advance(SHIFT);
+        assert!(s.pending_song_triggers().0.is_empty(), "backing: no synth");
+        assert!(!s.backing_muted());
+
+        assert_eq!(s.cycle_song_audio(), SongAudio::Synth);
+        assert!(!s.pending_song_triggers().0.is_empty(), "synth sounds");
+        assert!(s.backing_muted(), "synth: backing muted");
+
+        assert_eq!(s.cycle_song_audio(), SongAudio::Off);
+        assert!(s.pending_song_triggers().0.is_empty());
+        assert!(s.backing_muted());
+
+        assert_eq!(s.cycle_song_audio(), SongAudio::Backing);
+        assert!(!s.backing_muted());
+    }
+
+    /// The `m` mute and the off-tempo mute combine: neither undoes the other.
+    #[test]
+    fn backing_mute_combines_mode_and_rate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = load_session_from_dir(&backed_bundle(&tmp)).unwrap();
+        s.set_rate(500);
+        assert!(s.backing_muted(), "slowed: muted");
+        s.set_song_audio(SongAudio::Off).unwrap();
+        s.set_rate(PLAY_RATE_UNITY);
+        assert!(
+            s.backing_muted(),
+            "back at 1x must not unmute an `m`-off backing"
+        );
+        s.set_rate(500);
+        s.set_song_audio(SongAudio::Backing).unwrap();
+        assert!(
+            s.backing_muted(),
+            "selecting backing must not unmute while slowed"
+        );
+        s.set_rate(PLAY_RATE_UNITY);
+        assert!(!s.backing_muted());
     }
 
     // ── per-note hit/near/miss feedback (M14-B, issue #258) ─────────────────

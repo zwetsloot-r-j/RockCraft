@@ -23,8 +23,8 @@ use ratatui::{
 use rockcraft_audio::{BackingOut, SynthHandle};
 use rockcraft_control::{QueryKind, RemoteCommand, Request, Response};
 use rockcraft_core::{
-    Grid, Hand, HandOverride, Key, Mixer, RecordingMeta, Scale, SynthBus, Timeline, TrackOrigin,
-    DEFAULT_SPLIT,
+    Grid, Hand, HandOverride, Key, Mixer, RecordingMeta, Scale, SongAudio, SynthBus, Timeline,
+    TrackOrigin, DEFAULT_SPLIT,
 };
 use rockcraft_import::{fetch_command_configured, ImportInput};
 use rockcraft_midi::{smf_bytes_to_events, NoteSource};
@@ -552,7 +552,10 @@ impl Shell {
                 }
                 KeyCode::Char('r') => play.restart(),
                 KeyCode::Char(' ') => play.toggle_pause(),
-                KeyCode::Char('m') => play.toggle_hear_song(),
+                // Song audio: backing → synth → off (backing only if present).
+                KeyCode::Char('m') => {
+                    play.cycle_song_audio();
+                }
                 KeyCode::Char('w') => play.toggle_wait_mode(),
                 // Practise one hand (M18-C): both → right → left.
                 KeyCode::Char('h') => play.cycle_practice(),
@@ -991,8 +994,28 @@ impl rockcraft_control::HostServices for Shell {
                     detail: "no active play session".into(),
                 }),
             },
-            HostCommand::PlayToggleHearSong => {
-                Err(HostError::Unsupported("play_toggle_hear_song".into()))
+            // Cycle / set the song audio over the socket, mirroring the `m` key.
+            HostCommand::PlayCycleSongAudio => {
+                if let Screen::Play(play) = &mut self.screen {
+                    Ok(json!({ "song_audio": play.cycle_song_audio() }))
+                } else {
+                    Err(HostError::Failed {
+                        command: "play_cycle_song_audio".into(),
+                        detail: "no active play session".into(),
+                    })
+                }
+            }
+            HostCommand::PlaySetSongAudio { mode } => {
+                let result = match &mut self.screen {
+                    Screen::Play(play) => play.set_song_audio(mode),
+                    _ => Err("no active play session".into()),
+                };
+                result
+                    .map(|mode| json!({ "song_audio": mode }))
+                    .map_err(|detail| HostError::Failed {
+                        command: "play_set_song_audio".into(),
+                        detail,
+                    })
             }
             // Pause/resume the live play session over the socket, mirroring the
             // `Space` key. A no-op error (not a panic) off the play screen.
@@ -1357,7 +1380,7 @@ fn status_json(s: &crate::play::PlayStatus) -> serde_json::Value {
         "awaiting": s.awaiting,
         "held": s.held,
         "rate_permille": s.rate_permille,
-        "hear_song": s.hear_song,
+        "song_audio": s.song_audio,
         "score": s.score,
         "combo": s.combo,
         "best_combo": s.best_combo,
@@ -1619,7 +1642,7 @@ fn load_play_screen(
             }
         }
     }
-    Ok(play.with_hear_song(!has_backing))
+    Ok(play.with_song_audio(SongAudio::default_for(has_backing)))
 }
 
 /// The practised hand as `play_set_practice` reports it (M18-C).
@@ -1653,7 +1676,10 @@ mod tests {
                 dir: "does/not/exist".into(),
             },
             HostCommand::PlaySetWait { on: true },
-            HostCommand::PlayToggleHearSong,
+            HostCommand::PlayCycleSongAudio,
+            HostCommand::PlaySetSongAudio {
+                mode: SongAudio::Off,
+            },
             HostCommand::PlayTogglePause,
             HostCommand::PlayFinish,
             HostCommand::PlaySeekBar { delta: 1 },
@@ -3196,52 +3222,56 @@ mod tests {
         dir
     }
 
-    /// A MIDI-only piece would open silent without a live piano, so the synth
-    /// audition defaults ON at load.
+    /// A MIDI-only piece would open silent without a live piano, so the song
+    /// audio defaults to the synth at load.
     #[test]
-    fn hear_song_defaults_on_for_midi_only_bundle() {
+    fn song_audio_defaults_to_synth_for_midi_only_bundle() {
         let play = load_play_screen(&midi_only_fixture().join("song.mid"), None)
             .expect("load fixture bundle");
-        assert!(
-            play.is_hear_song(),
+        assert_eq!(
+            play.song_audio(),
+            SongAudio::Synth,
             "a bundle with no backing track must audition itself"
         );
     }
 
-    /// A piece with a real recording behind it doesn't need the synth doubling
-    /// the melody, so the audition defaults OFF.
+    /// A piece with a real recording behind it plays the recording, with the
+    /// synth off so it doesn't double the melody.
     #[test]
-    fn hear_song_defaults_off_when_bundle_has_backing() {
+    fn song_audio_defaults_to_backing_when_bundle_has_backing() {
         let dir = bundle_with_backing("backed", true);
         let play = load_play_screen(&dir.join("song.mid"), None).expect("load backed bundle");
-        assert!(
-            !play.is_hear_song(),
-            "a bundle with a backing track must not audition over it"
-        );
+        assert_eq!(play.song_audio(), SongAudio::Backing);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The `m` toggle still flips in both directions from whichever default
-    /// applied — the default only picks the starting side.
+    /// `m` cycles backing → synth → off with a backing track, and synth → off
+    /// without one (the backing is skipped).
     #[test]
-    fn m_toggles_hear_song_from_either_default() {
+    fn m_cycles_song_audio_from_either_default() {
         let mut shell = make_shell();
 
-        // MIDI-only: starts on, `m` turns it off, `m` again turns it back on.
         let play = load_play_screen(&midi_only_fixture().join("song.mid"), None).unwrap();
         shell.screen = Screen::Play(Box::new(play));
         shell.on_key(KeyCode::Char('m'));
-        assert!(!play_screen(&shell).is_hear_song(), "m turns it off");
+        assert_eq!(play_screen(&shell).song_audio(), SongAudio::Off);
         shell.on_key(KeyCode::Char('m'));
-        assert!(play_screen(&shell).is_hear_song(), "m turns it back on");
+        assert_eq!(
+            play_screen(&shell).song_audio(),
+            SongAudio::Synth,
+            "no backing: back to the synth"
+        );
 
-        // Backed: starts off, and `m` still lights it.
         let dir = bundle_with_backing("toggle", true);
         let play = load_play_screen(&dir.join("song.mid"), None).unwrap();
         shell.screen = Screen::Play(Box::new(play));
-        assert!(!play_screen(&shell).is_hear_song(), "backed starts off");
+        assert_eq!(play_screen(&shell).song_audio(), SongAudio::Backing);
         shell.on_key(KeyCode::Char('m'));
-        assert!(play_screen(&shell).is_hear_song(), "m turns it on");
+        assert_eq!(play_screen(&shell).song_audio(), SongAudio::Synth);
+        shell.on_key(KeyCode::Char('m'));
+        assert_eq!(play_screen(&shell).song_audio(), SongAudio::Off);
+        shell.on_key(KeyCode::Char('m'));
+        assert_eq!(play_screen(&shell).song_audio(), SongAudio::Backing);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3256,7 +3286,7 @@ mod tests {
     /// MIDI-only bundle opened straight off an import and the *same* bundle
     /// opened later from the library land in the same audition state.
     #[test]
-    fn import_completion_and_library_load_agree_on_hear_song() {
+    fn import_completion_and_library_load_agree_on_song_audio() {
         use crate::import_screen::{ImportingScreen, WorkerEvent};
 
         let bundle = midi_only_fixture();
@@ -3273,13 +3303,14 @@ mod tests {
         apply_import_outcome(&mut shell);
 
         assert_eq!(shell.screen_name(), "play", "a done import opens Play");
-        assert!(
-            play_screen(&shell).is_hear_song(),
+        assert_eq!(
+            play_screen(&shell).song_audio(),
+            SongAudio::Synth,
             "an imported MIDI-only piece must be audible"
         );
         assert_eq!(
-            play_screen(&shell).is_hear_song(),
-            via_library.is_hear_song(),
+            play_screen(&shell).song_audio(),
+            via_library.song_audio(),
             "import and library loads must agree"
         );
     }

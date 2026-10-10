@@ -23,7 +23,7 @@
 //! `HostCommand` reuses `core`'s [`ParamInfo`] / [`ActionError`] so the wire
 //! shapes and error vocabulary stay identical to the action tier.
 
-use rockcraft_core::{ActionError, Hand, MixerBus, ParamInfo, SynthBus};
+use rockcraft_core::{ActionError, Hand, MixerBus, ParamInfo, SongAudio, SynthBus};
 use serde::{Deserialize, Serialize};
 
 /// Where [`HostCommand::SaveBundle`] writes the current timeline.
@@ -108,8 +108,14 @@ pub enum HostCommand {
     /// Mirrors `core::Action::SetPlaybackRate`, which drives the *editor*
     /// transport; the play session is a separate engine and needs its own.
     PlaySetRate { rate_permille: u16 },
-    /// Toggle "hear the song" (audible song synth) for the play session.
-    PlayToggleHearSong,
+    /// Cycle the play session's song audio (`m`): `backing` → `synth` → `off`
+    /// → `backing` for a piece with a backing track, `synth` → `off` → `synth`
+    /// without one. Returns the new mode.
+    PlayCycleSongAudio,
+    /// Set the play session's song audio directly. `backing` on a piece with no
+    /// backing track is rejected (`HostError::Failed`) and the mode is kept.
+    /// Returns the applied mode.
+    PlaySetSongAudio { mode: SongAudio },
     /// Toggle pause on the active play session (freeze/thaw clock + backing).
     PlayTogglePause,
     /// Finish the play session; returns the score summary.
@@ -234,7 +240,8 @@ impl HostCommand {
             HostCommand::PlayLoad { .. } => "play_load",
             HostCommand::PlaySetWait { .. } => "play_set_wait",
             HostCommand::PlaySetRate { .. } => "play_set_rate",
-            HostCommand::PlayToggleHearSong => "play_toggle_hear_song",
+            HostCommand::PlayCycleSongAudio => "play_cycle_song_audio",
+            HostCommand::PlaySetSongAudio { .. } => "play_set_song_audio",
             HostCommand::PlayTogglePause => "play_toggle_pause",
             HostCommand::PlayFinish => "play_finish",
             HostCommand::PlayStatus => "play_status",
@@ -373,7 +380,8 @@ pub fn host_command_names() -> &'static [&'static str] {
         "play_load",
         "play_set_wait",
         "play_set_rate",
-        "play_toggle_hear_song",
+        "play_cycle_song_audio",
+        "play_set_song_audio",
         "play_toggle_pause",
         "play_finish",
         "play_status",
@@ -444,7 +452,8 @@ static HOST_HELP: &[HostCommandInfo] = {
         HostCommandInfo { name: "play_load", params: &[p("dir", "String")], description: "Load a bundle directory as a play session. Returns play info." },
         HostCommandInfo { name: "play_set_wait", params: &[p("on", "bool")], description: "Arm (true) or disarm (false) note-by-note wait mode for the play session." },
         HostCommandInfo { name: "play_set_rate", params: &[p("rate_permille", "u16")], description: "Set play-session speed in permille (1000 = 1x, 500 = half speed), clamped 0.25x-2x. Slows the highway, wait gate and scoring together; the backing recording mutes below 1x." },
-        HostCommandInfo { name: "play_toggle_hear_song", params: &[], description: "Toggle the audible song synth for the play session." },
+        HostCommandInfo { name: "play_cycle_song_audio", params: &[], description: "Cycle the play session's song audio (the m key): \"backing\" (the backing recording) -> \"synth\" (the synth replays the song's notes) -> \"off\" -> \"backing\"; a piece without a backing track skips \"backing\". Backing and synth never sound together. Returns {song_audio}." },
+        HostCommandInfo { name: "play_set_song_audio", params: &[p("mode", "SongAudio")], description: "Set the play session's song audio: \"backing\", \"synth\" or \"off\". \"backing\" on a piece with no backing track fails and keeps the current mode. Returns {song_audio}." },
         HostCommandInfo { name: "play_toggle_pause", params: &[], description: "Toggle pause on the active play session, freezing/thawing the clock and backing at the current position. No-op when no session is active." },
         HostCommandInfo { name: "play_finish", params: &[], description: "Finish the play session and return the score summary." },
         HostCommandInfo { name: "play_status", params: &[], description: "The live take's full state: clock, paused/frozen, wait gate (awaiting vs held pitches), practice hand + split, speed, score, and the chart's note count. Returns loaded:false when no take is running. Read-only — observing never perturbs the take." },
@@ -525,7 +534,10 @@ mod tests {
             },
             HostCommand::PlaySetWait { on: true },
             HostCommand::PlaySetRate { rate_permille: 500 },
-            HostCommand::PlayToggleHearSong,
+            HostCommand::PlayCycleSongAudio,
+            HostCommand::PlaySetSongAudio {
+                mode: SongAudio::Off,
+            },
             HostCommand::PlayTogglePause,
             HostCommand::PlayFinish,
             HostCommand::PlayStatus,
@@ -644,6 +656,7 @@ mod tests {
                     "bool" => json!(true),
                     "i64" | "i32" | "u32" => json!(0),
                     "LoopEdge" => json!("start"),
+                    "SongAudio" => json!("synth"),
                     "Hand?" => json!("left"),
                     "u16" => json!(1000),
                     "f32" => json!(0.5),
@@ -772,6 +785,24 @@ mod tests {
             }
         );
         assert!(host_command_from_name("play_mark_loop", &json!({ "edge": "middle" })).is_err());
+    }
+
+    #[test]
+    fn song_audio_commands_parse_their_typed_mode() {
+        assert_eq!(
+            host_command_from_name("play_set_song_audio", &json!({ "mode": "backing" })).unwrap(),
+            HostCommand::PlaySetSongAudio {
+                mode: SongAudio::Backing
+            }
+        );
+        assert_eq!(
+            host_command_from_name("play_cycle_song_audio", &json!({})).unwrap(),
+            HostCommand::PlayCycleSongAudio
+        );
+        assert!(matches!(
+            host_command_from_name("play_set_song_audio", &json!({ "mode": "loud" })),
+            Err(ActionError::BadParams { .. })
+        ));
     }
 
     #[test]

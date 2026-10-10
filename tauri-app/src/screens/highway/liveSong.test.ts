@@ -12,7 +12,7 @@ function info(notes: PlaySpan[], over: Partial<PlayInfo> = {}): PlayInfo {
     has_backing: false,
     video: null,
     backgrounds: [],
-    hear_song: true,
+    song_audio: "synth",
     bpm: 120,
     beats_per_bar: 4,
     split_pitch: 60,

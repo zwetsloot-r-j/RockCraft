@@ -7,7 +7,7 @@
 
 import { For, Show } from "solid-js";
 import type { HighwayCanvas } from "./HighwayCanvas";
-import type { PlayStateEvent } from "../../ipc/types";
+import type { PlayStateEvent, SongAudio } from "../../ipc/types";
 import type { SongData } from "./types";
 import { loopBadgeText } from "./practiceLoop";
 import { spectrumColor } from "./utils";
@@ -19,7 +19,8 @@ interface HighwayHeaderProps {
   /** Live mode (#168): read score/combo/clock from `playState`, not the eng. */
   live?: boolean;
   playState?: () => PlayStateEvent | null;
-  hearSong?: () => boolean;
+  /** Song-audio mode, cycled with `m`: backing → piano (synth) → off. */
+  songAudio?: () => SongAudio;
   waitMode?: () => boolean;
   monitor?: () => boolean;
   practice?: () => "both" | "left" | "right";
@@ -38,6 +39,11 @@ interface HighwayHeaderProps {
 const WHEEL = Array.from({ length: 12 }, (_, i) => spectrumColor(i, 0.72, 0.16));
 
 const monoFont = "'IBM Plex Mono', monospace";
+
+/** The `♪` chip's short label for a song-audio mode. */
+export function songAudioLabel(mode: SongAudio): string {
+  return mode === "backing" ? "bg" : mode === "synth" ? "piano" : "off";
+}
 
 export function HighwayHeader(props: HighwayHeaderProps) {
   // Derived reads — each touches props.frame() so the throttle signal drives them.
@@ -143,14 +149,16 @@ export function HighwayHeader(props: HighwayHeaderProps) {
               "font-family": monoFont,
               padding: "2px 8px",
               "border-radius": "6px",
-              background: props.hearSong?.()
-                ? "rgba(103,227,196,0.2)"
-                : "rgba(255,255,255,0.05)",
-              color: props.hearSong?.() ? "#67e3c4" : "#7c7f8e",
+              background:
+                (props.songAudio?.() ?? "off") !== "off"
+                  ? "rgba(103,227,196,0.2)"
+                  : "rgba(255,255,255,0.05)",
+              color:
+                (props.songAudio?.() ?? "off") !== "off" ? "#67e3c4" : "#7c7f8e",
             }}
-            title="m — hear the song"
+            title="m — song audio: backing → piano → off"
           >
-            ♪ m
+            ♪ {songAudioLabel(props.songAudio?.() ?? "off")}
           </span>
           <span
             style={{
