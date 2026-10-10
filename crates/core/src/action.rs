@@ -55,6 +55,8 @@ pub enum Action {
     // ── edit ────────────────────────────────────────────────────────────
     AddNote,
     DeleteNote,
+    /// Lengthen/shorten the note under the cursor by `delta_steps` grid steps,
+    /// snapping its end to the grid (see `Composer::resize_note`).
     ResizeNote {
         delta_steps: i64,
     },
@@ -624,7 +626,7 @@ static ACTION_HELP: &[ActionInfo] = {
         // ── edit ────────────────────────────────────────────────────────
         ActionInfo { name: "add_note", params: &[], description: "Add a note at the cursor (duration 1 step, velocity 80); replaces any note already in that cell." },
         ActionInfo { name: "delete_note", params: &[], description: "Delete the note under the cursor." },
-        ActionInfo { name: "resize_note", params: &[p("delta_steps", "i64")], description: "Lengthen (positive) or shorten (negative) the note under the cursor by delta_steps grid steps." },
+        ActionInfo { name: "resize_note", params: &[p("delta_steps", "i64")], description: "Lengthen (positive) or shorten (negative) the note under the cursor by delta_steps grid steps, snapping its end to the grid: each step moves the end to the next/previous grid line (an off-grid end lands on the grid on the first step). The onset never moves; the end stops at the next same-pitch note and never goes below one step past the line nearest the onset." },
         ActionInfo { name: "adjust_velocity", params: &[p("delta", "i16")], description: "Adjust the velocity of the note under the cursor by delta (clamped 1..=127)." },
         ActionInfo { name: "toggle_grab", params: &[], description: "Grab/drop the note under the cursor so cursor moves drag it." },
         ActionInfo { name: "insert_run", params: &[p("end_pitch", "u8"), p("span_steps", "u64")], description: "Lay a chromatic run from the cursor to end_pitch (inclusive), spread evenly across span_steps grid steps — a one-shot glissando/scale; replaces notes in target cells." },

@@ -1438,8 +1438,15 @@ impl Composer {
         Vec::new()
     }
 
-    /// Resize the note under the cursor by `delta_steps` grid steps (positive
-    /// lengthens; negative shortens, clamped at one step). No-op on an empty cell.
+    /// Resize the note under the cursor by `delta_steps` grid steps, **snapping
+    /// its end to the grid**: each positive step moves the end to the next grid
+    /// line after it, each negative step to the previous one (tempo-aware, at the
+    /// live subdivision). An off-grid end therefore lands on the grid on the
+    /// first press instead of staying off-grid. The onset never moves.
+    ///
+    /// The end never goes below one step past the grid line nearest the onset,
+    /// so shortening an off-grid note can't leave a sliver. No-op on an empty
+    /// cell.
     fn resize_note(&mut self, delta_steps: i64) -> Vec<Effect> {
         let Some(id) = self.note_under_cursor() else {
             return Vec::new();
@@ -1447,14 +1454,26 @@ impl Composer {
         let Some(note) = self.timeline().get(id).copied() else {
             return Vec::new();
         };
-        let step = self.grid.step_us();
-        let mut new_dur = if delta_steps >= 0 {
-            note.dur_us.saturating_add(step * delta_steps as u64)
-        } else {
-            note.dur_us
-                .saturating_sub(step * (-delta_steps) as u64)
-                .max(step)
-        };
+        let start = note.start_us;
+        let min_end = self.pos_us_of_step(self.pos_step_index(start) + 1);
+        let mut end = start + note.dur_us;
+        if delta_steps >= 0 {
+            for _ in 0..delta_steps {
+                end = self.grid_line_after(end);
+            }
+            end = end.max(min_end);
+        } else if end > min_end {
+            for _ in 0..delta_steps.unsigned_abs() {
+                match self.grid_line_before(end) {
+                    Some(prev) if prev > min_end => end = prev,
+                    _ => {
+                        end = min_end;
+                        break;
+                    }
+                }
+            }
+        }
+        let mut new_dur = end.saturating_sub(start).max(1);
         // Never grow into the next same-pitch note: that overlap cannot be
         // saved (see `Timeline::to_events`), so stop at its onset instead.
         if let Some(next) = self
@@ -2093,6 +2112,43 @@ impl Composer {
         let bd = self.bar_dur_us(bar);
         let sub = (us.saturating_sub(self.bar_start_us(bar)) * spb + bd / 2) / bd;
         bar * spb + sub.min(spb)
+    }
+
+    /// The step whose grid line is at or before `us` (`None` before step 0's
+    /// line, i.e. before the grid origin) — tempo-aware.
+    fn floor_step(&self, us: u64) -> Option<u64> {
+        let mut s = self.pos_step_index(us);
+        while s > 0 && self.pos_us_of_step(s) > us {
+            s -= 1;
+        }
+        if self.pos_us_of_step(s) > us {
+            return None;
+        }
+        while self.pos_us_of_step(s + 1) <= us {
+            s += 1;
+        }
+        Some(s)
+    }
+
+    /// The first grid line strictly after `us` at the live subdivision.
+    fn grid_line_after(&self, us: u64) -> u64 {
+        match self.floor_step(us) {
+            Some(s) => self.pos_us_of_step(s + 1),
+            None => self.pos_us_of_step(0),
+        }
+    }
+
+    /// The last grid line strictly before `us` at the live subdivision, if any.
+    fn grid_line_before(&self, us: u64) -> Option<u64> {
+        let s = self.floor_step(us)?;
+        let line = self.pos_us_of_step(s);
+        if line < us {
+            Some(line)
+        } else if s > 0 {
+            Some(self.pos_us_of_step(s - 1))
+        } else {
+            None
+        }
     }
 
     /// Snap `us` to the nearest grid line at the live subdivision — tempo-aware.
@@ -3178,6 +3234,88 @@ mod tests {
         // Shorten well past zero clamps at one step.
         apply(&mut c, Action::ResizeNote { delta_steps: -100 });
         assert_eq!(c.get_note(id).unwrap().dur_us, step);
+    }
+
+    /// `]`/`[` snap an off-grid end onto the grid: the first press lands on the
+    /// next/previous grid line rather than keeping the off-grid remainder.
+    #[test]
+    fn resize_snaps_an_off_grid_end_to_the_grid() {
+        let grid = Grid {
+            bpm: 120,
+            time_sig: TimeSig {
+                beats_per_bar: 4,
+                beat_unit: 4,
+            },
+            subdivision: Subdivision::Eighth, // step = 250_000 µs
+            origin_us: 0,
+        };
+        let mut tl = Timeline::new();
+        // Off-grid onset (10 ms late) and off-grid end (at 630_000).
+        let id = tl.insert(note(60, 10_000, 620_000));
+        let mut c = Composer::from_timeline(tl, grid);
+        apply(&mut c, Action::SetCursor { pitch: 60, step: 0 });
+        let end = |c: &Composer| {
+            let n = c.get_note(id).unwrap();
+            n.start_us + n.dur_us
+        };
+
+        apply(&mut c, Action::ResizeNote { delta_steps: 1 });
+        assert_eq!(end(&c), 750_000, "] snaps up to the next line");
+        apply(&mut c, Action::ResizeNote { delta_steps: 1 });
+        assert_eq!(end(&c), 1_000_000, "then moves a whole step");
+        apply(&mut c, Action::ResizeNote { delta_steps: -2 });
+        assert_eq!(end(&c), 500_000);
+        assert_eq!(c.get_note(id).unwrap().start_us, 10_000, "onset unchanged");
+
+        // Shortening stops one step past the grid line nearest the onset
+        // (0 → 250_000): never a sliver ending just after the onset.
+        apply(&mut c, Action::ResizeNote { delta_steps: -5 });
+        assert_eq!(end(&c), 250_000);
+        // Already at the floor: a no-op that adds no undo step — one undo goes
+        // straight back to before the -5 resize.
+        apply(&mut c, Action::ResizeNote { delta_steps: -1 });
+        assert_eq!(end(&c), 250_000);
+        apply(&mut c, Action::Undo);
+        assert_eq!(end(&c), 500_000, "no-op added no undo step");
+
+        // An off-grid end shortened by one lands on the previous line.
+        let mut tl = Timeline::new();
+        let id = tl.insert(note(60, 0, 630_000));
+        let mut c = Composer::from_timeline(tl, grid);
+        apply(&mut c, Action::SetCursor { pitch: 60, step: 0 });
+        apply(&mut c, Action::ResizeNote { delta_steps: -1 });
+        assert_eq!(c.get_note(id).unwrap().dur_us, 500_000);
+    }
+
+    /// With a tempo map, the snapped ends follow the map's (uneven) bar lines.
+    #[test]
+    fn resize_snaps_to_tempo_map_grid_lines() {
+        let grid = Grid {
+            bpm: 120,
+            time_sig: TimeSig {
+                beats_per_bar: 4,
+                beat_unit: 4,
+            },
+            subdivision: Subdivision::Quarter,
+            origin_us: 0,
+        };
+        let mut tl = Timeline::new();
+        let id = tl.insert(note(60, 0, 300_000));
+        let mut c = Composer::from_timeline(tl, grid);
+        // Bar 1 is 2 s long (quarters of 500_000), bar 2 is 4 s (quarters of 1 s).
+        apply(
+            &mut c,
+            Action::SetBarStarts {
+                bars_us: vec![0, 2_000_000, 6_000_000],
+            },
+        );
+        while c.current_subdivision() != Subdivision::Quarter {
+            apply(&mut c, Action::SubdivisionCoarser);
+        }
+        apply(&mut c, Action::SetCursor { pitch: 60, step: 0 });
+        apply(&mut c, Action::ResizeNote { delta_steps: 5 });
+        // Lines: 500k, 1.0M, 1.5M, 2.0M, then bar 2 quarters: 3.0M.
+        assert_eq!(c.get_note(id).unwrap().dur_us, 3_000_000);
     }
 
     #[test]
