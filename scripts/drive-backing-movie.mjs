@@ -195,15 +195,15 @@ try {
   console.log(`• play_load → ${played} notes + movie backing ✓`);
   await pause();
 
-  // Beat 6b (demo only) — audition the chart: turn "hear the song" on so the
+  // Beat 6b (demo only) — audition the chart: switch the song audio to the synth so the
   // notes synthesise through the SoundFont, then hold a real play window while
   // the transport advances past all four notes (steps 0/4/8/12 ≈ 0–1.5s at
   // 120 BPM). PLAY_MS defaults to a few seconds in demo mode, 0 for the fast
   // automated run (which has nothing to listen to and shouldn't dawdle).
   const playWindowMs = Number(process.env.PLAY_MS || (DELAY_MS > 0 ? 5000 : 0));
   if (playWindowMs > 0) {
-    const hs = await host(75, "play_toggle_hear_song", {});
-    console.log(`• play_toggle_hear_song → ${JSON.stringify(hs)} — auditioning ${playWindowMs}ms 🔊`);
+    const hs = await host(75, "play_set_song_audio", { mode: "synth" });
+    console.log(`• play_set_song_audio → ${JSON.stringify(hs)} — auditioning ${playWindowMs}ms 🔊`);
     await pause(playWindowMs);
   }
 

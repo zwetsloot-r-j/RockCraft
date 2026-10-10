@@ -24,8 +24,8 @@ use rockcraft_audio::{
 use rockcraft_core::{
     backing_position_us, hand::hand_of_pitch_value, score, BarMap, DriftGuard, ExpectedNote, Gain,
     GateState, Grid, Hand, HandOverride, LoopPhase, LoopStep, MidiNote, NoteEvent, NoteEventKind,
-    NoteJudgment, Pass, PlayClock, PracticeLoop, ScoreConfig, Summary, SustainEvent, SynthBus,
-    Timing, Velocity, WaitGate, DEFAULT_SPLIT,
+    NoteJudgment, Pass, PlayClock, PracticeLoop, ScoreConfig, SongAudio, Summary, SustainEvent,
+    SynthBus, Timing, Velocity, WaitGate, DEFAULT_SPLIT,
 };
 use rockcraft_midi::smf_bytes_to_events;
 
@@ -143,8 +143,9 @@ pub struct PlayScreen {
     /// Whether the song voice and the backing are faded out for a stopped
     /// transport (see [`sync_parked_audio`](Self::sync_parked_audio)).
     audio_parked: bool,
-    /// Whether the "hear the song" feature is active.
-    hear_song: bool,
+    /// What the play screen sounds of the song itself (`m`): the backing
+    /// recording, the synth replay of the chart, or neither — never both.
+    song_audio: SongAudio,
     /// Manual pause (the `Space` key / `HostCommand::PlayTogglePause`). Freezes
     /// the clock + backing independently of wait-mode; while set the highway,
     /// playhead, and scoring clock hold their position.
@@ -275,7 +276,7 @@ pub struct PlayStatus {
     pub awaiting: Vec<u8>,
     pub held: Vec<u8>,
     pub rate_permille: u16,
-    pub hear_song: bool,
+    pub song_audio: SongAudio,
     pub score: u64,
     pub combo: u32,
     pub best_combo: u32,
@@ -362,7 +363,7 @@ impl PlayScreen {
             backing_drift: DriftGuard::new(),
             backing_resyncs: 0,
             audio_parked: false,
-            hear_song: false,
+            song_audio: SongAudio::Off,
             paused: false,
             song_on_fired: HashSet::new(),
             song_off_fired: HashSet::new(),
@@ -385,14 +386,14 @@ impl PlayScreen {
         })
     }
 
-    /// Start with the "hear the song" audition on or off. Bundle loading passes
-    /// `meta.backing.is_none()` here (#247): a MIDI-only piece auditions itself
-    /// so it isn't silent without a live piano, while a piece with a backing
-    /// track leaves it off so the synth doesn't double the recording. The `m`
-    /// key still toggles it at runtime either way. Scoring keys off live MIDI
-    /// timestamps regardless, never this audio.
-    pub fn with_hear_song(mut self, on: bool) -> Self {
-        self.hear_song = on;
+    /// Start in song-audio mode `mode`. Bundle loading passes
+    /// [`SongAudio::default_for`] here (#247): a MIDI-only piece auditions
+    /// itself with the synth so it isn't silent without a live piano, while a
+    /// piece with a backing track plays the recording and leaves the synth off
+    /// so it doesn't double it. The `m` key cycles it at runtime. Scoring keys
+    /// off live MIDI timestamps regardless, never this audio.
+    pub fn with_song_audio(mut self, mode: SongAudio) -> Self {
+        self.song_audio = mode;
         self
     }
 
@@ -993,7 +994,7 @@ impl PlayScreen {
             awaiting,
             held: self.held.iter().collect(),
             rate_permille: self.rate_permille,
-            hear_song: self.hear_song,
+            song_audio: self.song_audio,
             score: self.score,
             combo: self.combo,
             best_combo: self.best_combo,
@@ -1006,16 +1007,39 @@ impl PlayScreen {
         }
     }
 
-    /// Toggle the "hear the song" feature. Turning it off silences any playing
-    /// song notes and resets the trigger bookkeeping.
-    pub fn toggle_hear_song(&mut self) {
-        self.hear_song = !self.hear_song;
-        if !self.hear_song {
+    /// Cycle the song audio (the `m` key): backing → synth → off → backing,
+    /// skipping the backing when the piece has none. Returns the new mode.
+    pub fn cycle_song_audio(&mut self) -> SongAudio {
+        let next = self.song_audio.next(self.backing.is_some());
+        self.apply_song_audio(next);
+        next
+    }
+
+    /// Set the song audio directly (`HostCommand::PlaySetSongAudio`).
+    /// `Backing` on a piece with no backing track is rejected and the current
+    /// mode kept.
+    pub fn set_song_audio(&mut self, mode: SongAudio) -> Result<SongAudio, String> {
+        if !mode.is_valid_for(self.backing.is_some()) {
+            return Err("this piece has no backing track".into());
+        }
+        self.apply_song_audio(mode);
+        Ok(mode)
+    }
+
+    /// Switch modes: leaving the synth silences any playing song notes and
+    /// resets the trigger bookkeeping; the backing is muted or restored via
+    /// [`applied_backing_gain`](Self::applied_backing_gain).
+    fn apply_song_audio(&mut self, mode: SongAudio) {
+        self.song_audio = mode;
+        if !mode.synth_on() {
             self.song_on_fired.clear();
             self.song_off_fired.clear();
             if let Some(s) = &self.synth {
                 s.all_off();
             }
+        }
+        if let Some(h) = &self.backing_handle {
+            h.set_gain(self.applied_backing_gain());
         }
     }
 
@@ -1026,9 +1050,10 @@ impl PlayScreen {
 
     /// The level the backing sink actually plays at: the fader, or silence
     /// while the take runs off-tempo (the recording cannot follow a changed
-    /// speed without resampling).
+    /// speed without resampling) or the song audio is not [`SongAudio::Backing`].
+    /// Both feed this one answer, so neither unmutes what the other silenced.
     pub fn applied_backing_gain(&self) -> Gain {
-        if self.is_off_tempo() {
+        if self.is_off_tempo() || !self.song_audio.backing_on() {
             Gain::SILENT
         } else {
             self.backing_gain
@@ -1045,10 +1070,9 @@ impl PlayScreen {
         }
     }
 
-    /// Whether the "hear the song" audition is currently active (for the status
-    /// line / tests).
-    pub fn is_hear_song(&self) -> bool {
-        self.hear_song
+    /// The current song-audio mode (for the status line / tests).
+    pub fn song_audio(&self) -> SongAudio {
+        self.song_audio
     }
 
     /// Check the playback clock and fire synth note_on / note_off commands for
@@ -1119,21 +1143,22 @@ impl PlayScreen {
     // ── seeking + practice loop (M17-B) ──────────────────────────────────
 
     /// Whether the app sounds span `i` right now. Outside a loop: every note
-    /// with "hear the song" on, and the *other* hand's whenever one hand is
-    /// practised. In a loop (hand as of the phase boundary): never in a
-    /// count-in; the demo plays the practised hand's loop notes (whatever
-    /// "hear the song" says); *your turn* plays the other hand's, plus the
-    /// practised hand's with "hear the song" on.
+    /// with the song audio on `Synth`, and the *other* hand's whenever one hand
+    /// is practised. In a loop (hand as of the phase boundary): never in a
+    /// count-in; the demo plays the practised hand's loop notes (whatever the
+    /// song audio says); *your turn* plays the other hand's, plus the
+    /// practised hand's with the song audio on `Synth`.
     fn autoplays(&self, i: usize) -> bool {
         let span = &self.spans[i];
         let hand = self.hands[i];
         match &self.practice_loop {
-            None => self.hear_song || self.practice.is_some_and(|h| hand != h),
+            None => self.song_audio.synth_on() || self.practice.is_some_and(|h| hand != h),
             Some(rl) => match rl.lp.phase() {
                 LoopPhase::CountIn { .. } => false,
                 LoopPhase::Demo => rl.contains(span) && rl.practice.is_none_or(|h| hand == h),
                 LoopPhase::YourTurn => {
-                    rl.contains(span) && (self.hear_song || rl.practice.is_some_and(|h| hand != h))
+                    rl.contains(span)
+                        && (self.song_audio.synth_on() || rl.practice.is_some_and(|h| hand != h))
                 }
             },
         }
@@ -1570,11 +1595,7 @@ impl PlayScreen {
     fn draw_status(&self, f: &mut Frame, area: Rect, now: u64) {
         let secs = now as f64 / 1_000_000.0;
         let total = self.duration_us as f64 / 1_000_000.0;
-        let music_color = if self.hear_song {
-            Color::Green
-        } else {
-            Color::DarkGray
-        };
+        let (music_label, music_color) = song_audio_badge(self.song_audio);
         let wait_color = if self.is_wait_mode() {
             Color::Green
         } else {
@@ -1614,7 +1635,10 @@ impl PlayScreen {
             ),
             Span::raw("[r] restart  [Tab] menu  [x] mix  "),
             Span::styled("[Space] pause  ", Style::default().fg(pause_color)),
-            Span::styled("[m] music  ", Style::default().fg(music_color)),
+            Span::styled(
+                format!("[m] {music_label}  "),
+                Style::default().fg(music_color),
+            ),
             Span::styled("[w] wait  ", Style::default().fg(wait_color)),
             Span::styled(
                 format!("[h] {hand_label}  "),
@@ -1905,6 +1929,16 @@ const LOOP_BADGE: Rgb = Rgb(0xff, 0xd1, 0x66);
 const LOOP_BAND: f32 = 0.08;
 /// How far notes outside a running loop fade toward the background.
 const OUTSIDE_LOOP_FADE: f32 = 0.65;
+
+/// The status-line song-audio label and colour for the `m` key: `bg` (the
+/// backing recording), `piano` (the synth replays the song) or `off`.
+pub fn song_audio_badge(mode: SongAudio) -> (&'static str, Color) {
+    match mode {
+        SongAudio::Backing => ("bg", Color::Green),
+        SongAudio::Synth => ("piano", Color::Green),
+        SongAudio::Off => ("off", Color::DarkGray),
+    }
+}
 
 /// The practice-speed badge by the clock — `0.75×  ` — or nothing at 1×.
 pub fn speed_badge(rate_permille: u16) -> String {
@@ -2209,20 +2243,56 @@ mod tests {
     // ── chart audition default (issue #152) ─────────────────────────────────
 
     #[test]
-    fn hear_song_defaults_off_but_builder_enables_it() {
+    fn song_audio_defaults_off_but_builder_enables_the_synth() {
         // Play-along default: the song does not sound over the player.
         let play = one_note_screen();
-        assert!(!play.is_hear_song());
+        assert_eq!(play.song_audio(), SongAudio::Off);
         // Imports opt in so the chart is audible on load.
-        let play = one_note_screen().with_hear_song(true);
-        assert!(play.is_hear_song());
+        let play = one_note_screen().with_song_audio(SongAudio::Synth);
+        assert_eq!(play.song_audio(), SongAudio::Synth);
+    }
+
+    #[test]
+    fn m_cycles_synth_and_off_without_a_backing() {
+        let mut play = one_note_screen().with_song_audio(SongAudio::Synth);
+        assert_eq!(play.cycle_song_audio(), SongAudio::Off);
+        assert_eq!(play.cycle_song_audio(), SongAudio::Synth, "backing skipped");
+        assert!(play.set_song_audio(SongAudio::Backing).is_err());
+        assert_eq!(
+            play.song_audio(),
+            SongAudio::Synth,
+            "rejected set keeps mode"
+        );
+    }
+
+    #[test]
+    fn backing_is_audible_only_in_backing_mode_at_unity_speed() {
+        let mut play = one_note_screen()
+            .with_backing(PathBuf::from("backing.wav"), 0)
+            .with_song_audio(SongAudio::Backing);
+        play.set_backing_gain(Gain::UNITY);
+        assert_eq!(play.applied_backing_gain(), Gain::UNITY);
+        assert_eq!(play.cycle_song_audio(), SongAudio::Synth);
+        assert_eq!(play.applied_backing_gain(), Gain::SILENT, "synth mutes it");
+        assert_eq!(play.cycle_song_audio(), SongAudio::Off);
+        assert_eq!(play.applied_backing_gain(), Gain::SILENT);
+        // Back at 1× must not unmute a backing `m` turned off…
+        play.set_rate(500);
+        play.set_rate(PLAY_RATE_UNITY);
+        assert_eq!(play.applied_backing_gain(), Gain::SILENT);
+        // …and selecting the backing must not unmute it while slowed.
+        play.set_rate(500);
+        assert_eq!(play.cycle_song_audio(), SongAudio::Backing);
+        assert_eq!(play.applied_backing_gain(), Gain::SILENT);
+        play.set_rate(PLAY_RATE_UNITY);
+        assert_eq!(play.applied_backing_gain(), Gain::UNITY);
     }
 
     #[test]
     fn pending_triggers_drive_audition_for_imported_chart() {
         // An auditioned chart fires note_on at the (shifted) note start. The one
         // note is at t=0, so after the whole-song shift it starts at SHIFT.
-        let play = one_note_screen().with_hear_song(true);
+        let play = one_note_screen().with_song_audio(SongAudio::Synth);
         let shift = PRE_ROLL_US + LEAD_US;
         let (on, _off) = pending_triggers(&play.spans, shift, &HashSet::new(), &HashSet::new());
         assert_eq!(
@@ -2264,7 +2334,7 @@ mod tests {
         ];
         PlayScreen::from_smf_bytes("legato".into(), &events_to_smf_bytes(&events), None)
             .unwrap()
-            .with_hear_song(true)
+            .with_song_audio(SongAudio::Synth)
     }
 
     #[test]
@@ -2784,9 +2854,9 @@ mod tests {
     }
 
     #[test]
-    fn the_demo_plays_the_loop_whatever_hear_the_song_says() {
+    fn the_demo_plays_the_loop_whatever_the_song_audio_says() {
         let mut play = loop_screen();
-        assert!(!play.is_hear_song());
+        assert_eq!(play.song_audio(), SongAudio::Off);
         play.set_loop(1, 1);
         // Count-in: nothing sounds, not even the notes it scrolls past.
         play.advance(BAR / 2);
@@ -2800,7 +2870,7 @@ mod tests {
         play.advance(BAR);
         play.tick_song_synth();
         assert!(!play.song_on_fired.contains(&span_at(&play, SHIFT)));
-        // Your turn with "hear the song" off: silent.
+        // Your turn with the song synth off: silent.
         play.advance(BAR); // the count-in reaches your turn
         assert_eq!(phase(&play), Some(LoopPhase::YourTurn));
         play.advance(BAR / 2);
@@ -2984,7 +3054,7 @@ mod tests {
     #[test]
     fn right_hand_practice_waits_for_right_and_autoplays_left() {
         let mut play = two_hand_screen();
-        assert!(!play.is_hear_song());
+        assert_eq!(play.song_audio(), SongAudio::Off);
         play.set_wait_mode(true);
         play.set_practice(Some(Hand::Right));
         // The gate holds the right hand's notes, the override among them.
@@ -3168,7 +3238,9 @@ mod tests {
 
     #[test]
     fn the_backing_mutes_off_tempo_and_comes_back_at_the_fader_level() {
-        let mut play = two_note_screen();
+        let mut play = two_note_screen()
+            .with_backing(PathBuf::from("backing.mp3"), 0)
+            .with_song_audio(SongAudio::Backing);
         let fader = Gain::new(0.6).unwrap();
         play.set_backing_gain(fader);
         play.set_rate(750);

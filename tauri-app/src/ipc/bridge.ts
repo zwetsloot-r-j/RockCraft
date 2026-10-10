@@ -29,6 +29,7 @@ import type {
   SaveBundleResult,
   SaveDest,
   SegmentSpec,
+  SongAudio,
 } from "./types";
 
 /** Event name the backend emits a fresh {@link ComposerSnapshot} on. */
@@ -439,9 +440,16 @@ export function playSetWait(on: boolean): Promise<boolean> {
   return invoke<boolean>("play_set_wait", { on });
 }
 
-/** Toggle "hear the song" audition (`m` key). Returns the new state. */
-export function playToggleHearSong(): Promise<boolean> {
-  return invoke<boolean>("play_toggle_hear_song");
+/** Cycle the song audio (`m` key): backing → synth → off (backing skipped
+ * when the piece has none). Returns the new mode. */
+export function playCycleSongAudio(): Promise<SongAudio> {
+  return invoke<SongAudio>("play_cycle_song_audio");
+}
+
+/** Set the song audio directly. Rejects `"backing"` on a piece without a
+ * backing track. Returns the applied mode. */
+export function playSetSongAudio(mode: SongAudio): Promise<SongAudio> {
+  return invoke<SongAudio>("play_set_song_audio", { mode });
 }
 
 /** Toggle manual pause of the active take (Start / play-pause). Returns the new

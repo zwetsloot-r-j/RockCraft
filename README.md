@@ -40,7 +40,7 @@ device is available it runs silently.
 | --- | --- |
 | Menu | `↑`/`k` `↓`/`j` move · `Enter` select · `q`/`Esc` quit |
 | Record | play notes (mock: number row `1`-`0` = C-major) · `s` save take · `Tab`/`Esc` back to menu |
-| Play | `r` restart · `m` toggle hear song · `Tab`/`Esc` back to menu |
+| Play | `r` restart · `m` song audio (backing → piano → off) · `Tab`/`Esc` back to menu |
 | Edit | letters/symbols = editor commands · `R` arm record, then number row `1`-`0` plays notes · `?` help |
 
 Menu items: **Record**, **Play last recording**, **Quit**. Recordings are saved

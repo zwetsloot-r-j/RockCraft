@@ -422,7 +422,8 @@ below is an at-a-glance convenience only.
 | `split_bundle` | `{ segments: [{ start_us, end_us, name }] }` | Slice the loaded piece into the kept parts, each a new library bundle (subset MIDI + copied media + derived offsets, `origin=Edited`). Discarded parts are omitted (= trimming). Returns the created bundle dirs; the source is untouched |
 | `play_load` | `{ dir: String }` | Load a bundle as a play session. Returns play info |
 | `play_set_wait` | `{ on: bool }` | Arm/disarm note-by-note wait mode |
-| `play_toggle_hear_song` | none | Toggle the audible song synth |
+| `play_cycle_song_audio` | none | Cycle the song audio (the `m` key): `"backing"` → `"synth"` → `"off"` → `"backing"`; a piece without a backing track cycles `"synth"` ↔ `"off"`. Returns `{ song_audio }` — see below |
+| `play_set_song_audio` | `{ mode: "backing"\|"synth"\|"off" }` | Set the song audio directly. `"backing"` on a piece with no backing track fails (`failed:`) and keeps the current mode. Returns `{ song_audio }` |
 | `play_toggle_pause` | none | Pause/resume the active play session, freezing/thawing the clock + backing at the current position. No-op with no active session |
 | `play_finish` | none | Finish the play session; returns the score summary |
 | `play_set_practice` | `{ hand: "left"\|"right"\|null }` | Set the practised hand (the other hand auto-plays and isn't scored); `null` = both. Returns `{ practice }` |
@@ -458,7 +459,8 @@ The TUI remembers the mix: every change (from its `x` mixer overlay or from `set
 Not every frontend supports every command: the TUI's record/import/backing
 flows are interactive screen state machines, so it returns `unsupported:` for
 those (it wires `scan_library`, `query_dirty`, `play_load`, the mixer trio,
-`play_toggle_pause`, `play_set_rate` — replying `{ rate_permille }`; the play
+`play_toggle_pause`, `play_cycle_song_audio` / `play_set_song_audio`,
+`play_set_rate` — replying `{ rate_permille }`; the play
 screen's `-` / `=` keys step the same speed — and `play_status` / `play_finish`,
 with the desktop's field names minus the practice hand, split, monitor and bpm.
 The play commands work on the play screen and answer `failed:` off it;
@@ -469,13 +471,31 @@ untouched, so editing a chart there never destroys its backdrops. The Tauri
 desktop host backs the full set. Always discover
 the live set with `query help`.
 
+#### Song audio (`m`)
+
+A play session sounds at most **one** rendition of the song itself, chosen by
+its `song_audio` mode (reported by `play_load`'s info and `play_status`):
+
+- `"backing"` — the backing recording plays (a piece imported from a movie has
+  its soundtrack extracted to one); the synth stays silent.
+- `"synth"` — the synth replays the chart's notes through the `song` voice; the
+  backing is muted.
+- `"off"` — neither: only the notes you play.
+
+A piece starts on `"backing"` when it has a backing track, else on `"synth"`
+(so a MIDI-only piece isn't silent without a live piano). The backing is also
+muted off 1× speed (`play_set_rate`); the two mutes combine, so returning to 1×
+never unmutes a backing the mode turned off, and selecting `"backing"` while
+slowed stays silent until 1×. The mixer levels (`set_bus_gain`) are independent
+of the mode. Hand practice still autoplays the other hand whatever the mode.
+
 #### The practice loop (M17-A)
 
 `play_set_loop` drills a passage: **count-in** (one bar of clicks — the length of
 the loop's first bar — starting that far before the loop; nothing autoplays or
 is scored) → **demo** (the app plays the practised hand, or both; unscored, wait
 mode off) → **count-in** → **your turn** (you play it: the other hand autoplays,
-"hear the song" applies, wait mode applies to the loop's notes only, and only
+the song synth sounds too when the song audio is `"synth"`, wait mode applies to the loop's notes only, and only
 notes starting in the loop are scored) → back to the demo with the pass counter
 bumped. Speed (`play_set_rate`) applies at once; a practice-hand or wait-mode
 change takes effect at the next phase boundary. The loop never finishes the take.

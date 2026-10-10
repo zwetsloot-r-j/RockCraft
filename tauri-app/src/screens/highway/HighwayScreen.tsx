@@ -4,8 +4,8 @@
 // recording" with a bundle `dir`. It loads the bundle (`play_load`), drives the
 // HighwayCanvas off the backend `play_state` event (real `core::PlayClock` +
 // scoring, never the render loop), and shows an end-of-take summary. Keys:
-// m hear-song, w wait mode, Enter replay (on summary), Esc → menu (handled by
-// the shell router).
+// m song audio (backing → piano → off), w wait mode, Enter replay (on
+// summary), Esc → menu (handled by the shell router).
 //
 // Opening Play without a `dir` is just a guard (reaching it requires a bundle):
 // it shows a centered empty state instead of any canned fixture.
@@ -24,7 +24,7 @@ import {
   playSetRate,
   playSetSplit,
   playSetWait,
-  playToggleHearSong,
+  playCycleSongAudio,
   playToggleMonitor,
   playTogglePause,
 } from "../../ipc/bridge";
@@ -34,6 +34,7 @@ import type {
   BackgroundVideoView,
   PlayStateEvent,
   PlaySummary,
+  SongAudio,
 } from "../../ipc/types";
 import {
   midiRescan,
@@ -230,7 +231,8 @@ export function HighwayScreen() {
   const [summary, setSummary] = createSignal<PlaySummary | null>(null);
   const [song, setSong] = createSignal<SongData>(EMPTY_SONG);
   const [loadErr, setLoadErr] = createSignal<string | null>(null);
-  const [hearSong, setHearSong] = createSignal(false);
+  // Song audio (`m`): the backing recording, the synth replay, or neither.
+  const [songAudio, setSongAudio] = createSignal<SongAudio>("off");
   // Input monitor: synthesise the player's own key presses (`n`), off by default.
   const [monitor, setMonitor] = createSignal(false);
   // Wait-mode preference persists across takes/sessions (defaults on).
@@ -306,7 +308,7 @@ export function HighwayScreen() {
       case "m":
       case "M":
         e.preventDefault();
-        void playToggleHearSong().then(setHearSong);
+        void playCycleSongAudio().then(setSongAudio);
         break;
       case "w":
       case "W":
@@ -497,7 +499,7 @@ export function HighwayScreen() {
   function startLive(bundleDir: string, autoStart = false): void {
     playLoad(bundleDir)
       .then((info) => {
-        setHearSong(info.hear_song);
+        setSongAudio(info.song_audio);
         shiftUs = info.shift_us;
         // The piece's authored split (meta.hand_split) is authoritative: seed
         // the play-mode split from it so moving the splitter in edit mode
@@ -724,7 +726,7 @@ export function HighwayScreen() {
           song={song()}
           live={live}
           playState={playState}
-          hearSong={hearSong}
+          songAudio={songAudio}
           waitMode={waitMode}
           monitor={monitor}
           practice={practice}

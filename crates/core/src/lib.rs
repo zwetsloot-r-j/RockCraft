@@ -26,6 +26,7 @@ pub mod practice_loop;
 pub mod scoring;
 pub mod segment;
 pub mod song;
+pub mod song_audio;
 pub mod stats;
 pub mod timeline;
 pub mod wait;
@@ -60,6 +61,7 @@ pub use song::{
     backing_position_us, song_shift_us, BackgroundVideo, BackingTrack, MetaError, RecordingMeta,
     TrackOrigin,
 };
+pub use song_audio::SongAudio;
 pub use stats::Summary;
 pub use timeline::{Note, NoteId, Timeline};
 pub use wait::{GateState, Step, WaitGate, WaitTracker};
