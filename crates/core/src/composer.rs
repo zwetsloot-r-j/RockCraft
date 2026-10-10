@@ -1443,15 +1443,26 @@ impl Composer {
         let Some(note) = self.timeline().get(id).copied() else {
             return Vec::new();
         };
-        self.history.checkpoint();
         let step = self.grid.step_us();
-        let new_dur = if delta_steps >= 0 {
+        let mut new_dur = if delta_steps >= 0 {
             note.dur_us.saturating_add(step * delta_steps as u64)
         } else {
             note.dur_us
                 .saturating_sub(step * (-delta_steps) as u64)
                 .max(step)
         };
+        // Never grow into the next same-pitch note: that overlap cannot be
+        // saved (see `Timeline::to_events`), so stop at its onset instead.
+        if let Some(next) = self
+            .timeline()
+            .next_onset_after(note.pitch.value(), note.start_us)
+        {
+            new_dur = new_dur.min(next - note.start_us);
+        }
+        if new_dur == note.dur_us {
+            return Vec::new();
+        }
+        self.history.checkpoint();
         self.history.current_mut().resize(id, new_dur);
         Vec::new()
     }
@@ -2574,6 +2585,35 @@ mod tests {
         assert_eq!(c.note_count(), 1, "replaced, not stacked");
         let id2 = c.note_under_cursor().unwrap();
         assert_eq!(c.get_note(id2).unwrap().velocity.value(), DEFAULT_NOTE_VEL);
+    }
+
+    /// Lengthening a note stops at the next same-pitch onset: the overlap could
+    /// not be saved, and used to shorten the later note on reload.
+    #[test]
+    fn resize_note_stops_at_the_next_same_pitch_note() {
+        let grid = Grid {
+            bpm: 120,
+            time_sig: TimeSig {
+                beats_per_bar: 4,
+                beat_unit: 4,
+            },
+            subdivision: Subdivision::Eighth, // step = 250_000 µs
+            origin_us: 0,
+        };
+        let mut tl = Timeline::new();
+        let a = tl.insert(note(60, 0, 250_000));
+        let b = tl.insert(note(60, 510_000, 250_000)); // a little off-grid
+        tl.insert(note(62, 300_000, 250_000)); // other pitch: no limit
+        let mut c = Composer::from_timeline(tl, grid);
+        apply(&mut c, Action::SetCursor { pitch: 60, step: 0 });
+        apply(&mut c, Action::ResizeNote { delta_steps: 4 });
+        assert_eq!(c.get_note(a).unwrap().dur_us, 510_000);
+        assert_eq!(c.get_note(b).unwrap().dur_us, 250_000);
+        // Already at the limit: a further grow is a no-op, not an undo step.
+        apply(&mut c, Action::ResizeNote { delta_steps: 1 });
+        assert_eq!(c.get_note(a).unwrap().dur_us, 510_000);
+        apply(&mut c, Action::Undo);
+        assert_eq!(c.get_note(a).unwrap().dur_us, 250_000);
     }
 
     /// Regression: an imported note whose onset sits a few µs past the
