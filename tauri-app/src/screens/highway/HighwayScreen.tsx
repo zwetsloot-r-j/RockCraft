@@ -266,6 +266,9 @@ export function HighwayScreen() {
       if (e.key === "Enter") {
         e.preventDefault();
         replay();
+      } else if (e.key === "r" || e.key === "R") {
+        e.preventDefault();
+        restart();
       }
       return;
     }
@@ -289,6 +292,12 @@ export function HighwayScreen() {
       return;
     }
     switch (e.key) {
+      case "r":
+      case "R":
+        // Restart the take from the top (like the TUI's `r`).
+        e.preventDefault();
+        restart();
+        break;
       case " ":
         // Play/pause toggle once running.
         e.preventDefault();
@@ -485,7 +494,7 @@ export function HighwayScreen() {
     }
   }
 
-  function startLive(bundleDir: string): void {
+  function startLive(bundleDir: string, autoStart = false): void {
     playLoad(bundleDir)
       .then((info) => {
         setHearSong(info.hear_song);
@@ -527,8 +536,10 @@ export function HighwayScreen() {
         }
         engine.start();
         setEng(engine);
-        // The backend session loaded paused; wait for Start before advancing.
-        setStarted(false);
+        // The backend session loaded paused; wait for Start before advancing —
+        // unless this is a restart (`r`), which runs straight away like the TUI.
+        if (autoStart) start();
+        else setStarted(false);
         // A fresh session is disarmed; apply the persisted wait-mode preference
         // so it is remembered across takes/sessions and Replay.
         void playSetWait(waitMode()).then(setWaitMode);
@@ -615,15 +626,25 @@ export function HighwayScreen() {
     void playSetSplit(next).then(setSplit);
   }
 
-  function replay(): void {
+  /** Reload the bundle into a fresh take. `autoStart` skips the Start prompt. */
+  function replay(autoStart = false): void {
     if (dir === undefined) return;
     finished = false;
-    setStarted(false);
+    // A restart keeps `started` set so the Start overlay doesn't flash while the
+    // fresh session loads; `startLive` begins it once loaded.
+    if (!autoStart) setStarted(false);
     setSummary(null);
     setPlayState(null);
     eng()?.stop();
     setEng(null);
-    startLive(dir);
+    startLive(dir, autoStart);
+  }
+
+  /** `r` / the ↻ button: start the take over from the top, mirroring the TUI's
+   * `r` — a fresh session (score, summary and any loop cleared) that runs
+   * straight away instead of re-showing the Start prompt. */
+  function restart(): void {
+    replay(true);
   }
 
   onMount(() => {
@@ -710,6 +731,8 @@ export function HighwayScreen() {
           backdrop={backdrop}
           rate={rate}
           splitName={() => noteName(split())}
+          onRestart={restart}
+          canRestart={() => started() && !summary()}
         />
         <div style={{ flex: "1 1 auto", "min-height": 0, position: "relative" }}>
           {/* Background video backdrop (M9-G) — sits *behind* the canvas (lower
