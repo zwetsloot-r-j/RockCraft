@@ -134,6 +134,17 @@ impl Timeline {
         }
     }
 
+    /// The earliest onset of a `pitch` note starting strictly after `after_us`
+    /// — how far a note at `after_us` may extend before it would overlap its
+    /// same-pitch successor (which [`to_events`](Self::to_events) cannot store).
+    pub fn next_onset_after(&self, pitch: u8, after_us: u64) -> Option<u64> {
+        self.notes
+            .values()
+            .filter(|n| n.pitch.value() == pitch && n.start_us > after_us)
+            .map(|n| n.start_us)
+            .min()
+    }
+
     /// The note whose span `[start_us, start_us + dur_us)` covers `us` at
     /// `pitch`, if any — what an editing cursor sits on. On overlap the
     /// highest-id (most recently inserted) note wins.
@@ -328,11 +339,35 @@ impl Timeline {
     /// Emit on/off events sorted by timestamp, with note-off ordered before
     /// note-on at an equal timestamp so a note that ends exactly when another
     /// begins re-pairs cleanly. Feeds `events_to_smf_bytes` and `build_spans`.
+    ///
+    /// Two notes of the **same pitch** that overlap cannot be represented as
+    /// flat on/off pairs: a reader closes the first note at the re-press, and
+    /// the first note's later off then truncates the *second* note (which is how
+    /// a lengthened note used to shorten its neighbour on save). So each note's
+    /// end is clipped to the next onset of the same pitch, making the round-trip
+    /// through [`from_events`](Self::from_events) exact. A note sharing its
+    /// onset with a later-inserted same-pitch note is dropped (the later one
+    /// stands) — it would be zero-length after clipping.
     pub fn to_events(&self) -> Vec<NoteEvent> {
         let mut events = Vec::with_capacity(self.notes.len() * 2);
+        let mut by_pitch: BTreeMap<u8, Vec<&Note>> = BTreeMap::new();
         for note in self.notes.values() {
-            events.push(NoteEvent::on(note.pitch, note.velocity, note.start_us));
-            events.push(NoteEvent::off(note.pitch, note.start_us + note.dur_us));
+            by_pitch.entry(note.pitch.value()).or_default().push(note);
+        }
+        for notes in by_pitch.values_mut() {
+            // Stable sort: equal onsets keep ascending-id order.
+            notes.sort_by_key(|n| n.start_us);
+            for (i, note) in notes.iter().enumerate() {
+                let mut end = note.start_us + note.dur_us;
+                if let Some(next) = notes.get(i + 1) {
+                    end = end.min(next.start_us);
+                }
+                if end <= note.start_us {
+                    continue;
+                }
+                events.push(NoteEvent::on(note.pitch, note.velocity, note.start_us));
+                events.push(NoteEvent::off(note.pitch, end));
+            }
         }
         // Sort by timestamp; within a timestamp, Off (0) before On (1).
         events.sort_by_key(|ev| {
@@ -647,6 +682,47 @@ mod tests {
         assert_eq!(at_1000.len(), 2);
         assert!(matches!(at_1000[0].kind, NoteEventKind::Off));
         assert!(matches!(at_1000[1].kind, NoteEventKind::On { .. }));
+    }
+
+    #[test]
+    fn round_trip_same_pitch_overlap_keeps_the_later_note() {
+        // A lengthened past B's onset (same pitch). The later note B must come
+        // back whole; A is clipped at B's onset.
+        let mut tl = Timeline::new();
+        tl.insert(note(60, 0, 1_010_000, 90));
+        tl.insert(note(60, 1_000_000, 500_000, 80));
+        let rebuilt = Timeline::from_events(&tl.to_events());
+        let mut got: Vec<(u64, u64, u8)> = rebuilt
+            .notes()
+            .map(|(_, n)| (n.start_us, n.dur_us, n.velocity.value()))
+            .collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![(0, 1_000_000, 90), (1_000_000, 500_000, 80)]);
+    }
+
+    #[test]
+    fn to_events_drops_a_same_pitch_note_sharing_an_onset() {
+        let mut tl = Timeline::new();
+        tl.insert(note(60, 1_000, 5_000, 90));
+        tl.insert(note(60, 1_000, 2_000, 70)); // later insert stands
+        let rebuilt = Timeline::from_events(&tl.to_events());
+        let got: Vec<(u64, u64, u8)> = rebuilt
+            .notes()
+            .map(|(_, n)| (n.start_us, n.dur_us, n.velocity.value()))
+            .collect();
+        assert_eq!(got, vec![(1_000, 2_000, 70)]);
+    }
+
+    #[test]
+    fn next_onset_after_finds_the_same_pitch_successor() {
+        let mut tl = Timeline::new();
+        tl.insert(note(60, 0, 100, 90));
+        tl.insert(note(62, 50, 100, 90));
+        tl.insert(note(60, 300, 100, 90));
+        tl.insert(note(60, 200, 100, 90));
+        assert_eq!(tl.next_onset_after(60, 0), Some(200));
+        assert_eq!(tl.next_onset_after(60, 300), None);
+        assert_eq!(tl.next_onset_after(62, 0), Some(50));
     }
 
     #[test]
