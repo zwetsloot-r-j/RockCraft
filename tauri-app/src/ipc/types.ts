@@ -315,6 +315,8 @@ export type ActionName =
   | "set_playhead"
   // ── backing alignment ───────────────────────────────────────────────
   | "nudge_backing_offset"
+  // ── grid phase (bar lines slide under fixed notes) ──────────────────
+  | "nudge_grid_origin"
   // ── loop / metronome / count-in ─────────────────────────────────────
   | "toggle_loop"
   | "toggle_metronome"

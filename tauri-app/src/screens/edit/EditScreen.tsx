@@ -70,7 +70,11 @@ import { cursorUsOf, EditCanvas } from "./EditCanvas";
 import { StatusBar } from "./StatusBar";
 import { RecordControls } from "./RecordControls";
 import { DEFAULT_SPLIT } from "./hand";
-import { resolveBackgroundKey, resolveKey } from "./keymap";
+import {
+  GRID_ORIGIN_NUDGE_COARSE_US,
+  resolveBackgroundKey,
+  resolveKey,
+} from "./keymap";
 import { IDENTITY_TRANSFORM, layerStyle } from "../highway/backgrounds";
 import { HIGHEST_MIDI, LOWEST_MIDI } from "./viewport";
 import {
@@ -89,6 +93,9 @@ import { useRouter } from "../../shell/Router";
 /** Fine backdrop-offset nudge (10 ms), bound to `,` / `.` while attached. */
 /** Physical keys of the Alt tempo shortcuts (matched on `code`, see onKeydown). */
 const ALT_TEMPO_CODES = new Set(["KeyT", "KeyE", "KeyR"]);
+/** Alt + these keys nudge the grid phase coarsely (±250 ms). Matched on `key`
+ * so they follow the backing-nudge keys on any layout (e.g. JIS `'`). */
+const ALT_GRID_KEYS = new Set([";", "'"]);
 const BACKDROP_NUDGE_FINE_US = 10_000;
 /** Coarse backdrop-offset nudge (250 ms), bound to `;` / `'` while attached. */
 const BACKDROP_NUDGE_COARSE_US = 250_000;
@@ -1360,7 +1367,7 @@ export function EditScreen(props: Props): JSX.Element {
     if (e.ctrlKey || e.metaKey) return;
     // Alt combos are left to the webview, except the tempo-from-checkpoint
     // keys (Alt+T / Alt+e / Alt+r), handled with the other tempo keys below.
-    if (e.altKey && !ALT_TEMPO_CODES.has(e.code)) return;
+    if (e.altKey && !ALT_TEMPO_CODES.has(e.code) && !ALT_GRID_KEYS.has(e.key)) return;
 
     // Let native text editing own the keyboard while a real text field is
     // focused (the split editor's segment-name inputs). Without this the editor
@@ -1605,6 +1612,16 @@ export function EditScreen(props: Props): JSX.Element {
       // Tempo from a checkpoint: Alt + the tempo keys apply from the cursor's
       // bar to the end. Matched on `code` — Alt can change `key` on some layouts.
       if (e.altKey && !e.ctrlKey && !e.metaKey) {
+        // Alt+; / Alt+' slide the bar lines ±250 ms (the coarse twin of `:`/`"`).
+        if (ALT_GRID_KEYS.has(e.key)) {
+          e.preventDefault();
+          const delta_us =
+            e.key === ";" ? -GRID_ORIGIN_NUDGE_COARSE_US : GRID_ORIGIN_NUDGE_COARSE_US;
+          void runAction("nudge_grid_origin", { delta_us }).then((reply) => {
+            setDirty(reply.dirty);
+          });
+          return;
+        }
         if (e.code === "KeyT") {
           e.preventDefault();
           setBpmFromCursor(true);
@@ -2973,6 +2990,9 @@ function HelpOverlay(props: { onClose: () => void }): JSX.Element {
         "Backspace     Detach the backing (keeps the video backdrop)",
         ", / .         Nudge −/+ 10 ms",
         "; / '         Nudge −/+ 250 ms",
+        ": / \"         Slide the bar lines −/+ 10 ms (grid phase; no note",
+        "              or audio moves — line bar 1 up with the downbeat)",
+        "Alt+; / Alt+' Slide the bar lines −/+ 250 ms",
       ],
     },
     {
