@@ -1,6 +1,6 @@
 # M21-A — Backing-track waveform data (envelope + onsets)
 
-> Milestone: M21 — Audio-guided editing · Issue: TBD · Suggested tier: sonnet
+> Milestone: M21 — Audio-guided editing · Issue: #326 · Suggested tier: sonnet
 > Branch: `claude/m21-waveform-data`
 
 ## Goal

@@ -1,6 +1,6 @@
 # M21-B — Waveform overlay in the desktop edit grid
 
-> Milestone: M21 — Audio-guided editing · Issue: TBD · Suggested tier: sonnet
+> Milestone: M21 — Audio-guided editing · Issue: #327 · Suggested tier: sonnet
 > Branch: `claude/m21-waveform-overlay`
 > **Depends on M21-A** — `backing_waveform` / `editBackingWaveform()` must be on `main`.
 
