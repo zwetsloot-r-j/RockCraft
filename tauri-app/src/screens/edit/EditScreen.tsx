@@ -86,6 +86,7 @@ import {
   type SegmentMeta,
 } from "./split";
 import { noteName } from "../highway/utils";
+import { bpmInRange, formatBpm, MAX_BPM, MIN_BPM, parseBpm, typeBpmKey } from "./bpm";
 import { useRouter } from "../../shell/Router";
 
 // ── Video backdrop (M7-tauri-N) ────────────────────────────────────────────
@@ -96,6 +97,12 @@ const ALT_TEMPO_CODES = new Set(["KeyT", "KeyE", "KeyR"]);
 /** Alt + these keys nudge the grid phase coarsely (±250 ms). Matched on `key`
  * so they follow the backing-nudge keys on any layout (e.g. JIS `'`). */
 const ALT_GRID_KEYS = new Set([";", "'"]);
+/** Alt + `(` / `)` nudge the piece tempo finely (±0.1 BPM — the fine twin of
+ * the ±5 `(`/`)` keymap nudge). Matched on `key`, like ALT_GRID_KEYS, so they
+ * follow the parentheses on any layout. */
+const ALT_FINE_BPM_KEYS = new Set(["(", ")"]);
+/** Fine tempo nudge in BPM for `Alt+(` / `Alt+)`. */
+const BPM_NUDGE_FINE = 0.1;
 const BACKDROP_NUDGE_FINE_US = 10_000;
 /** Coarse backdrop-offset nudge (250 ms), bound to `;` / `'` while attached. */
 const BACKDROP_NUDGE_COARSE_US = 250_000;
@@ -1366,8 +1373,16 @@ export function EditScreen(props: Props): JSX.Element {
     const s = store.snap;
     if (e.ctrlKey || e.metaKey) return;
     // Alt combos are left to the webview, except the tempo-from-checkpoint
-    // keys (Alt+T / Alt+e / Alt+r), handled with the other tempo keys below.
-    if (e.altKey && !ALT_TEMPO_CODES.has(e.code) && !ALT_GRID_KEYS.has(e.key)) return;
+    // keys (Alt+T / Alt+e / Alt+r), the fine tempo nudge (Alt+( / Alt+)) and the
+    // coarse grid nudge (Alt+; / Alt+'), handled with the other tempo keys below.
+    if (
+      e.altKey &&
+      !ALT_TEMPO_CODES.has(e.code) &&
+      !ALT_GRID_KEYS.has(e.key) &&
+      !ALT_FINE_BPM_KEYS.has(e.key)
+    ) {
+      return;
+    }
 
     // Let native text editing own the keyboard while a real text field is
     // focused (the split editor's segment-name inputs). Without this the editor
@@ -1415,11 +1430,15 @@ export function EditScreen(props: Props): JSX.Element {
         setOverlay("none");
         setBpmText("");
       } else if (e.key === "Enter") {
-        const bpm = parseInt(bpmText().trim(), 10);
+        const bpm = parseBpm(bpmText());
         setOverlay("none");
         setBpmText("");
-        if (Number.isFinite(bpm)) {
-          // core clamps to 20..=300; we just forward the typed value.
+        if (bpm !== null) {
+          if (!bpmInRange(bpm)) {
+            showFlash(`BPM must be ${MIN_BPM}–${MAX_BPM} (got ${formatBpm(bpm)})`);
+            return;
+          }
+          // Decimals go over the wire as-is; core stores 0.001 BPM precision.
           const name = bpmFromCursor() ? "set_tempo_from" : "set_bpm";
           void runAction(name, { bpm }).then((reply) => {
             setDirty(reply.dirty);
@@ -1427,9 +1446,9 @@ export function EditScreen(props: Props): JSX.Element {
         }
       } else if (e.key === "Backspace") {
         setBpmText((n) => n.slice(0, -1));
-      } else if (/^[0-9]$/.test(e.key)) {
-        // Cap at 3 digits (max BPM is 300).
-        setBpmText((n) => (n.length < 3 ? n + e.key : n));
+      } else {
+        // Digits (≤ 3 whole, ≤ 3 decimal) and one `.`/`,` decimal separator.
+        setBpmText((n) => typeBpmKey(n, e.key));
       }
       return;
     }
@@ -1625,8 +1644,16 @@ export function EditScreen(props: Props): JSX.Element {
         if (e.code === "KeyT") {
           e.preventDefault();
           setBpmFromCursor(true);
-          setBpmText(String(Math.round(s.bar_bpm ?? s.bpm)));
+          setBpmText(formatBpm(s.bar_bpm ?? s.bpm));
           setOverlay("set-bpm");
+          return;
+        }
+        if (ALT_FINE_BPM_KEYS.has(e.key)) {
+          e.preventDefault();
+          const delta = e.key === "(" ? -BPM_NUDGE_FINE : BPM_NUDGE_FINE;
+          void runAction("adjust_bpm", { delta }).then((reply) => {
+            setDirty(reply.dirty);
+          });
           return;
         }
         if (e.code === "KeyE" || e.code === "KeyR") {
@@ -1642,7 +1669,7 @@ export function EditScreen(props: Props): JSX.Element {
       if (e.key === "T") {
         e.preventDefault();
         setBpmFromCursor(false);
-        setBpmText(String(Math.round(s.bpm)));
+        setBpmText(formatBpm(s.bpm));
         setOverlay("set-bpm");
         return;
       }
@@ -2933,7 +2960,8 @@ function HelpOverlay(props: { onClose: () => void }): JSX.Element {
         "+ / =         Velocity +8",
         "-             Velocity −8",
         "( / )         Tempo −/+ 5 BPM",
-        "T             Set BPM (type a value, Enter to apply)",
+        "Alt+( / Alt+) Tempo −/+ 0.1 BPM (fine)",
+        "T             Set BPM (type a value, e.g. 120.5; Enter to apply)",
         "Alt+T         Set BPM from the cursor's bar to the end (a tempo",
         "              change at a checkpoint; earlier bars keep theirs)",
         "Alt+e / Alt+r Tempo −/+ 1 BPM from the cursor's bar to the end",
@@ -3270,7 +3298,8 @@ function SaveAsPrompt(props: { name: string }): JSX.Element {
 /**
  * Single-line numeric input overlay for the absolute tempo (BPM). Mirrors the
  * TUI's `draw_bpm_prompt`; key routing is in the parent `onKeydown`. The typed
- * value is forwarded to `set_bpm`, which clamps to 20..=300 in `core`.
+ * value (decimals allowed, 0.001 BPM precision; `.` or `,` separator) is checked
+ * against 20..=300 and forwarded to `set_bpm` / `set_tempo_from`.
  */
 function SetBpmPrompt(props: { text: string; title: string }): JSX.Element {
   return (

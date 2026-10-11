@@ -266,7 +266,7 @@ mod tests {
         use crate::Grid;
         // Simulate an edit-mode BPM change, then persist+reload the meta.
         let mut grid = Grid::default_120();
-        grid.set_bpm(96);
+        grid.set_bpm(crate::Bpm::from_whole(96));
         let meta = RecordingMeta {
             midi_file: "song.mid".into(),
             backing: None,
@@ -281,7 +281,62 @@ mod tests {
             version: 1,
         };
         let back = RecordingMeta::from_json(&meta.to_json()).unwrap();
-        assert_eq!(back.grid.unwrap().bpm, 96);
+        assert_eq!(back.grid.unwrap().bpm, crate::Bpm::from_whole(96));
+    }
+
+    #[test]
+    fn fractional_bpm_survives_grid_roundtrip() {
+        use crate::{Bpm, Grid};
+        let mut grid = Grid::default_120();
+        grid.set_bpm(Bpm::from_milli(97_250));
+        let meta = RecordingMeta {
+            midi_file: "song.mid".into(),
+            backing: None,
+            grid: Some(grid),
+            key: None,
+            origin: None,
+            video: None,
+            backgrounds: Vec::new(),
+            hand_split: None,
+            hand_overrides: Vec::new(),
+            bar_starts: Vec::new(),
+            version: 1,
+        };
+        let json = meta.to_json();
+        assert!(
+            json.contains("97.25"),
+            "decimal BPM is written as a number: {json}"
+        );
+        let back = RecordingMeta::from_json(&json).unwrap();
+        assert_eq!(back.grid.unwrap().bpm, Bpm::from_milli(97_250));
+    }
+
+    #[test]
+    fn old_integer_bpm_meta_still_loads() {
+        use crate::{Bpm, Grid};
+        // A meta.json written before fractional BPM: `bpm` is a bare integer.
+        let old = r#"{
+            "midi_file": "song.mid",
+            "grid": {
+                "bpm": 96,
+                "time_sig": {"beats_per_bar": 3, "beat_unit": 4},
+                "subdivision": "Eighth"
+            },
+            "version": 1
+        }"#;
+        let meta = RecordingMeta::from_json(old).unwrap();
+        let grid = meta.grid.unwrap();
+        assert_eq!(grid.bpm, Bpm::from_whole(96));
+        assert_eq!(grid.quarter_us(), 625_000);
+        assert_eq!(grid.bar_us(), 1_875_000);
+        // Re-saving keeps the integer form for a whole tempo.
+        let resaved: serde_json::Value = serde_json::from_str(&meta.to_json()).unwrap();
+        assert_eq!(resaved["grid"]["bpm"], serde_json::json!(96));
+        assert!(resaved["grid"]["bpm"].is_u64());
+        assert_eq!(
+            serde_json::from_value::<Grid>(resaved["grid"].clone()).unwrap(),
+            grid
+        );
     }
 
     #[test]

@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use crate::action::{Action, ActionError, Effect};
 use crate::background::{BackgroundStack, BackgroundView, Easing, Transform};
 use crate::bars::BarMap;
+use crate::bpm::Bpm;
 use crate::chord::{ChordKind, Key, Scale};
 use crate::events::{MidiNote, NoteEvent, NoteEventKind, Velocity};
 use crate::grid::{Grid, Subdivision, TimeSig};
@@ -547,10 +548,11 @@ impl Composer {
             Action::NudgeBarTempo { delta } => self.nudge_bar_tempo(delta),
             Action::SetTempoFrom { bpm } => {
                 let ts = self.grid.time_sig;
-                let bpm = bpm.clamp(Grid::MIN_BPM, Grid::MAX_BPM) as u128;
-                // bar_us = beats_per_bar · 240 s / (bpm · beat_unit)
+                let milli = bpm.clamp(Grid::MIN_BPM, Grid::MAX_BPM).milli() as u128;
+                // bar_us = beats_per_bar · 240 s / (bpm · beat_unit), in milli-BPM
+                // (floored, so a whole tempo matches the old integer formula).
                 let bar_us =
-                    240_000_000u128 * ts.beats_per_bar as u128 / (bpm * ts.beat_unit as u128);
+                    240_000_000_000u128 * ts.beats_per_bar as u128 / (milli * ts.beat_unit as u128);
                 self.retempo_from_cursor_bar(|_| bar_us as u64)
             }
             Action::AdjustTempoFrom { delta } => {
@@ -560,8 +562,8 @@ impl Composer {
                 let k = 240_000_000f64 * ts.beats_per_bar as f64;
                 let bu = ts.beat_unit as f64;
                 self.retempo_from_cursor_bar(|old_us| {
-                    let bpm = k / (old_us as f64 * bu) + delta as f64;
-                    let bpm = bpm.clamp(Grid::MIN_BPM as f64, Grid::MAX_BPM as f64);
+                    let bpm = k / (old_us as f64 * bu) + delta.as_f64();
+                    let bpm = bpm.clamp(Grid::MIN_BPM.as_f64(), Grid::MAX_BPM.as_f64());
                     (k / (bpm * bu)).round() as u64
                 })
             }
@@ -887,7 +889,7 @@ impl Composer {
         ComposerSnapshot {
             notes,
             cursor: self.cursor,
-            bpm: self.grid.bpm as f64,
+            bpm: self.grid.bpm.as_f64(),
             bar_bpm: self.cursor_bar_bpm(),
             tempo_changes: crate::bars::tempo_changes(
                 &self.bar_starts,
@@ -2167,9 +2169,10 @@ impl Composer {
     /// tempo. The cursor stays on its (beat-relative) step. A no-op if the tempo
     /// is unchanged (e.g. already clamped at a bound).
     fn retempo(&mut self, change: impl FnOnce(&mut Grid)) -> Vec<Effect> {
-        let old = self.grid.bpm.max(1);
+        // Ratios in milli-BPM: identical to whole-BPM ratios for whole tempos.
+        let old = self.grid.bpm.milli().max(1);
         change(&mut self.grid);
-        let new = self.grid.bpm.max(1);
+        let new = self.grid.bpm.milli().max(1);
         if new == old {
             return Vec::new();
         }
@@ -2212,10 +2215,12 @@ impl Composer {
         durs.sort_unstable();
         let median = durs[durs.len() / 2];
         let ts = self.grid.time_sig;
-        // bar_us = beats_per_bar · quarter · 4 / beat_unit  →  solve for BPM.
-        let bpm = (240_000_000u64 * ts.beats_per_bar as u64 + median * ts.beat_unit as u64 / 2)
-            / (median * ts.beat_unit as u64);
-        self.grid.set_bpm(bpm.min(u32::MAX as u64) as u32);
+        // bar_us = beats_per_bar · quarter · 4 / beat_unit  →  solve for BPM,
+        // rounded to the nearest milli-BPM.
+        let den = median as u128 * ts.beat_unit as u128;
+        let milli = (240_000_000_000u128 * ts.beats_per_bar as u128 + den / 2) / den;
+        self.grid
+            .set_bpm(Bpm::from_milli(milli.min(u32::MAX as u128) as u32));
         self.grid.set_origin_us(bars[0]);
         self.set_bar_starts(bars);
     }
@@ -2475,6 +2480,7 @@ fn audition_pending_triggers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bpm::BpmDelta;
     use crate::hand::HandOverride;
 
     fn note(pitch: u8, start_us: u64, dur_us: u64) -> Note {
@@ -2652,7 +2658,7 @@ mod tests {
     #[test]
     fn resize_note_stops_at_the_next_same_pitch_note() {
         let grid = Grid {
-            bpm: 120,
+            bpm: Bpm::from_whole(120),
             time_sig: TimeSig {
                 beats_per_bar: 4,
                 beat_unit: 4,
@@ -2683,7 +2689,7 @@ mod tests {
     fn note_under_cursor_prefers_onset_in_cell_over_earlier_sounding_note() {
         // 120 BPM 4/4 sixteenths: step = 125_000 µs; step 8 = [1_000_000, 1_125_000).
         let grid = Grid {
-            bpm: 120,
+            bpm: Bpm::from_whole(120),
             time_sig: TimeSig {
                 beats_per_bar: 4,
                 beat_unit: 4,
@@ -2720,7 +2726,7 @@ mod tests {
     #[test]
     fn note_under_cursor_finds_short_note_drifted_off_the_grid_line() {
         let grid = Grid {
-            bpm: 170,
+            bpm: Bpm::from_whole(170),
             time_sig: TimeSig {
                 beats_per_bar: 3,
                 beat_unit: 4,
@@ -2755,7 +2761,7 @@ mod tests {
     #[test]
     fn insert_bar_and_remove_bar_ripple_the_tail() {
         let grid = Grid {
-            bpm: 120,
+            bpm: Bpm::from_whole(120),
             time_sig: TimeSig {
                 beats_per_bar: 4,
                 beat_unit: 4,
@@ -2820,7 +2826,7 @@ mod tests {
     #[test]
     fn nudge_tail_ripples_notes_at_or_after_the_cursor() {
         let grid = Grid {
-            bpm: 120,
+            bpm: Bpm::from_whole(120),
             time_sig: TimeSig {
                 beats_per_bar: 4,
                 beat_unit: 4,
@@ -2863,7 +2869,7 @@ mod tests {
     #[test]
     fn nudge_bar_tempo_stretches_the_cursor_bar_and_ripples() {
         let grid = Grid {
-            bpm: 120,
+            bpm: Bpm::from_whole(120),
             time_sig: TimeSig {
                 beats_per_bar: 4,
                 beat_unit: 4,
@@ -2898,7 +2904,7 @@ mod tests {
     /// downbeat), 3 s (bar 1 beat 3), 4 s (bar 2) and 6 s (bar 3); cursor in bar 1.
     fn tempo_from_fixture() -> Composer {
         let grid = Grid {
-            bpm: 120,
+            bpm: Bpm::from_whole(120),
             time_sig: TimeSig {
                 beats_per_bar: 4,
                 beat_unit: 4,
@@ -2935,7 +2941,12 @@ mod tests {
         let mut c = tempo_from_fixture();
         assert_eq!(c.snapshot().bar_bpm, 120.0);
         // 120 → 100 BPM from bar 1: bars there become 2.4 s (×1.2).
-        apply(&mut c, Action::SetTempoFrom { bpm: 100 });
+        apply(
+            &mut c,
+            Action::SetTempoFrom {
+                bpm: Bpm::from_whole(100),
+            },
+        );
         assert_eq!(
             start_of(&c, 60),
             1_000_000,
@@ -2959,11 +2970,21 @@ mod tests {
     #[test]
     fn adjust_tempo_from_is_relative_to_the_cursor_bar() {
         let mut c = tempo_from_fixture();
-        apply(&mut c, Action::AdjustTempoFrom { delta: -20 }); // 120 → 100
+        apply(
+            &mut c,
+            Action::AdjustTempoFrom {
+                delta: BpmDelta::from_whole(-20),
+            },
+        ); // 120 → 100
         assert_eq!(start_of(&c, 60), 1_000_000);
         assert_eq!(start_of(&c, 67), 6_800_000);
         assert_eq!(c.snapshot().bar_bpm, 100.0);
-        apply(&mut c, Action::AdjustTempoFrom { delta: 20 }); // back to 120
+        apply(
+            &mut c,
+            Action::AdjustTempoFrom {
+                delta: BpmDelta::from_whole(20),
+            },
+        ); // back to 120
         assert_eq!(start_of(&c, 67), 6_000_000);
         assert_eq!(c.snapshot().bar_bpm, 120.0);
     }
@@ -2976,7 +2997,12 @@ mod tests {
         apply(&mut c, Action::SetCursor { pitch: 60, step: 9 }); // bar 2
         apply(&mut c, Action::NudgeBarTempo { delta: 1 });
         apply(&mut c, Action::SetCursor { pitch: 60, step: 5 }); // bar 1
-        apply(&mut c, Action::SetTempoFrom { bpm: 60 });
+        apply(
+            &mut c,
+            Action::SetTempoFrom {
+                bpm: Bpm::from_whole(60),
+            },
+        );
         assert_eq!(&c.bar_starts()[..4], &[0, 2_000_000, 6_000_000, 11_000_000]);
         assert_eq!(start_of(&c, 60), 1_000_000);
     }
@@ -2984,7 +3010,7 @@ mod tests {
     #[test]
     fn nudge_bar_length_moves_bar_lines_not_notes() {
         let grid = Grid {
-            bpm: 120,
+            bpm: Bpm::from_whole(120),
             time_sig: TimeSig {
                 beats_per_bar: 3,
                 beat_unit: 4,
@@ -3020,7 +3046,7 @@ mod tests {
     #[test]
     fn tempo_change_retimes_notes_and_history_stays_aligned() {
         let grid = Grid {
-            bpm: 120,
+            bpm: Bpm::from_whole(120),
             time_sig: TimeSig {
                 beats_per_bar: 4,
                 beat_unit: 4,
@@ -3035,7 +3061,12 @@ mod tests {
         apply(&mut c, Action::SetCursor { pitch: 64, step: 0 });
         apply(&mut c, Action::AddNote);
         // Double the tempo: note times halve so beats are preserved.
-        apply(&mut c, Action::SetBpm { bpm: 240 });
+        apply(
+            &mut c,
+            Action::SetBpm {
+                bpm: Bpm::from_whole(240),
+            },
+        );
         assert_eq!(c.snapshot().bpm, 240.0);
         let s = |c: &Composer, p: u8| {
             c.timeline()
@@ -3060,7 +3091,7 @@ mod tests {
     fn tempo_map_makes_grid_positions_follow_variable_bar_lengths() {
         // 4/4 @120, quarter subdivision → 4 steps per bar.
         let grid = Grid {
-            bpm: 120,
+            bpm: Bpm::from_whole(120),
             time_sig: TimeSig {
                 beats_per_bar: 4,
                 beat_unit: 4,
@@ -3241,7 +3272,7 @@ mod tests {
     #[test]
     fn resize_snaps_an_off_grid_end_to_the_grid() {
         let grid = Grid {
-            bpm: 120,
+            bpm: Bpm::from_whole(120),
             time_sig: TimeSig {
                 beats_per_bar: 4,
                 beat_unit: 4,
@@ -3291,7 +3322,7 @@ mod tests {
     #[test]
     fn resize_snaps_to_tempo_map_grid_lines() {
         let grid = Grid {
-            bpm: 120,
+            bpm: Bpm::from_whole(120),
             time_sig: TimeSig {
                 beats_per_bar: 4,
                 beat_unit: 4,
@@ -3337,17 +3368,102 @@ mod tests {
     #[test]
     fn set_bpm_changes_grid_and_snapshot_and_clamps() {
         let mut c = Composer::new();
-        assert_eq!(c.grid().bpm, 120);
+        assert_eq!(c.grid().bpm, Bpm::from_whole(120));
 
-        apply(&mut c, Action::SetBpm { bpm: 90 });
-        assert_eq!(c.grid().bpm, 90);
+        apply(
+            &mut c,
+            Action::SetBpm {
+                bpm: Bpm::from_whole(90),
+            },
+        );
+        assert_eq!(c.grid().bpm, Bpm::from_whole(90));
         assert_eq!(c.snapshot().bpm, 90.0);
 
         // Clamp below the floor and above the ceiling.
-        apply(&mut c, Action::SetBpm { bpm: 1 });
+        apply(
+            &mut c,
+            Action::SetBpm {
+                bpm: Bpm::from_whole(1),
+            },
+        );
         assert_eq!(c.grid().bpm, Grid::MIN_BPM);
-        apply(&mut c, Action::SetBpm { bpm: 100_000 });
+        apply(
+            &mut c,
+            Action::SetBpm {
+                bpm: Bpm::from_whole(100_000),
+            },
+        );
         assert_eq!(c.grid().bpm, Grid::MAX_BPM);
+    }
+
+    #[test]
+    fn fractional_set_bpm_and_fine_nudge() {
+        let mut c = Composer::new();
+        apply(
+            &mut c,
+            Action::SetBpm {
+                bpm: Bpm::from_milli(120_500),
+            },
+        );
+        assert_eq!(c.grid().bpm, Bpm::from_milli(120_500));
+        assert_eq!(c.snapshot().bpm, 120.5);
+        assert_eq!(c.grid().quarter_us(), 497_925);
+        apply(
+            &mut c,
+            Action::AdjustBpm {
+                delta: BpmDelta::from_milli(-250),
+            },
+        );
+        assert_eq!(c.grid().bpm, Bpm::from_milli(120_250));
+        assert_eq!(c.snapshot().bpm, 120.25);
+    }
+
+    #[test]
+    fn fractional_set_bpm_retimes_notes_by_exact_ratio() {
+        let mut tl = Timeline::new();
+        tl.insert(note(60, 1_000_000, 500_000)); // beat 2 at 120 BPM
+        let mut c = Composer::from_timeline(tl, Grid::default_120());
+        // 120 → 125.5 BPM: times scale by 120 / 125.5.
+        apply(
+            &mut c,
+            Action::SetBpm {
+                bpm: Bpm::from_milli(125_500),
+            },
+        );
+        // 1_000_000 · 120_000 / 125_500 = 956_175.29… → 956_175.
+        assert_eq!(start_of(&c, 60), 956_175);
+    }
+
+    #[test]
+    fn fractional_set_tempo_from_and_adjust_tempo_from() {
+        let mut c = tempo_from_fixture();
+        apply(
+            &mut c,
+            Action::SetTempoFrom {
+                bpm: Bpm::from_milli(100_500),
+            },
+        );
+        // A 4/4 bar at 100.5 BPM: 240 s · 4 / (100.5 · 4) = 2_388_059.7… → floored.
+        assert_eq!(c.bar_starts()[2] - c.bar_starts()[1], 2_388_059);
+        assert!((c.snapshot().bar_bpm - 100.5).abs() < 1e-3);
+        apply(
+            &mut c,
+            Action::AdjustTempoFrom {
+                delta: BpmDelta::from_milli(-500),
+            },
+        );
+        assert!((c.snapshot().bar_bpm - 100.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn set_bar_starts_keeps_fractional_median_tempo() {
+        let mut c = Composer::new();
+        // 4/4 bars of 2_388_060 µs ≈ 100.5 BPM: the grid keeps the fraction
+        // (to the nearest milli-BPM) instead of rounding to 100 or 101.
+        let bar = 2_388_060u64;
+        let bars: Vec<u64> = (0..4).map(|i| i * bar).collect();
+        apply(&mut c, Action::SetBarStarts { bars_us: bars });
+        assert_eq!(c.grid().bpm, Bpm::from_milli(100_500));
     }
 
     #[test]
@@ -3384,17 +3500,37 @@ mod tests {
     #[test]
     fn adjust_bpm_nudges_and_clamps_and_updates_snapshot() {
         let mut c = Composer::new();
-        apply(&mut c, Action::AdjustBpm { delta: 10 });
-        assert_eq!(c.grid().bpm, 130);
+        apply(
+            &mut c,
+            Action::AdjustBpm {
+                delta: BpmDelta::from_whole(10),
+            },
+        );
+        assert_eq!(c.grid().bpm, Bpm::from_whole(130));
         assert_eq!(c.snapshot().bpm, 130.0);
 
-        apply(&mut c, Action::AdjustBpm { delta: -20 });
-        assert_eq!(c.grid().bpm, 110);
+        apply(
+            &mut c,
+            Action::AdjustBpm {
+                delta: BpmDelta::from_whole(-20),
+            },
+        );
+        assert_eq!(c.grid().bpm, Bpm::from_whole(110));
 
         // Extreme deltas clamp to the bounds.
-        apply(&mut c, Action::AdjustBpm { delta: -100_000 });
+        apply(
+            &mut c,
+            Action::AdjustBpm {
+                delta: BpmDelta::from_whole(-100_000),
+            },
+        );
         assert_eq!(c.grid().bpm, Grid::MIN_BPM);
-        apply(&mut c, Action::AdjustBpm { delta: 100_000 });
+        apply(
+            &mut c,
+            Action::AdjustBpm {
+                delta: BpmDelta::from_whole(100_000),
+            },
+        );
         assert_eq!(c.grid().bpm, Grid::MAX_BPM);
     }
 
@@ -4137,7 +4273,7 @@ mod tests {
 
     fn grid_4_4(bpm: u32, sub: Subdivision) -> Grid {
         Grid {
-            bpm,
+            bpm: Bpm::from_whole(bpm),
             time_sig: TimeSig {
                 beats_per_bar: 4,
                 beat_unit: 4,
@@ -4161,7 +4297,7 @@ mod tests {
             },
         );
         assert_eq!(c.bar_starts(), bars.as_slice());
-        assert_eq!(c.grid().bpm, 100, "BPM = median bar tempo");
+        assert_eq!(c.grid().bpm, Bpm::from_whole(100), "BPM = median bar tempo");
         assert_eq!(c.grid().origin_us, 500_000, "origin = first downbeat");
         let starts: Vec<u64> = c.timeline().notes().map(|(_, n)| n.start_us).collect();
         assert_eq!(starts, vec![1_234_567], "no note moves");

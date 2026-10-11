@@ -12,6 +12,7 @@
 pub mod action;
 pub mod background;
 pub mod bars;
+pub mod bpm;
 pub mod buffer;
 pub mod chord;
 pub mod composer;
@@ -40,6 +41,7 @@ pub use background::{
     MIN_SCALE, POS_LIMIT,
 };
 pub use bars::{tempo_changes, BarMap, TempoChange, TEMPO_CHANGE_MIN_BPM};
+pub use bpm::{Bpm, BpmDelta};
 pub use buffer::EventBuffer;
 pub use chord::{ChordKind, Key, Scale};
 pub use composer::{Composer, ComposerSnapshot, Cursor, InputMode, NoteView, SelectionView};

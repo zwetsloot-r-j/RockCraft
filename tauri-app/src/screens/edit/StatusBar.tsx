@@ -8,6 +8,7 @@
 import { Show, type JSX } from "solid-js";
 import type { ComposerSnapshot, Subdivision } from "../../ipc/types";
 import { barBeatOf, stepUs } from "./viewport";
+import { formatBpm } from "./bpm";
 import { noteName } from "../highway/utils";
 
 const FONT_MONO = "'IBM Plex Mono', ui-monospace, monospace";
@@ -124,7 +125,7 @@ export function StatusBar(props: Props): JSX.Element {
         <Badge text="METRO" bg="#7aa2ff" />
       </Show>
 
-      <Field label="bpm" value={String(props.snapshot.bpm)} />
+      <Field label="bpm" value={formatBpm(props.snapshot.bpm)} />
       <Show
         when={
           props.snapshot.bar_bpm !== undefined &&

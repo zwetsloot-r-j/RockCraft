@@ -402,6 +402,15 @@ authoritative, exhaustive source:
 | `set_hand_split` | `{ pitch: u8 }` | Set the piece's left/right split line (notes below `pitch` default to the left hand) |
 | `set_note_hand` | `{ hand: "auto"\|"left"\|"right" }` | Pin the selection — or the cursor note — to a hand; `auto` clears the override |
 | `cycle_note_hand` | none | Cycle that same target `auto → left → right → auto` |
+| `set_bpm` | `{ bpm: number }` | Set the piece tempo (clamped to 20..=300). **Decimals allowed**, 0.001 BPM precision: `{"bpm":120}` and `{"bpm":120.5}` both work (finer values round to the nearest 0.001) |
+| `adjust_bpm` | `{ delta: number }` | Nudge the piece tempo by a signed delta in BPM — `{"delta":1}` is one BPM, `{"delta":-0.1}` a tenth of one |
+| `set_tempo_from` | `{ bpm: number }` | Set the tempo from the cursor's bar to the end (decimals allowed, as `set_bpm`) |
+| `adjust_tempo_from` | `{ delta: number }` | Nudge the tempo from the cursor's bar to the end by a signed, possibly fractional, BPM delta |
+
+Tempo values are fixed-point milli-BPM in `core` (`core::Bpm`), so they round-trip
+exactly. The state snapshot's `bpm` / `bar_bpm` are plain JSON numbers, and the
+bundle's `meta.json` stores `grid.bpm` as an integer when whole (`120`) and a
+decimal otherwise (`120.5`); older integer-only files load unchanged.
 
 For the exhaustive list, call `query { what: "actions" }` or consult `core::action_names()`.
 
