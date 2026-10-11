@@ -376,6 +376,28 @@ export function editQueryBacking(): Promise<BackingRef | null> {
   return invoke<BackingRef | null>("edit_query_backing");
 }
 
+/**
+ * The attached backing track's waveform (M21-A) — mirror of
+ * `waveform::WaveformReply`. `ready` curves are 0..255 per `bucket_us` bucket,
+ * indexed by backing-file position (song time + `backing_offset_us`).
+ */
+export type BackingWaveform =
+  | { status: "none" }
+  | { status: "pending" }
+  | { status: "failed"; detail: string }
+  | {
+      status: "ready";
+      file: string;
+      bucket_us: number;
+      envelope: number[];
+      onsets: number[];
+    };
+
+/** Ask for the backing waveform; poll while it answers `pending` (M21-A). */
+export function editBackingWaveform(): Promise<BackingWaveform> {
+  return invoke<BackingWaveform>("edit_backing_waveform");
+}
+
 // ── Record commands ───────────────────────────────────────────────────────────
 
 /** Status of the live-recording session. */

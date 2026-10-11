@@ -69,7 +69,10 @@ pub fn analyze(samples: &[i16], channels: u16, sample_rate: u32, bucket_us: u64)
 - **Onsets (energy flux, no FFT):** split the mono signal into three bands
   with simple IIR filters (one-pole or biquad):
   low `< 200 Hz`, mid `200 Hz–2 kHz`, high `> 2 kHz`. Per bucket and band,
-  take the log energy `ln(1e-9 + Σx²)`. The bucket's flux is the sum over
+  take the compressed level `ln(1 + 100·rms)` (rms on a 0..1 scale). This is
+  log-like for loud material but near-linear for quiet noise, so hiss and
+  reverb tails don't read as onsets (a plain `ln(ε + Σx²)` would amplify
+  them). The bucket's flux is the sum over
   bands of `max(0, E_b[i] − E_b[i−1])` (bucket 0 = 0). Normalise so the
   **99th percentile** of non-zero flux maps to 255 (clamp above). An all-silent
   track gives all zeros, never NaN.
@@ -94,6 +97,7 @@ Reply payload, tagged by `status`:
 ```json
 { "status": "none" }                      // no backing attached
 { "status": "pending" }                   // decode/analysis still running
+{ "status": "failed", "detail": "..." }  // the backing could not be decoded
 { "status": "ready", "file": "backing.wav",
   "bucket_us": 10000, "envelope": [..], "onsets": [..] }
 ```
@@ -103,12 +107,14 @@ same way existing variants are.
 
 ### 4. Desktop backend (`tauri-app/src-tauri`)
 
-- When a backing becomes attached (bundle load **or** `AttachBacking`), start
-  a background thread: `DecodedTrack::load` → `core::waveform::analyze`.
-  Cache the result in app state, keyed by the backing path. Never run this on
-  the audio thread, and never block a command on it (`pending` instead).
-- `DetachBacking` or a replaced backing drops the cache. A finished analysis
-  for a path that is no longer attached is discarded.
+- The first query for a backing path (the editor asks right after a bundle
+  load and after `B` attaches one) starts a background thread:
+  `DecodedTrack::load` → `core::waveform::analyze`. The result is cached in
+  app state, keyed by the backing path (`waveform.rs`, `WaveformCache`). Never
+  run this on the audio thread, and never block a command on it (`pending`
+  instead).
+- A query with no backing, or with a different path, drops the cache. A
+  finished analysis for a path that is no longer the current one is discarded.
 - Add `HostCommand::BackingWaveform` to the exhaustive match in `control.rs`
   and a paired IPC command `edit_backing_waveform` that calls the same
   function (precedent: `edit_query_video`). Add `editBackingWaveform()` and

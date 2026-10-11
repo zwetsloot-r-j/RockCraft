@@ -394,6 +394,21 @@ impl DecodedTrack {
         }
     }
 
+    /// Channel count of the interleaved [`samples`](Self::samples).
+    pub fn channels(&self) -> u16 {
+        self.channels
+    }
+
+    /// Sample rate in Hz.
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    /// The decoded samples, interleaved by channel.
+    pub fn samples(&self) -> &[i16] {
+        &self.samples
+    }
+
     /// Length of the track.
     pub fn duration(&self) -> std::time::Duration {
         let frames = self.samples.len() / self.channels as usize;

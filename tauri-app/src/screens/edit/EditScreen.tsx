@@ -31,6 +31,7 @@ import {
   alignmentLoad,
   alignmentSave,
   detectTempoMap,
+  editBackingWaveform,
   editClearBacking,
   editClearVideo,
   editQueryBackgrounds,
@@ -58,6 +59,13 @@ import {
 import type { AlignmentDto } from "../../ipc/bridge";
 import type { BackgroundView, ComposerSnapshot } from "../../ipc/types";
 import { onMidiEvent } from "../../ipc/midi";
+import {
+  loadWaveMode,
+  nextWaveMode,
+  saveWaveMode,
+  type WaveformData,
+  type WaveMode,
+} from "./waveform";
 import { cursorUsOf, EditCanvas } from "./EditCanvas";
 import { StatusBar } from "./StatusBar";
 import { RecordControls } from "./RecordControls";
@@ -86,6 +94,14 @@ const BACKDROP_NUDGE_FINE_US = 10_000;
 const BACKDROP_NUDGE_COARSE_US = 250_000;
 /** Opacity the backdrop `<video>` renders at (dimmed under the grid). */
 const BACKDROP_OPACITY = 0.5;
+
+/** Short labels for the waveform modes (status bar + flash). */
+const WAVE_MODE_LABEL: Record<WaveMode, string> = {
+  both: "both",
+  env: "loudness",
+  onset: "onsets",
+  off: "off",
+};
 /**
  * How long the edit cursor must rest before the backdrop scrubs to it (ms).
  *
@@ -266,6 +282,27 @@ export function EditScreen(props: Props): JSX.Element {
   // `save_bundle` (the backend holds the path). The backing and the background
   // video are independent: swapping/detaching one never disturbs the other.
   const [backingName, setBackingName] = createSignal<string | null>(null);
+
+  // ── Backing waveform strips (M21-B) ─────────────────────────────────────
+  // The backend analyses the backing off thread (M21-A); we poll while it is
+  // `pending`. `waveGen` invalidates an in-flight poll when the backing changes
+  // or the screen unmounts. `O` cycles which strips show; persisted per viewer.
+  const [waveform, setWaveform] = createSignal<WaveformData | null>(null);
+  const [waveStatus, setWaveStatus] = createSignal<
+    "none" | "pending" | "ready" | "failed"
+  >("none");
+  const [waveMode, setWaveMode] = createSignal<WaveMode>(
+    loadWaveMode(() => localStorage),
+  );
+  /** Status-bar text for the strips: the mode, or `…` while analysing. */
+  const waveLabel = (): string =>
+    waveStatus() === "pending"
+      ? "…"
+      : waveStatus() === "failed"
+        ? "error"
+        : WAVE_MODE_LABEL[waveMode()];
+  let waveGen = 0;
+  let waveTimer: ReturnType<typeof setTimeout> | undefined;
 
   // The snapshot mirror.
   const [store, setStore] = createStore<{ snap: ComposerSnapshot | null }>({
@@ -577,6 +614,7 @@ export function EditScreen(props: Props): JSX.Element {
     const s = store.snap;
     if (!engine || !s) return;
     engine.setBackdrop(videoPath() !== null);
+    engine.setWaveform(waveform(), waveMode());
     // Overlay the split markers + discarded shading while the editor is open so
     // the cuts are readable over the grid and video backdrop.
     engine.setSplits(
@@ -882,6 +920,7 @@ export function EditScreen(props: Props): JSX.Element {
    * dir is known (GUI load); the socket path falls back to localStorage. */
   function reattachBackdropAndBacking(dir: string | undefined): void {
     refreshBackgroundPaths();
+    refreshWaveform();
     void editQueryBacking()
       .then((ref) => setBackingName(ref ? ref.name : null))
       .catch(() => {
@@ -1060,6 +1099,7 @@ export function EditScreen(props: Props): JSX.Element {
             setBackingName(name);
             setDirty(true);
             showFlash(`backing → ${name}`);
+            refreshWaveform();
           })
           .catch((e: unknown) => {
             showFlash(`backing failed: ${String(e)}`);
@@ -1075,9 +1115,47 @@ export function EditScreen(props: Props): JSX.Element {
   function detachBacking(): void {
     setBackingName(null);
     setDirty(true);
-    void editClearBacking().catch(() => {
-      /* backend down — UI state already cleared */
-    });
+    void editClearBacking()
+      .catch(() => {
+        /* backend down — UI state already cleared */
+      })
+      .finally(refreshWaveform);
+  }
+
+  /** Re-fetch the backing waveform (M21-B), polling every 500 ms while the
+   * backend is still analysing. A newer call (backing changed) or unmount
+   * abandons the old poll via `waveGen`. */
+  function refreshWaveform(): void {
+    const gen = ++waveGen;
+    if (waveTimer !== undefined) clearTimeout(waveTimer);
+    waveTimer = undefined;
+    const poll = (): void => {
+      void editBackingWaveform()
+        .then((r) => {
+          if (gen !== waveGen) return;
+          setWaveStatus(r.status);
+          if (r.status === "pending") {
+            waveTimer = setTimeout(poll, 500);
+            return;
+          }
+          setWaveform(r.status === "ready" ? r : null);
+          if (r.status === "failed") showFlash(`waveform: ${r.detail}`);
+          if (!store.snap?.playing) render();
+        })
+        .catch(() => {
+          /* backend down — leave the strips as they are */
+        });
+    };
+    poll();
+  }
+
+  /** `O`: cycle the waveform strips both → loudness → onsets → off (M21-B). */
+  function cycleWaveMode(): void {
+    const m = nextWaveMode(waveMode());
+    setWaveMode(m);
+    saveWaveMode(() => localStorage, m);
+    showFlash(`waveform: ${WAVE_MODE_LABEL[m]}`);
+    if (!store.snap?.playing) render();
   }
 
   // ── Background image layers (M14-D) ──────────────────────────────────────
@@ -1576,6 +1654,12 @@ export function EditScreen(props: Props): JSX.Element {
         attachBacking();
         return;
       }
+      // `O` cycles the backing waveform strips (M21-B).
+      if (e.key === "O") {
+        e.preventDefault();
+        cycleWaveMode();
+        return;
+      }
       // Backspace / Delete detaches the backing (audio only — the video, if
       // any, remains). Only intercepted while a track is attached so the keys
       // still bubble otherwise.
@@ -1868,6 +1952,8 @@ export function EditScreen(props: Props): JSX.Element {
       window.removeEventListener("keydown", onKeydown, true);
       cancelAnimationFrame(raf);
       clearTimeout(flashTimeout);
+      waveGen++;
+      if (waveTimer !== undefined) clearTimeout(waveTimer);
       if (scrubTimer !== undefined) clearTimeout(scrubTimer);
       unlisten?.();
       unlistenMeta?.();
@@ -1914,7 +2000,13 @@ export function EditScreen(props: Props): JSX.Element {
               </div>
             }
           >
-            {(snap) => <StatusBar snapshot={snap()} dirty={dirty()} />}
+            {(snap) => (
+              <StatusBar
+                snapshot={snap()}
+                dirty={dirty()}
+                wave={backingName() === null ? null : waveLabel()}
+              />
+            )}
           </Show>
         }
       >
@@ -2876,6 +2968,8 @@ function HelpOverlay(props: { onClose: () => void }): JSX.Element {
       title: "Backing track",
       rows: [
         "B             Choose / replace the backing audio track",
+        "O             Cycle the waveform strips: both → loudness (right",
+        "              edge) → onsets (left edge) → off",
         "Backspace     Detach the backing (keeps the video backdrop)",
         ", / .         Nudge −/+ 10 ms",
         "; / '         Nudge −/+ 250 ms",

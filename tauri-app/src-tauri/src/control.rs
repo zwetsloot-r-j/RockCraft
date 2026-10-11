@@ -481,6 +481,10 @@ impl HostServices for TauriHost<'_> {
                 "query_video",
                 crate::state::query_video(&app.state::<AppState>()),
             ),
+            HostCommand::BackingWaveform => json_payload(
+                "backing_waveform",
+                crate::state::query_waveform(&app.state::<AppState>()),
+            ),
 
             // ── background images (M14-D) ───────────────────────────────
             HostCommand::AttachBackground { path } => json_payload(

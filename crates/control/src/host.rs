@@ -175,6 +175,11 @@ pub enum HostCommand {
     DetachVideo,
     /// The currently attached background video, or null.
     QueryVideo,
+    /// The attached backing track's waveform (M21-A): a loudness envelope and
+    /// an onset-strength curve, indexed by **backing-file** position. Song time
+    /// `t` maps to bucket `(t + backing_offset_us) / bucket_us`. Answers
+    /// `{status: "none" | "pending" | "ready", ...}`.
+    BackingWaveform,
 
     // ── background images (M14-D) ───────────────────────────────────────
     /// Attach a background image by path as the front-most layer, selecting it.
@@ -262,6 +267,7 @@ impl HostCommand {
             HostCommand::SetVideoOffset { .. } => "set_video_offset",
             HostCommand::DetachVideo => "detach_video",
             HostCommand::QueryVideo => "query_video",
+            HostCommand::BackingWaveform => "backing_waveform",
             HostCommand::AttachBackground { .. } => "attach_background",
             HostCommand::DetachBackground { .. } => "detach_background",
             HostCommand::QueryBackgrounds => "query_backgrounds",
@@ -402,6 +408,7 @@ pub fn host_command_names() -> &'static [&'static str] {
         "set_video_offset",
         "detach_video",
         "query_video",
+        "backing_waveform",
         "attach_background",
         "detach_background",
         "query_backgrounds",
@@ -478,6 +485,7 @@ static HOST_HELP: &[HostCommandInfo] = {
         HostCommandInfo { name: "set_video_offset", params: &[p("offset_us", "i64")], description: "Update only the alignment offset of the already-attached background video. Returns the attached video reference." },
         HostCommandInfo { name: "detach_video", params: &[], description: "Detach the background video." },
         HostCommandInfo { name: "query_video", params: &[], description: "Return the currently attached background video, or null." },
+        HostCommandInfo { name: "backing_waveform", params: &[], description: "Return the backing track's waveform: {status: none|pending|ready, bucket_us, envelope[], onsets[]} (0..255 per bucket), indexed by backing-file position (song time + backing offset)." },
         // ── background images (M14-D) ───────────────────────────────────
         HostCommandInfo { name: "attach_background", params: &[p("path", "String")], description: "Attach a background image by path as the front-most layer and select it. The layer starts still (no keyframes); animate it with the background actions (nudge_background_pos/scale/rotation, set_background_opacity, add_background_keyframe). Persisted into the bundle on save. Returns the layer list." },
         HostCommandInfo { name: "detach_background", params: &[p("id", "String")], description: "Detach the background image layer with this id, dropping its keyframes. Returns the remaining layer list." },
@@ -576,6 +584,7 @@ mod tests {
             HostCommand::SetVideoOffset { offset_us: 50_000 },
             HostCommand::DetachVideo,
             HostCommand::QueryVideo,
+            HostCommand::BackingWaveform,
             HostCommand::AttachBackground {
                 path: "art.png".into(),
             },
