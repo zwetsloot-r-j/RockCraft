@@ -2665,7 +2665,7 @@ mod tests {
         use rockcraft_core::{Subdivision, TimeSig};
 
         let grid = Grid {
-            bpm: 140,
+            bpm: rockcraft_core::Bpm::from_whole(140),
             time_sig: TimeSig {
                 beats_per_bar: 3,
                 beat_unit: 4,

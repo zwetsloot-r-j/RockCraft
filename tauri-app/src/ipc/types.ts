@@ -87,6 +87,7 @@ export interface TempoChange {
 export interface ComposerSnapshot {
   notes: NoteView[];
   cursor: Cursor;
+  /** Piece tempo (quarter-note BPM). Fractional, 0.001 precision (e.g. 120.5). */
   bpm: number;
   /**
    * Tempo (BPM) of the bar under the cursor — differs from `bpm` once a per-bar
@@ -436,7 +437,8 @@ export interface PlayInfo {
   backgrounds: BackgroundLayerView[];
   /** The song-audio mode the take starts in (`m` cycles it). */
   song_audio: SongAudio;
-  /** Piece tempo (BPM) for the highway bar/beat grid; 120 when no grid. */
+  /** Piece tempo (BPM, may be fractional — 0.001 precision) for the highway
+   * bar/beat grid; 120 when no grid. */
   bpm: number;
   /** Beats per bar (time-signature numerator); 4 when no grid. */
   beats_per_bar: number;

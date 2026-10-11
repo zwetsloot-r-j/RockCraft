@@ -142,7 +142,7 @@ fn write_bundle_rejects_tracked_workspace_path() {
 fn notation_round_trips() {
     let chart = ExtractedChart {
         notation: Some(NotationMeta {
-            bpm: Some(90),
+            bpm: Some(rockcraft_core::Bpm::from_milli(97_500)),
             time_sig: Some(TimeSig {
                 beats_per_bar: 3,
                 beat_unit: 4,
@@ -156,7 +156,10 @@ fn notation_round_trips() {
     };
     let back = from_json(&to_json(&chart)).unwrap();
     assert_eq!(chart, back);
-    assert_eq!(back.notation.unwrap().bpm, Some(90));
+    assert_eq!(
+        back.notation.unwrap().bpm,
+        Some(rockcraft_core::Bpm::from_milli(97_500))
+    );
 }
 
 /// A chart with no `notation` key — every chart the video extractor has ever

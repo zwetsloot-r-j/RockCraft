@@ -119,14 +119,15 @@ class NotationMeta:
     default". The Rust writer decides what a missing field falls back to.
     """
 
-    bpm: Optional[int] = None
+    bpm: Optional[float] = None  # 0.001 BPM precision; whole tempos emit an int
     time_sig: Optional[TimeSig] = None
     key: Optional[Key] = None
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {}
         if self.bpm is not None:
-            out["bpm"] = int(self.bpm)
+            bpm = round(float(self.bpm), 3)
+            out["bpm"] = int(bpm) if bpm.is_integer() else bpm
         if self.time_sig is not None:
             out["time_sig"] = self.time_sig.to_dict()
         if self.key is not None:

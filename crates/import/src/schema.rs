@@ -25,11 +25,12 @@ pub struct ExtractedChart {
 /// is inferred. A `None` field means "the source did not say", not "default".
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct NotationMeta {
-    /// Tempo at the start of the piece, in BPM. The writer clamps it to
+    /// Tempo at the start of the piece, in BPM (a JSON number, 0.001
+    /// precision — `90` or `97.5`). The writer clamps it to
     /// [`Grid::MIN_BPM`](rockcraft_core::Grid::MIN_BPM)..=[`Grid::MAX_BPM`](rockcraft_core::Grid::MAX_BPM);
     /// out-of-range is not an error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bpm: Option<u32>,
+    pub bpm: Option<rockcraft_core::Bpm>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time_sig: Option<rockcraft_core::TimeSig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

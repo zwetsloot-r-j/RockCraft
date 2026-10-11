@@ -38,7 +38,11 @@ export interface GridTiming {
 
 /** µs of one quarter note at `bpm` — mirrors `Grid::quarter_us`. */
 export function quarterUs(bpm: number): number {
-  return Math.floor(60_000_000 / bpm);
+  // `core` holds the tempo as integer milli-BPM and floors 60e9 / milli; doing
+  // the same here (both operands exact integers) keeps fractional tempos in
+  // lock-step with the backend instead of drifting by float rounding.
+  const milli = Math.max(1, Math.round(bpm * 1000));
+  return Math.floor(60_000_000_000 / milli);
 }
 
 /** µs of one subdivision step — mirrors `Grid::step_us`. */

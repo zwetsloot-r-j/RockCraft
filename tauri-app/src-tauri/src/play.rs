@@ -26,7 +26,7 @@ use std::sync::Mutex;
 
 use rockcraft_core::{
     backing_position_us, hand::hand_of_pitch_value, interleave_by_time, score, song_shift_us,
-    BackgroundImage, BarMap, ExpectedNote, Feedback, GateState, Hand, HandOverride, LoopPhase,
+    BackgroundImage, BarMap, Bpm, ExpectedNote, Feedback, GateState, Hand, HandOverride, LoopPhase,
     LoopStep, MidiNote, NoteEvent, NoteEventKind, NoteJudgment, Pass, PlayClock, PracticeLoop,
     RecordingMeta, ScoreConfig, ScoreReport, SongAudio, Summary, SustainEvent, SynthBus, Timing,
     Transform, WaitGate, DEFAULT_SPLIT,
@@ -166,7 +166,7 @@ pub struct PlayInfo {
     pub song_audio: SongAudio,
     /// Piece tempo (BPM) so the highway draws its bar/beat grid at the right
     /// spacing; defaults to 120 when the bundle has no grid.
-    pub bpm: u32,
+    pub bpm: Bpm,
     /// Beats per bar (time-signature numerator); defaults to 4.
     pub beats_per_bar: u8,
     /// Tempo map (M16-A): bar downbeats in **play-clock** µs (already shifted),
@@ -347,7 +347,7 @@ pub struct PlayStatusView {
     pub best_combo: u32,
     pub hits: usize,
     pub misses: usize,
-    pub bpm: u32,
+    pub bpm: Bpm,
     pub beats_per_bar: u8,
     /// Total notes in the loaded chart, to sanity-check against the bundle.
     pub note_count: usize,
@@ -386,7 +386,7 @@ pub const PLAY_RATE_MAX: u16 = 2000;
 /// the highway bar/beat grid at the piece's real tempo.
 #[derive(Debug, Clone, Copy)]
 struct GridInfo {
-    bpm: u32,
+    bpm: Bpm,
     beats_per_bar: u8,
     bar_us: u64,
     origin_us: u64,
@@ -577,7 +577,7 @@ pub struct PlaySession {
     /// Piece tempo + beats/bar (from `meta.grid`, else 120/4) so the play highway
     /// draws its bar/beat grid at the real tempo. Bar-alignment of the pre-roll
     /// shift keeps timeline bars on play bar lines.
-    bpm: u32,
+    bpm: Bpm,
     beats_per_bar: u8,
     /// The piece's tempo map shifted into play-clock µs (empty = uniform).
     bar_starts_us: Vec<u64>,
@@ -683,7 +683,7 @@ impl PlaySession {
             split_pitch: DEFAULT_SPLIT,
             paused: false,
             cfg: ScoreConfig::default(),
-            bpm: grid.map(|g| g.bpm).unwrap_or(120),
+            bpm: grid.map(|g| g.bpm).unwrap_or(Bpm::from_whole(120)),
             beats_per_bar: grid.map(|g| g.beats_per_bar).unwrap_or(4),
             bar_starts_us: Vec::new(),
             held: BTreeSet::new(),
@@ -1891,7 +1891,7 @@ fn status_of(session: Option<&PlaySession>) -> PlayStatusView {
         best_combo: 0,
         hits: 0,
         misses: 0,
-        bpm: 0,
+        bpm: Bpm::default(),
         beats_per_bar: 0,
         note_count: 0,
         bar: 0,
@@ -3214,7 +3214,7 @@ mod tests {
         ev.push(off(74, 2_400_000));
         ev.sort_by_key(|e| e.timestamp_us);
         let grid = GridInfo {
-            bpm: 120,
+            bpm: Bpm::from_whole(120),
             beats_per_bar: 4,
             bar_us: 2_000_000,
             origin_us: 0,

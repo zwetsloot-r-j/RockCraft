@@ -499,7 +499,8 @@ def _notation(
     report: ConversionReport,
 ) -> NotationMeta:
     """Tempo / metre / key as notated at the start of the piece."""
-    bpm = int(round(60.0 / tempo_map[0][1])) if tempo_map else DEFAULT_BPM
+    # Keep fractional marks (e.g. ♩ = 97.5): the grid stores 0.001 BPM.
+    bpm = round(60.0 / tempo_map[0][1], 3) if tempo_map else DEFAULT_BPM
     return NotationMeta(bpm=bpm, time_sig=_time_sig(score), key=_key(score, report))
 
 

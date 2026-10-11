@@ -14,6 +14,7 @@
 //! these meaning; this module only names them.
 
 use crate::background::Easing;
+use crate::bpm::{Bpm, BpmDelta};
 use crate::hand::HandSetting;
 use serde::{Deserialize, Serialize};
 
@@ -86,13 +87,15 @@ pub enum Action {
     },
 
     // ── tempo (piece-wide; lives in the composer Grid) ──────────────────
-    /// Nudge the piece tempo by `delta` BPM (clamped to a sane range).
+    /// Nudge the piece tempo by `delta` BPM (clamped to a sane range). On the
+    /// wire `delta` is any JSON number, 0.001 BPM precision (`1`, `-0.1`).
     AdjustBpm {
-        delta: i32,
+        delta: BpmDelta,
     },
-    /// Set the piece tempo to `bpm` BPM (clamped to a sane range).
+    /// Set the piece tempo to `bpm` BPM (clamped to a sane range). On the wire
+    /// `bpm` is any JSON number, 0.001 BPM precision (`120`, `120.5`).
     SetBpm {
-        bpm: u32,
+        bpm: Bpm,
     },
     /// Set the metre, e.g. `3/4`. `beat_unit` is a note value (power of two);
     /// both fields are clamped/snapped rather than rejected.
@@ -281,13 +284,13 @@ pub enum Action {
     /// their beats; everything before it is untouched. A tempo change at a
     /// checkpoint, where [`SetBpm`](Action::SetBpm) re-times the whole piece.
     SetTempoFrom {
-        bpm: u32,
+        bpm: Bpm,
     },
     /// Nudge the tempo from the cursor's bar to the end by `delta` BPM (signed,
     /// clamped to the grid's BPM range), relative to the cursor bar's current
     /// tempo. The rest behaves as [`SetTempoFrom`](Action::SetTempoFrom).
     AdjustTempoFrom {
-        delta: i32,
+        delta: BpmDelta,
     },
     /// Change the length of the bar the cursor sits in by `delta_steps` grid
     /// steps (at the live subdivision), sliding every **bar line after it** by
@@ -631,8 +634,8 @@ static ACTION_HELP: &[ActionInfo] = {
         ActionInfo { name: "toggle_grab", params: &[], description: "Grab/drop the note under the cursor so cursor moves drag it." },
         ActionInfo { name: "insert_run", params: &[p("end_pitch", "u8"), p("span_steps", "u64")], description: "Lay a chromatic run from the cursor to end_pitch (inclusive), spread evenly across span_steps grid steps — a one-shot glissando/scale; replaces notes in target cells." },
         // ── tempo ─────────────────────────────────────────────────────────
-        ActionInfo { name: "adjust_bpm", params: &[p("delta", "i32")], description: "Nudge the piece tempo by delta BPM (clamped to 20..=300)." },
-        ActionInfo { name: "set_bpm", params: &[p("bpm", "u32")], description: "Set the piece tempo to bpm BPM (clamped to 20..=300)." },
+        ActionInfo { name: "adjust_bpm", params: &[p("delta", "bpm delta (signed number, 0.001 precision)")], description: "Nudge the piece tempo by delta BPM (clamped to 20..=300). Decimals allowed: 1 = one BPM, -0.1 = a tenth of one." },
+        ActionInfo { name: "set_bpm", params: &[p("bpm", "bpm (number, 0.001 precision)")], description: "Set the piece tempo to bpm BPM (clamped to 20..=300). Decimals allowed, e.g. 120.5 or 97.25 (rounded to 0.001)." },
         ActionInfo { name: "set_time_sig", params: &[p("beats_per_bar", "u8"), p("beat_unit", "u8")], description: "Set the metre, e.g. beats_per_bar 3 / beat_unit 4 for 3/4. beats_per_bar is clamped to 1..=32; beat_unit snaps to the nearest note value in 1/2/4/8/16/32. Bar lines move; note times do not." },
         ActionInfo { name: "set_grid_origin", params: &[p("us", "u64")], description: "Set the grid phase origin (us): the song time bar 1/beat 1/step 0 lands on. Align to the first downbeat so bar lines fall on the performance." },
         ActionInfo { name: "nudge_grid_origin", params: &[p("delta_us", "i64")], description: "Slide the grid phase origin by delta_us (clamped at 0), moving the bar lines under fixed note times. The nudge companion to set_grid_origin, for dialling the phase in by feel while the tempo is still being tuned." },
@@ -690,8 +693,8 @@ static ACTION_HELP: &[ActionInfo] = {
         ActionInfo { name: "remove_bar", params: &[], description: "Cut the bar the cursor sits in: delete the notes starting in it and slide everything after one bar earlier so no gap is left (ripple)." },
         ActionInfo { name: "nudge_tail", params: &[p("delta_steps", "i32")], description: "Ripple-shift every note at or after the cursor by delta_steps grid steps (signed) — re-phases the rest of the song in one move to fix a constant timing offset that starts at a point. Notes before the cursor are untouched." },
         ActionInfo { name: "nudge_bar_tempo", params: &[p("delta", "i32")], description: "Slow (delta>0) or speed (delta<0) the bar the cursor sits in by delta grid steps of length; the notes inside re-time to stay on their beats and everything after ripples. Uses the per-bar tempo map so untouched bars stay put." },
-        ActionInfo { name: "set_tempo_from", params: &[p("bpm", "u32")], description: "Set the tempo from the cursor's bar to the end to bpm: that bar gets exactly bpm and every later bar scales by the same factor (keeping per-bar differences). Notes from the bar on re-time to stay on their beats; earlier bars are untouched. A tempo change at a checkpoint — set_bpm re-times the whole piece." },
-        ActionInfo { name: "adjust_tempo_from", params: &[p("delta", "i32")], description: "Nudge the tempo from the cursor's bar to the end by delta BPM (signed), relative to that bar's current tempo. Otherwise as set_tempo_from." },
+        ActionInfo { name: "set_tempo_from", params: &[p("bpm", "bpm (number, 0.001 precision)")], description: "Set the tempo from the cursor's bar to the end to bpm (decimals allowed, e.g. 120.5): that bar gets exactly bpm and every later bar scales by the same factor (keeping per-bar differences). Notes from the bar on re-time to stay on their beats; earlier bars are untouched. A tempo change at a checkpoint — set_bpm re-times the whole piece." },
+        ActionInfo { name: "adjust_tempo_from", params: &[p("delta", "bpm delta (signed number, 0.001 precision)")], description: "Nudge the tempo from the cursor's bar to the end by delta BPM (signed; decimals allowed, e.g. -0.1), relative to that bar's current tempo. Otherwise as set_tempo_from." },
         ActionInfo { name: "nudge_bar_length", params: &[p("delta_steps", "i32")], description: "Change the length of the cursor's bar by delta_steps grid steps (at the live subdivision) and slide every bar line after it by that amount. Grid-only: NO note moves and NO time is added/removed — for fixing an odd-length measure so bar lines land back on the fixed notes. Use </> to change the subdivision for finer/coarser steps (down to 1/32)." },
         ActionInfo { name: "set_bar_starts", params: &[p("bars_us", "Vec<u64>")], description: "Install a whole per-bar tempo map: bars_us = song time (µs) of every bar's downbeat, strictly ascending, >= 2 entries (the last closes the final bar). [] clears it back to the uniform grid; a malformed list is a no-op. Grid-only: no note moves. The grid origin becomes the first downbeat and the BPM the median bar's tempo. See the detect_tempo_map host command to fill it from the backing audio." },
         // ── history ─────────────────────────────────────────────────────
@@ -735,8 +738,12 @@ mod tests {
                 end_pitch: 72,
                 span_steps: 8,
             },
-            Action::AdjustBpm { delta: -5 },
-            Action::SetBpm { bpm: 90 },
+            Action::AdjustBpm {
+                delta: BpmDelta::from_whole(-5),
+            },
+            Action::SetBpm {
+                bpm: Bpm::from_milli(90_500),
+            },
             Action::SetTimeSig {
                 beats_per_bar: 3,
                 beat_unit: 4,
@@ -804,8 +811,12 @@ mod tests {
             Action::RemoveBar,
             Action::NudgeTail { delta_steps: -2 },
             Action::NudgeBarTempo { delta: 1 },
-            Action::SetTempoFrom { bpm: 96 },
-            Action::AdjustTempoFrom { delta: -1 },
+            Action::SetTempoFrom {
+                bpm: Bpm::from_whole(96),
+            },
+            Action::AdjustTempoFrom {
+                delta: BpmDelta::from_milli(-100),
+            },
             Action::NudgeBarLength { delta_steps: -1 },
             Action::SetBarStarts {
                 bars_us: vec![0, 2_000_000, 4_100_000],
@@ -1031,15 +1042,21 @@ mod tests {
     fn bpm_actions_round_trip_via_name() {
         assert_eq!(
             action_from_name("adjust_bpm", &json!({ "delta": 5 })).unwrap(),
-            Action::AdjustBpm { delta: 5 }
+            Action::AdjustBpm {
+                delta: BpmDelta::from_whole(5)
+            }
         );
         assert_eq!(
             action_from_name("adjust_bpm", &json!({ "delta": -10 })).unwrap(),
-            Action::AdjustBpm { delta: -10 }
+            Action::AdjustBpm {
+                delta: BpmDelta::from_whole(-10)
+            }
         );
         assert_eq!(
             action_from_name("set_bpm", &json!({ "bpm": 90 })).unwrap(),
-            Action::SetBpm { bpm: 90 }
+            Action::SetBpm {
+                bpm: Bpm::from_whole(90)
+            }
         );
         // Missing params are rejected.
         assert!(matches!(
@@ -1048,6 +1065,66 @@ mod tests {
         ));
         assert!(matches!(
             action_from_name("set_bpm", &json!({})).unwrap_err(),
+            ActionError::BadParams { .. }
+        ));
+    }
+
+    #[test]
+    fn bpm_actions_accept_decimals_via_name() {
+        assert_eq!(
+            action_from_name("set_bpm", &json!({ "bpm": 120.5 })).unwrap(),
+            Action::SetBpm {
+                bpm: Bpm::from_milli(120_500)
+            }
+        );
+        assert_eq!(
+            action_from_name("set_tempo_from", &json!({ "bpm": 97.25 })).unwrap(),
+            Action::SetTempoFrom {
+                bpm: Bpm::from_milli(97_250)
+            }
+        );
+        assert_eq!(
+            action_from_name("set_tempo_from", &json!({ "bpm": 96 })).unwrap(),
+            Action::SetTempoFrom {
+                bpm: Bpm::from_whole(96)
+            }
+        );
+        assert_eq!(
+            action_from_name("adjust_bpm", &json!({ "delta": 0.1 })).unwrap(),
+            Action::AdjustBpm {
+                delta: BpmDelta::from_milli(100)
+            }
+        );
+        assert_eq!(
+            action_from_name("adjust_tempo_from", &json!({ "delta": -0.25 })).unwrap(),
+            Action::AdjustTempoFrom {
+                delta: BpmDelta::from_milli(-250)
+            }
+        );
+        assert_eq!(
+            action_from_name("adjust_tempo_from", &json!({ "delta": -1 })).unwrap(),
+            Action::AdjustTempoFrom {
+                delta: BpmDelta::from_whole(-1)
+            }
+        );
+        // Serialising keeps the number form: whole → int, else decimal.
+        let v = serde_json::to_value(Action::SetBpm {
+            bpm: Bpm::from_milli(120_500),
+        })
+        .unwrap();
+        assert_eq!(v, json!({ "action": "set_bpm", "bpm": 120.5 }));
+        let v = serde_json::to_value(Action::SetBpm {
+            bpm: Bpm::from_whole(120),
+        })
+        .unwrap();
+        assert_eq!(v, json!({ "action": "set_bpm", "bpm": 120 }));
+        // A negative tempo or a string is rejected.
+        assert!(matches!(
+            action_from_name("set_bpm", &json!({ "bpm": -1 })).unwrap_err(),
+            ActionError::BadParams { .. }
+        ));
+        assert!(matches!(
+            action_from_name("set_bpm", &json!({ "bpm": "120" })).unwrap_err(),
             ActionError::BadParams { .. }
         ));
     }

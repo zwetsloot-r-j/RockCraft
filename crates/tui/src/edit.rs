@@ -45,9 +45,9 @@ use rockcraft_audio::{
 use rockcraft_control::SegmentSpec;
 use rockcraft_core::{
     backing_position_us, segments_from_splits, slice_segment, Action, BackgroundImage,
-    BackgroundStack, BackgroundVideo, BackingTrack, Composer, Cursor, Effect, Grid, InputMode, Key,
-    MidiNote, Note, NoteEvent, NoteId, RecordingMeta, Scale as MusicScale, Segment, Subdivision,
-    Timeline, TrackOrigin, Velocity,
+    BackgroundStack, BackgroundVideo, BackingTrack, Bpm, BpmDelta, Composer, Cursor, Effect, Grid,
+    InputMode, Key, MidiNote, Note, NoteEvent, NoteId, RecordingMeta, Scale as MusicScale, Segment,
+    Subdivision, Timeline, TrackOrigin, Velocity,
 };
 use rockcraft_import::write_part_bundle;
 use rockcraft_midi::{events_to_smf_bytes, key_map as mock_key_map};
@@ -92,7 +92,7 @@ const GRID_ORIGIN_NUDGE_FINE_US: i64 = 10_000;
 const GRID_ORIGIN_NUDGE_COARSE_US: i64 = 250_000;
 
 /// Tempo nudge step in BPM, bound to `(` / `)`.
-const BPM_NUDGE: i32 = 5;
+const BPM_NUDGE: BpmDelta = BpmDelta::from_whole(5);
 
 /// Cursor highlight (status badge, cursor key, cursor cell).
 const CURSOR_COLOR: Color = Color::Magenta;
@@ -220,7 +220,9 @@ fn key_to_action(code: KeyCode) -> Option<Action> {
         // ── tempo (BPM) ──────────────────────────────────────────────────
         // `(` / `)` nudge tempo down/up; `T` opens an absolute set-BPM prompt
         // (handled in `on_key`, not here, since it needs text entry).
-        KeyCode::Char('(') => Action::AdjustBpm { delta: -BPM_NUDGE },
+        KeyCode::Char('(') => Action::AdjustBpm {
+            delta: BPM_NUDGE.neg(),
+        },
         KeyCode::Char(')') => Action::AdjustBpm { delta: BPM_NUDGE },
 
         // ── input mode ──────────────────────────────────────────────────
@@ -1570,7 +1572,8 @@ impl EditScreen {
 
     /// Handle a key while the set-BPM overlay is active. Enter commits the typed
     /// value via [`Action::SetBpm`] (clamped in `core`); Esc or empty Enter
-    /// cancels; Backspace edits; only ASCII digits are accepted.
+    /// cancels; Backspace edits. Accepts ASCII digits and one decimal separator
+    /// (`.` or `,`) with up to three decimals — 0.001 BPM precision.
     fn on_bpm_key(&mut self, code: KeyCode) {
         let Some(buf) = self.bpm_prompt.as_mut() else {
             return;
@@ -1580,7 +1583,7 @@ impl EditScreen {
                 self.bpm_prompt = None;
             }
             KeyCode::Enter => {
-                let parsed = buf.trim().parse::<u32>().ok();
+                let parsed = Bpm::parse(buf);
                 self.bpm_prompt = None;
                 if let Some(bpm) = parsed {
                     self.dispatch(Action::SetBpm { bpm });
@@ -1589,9 +1592,20 @@ impl EditScreen {
             KeyCode::Backspace => {
                 buf.pop();
             }
-            // Cap at 3 digits (max BPM is 300); ignore extra input.
-            KeyCode::Char(c) if c.is_ascii_digit() && buf.len() < 3 => {
-                buf.push(c);
+            // At most 3 whole digits (max BPM is 300) and 3 decimals (0.001
+            // precision); ignore extra input.
+            KeyCode::Char(c) if c.is_ascii_digit() => {
+                let sep = buf.find(['.', ',']);
+                let room = match sep {
+                    Some(i) => buf.len() - i - 1 < 3,
+                    None => buf.len() < 3,
+                };
+                if room {
+                    buf.push(c);
+                }
+            }
+            KeyCode::Char('.' | ',') if !buf.contains(['.', ',']) => {
+                buf.push('.');
             }
             _ => {}
         }
@@ -2672,19 +2686,22 @@ mod tests {
         );
         assert_eq!(
             key_to_action(KeyCode::Char('(')),
-            Some(Action::AdjustBpm { delta: -BPM_NUDGE })
+            Some(Action::AdjustBpm {
+                delta: BPM_NUDGE.neg()
+            })
         );
 
         let mut e = EditScreen::new();
-        assert_eq!(e.composer.grid().bpm, 120);
+        assert_eq!(e.composer.grid().bpm, Bpm::from_whole(120));
         e.on_key(KeyCode::Char(')'));
-        assert_eq!(e.composer.grid().bpm, 125);
+        assert_eq!(e.composer.grid().bpm, Bpm::from_whole(125));
         assert_eq!(
-            e.grid.bpm, 125,
+            e.grid.bpm,
+            Bpm::from_whole(125),
             "mirrored grid re-synced for the status bar"
         );
         e.on_key(KeyCode::Char('('));
-        assert_eq!(e.composer.grid().bpm, 120);
+        assert_eq!(e.composer.grid().bpm, Bpm::from_whole(120));
     }
 
     #[test]
@@ -2704,8 +2721,31 @@ mod tests {
         assert_eq!(e.bpm_prompt_text(), "90");
         e.on_key(KeyCode::Enter);
         assert!(!e.is_setting_bpm());
-        assert_eq!(e.composer.grid().bpm, 90);
-        assert_eq!(e.grid.bpm, 90);
+        assert_eq!(e.composer.grid().bpm, Bpm::from_whole(90));
+        assert_eq!(e.grid.bpm, Bpm::from_whole(90));
+    }
+
+    #[test]
+    fn set_bpm_prompt_accepts_decimals() {
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('T'));
+        for _ in 0..3 {
+            e.on_key(KeyCode::Backspace);
+        }
+        for c in "97,2501".chars() {
+            e.on_key(KeyCode::Char(c));
+        }
+        // `,` normalises to `.`, a second separator is ignored, and input stops
+        // at three decimals.
+        e.on_key(KeyCode::Char('.'));
+        assert_eq!(e.bpm_prompt_text(), "97.250");
+        e.on_key(KeyCode::Enter);
+        assert_eq!(e.composer.grid().bpm, Bpm::from_milli(97_250));
+        assert_eq!(e.grid.bpm, Bpm::from_milli(97_250));
+        // Re-opening seeds the prompt with the formatted fractional tempo.
+        e.on_key(KeyCode::Char('T'));
+        assert_eq!(e.bpm_prompt_text(), "97.25");
+        e.on_key(KeyCode::Esc);
     }
 
     #[test]
@@ -2716,7 +2756,11 @@ mod tests {
         e.on_key(KeyCode::Char('6'));
         e.on_key(KeyCode::Esc);
         assert!(!e.is_setting_bpm());
-        assert_eq!(e.composer.grid().bpm, 120, "Esc left tempo unchanged");
+        assert_eq!(
+            e.composer.grid().bpm,
+            Bpm::from_whole(120),
+            "Esc left tempo unchanged"
+        );
     }
 
     fn note(pitch: u8, start_us: u64, dur_us: u64) -> Note {

@@ -337,6 +337,7 @@ fn events_to_smf_bytes(events: &[NoteEvent]) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::schema::{ExtractedNote, Hand};
+    use rockcraft_core::Bpm;
     use tempfile::TempDir;
 
     fn chart_with_source(source: SourceMeta) -> ExtractedChart {
@@ -462,7 +463,7 @@ mod tests {
         let meta = meta_for_notation(
             &tmp,
             Some(NotationMeta {
-                bpm: Some(90),
+                bpm: Some(Bpm::from_whole(90)),
                 time_sig: Some(rockcraft_core::TimeSig {
                     beats_per_bar: 3,
                     beat_unit: 4,
@@ -475,7 +476,7 @@ mod tests {
         );
 
         let grid = meta.grid.expect("notation must produce a grid");
-        assert_eq!(grid.bpm, 90);
+        assert_eq!(grid.bpm, Bpm::from_whole(90));
         assert_eq!(grid.time_sig.beats_per_bar, 3);
         assert_eq!(grid.time_sig.beat_unit, 4);
         assert_eq!(
@@ -506,7 +507,10 @@ mod tests {
     /// A tempo outside the editable range clamps rather than failing the import.
     #[test]
     fn notation_bpm_is_clamped() {
-        for (notated, expected) in [(5u32, Grid::MIN_BPM), (5000, Grid::MAX_BPM)] {
+        for (notated, expected) in [
+            (Bpm::from_whole(5), Grid::MIN_BPM),
+            (Bpm::from_whole(5000), Grid::MAX_BPM),
+        ] {
             let tmp = TempDir::new().unwrap();
             let meta = meta_for_notation(
                 &tmp,

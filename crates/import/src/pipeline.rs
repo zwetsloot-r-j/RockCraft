@@ -1291,7 +1291,7 @@ mod tests {
         let json = std::fs::read_to_string(bundle.join("meta.json")).unwrap();
         let meta = RecordingMeta::from_json(&json).unwrap();
         let grid = meta.grid.expect("notated grid must reach meta.json");
-        assert_eq!(grid.bpm, 90);
+        assert_eq!(grid.bpm, rockcraft_core::Bpm::from_whole(90));
         assert_eq!(grid.time_sig.beats_per_bar, 3);
         assert_eq!(
             meta.key,

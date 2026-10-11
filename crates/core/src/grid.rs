@@ -1,3 +1,4 @@
+use crate::bpm::{Bpm, BpmDelta};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,7 +51,8 @@ impl Subdivision {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Grid {
-    pub bpm: u32,
+    /// Piece tempo (quarter-note BPM, 0.001 precision).
+    pub bpm: Bpm,
     pub time_sig: TimeSig,
     pub subdivision: Subdivision,
     /// Phase offset (µs) of the grid: the song time at which bar 1, beat 1,
@@ -63,10 +65,10 @@ pub struct Grid {
 }
 
 impl Grid {
-    /// Lowest editable tempo, in BPM.
-    pub const MIN_BPM: u32 = 20;
-    /// Highest editable tempo, in BPM.
-    pub const MAX_BPM: u32 = 300;
+    /// Lowest editable tempo.
+    pub const MIN_BPM: Bpm = Bpm::from_whole(20);
+    /// Highest editable tempo.
+    pub const MAX_BPM: Bpm = Bpm::from_whole(300);
     /// Fewest beats a bar may hold. One is degenerate but legal (every beat a
     /// downbeat); zero would make [`bar_us`](Grid::bar_us) zero and divide by it.
     pub const MIN_BEATS_PER_BAR: u8 = 1;
@@ -77,21 +79,22 @@ impl Grid {
     pub const BEAT_UNITS: [u8; 6] = [1, 2, 4, 8, 16, 32];
 
     /// Set the tempo to `bpm`, clamped to [`MIN_BPM`](Grid::MIN_BPM)..=[`MAX_BPM`](Grid::MAX_BPM).
-    pub fn set_bpm(&mut self, bpm: u32) {
+    pub fn set_bpm(&mut self, bpm: Bpm) {
         self.bpm = bpm.clamp(Self::MIN_BPM, Self::MAX_BPM);
     }
 
-    /// Nudge the tempo by `delta` BPM, clamped to the editable range. Saturating
+    /// Nudge the tempo by `delta`, clamped to the editable range. Saturating
     /// so extreme deltas land cleanly on a bound rather than wrapping.
-    pub fn adjust_bpm(&mut self, delta: i32) {
-        let next =
-            (self.bpm as i64 + delta as i64).clamp(Self::MIN_BPM as i64, Self::MAX_BPM as i64);
-        self.bpm = next as u32;
+    pub fn adjust_bpm(&mut self, delta: BpmDelta) {
+        self.bpm = self
+            .bpm
+            .saturating_add(delta)
+            .clamp(Self::MIN_BPM, Self::MAX_BPM);
     }
 
     pub fn default_120() -> Self {
         Grid {
-            bpm: 120,
+            bpm: Bpm::from_whole(120),
             time_sig: TimeSig {
                 beats_per_bar: 4,
                 beat_unit: 4,
@@ -141,8 +144,12 @@ impl Grid {
         self.origin_us + (rel + step / 2) / step * step
     }
 
+    /// Length of one quarter note in µs: `60 s / bpm`, computed in integer
+    /// milli-BPM and **floored** — so a whole-number tempo gives exactly the
+    /// same result as the historical `60_000_000 / bpm` (120 BPM → 500_000),
+    /// and a fractional one is at most 1 µs short of the exact value.
     pub fn quarter_us(&self) -> u64 {
-        60_000_000 / self.bpm as u64
+        60_000_000_000 / self.bpm.milli().max(1) as u64
     }
 
     pub fn step_us(&self) -> u64 {
@@ -208,7 +215,7 @@ mod tests {
 
     fn grid_120_4_4(sub: Subdivision) -> Grid {
         Grid {
-            bpm: 120,
+            bpm: Bpm::from_whole(120),
             time_sig: TimeSig {
                 beats_per_bar: 4,
                 beat_unit: 4,
@@ -226,26 +233,26 @@ mod tests {
     #[test]
     fn set_bpm_clamps_to_range() {
         let mut g = grid_120_4_4(Subdivision::Quarter);
-        g.set_bpm(140);
-        assert_eq!(g.bpm, 140);
-        g.set_bpm(5); // below MIN
+        g.set_bpm(Bpm::from_whole(140));
+        assert_eq!(g.bpm, Bpm::from_whole(140));
+        g.set_bpm(Bpm::from_whole(5)); // below MIN
         assert_eq!(g.bpm, Grid::MIN_BPM);
-        g.set_bpm(10_000); // above MAX
+        g.set_bpm(Bpm::from_whole(10_000)); // above MAX
         assert_eq!(g.bpm, Grid::MAX_BPM);
     }
 
     #[test]
     fn adjust_bpm_nudges_and_clamps() {
         let mut g = grid_120_4_4(Subdivision::Quarter);
-        g.adjust_bpm(5);
-        assert_eq!(g.bpm, 125);
-        g.adjust_bpm(-10);
-        assert_eq!(g.bpm, 115);
+        g.adjust_bpm(BpmDelta::from_whole(5));
+        assert_eq!(g.bpm, Bpm::from_whole(125));
+        g.adjust_bpm(BpmDelta::from_whole(-10));
+        assert_eq!(g.bpm, Bpm::from_whole(115));
         // Clamp at the floor with an extreme negative delta.
-        g.adjust_bpm(-100_000);
+        g.adjust_bpm(BpmDelta::from_whole(-100_000));
         assert_eq!(g.bpm, Grid::MIN_BPM);
         // Clamp at the ceiling with an extreme positive delta.
-        g.adjust_bpm(100_000);
+        g.adjust_bpm(BpmDelta::from_whole(100_000));
         assert_eq!(g.bpm, Grid::MAX_BPM);
     }
 
@@ -339,7 +346,7 @@ mod tests {
     #[test]
     fn default_120() {
         let g = Grid::default_120();
-        assert_eq!(g.bpm, 120);
+        assert_eq!(g.bpm, Bpm::from_whole(120));
         assert_eq!(g.time_sig.beats_per_bar, 4);
         assert_eq!(g.time_sig.beat_unit, 4);
         assert_eq!(g.subdivision, Subdivision::Sixteenth);
@@ -388,5 +395,64 @@ mod tests {
         g.set_time_sig(6, 8);
         // 6/8 at 120 BPM: six eighths = three quarters = 1.5 s.
         assert_eq!(g.bar_us(), 1_500_000);
+    }
+    #[test]
+    fn whole_bpm_timing_is_bit_identical_to_integer_formula() {
+        // The milli-BPM math must reproduce the old `60_000_000 / bpm` exactly
+        // for every whole tempo in range, for every derived length.
+        for whole in 20u32..=300 {
+            let mut g = Grid::default_120();
+            g.set_bpm(Bpm::from_whole(whole));
+            let old_quarter = 60_000_000 / whole as u64;
+            assert_eq!(g.quarter_us(), old_quarter, "{whole} BPM");
+            assert_eq!(g.bar_us(), 4 * old_quarter);
+            assert_eq!(g.step_us(), old_quarter / 4);
+        }
+        // Spot checks against the familiar values.
+        let mut g = Grid::default_120();
+        assert_eq!(g.quarter_us(), 500_000);
+        g.set_bpm(Bpm::from_whole(70));
+        assert_eq!(g.quarter_us(), 857_142);
+    }
+
+    #[test]
+    fn fractional_bpm_timing() {
+        let mut g = Grid::default_120();
+        g.set_bpm(Bpm::from_milli(120_500));
+        // 60 s / 120.5 = 497_925.31… µs → floored.
+        assert_eq!(g.quarter_us(), 497_925);
+        g.set_bpm(Bpm::from_milli(97_250));
+        // 60 s / 97.25 = 616_966.58… µs → floored.
+        assert_eq!(g.quarter_us(), 616_966);
+        g.set_bpm(Bpm::from_milli(150_000));
+        assert_eq!(g.quarter_us(), 400_000);
+    }
+
+    #[test]
+    fn fractional_set_and_adjust_clamp() {
+        let mut g = Grid::default_120();
+        g.adjust_bpm(BpmDelta::from_milli(100));
+        assert_eq!(g.bpm, Bpm::from_milli(120_100));
+        g.adjust_bpm(BpmDelta::from_milli(-250));
+        assert_eq!(g.bpm, Bpm::from_milli(119_850));
+        g.set_bpm(Bpm::from_milli(19_999));
+        assert_eq!(g.bpm, Grid::MIN_BPM);
+        g.set_bpm(Bpm::from_milli(300_001));
+        assert_eq!(g.bpm, Grid::MAX_BPM);
+    }
+
+    #[test]
+    fn grid_serde_accepts_old_integer_bpm_and_writes_decimal() {
+        let old =
+            r#"{"bpm":120,"time_sig":{"beats_per_bar":4,"beat_unit":4},"subdivision":"Sixteenth"}"#;
+        let g: Grid = serde_json::from_str(old).unwrap();
+        assert_eq!(g, Grid::default_120());
+        assert!(serde_json::to_string(&g).unwrap().contains(r#""bpm":120,"#));
+
+        let mut g = Grid::default_120();
+        g.set_bpm(Bpm::from_milli(97_250));
+        let json = serde_json::to_string(&g).unwrap();
+        assert!(json.contains(r#""bpm":97.25,"#), "{json}");
+        assert_eq!(serde_json::from_str::<Grid>(&json).unwrap(), g);
     }
 }
