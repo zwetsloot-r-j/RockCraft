@@ -30,6 +30,7 @@ pub mod song_audio;
 pub mod stats;
 pub mod timeline;
 pub mod wait;
+pub mod waveform;
 
 pub use action::{
     action_from_name, action_help, action_names, Action, ActionError, ActionInfo, Effect, ParamInfo,
@@ -65,3 +66,4 @@ pub use song_audio::SongAudio;
 pub use stats::Summary;
 pub use timeline::{Note, NoteId, Timeline};
 pub use wait::{GateState, Step, WaitGate, WaitTracker};
+pub use waveform::{analyze as analyze_waveform, Waveform, WAVEFORM_BUCKET_US};

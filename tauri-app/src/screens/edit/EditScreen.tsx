@@ -31,6 +31,7 @@ import {
   alignmentLoad,
   alignmentSave,
   detectTempoMap,
+  editBackingWaveform,
   editClearBacking,
   editClearVideo,
   editQueryBackgrounds,
@@ -58,11 +59,22 @@ import {
 import type { AlignmentDto } from "../../ipc/bridge";
 import type { BackgroundView, ComposerSnapshot } from "../../ipc/types";
 import { onMidiEvent } from "../../ipc/midi";
+import {
+  loadWaveMode,
+  nextWaveMode,
+  saveWaveMode,
+  type WaveformData,
+  type WaveMode,
+} from "./waveform";
 import { cursorUsOf, EditCanvas } from "./EditCanvas";
 import { StatusBar } from "./StatusBar";
 import { RecordControls } from "./RecordControls";
 import { DEFAULT_SPLIT } from "./hand";
-import { resolveBackgroundKey, resolveKey } from "./keymap";
+import {
+  GRID_ORIGIN_NUDGE_COARSE_US,
+  resolveBackgroundKey,
+  resolveKey,
+} from "./keymap";
 import { IDENTITY_TRANSFORM, layerStyle } from "../highway/backgrounds";
 import { HIGHEST_MIDI, LOWEST_MIDI } from "./viewport";
 import {
@@ -81,11 +93,22 @@ import { useRouter } from "../../shell/Router";
 /** Fine backdrop-offset nudge (10 ms), bound to `,` / `.` while attached. */
 /** Physical keys of the Alt tempo shortcuts (matched on `code`, see onKeydown). */
 const ALT_TEMPO_CODES = new Set(["KeyT", "KeyE", "KeyR"]);
+/** Alt + these keys nudge the grid phase coarsely (±250 ms). Matched on `key`
+ * so they follow the backing-nudge keys on any layout (e.g. JIS `'`). */
+const ALT_GRID_KEYS = new Set([";", "'"]);
 const BACKDROP_NUDGE_FINE_US = 10_000;
 /** Coarse backdrop-offset nudge (250 ms), bound to `;` / `'` while attached. */
 const BACKDROP_NUDGE_COARSE_US = 250_000;
 /** Opacity the backdrop `<video>` renders at (dimmed under the grid). */
 const BACKDROP_OPACITY = 0.5;
+
+/** Short labels for the waveform modes (status bar + flash). */
+const WAVE_MODE_LABEL: Record<WaveMode, string> = {
+  both: "both",
+  env: "loudness",
+  onset: "onsets",
+  off: "off",
+};
 /**
  * How long the edit cursor must rest before the backdrop scrubs to it (ms).
  *
@@ -266,6 +289,27 @@ export function EditScreen(props: Props): JSX.Element {
   // `save_bundle` (the backend holds the path). The backing and the background
   // video are independent: swapping/detaching one never disturbs the other.
   const [backingName, setBackingName] = createSignal<string | null>(null);
+
+  // ── Backing waveform strips (M21-B) ─────────────────────────────────────
+  // The backend analyses the backing off thread (M21-A); we poll while it is
+  // `pending`. `waveGen` invalidates an in-flight poll when the backing changes
+  // or the screen unmounts. `O` cycles which strips show; persisted per viewer.
+  const [waveform, setWaveform] = createSignal<WaveformData | null>(null);
+  const [waveStatus, setWaveStatus] = createSignal<
+    "none" | "pending" | "ready" | "failed"
+  >("none");
+  const [waveMode, setWaveMode] = createSignal<WaveMode>(
+    loadWaveMode(() => localStorage),
+  );
+  /** Status-bar text for the strips: the mode, or `…` while analysing. */
+  const waveLabel = (): string =>
+    waveStatus() === "pending"
+      ? "…"
+      : waveStatus() === "failed"
+        ? "error"
+        : WAVE_MODE_LABEL[waveMode()];
+  let waveGen = 0;
+  let waveTimer: ReturnType<typeof setTimeout> | undefined;
 
   // The snapshot mirror.
   const [store, setStore] = createStore<{ snap: ComposerSnapshot | null }>({
@@ -577,6 +621,7 @@ export function EditScreen(props: Props): JSX.Element {
     const s = store.snap;
     if (!engine || !s) return;
     engine.setBackdrop(videoPath() !== null);
+    engine.setWaveform(waveform(), waveMode());
     // Overlay the split markers + discarded shading while the editor is open so
     // the cuts are readable over the grid and video backdrop.
     engine.setSplits(
@@ -882,6 +927,7 @@ export function EditScreen(props: Props): JSX.Element {
    * dir is known (GUI load); the socket path falls back to localStorage. */
   function reattachBackdropAndBacking(dir: string | undefined): void {
     refreshBackgroundPaths();
+    refreshWaveform();
     void editQueryBacking()
       .then((ref) => setBackingName(ref ? ref.name : null))
       .catch(() => {
@@ -1060,6 +1106,7 @@ export function EditScreen(props: Props): JSX.Element {
             setBackingName(name);
             setDirty(true);
             showFlash(`backing → ${name}`);
+            refreshWaveform();
           })
           .catch((e: unknown) => {
             showFlash(`backing failed: ${String(e)}`);
@@ -1075,9 +1122,47 @@ export function EditScreen(props: Props): JSX.Element {
   function detachBacking(): void {
     setBackingName(null);
     setDirty(true);
-    void editClearBacking().catch(() => {
-      /* backend down — UI state already cleared */
-    });
+    void editClearBacking()
+      .catch(() => {
+        /* backend down — UI state already cleared */
+      })
+      .finally(refreshWaveform);
+  }
+
+  /** Re-fetch the backing waveform (M21-B), polling every 500 ms while the
+   * backend is still analysing. A newer call (backing changed) or unmount
+   * abandons the old poll via `waveGen`. */
+  function refreshWaveform(): void {
+    const gen = ++waveGen;
+    if (waveTimer !== undefined) clearTimeout(waveTimer);
+    waveTimer = undefined;
+    const poll = (): void => {
+      void editBackingWaveform()
+        .then((r) => {
+          if (gen !== waveGen) return;
+          setWaveStatus(r.status);
+          if (r.status === "pending") {
+            waveTimer = setTimeout(poll, 500);
+            return;
+          }
+          setWaveform(r.status === "ready" ? r : null);
+          if (r.status === "failed") showFlash(`waveform: ${r.detail}`);
+          if (!store.snap?.playing) render();
+        })
+        .catch(() => {
+          /* backend down — leave the strips as they are */
+        });
+    };
+    poll();
+  }
+
+  /** `O`: cycle the waveform strips both → loudness → onsets → off (M21-B). */
+  function cycleWaveMode(): void {
+    const m = nextWaveMode(waveMode());
+    setWaveMode(m);
+    saveWaveMode(() => localStorage, m);
+    showFlash(`waveform: ${WAVE_MODE_LABEL[m]}`);
+    if (!store.snap?.playing) render();
   }
 
   // ── Background image layers (M14-D) ──────────────────────────────────────
@@ -1282,7 +1367,7 @@ export function EditScreen(props: Props): JSX.Element {
     if (e.ctrlKey || e.metaKey) return;
     // Alt combos are left to the webview, except the tempo-from-checkpoint
     // keys (Alt+T / Alt+e / Alt+r), handled with the other tempo keys below.
-    if (e.altKey && !ALT_TEMPO_CODES.has(e.code)) return;
+    if (e.altKey && !ALT_TEMPO_CODES.has(e.code) && !ALT_GRID_KEYS.has(e.key)) return;
 
     // Let native text editing own the keyboard while a real text field is
     // focused (the split editor's segment-name inputs). Without this the editor
@@ -1527,6 +1612,16 @@ export function EditScreen(props: Props): JSX.Element {
       // Tempo from a checkpoint: Alt + the tempo keys apply from the cursor's
       // bar to the end. Matched on `code` — Alt can change `key` on some layouts.
       if (e.altKey && !e.ctrlKey && !e.metaKey) {
+        // Alt+; / Alt+' slide the bar lines ±250 ms (the coarse twin of `:`/`"`).
+        if (ALT_GRID_KEYS.has(e.key)) {
+          e.preventDefault();
+          const delta_us =
+            e.key === ";" ? -GRID_ORIGIN_NUDGE_COARSE_US : GRID_ORIGIN_NUDGE_COARSE_US;
+          void runAction("nudge_grid_origin", { delta_us }).then((reply) => {
+            setDirty(reply.dirty);
+          });
+          return;
+        }
         if (e.code === "KeyT") {
           e.preventDefault();
           setBpmFromCursor(true);
@@ -1574,6 +1669,12 @@ export function EditScreen(props: Props): JSX.Element {
       if (e.key === "B") {
         e.preventDefault();
         attachBacking();
+        return;
+      }
+      // `O` cycles the backing waveform strips (M21-B).
+      if (e.key === "O") {
+        e.preventDefault();
+        cycleWaveMode();
         return;
       }
       // Backspace / Delete detaches the backing (audio only — the video, if
@@ -1868,6 +1969,8 @@ export function EditScreen(props: Props): JSX.Element {
       window.removeEventListener("keydown", onKeydown, true);
       cancelAnimationFrame(raf);
       clearTimeout(flashTimeout);
+      waveGen++;
+      if (waveTimer !== undefined) clearTimeout(waveTimer);
       if (scrubTimer !== undefined) clearTimeout(scrubTimer);
       unlisten?.();
       unlistenMeta?.();
@@ -1914,7 +2017,13 @@ export function EditScreen(props: Props): JSX.Element {
               </div>
             }
           >
-            {(snap) => <StatusBar snapshot={snap()} dirty={dirty()} />}
+            {(snap) => (
+              <StatusBar
+                snapshot={snap()}
+                dirty={dirty()}
+                wave={backingName() === null ? null : waveLabel()}
+              />
+            )}
           </Show>
         }
       >
@@ -2876,9 +2985,14 @@ function HelpOverlay(props: { onClose: () => void }): JSX.Element {
       title: "Backing track",
       rows: [
         "B             Choose / replace the backing audio track",
+        "O             Cycle the waveform strips: both → loudness (right",
+        "              edge) → onsets (left edge) → off",
         "Backspace     Detach the backing (keeps the video backdrop)",
         ", / .         Nudge −/+ 10 ms",
         "; / '         Nudge −/+ 250 ms",
+        ": / \"         Slide the bar lines −/+ 10 ms (grid phase; no note",
+        "              or audio moves — line bar 1 up with the downbeat)",
+        "Alt+; / Alt+' Slide the bar lines −/+ 250 ms",
       ],
     },
     {

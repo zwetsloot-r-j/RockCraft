@@ -19,6 +19,11 @@ const VEL_STEP = 8;
 const BACKING_NUDGE_FINE_US = 10_000;
 /** Coarse backing-alignment nudge (250 ms), bound to `;` / `'`. */
 const BACKING_NUDGE_COARSE_US = 250_000;
+/** Fine grid-phase nudge (10 ms), bound to `:` / `"` (mirrors
+ * `edit.rs::GRID_ORIGIN_NUDGE_FINE_US`). The coarse 250 ms twin is `Alt+;` /
+ * `Alt+'`, handled in EditScreen (Alt combos need the allow-list there). */
+export const GRID_ORIGIN_NUDGE_FINE_US = 10_000;
+export const GRID_ORIGIN_NUDGE_COARSE_US = 250_000;
 /** Tempo nudge in BPM, bound to `(` / `)` (mirrors `edit.rs::BPM_NUDGE`). */
 const BPM_NUDGE = 5;
 
@@ -151,6 +156,24 @@ export const NORMAL_BINDINGS: Binding[] = [
     action: {
       name: "nudge_backing_offset",
       params: { delta_us: BACKING_NUDGE_COARSE_US },
+    },
+  },
+
+  // ── grid phase (slide the bar lines under the notes) ──────────────────
+  // Shifted twins of the backing-alignment keys: same fingers, but the bar
+  // lines move instead of the audio. No note moves.
+  {
+    keys: [":"],
+    action: {
+      name: "nudge_grid_origin",
+      params: { delta_us: -GRID_ORIGIN_NUDGE_FINE_US },
+    },
+  },
+  {
+    keys: ['"'],
+    action: {
+      name: "nudge_grid_origin",
+      params: { delta_us: GRID_ORIGIN_NUDGE_FINE_US },
     },
   },
 

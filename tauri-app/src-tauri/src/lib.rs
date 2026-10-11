@@ -24,6 +24,7 @@ mod play;
 mod record;
 mod state;
 mod transcription;
+mod waveform;
 
 use std::sync::Mutex;
 use std::time::Instant;
@@ -359,6 +360,12 @@ fn edit_query_backing(state: State<'_, AppState>) -> Option<BackingRef> {
     state::query_backing(&state)
 }
 
+/// The attached backing track's waveform (M21-A); see `state::query_waveform`.
+#[tauri::command]
+fn edit_backing_waveform(state: State<'_, AppState>) -> waveform::WaveformReply {
+    state::query_waveform(&state)
+}
+
 /// Return the current MIDI input status (`kind` + optional `port` name).
 #[tauri::command]
 fn midi_status(midi: State<'_, MidiState>) -> MidiStatus {
@@ -630,6 +637,7 @@ pub fn run() {
             edit_set_backing,
             edit_clear_backing,
             edit_query_backing,
+            edit_backing_waveform,
             midi_status,
             midi_rescan,
             mock_key,

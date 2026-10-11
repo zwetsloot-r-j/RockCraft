@@ -29,6 +29,14 @@ import {
 } from "../highway/utils";
 import { DEFAULT_SPLIT, handTint } from "./hand";
 import { gridTiming, Viewport } from "./viewport";
+import {
+  bucketRange,
+  maxOver,
+  showsEnvelope,
+  showsOnsets,
+  type WaveformData,
+  type WaveMode,
+} from "./waveform";
 
 /** Euclidean modulo (non-negative result), for classifying step indices that
  * may be negative when the viewport bottom edge sits before the grid origin. */
@@ -99,6 +107,11 @@ const BG_BACKDROP = "rgba(15,16,22,0.45)";
 /** Tempo-checkpoint line + new-BPM label, and the dimmer previous-BPM label. */
 const TEMPO_MARK = "#4fd1c5";
 const TEMPO_MARK_PREV = "rgba(79,209,197,0.45)";
+/** Backing waveform strips (M21-B): loudness on the right edge, onsets on the left. */
+const WAVE_ENVELOPE = "rgba(120,180,255,0.35)";
+const WAVE_ONSET = "rgba(255,190,90,0.45)";
+/** Width of each waveform strip, as a fraction of the canvas width. */
+const WAVE_STRIP_FRAC = 0.12;
 
 /** A BPM for a checkpoint label: whole numbers bare, otherwise one decimal. */
 function fmtBpm(bpm: number): string {
@@ -149,6 +162,9 @@ export class EditCanvas {
   // dim it. The <video> stays behind, decoding, fully covered by the opaque
   // canvas. `backdropVideo` is that source element (or null when unset).
   private backdrop = false;
+  /** Backing waveform strips (M21-B); null = no backing / not analysed yet. */
+  private waveform: WaveformData | null = null;
+  private waveMode: WaveMode = "both";
   private backdropVideo: HTMLVideoElement | null = null;
 
   // Last frame successfully sampled from `backdropVideo`, kept at the video's
@@ -217,6 +233,15 @@ export class EditCanvas {
    */
   setBackdrop(on: boolean): void {
     this.backdrop = on;
+  }
+
+  /**
+   * The backing track's analysed waveform (M21-B), or null for none, and which
+   * of its strips to show. The next `draw` call picks it up.
+   */
+  setWaveform(w: WaveformData | null, mode: WaveMode): void {
+    this.waveform = w;
+    this.waveMode = mode;
   }
 
   /**
@@ -411,6 +436,8 @@ export class EditCanvas {
 
     this.drawLanes(vp);
     this.drawLoopRegion(snapshot, vp);
+    // Over the movie and lanes, under the grid lines and notes.
+    this.drawWaveform(snapshot, vp);
     this.drawGridlines(g, vp, gridOriginUs, bars);
     this.drawTempoChangeLines(snapshot, vp);
     // Crosshair guides sit under the notes so a note on the cursor's column /
@@ -429,6 +456,48 @@ export class EditCanvas {
     // The piano keyboard strip sits on top of everything at the bottom edge,
     // aligned 1:1 with the pitch lanes so a falling note descends into its key.
     this.drawKeyboard(snapshot, vp);
+  }
+
+  // ── backing waveform (M21-B) ─────────────────────────────────────────────
+
+  /**
+   * The backing track's loudness (right edge, growing left) and onset strength
+   * (left edge, growing right), one bar per pixel row, time-aligned with the
+   * grid through the same viewport. Each row max-pools the buckets it covers
+   * so short spikes survive when zoomed out. The data is indexed by backing-file
+   * position, so the snapshot's backing offset shifts it without a refetch.
+   */
+  private drawWaveform(snapshot: ComposerSnapshot, vp: Viewport): void {
+    const w = this.waveform;
+    const env = w !== null && showsEnvelope(this.waveMode);
+    const ons = w !== null && showsOnsets(this.waveMode);
+    if (w === null || (!env && !ons)) return;
+    const ctx = this.ctx;
+    const stripW = this.w * WAVE_STRIP_FRAC;
+    const offsetUs = snapshot.backing_offset_us;
+    const len = Math.min(w.envelope.length, w.onsets.length);
+    const usAt = (y: number): number => vp.originUs + (vp.height - y) / vp.pxPerUs;
+    const bottom = Math.ceil(this.h - this.keyboardBandH());
+    ctx.save();
+    for (let y = 0; y < bottom; y++) {
+      const r = bucketRange(usAt(y + 1), usAt(y), offsetUs, w.bucket_us, len);
+      if (r === null) continue;
+      if (env) {
+        const bw = (maxOver(w.envelope, r[0], r[1]) / 255) * stripW;
+        if (bw > 0) {
+          ctx.fillStyle = WAVE_ENVELOPE;
+          ctx.fillRect(this.w - bw, y, bw, 1);
+        }
+      }
+      if (ons) {
+        const bw = (maxOver(w.onsets, r[0], r[1]) / 255) * stripW;
+        if (bw > 0) {
+          ctx.fillStyle = WAVE_ONSET;
+          ctx.fillRect(0, y, bw, 1);
+        }
+      }
+    }
+    ctx.restore();
   }
 
   // ── keyboard strip (note-by-note verification) ──────────────────────────

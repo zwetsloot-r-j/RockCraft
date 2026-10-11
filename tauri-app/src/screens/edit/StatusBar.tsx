@@ -58,6 +58,8 @@ interface Props {
   snapshot: ComposerSnapshot;
   /** Whether the timeline has unsaved changes (shows a dirty indicator). */
   dirty?: boolean;
+  /** Backing waveform strip mode (M21-B); null/undefined = no backing. */
+  wave?: string | null;
 }
 
 export function StatusBar(props: Props): JSX.Element {
@@ -147,6 +149,10 @@ export function StatusBar(props: Props): JSX.Element {
         />
       </Show>
 
+      <Show when={props.wave}>
+        {(w) => <Field label="wave" value={w()} />}
+      </Show>
+
       <Show when={props.dirty}>
         <span
           style={{
@@ -171,7 +177,7 @@ export function StatusBar(props: Props): JSX.Element {
       >
         a/x add·del · [/] size · +/- vel · (/) tempo · T set BPM · m grab · c
         chord · v·y·p·D select · u/U undo · Space play/stop · P play-start · o
-        loop · {"{"}/{"}"} loop in/out · B backing · V video · s save · ? help
+        loop · {"{"}/{"}"} loop in/out · B backing · O wave · V video · s save · ? help
       </span>
     </div>
   );

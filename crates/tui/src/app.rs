@@ -1111,6 +1111,7 @@ impl rockcraft_control::HostServices for Shell {
             }
             HostCommand::DetachVideo => Err(HostError::Unsupported("detach_video".into())),
             HostCommand::QueryVideo => Err(HostError::Unsupported("query_video".into())),
+            HostCommand::BackingWaveform => Err(HostError::Unsupported("backing_waveform".into())),
             // A terminal cannot draw an image: background layers ride through
             // the TUI's save/split paths untouched but are not editable here
             // (M14-D), exactly like the movie backdrop above.
@@ -1706,6 +1707,7 @@ mod tests {
             HostCommand::SetVideoOffset { offset_us: 0 },
             HostCommand::DetachVideo,
             HostCommand::QueryVideo,
+            HostCommand::BackingWaveform,
             HostCommand::ImportStart { url: "u".into() },
             HostCommand::ImportScore {
                 path: "s.musicxml".into(),

@@ -84,6 +84,9 @@ pub struct AppState {
     /// re-typing a name. `None` for a brand-new composition (falls back to a
     /// quick-save take).
     pub current_dir: Mutex<Option<std::path::PathBuf>>,
+    /// The attached backing track's analysed waveform (M21-A), computed off
+    /// thread on the first query for a backing path.
+    pub waveform: crate::waveform::WaveformCache,
 }
 
 /// A background image attached to the live editor: the layer id it belongs to
@@ -125,6 +128,7 @@ impl AppState {
             video: Mutex::new(None),
             background_srcs: Mutex::new(Vec::new()),
             current_dir: Mutex::new(None),
+            waveform: crate::waveform::WaveformCache::default(),
         }
     }
 }
@@ -766,6 +770,18 @@ pub fn query_backing(state: &AppState) -> Option<BackingRef> {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| p.to_string_lossy().into_owned()),
         })
+}
+
+/// The attached backing track's waveform (M21-A): `none` without a backing,
+/// `pending` while the first analysis of this path runs, then `ready`. Shared by
+/// the `edit_backing_waveform` IPC and `HostCommand::BackingWaveform`.
+pub fn query_waveform(state: &AppState) -> crate::waveform::WaveformReply {
+    let backing = state
+        .backing_path
+        .lock()
+        .expect("backing_path mutex poisoned")
+        .clone();
+    state.waveform.query(backing.as_deref())
 }
 
 /// Result of [`detect_tempo_map`] (M16-A), in **song** time.
