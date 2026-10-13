@@ -128,6 +128,14 @@ pub enum HostCommand {
     /// Pause the play session and jump the playhead `delta` bars from the bar
     /// under it, to that bar's start (`←` / `→`). Outside a practice loop only.
     PlaySeekBar { delta: i32 },
+    /// Pause the play session and jump the playhead to the start of bar `bar`,
+    /// numbered as the **editor** numbers them (0 = the piece's first bar; the
+    /// count-in is not a bar), clamped to the song. Outside a practice loop only.
+    PlayGotoBar { bar: u64 },
+    /// Pause the play session and jump the playhead to the start of the bar
+    /// containing song time `us` (file µs, the editor's time axis — the count-in
+    /// is not counted). Outside a practice loop only. Edit → Play uses this.
+    PlaySeekUs { us: u64 },
     /// Mark the practice loop's first (`start`) or last (`end`) bar as the bar
     /// under the playhead (`[` / `]`). Restarts a running loop on the new range.
     PlayMarkLoop { edge: LoopEdge },
@@ -251,6 +259,8 @@ impl HostCommand {
             HostCommand::PlayFinish => "play_finish",
             HostCommand::PlayStatus => "play_status",
             HostCommand::PlaySeekBar { .. } => "play_seek_bar",
+            HostCommand::PlayGotoBar { .. } => "play_goto_bar",
+            HostCommand::PlaySeekUs { .. } => "play_seek_us",
             HostCommand::PlayMarkLoop { .. } => "play_mark_loop",
             HostCommand::PlaySetLoop { .. } => "play_set_loop",
             HostCommand::PlayClearLoop => "play_clear_loop",
@@ -392,6 +402,8 @@ pub fn host_command_names() -> &'static [&'static str] {
         "play_finish",
         "play_status",
         "play_seek_bar",
+        "play_goto_bar",
+        "play_seek_us",
         "play_mark_loop",
         "play_set_loop",
         "play_clear_loop",
@@ -465,6 +477,8 @@ static HOST_HELP: &[HostCommandInfo] = {
         HostCommandInfo { name: "play_finish", params: &[], description: "Finish the play session and return the score summary." },
         HostCommandInfo { name: "play_status", params: &[], description: "The live take's full state: clock, paused/frozen, wait gate (awaiting vs held pitches), practice hand + split, speed, score, and the chart's note count. Returns loaded:false when no take is running. Read-only — observing never perturbs the take." },
         HostCommandInfo { name: "play_seek_bar", params: &[p("delta", "i32")], description: "Pause the play session and jump the playhead to the start of the bar `delta` bars from the one under it (-1 = previous, 1 = next), clamped to the song. No-op while a practice loop runs. Returns play status." },
+        HostCommandInfo { name: "play_goto_bar", params: &[p("bar", "u64")], description: "Pause the play session and jump the playhead to the start of bar `bar`, numbered as the editor numbers them (0 = the piece's first bar; the count-in is not a bar), clamped to the song. No-op while a practice loop runs. Returns play status." },
+        HostCommandInfo { name: "play_seek_us", params: &[p("us", "u64")], description: "Pause the play session and jump the playhead to the start of the bar containing song time `us` (file µs, the editor's time axis), clamped to the song. No-op while a practice loop runs. Returns play status." },
         HostCommandInfo { name: "play_mark_loop", params: &[p("edge", "LoopEdge")], description: "Mark the practice loop's first (edge \"start\") or last (edge \"end\", inclusive) bar as the bar under the playhead. Doesn't pause; restarts a running loop on the new range. Returns play status (practice_loop names the marked bars)." },
         HostCommandInfo { name: "play_set_loop", params: &[p("first_bar", "u32"), p("last_bar", "u32")], description: "Mark bars first_bar..=last_bar (0-based; swapped if reversed) and start the practice loop: a one-bar count-in, a demo (the app plays the practised hand), another count-in, then your turn (scored, wait mode applies), repeating. Each finished your-turn pass is published as practice_loop.last_pass. Returns play status." },
         HostCommandInfo { name: "play_clear_loop", params: &[], description: "Stop a running practice loop, pausing at the loop start with normal play restored; with no loop running, clear the loop marks. Returns play status." },
@@ -550,6 +564,8 @@ mod tests {
             HostCommand::PlayFinish,
             HostCommand::PlayStatus,
             HostCommand::PlaySeekBar { delta: -1 },
+            HostCommand::PlayGotoBar { bar: 3 },
+            HostCommand::PlaySeekUs { us: 4_000_000 },
             HostCommand::PlayMarkLoop {
                 edge: LoopEdge::End,
             },
@@ -663,7 +679,7 @@ mod tests {
             for p in info.params {
                 let sample = match p.ty {
                     "bool" => json!(true),
-                    "i64" | "i32" | "u32" => json!(0),
+                    "i64" | "i32" | "u32" | "u64" => json!(0),
                     "LoopEdge" => json!("start"),
                     "SongAudio" => json!("synth"),
                     "Hand?" => json!("left"),
@@ -782,6 +798,14 @@ mod tests {
         assert_eq!(
             host_command_from_name("play_seek_bar", &json!({ "delta": 1 })).unwrap(),
             HostCommand::PlaySeekBar { delta: 1 }
+        );
+        assert_eq!(
+            host_command_from_name("play_goto_bar", &json!({ "bar": 7 })).unwrap(),
+            HostCommand::PlayGotoBar { bar: 7 }
+        );
+        assert_eq!(
+            host_command_from_name("play_seek_us", &json!({ "us": 3_600_000 })).unwrap(),
+            HostCommand::PlaySeekUs { us: 3_600_000 }
         );
         assert_eq!(
             host_command_from_name("play_set_practice", &json!({ "hand": null })).unwrap(),

@@ -381,6 +381,14 @@ impl HostServices for TauriHost<'_> {
                 let status = crate::play::play_seek_bar(app.state::<PlayState>(), delta);
                 json_payload("play_seek_bar", status)
             }
+            HostCommand::PlayGotoBar { bar } => {
+                let status = crate::play::play_goto_bar(app.state::<PlayState>(), bar);
+                json_payload("play_goto_bar", status)
+            }
+            HostCommand::PlaySeekUs { us } => {
+                let status = crate::play::play_seek_us(app.state::<PlayState>(), us);
+                json_payload("play_seek_us", status)
+            }
             HostCommand::PlayMarkLoop { edge } => {
                 let status = crate::play::play_mark_loop(app.state::<PlayState>(), edge);
                 json_payload("play_mark_loop", status)

@@ -19,6 +19,7 @@ import {
   playLoad,
   playMarkLoop,
   playSeekBar,
+  playSeekUs,
   playSetLoop,
   playSetPractice,
   playSetRate,
@@ -49,7 +50,7 @@ import { HighwayHeader } from "./HighwayHeader";
 import { MixerPanel } from "./MixerPanel";
 import { PlaySummaryPanel } from "./PlaySummaryPanel";
 import { songFromInfo } from "./liveSong";
-import { loopBand, loopKeyCommand, type LoopCommand } from "./practiceLoop";
+import { loopBand, loopKeyCommand, seekBarSongUs, type LoopCommand } from "./practiceLoop";
 import type { HighwayConfig, SongData } from "./types";
 
 /** Empty song used as the initial signal value before a bundle loads. */
@@ -211,6 +212,8 @@ export function HighwayScreen() {
   // Whole-song shift in µs; the video aligns to song *content*, which begins
   // after the pre-roll shift. videoTime = (songTime - shift) + offset.
   let shiftUs = 0;
+  // Play-clock length (count-in included), for the header's seek bar (M24-A).
+  const [durationUs, setDurationUs] = createSignal(0);
   // Backdrop servo state (see driveVideo): wall-clock of the last seek, so seeks
   // stay throttled, and the previous target so a backward jump is detectable.
   let lastVideoSeekMs = 0;
@@ -287,6 +290,7 @@ export function HighwayScreen() {
       e.key,
       playState()?.bar ?? 0,
       playState()?.practice_loop ?? null,
+      e.shiftKey,
     );
     if (cmd) {
       e.preventDefault();
@@ -507,6 +511,7 @@ export function HighwayScreen() {
       .then((info) => {
         setSongAudio(info.song_audio);
         shiftUs = info.shift_us;
+        setDurationUs(info.duration_us);
         // The piece's authored split (meta.hand_split) is authoritative: seed
         // the play-mode split from it so moving the splitter in edit mode
         // takes effect here, instead of a machine-global localStorage value
@@ -752,6 +757,12 @@ export function HighwayScreen() {
           splitName={() => noteName(split())}
           onRestart={restart}
           onEditHere={editHere}
+          durationUs={durationUs}
+          onSeek={(fraction) => {
+            // Pauses on the clicked bar's downbeat; Space plays on (M24-A).
+            if (!started() || summary()) return;
+            void playSeekUs(seekBarSongUs(fraction, durationUs(), shiftUs));
+          }}
           canRestart={() => started() && !summary()}
         />
         <div style={{ flex: "1 1 auto", "min-height": 0, position: "relative" }}>

@@ -16,22 +16,43 @@ export type LoopCommand =
  * does nothing right now).
  *
  * - `←` / `→`: pause and jump a bar — outside a running loop only.
+ * - `PageUp` / `PageDown`, or `shift` + `←` / `→`: the same, four bars (M24-A).
  * - `[` / `]`: mark the loop start / end at the bar under the playhead.
  * - `l`: stop a running loop; otherwise start one over the marks, or over the
  *   bar under the playhead when nothing is marked (the backend reports a lone
  *   mark as a one-bar range).
  */
+/** Bars per big skip (PageUp/PageDown, Shift+←/→). */
+export const BIG_SKIP_BARS = 4;
+
+/**
+ * The seek bar (M24-A): a click at `fraction` (0–1) of the bar → the **song**
+ * time (µs) to hand to `play_seek_us`, which snaps it to that bar's start. The
+ * bar spans the whole play clock (`duration_us`, count-in included); the
+ * count-in maps to song time 0.
+ */
+export function seekBarSongUs(fraction: number, durationUs: number, shiftUs: number): number {
+  const f = Math.min(1, Math.max(0, fraction));
+  return Math.max(0, Math.round(f * durationUs - shiftUs));
+}
+
 export function loopKeyCommand(
   key: string,
   bar: number,
   loop: LoopView | null,
+  shift = false,
 ): LoopCommand | null {
   const running = loop?.running ?? false;
+  const step = shift ? BIG_SKIP_BARS : 1;
   switch (key) {
     case "ArrowLeft":
-      return running ? null : { kind: "seek", delta: -1 };
+      return running ? null : { kind: "seek", delta: -step };
     case "ArrowRight":
-      return running ? null : { kind: "seek", delta: 1 };
+      return running ? null : { kind: "seek", delta: step };
+    case "PageUp":
+      return running ? null : { kind: "seek", delta: -BIG_SKIP_BARS };
+    case "PageDown":
+      return running ? null : { kind: "seek", delta: BIG_SKIP_BARS };
     case "[":
       return { kind: "mark", edge: "start" };
     case "]":

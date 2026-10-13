@@ -1293,16 +1293,32 @@ impl PlayScreen {
     /// the one under the playhead (clamped to the song). Outside a loop only;
     /// returns whether it moved.
     pub fn step_bar(&mut self, delta: i32) -> bool {
+        let bar = (self.current_bar() as i64 + delta as i64).max(0) as u64;
+        self.goto_bar(bar)
+    }
+
+    /// Pause, then jump to the start of bar `bar` (clamped to the song). Bars are
+    /// numbered as the editor numbers them — `with_grid` shifts the bar origin
+    /// by the count-in, so play bar *n* is the composer's bar *n*
+    /// (`HostCommand::PlayGotoBar`, M24-A). Outside a loop only; returns whether
+    /// it moved.
+    pub fn goto_bar(&mut self, bar: u64) -> bool {
         if self.practice_loop.is_some() {
             return false;
         }
         self.pause_now();
         let map = self.bar_map();
-        let last = map.bar_at(self.duration_us);
-        let bar = (map.bar_at(self.now_us()) as i64 + delta as i64).clamp(0, last as i64) as u64;
-        let target = map.bar_start(bar);
+        let target = map.bar_start(bar.min(map.bar_at(self.duration_us)));
         self.seek_to(target);
         true
+    }
+
+    /// Pause, then jump to the start of the bar containing **song** time `us`
+    /// (the editor's time axis; the count-in is added here) —
+    /// `HostCommand::PlaySeekUs`, used by Edit → Play (M24-B).
+    pub fn seek_song_us(&mut self, us: u64) -> bool {
+        let bar = self.bar_map().bar_at(us + self.shift_us);
+        self.goto_bar(bar)
     }
 
     /// The marked bars as an ordered `(first, last)`: both marks, or the one
@@ -2991,6 +3007,27 @@ mod tests {
         assert!(play.song_on_fired.contains(&span_at(&play, SHIFT)));
         play.set_loop(0, 0);
         assert!(!play.step_bar(1), "refused while looping");
+    }
+
+    #[test]
+    fn goto_bar_and_seek_song_us_use_the_editors_bar_numbers() {
+        let mut play = loop_screen();
+        assert!(play.goto_bar(2));
+        assert!(play.is_paused());
+        assert_eq!(
+            play.now_us(),
+            SHIFT + 2 * BAR,
+            "bar 2 is two bars past the count-in"
+        );
+        assert!(play.goto_bar(10_000), "clamped to the last bar");
+        assert_eq!(play.current_bar(), play.bar_map().bar_at(play.duration_us));
+        // Song time 1.3 bars → bar 1's downbeat, count-in added.
+        assert!(play.seek_song_us(BAR + 3 * BAR / 10));
+        assert_eq!(play.now_us(), SHIFT + BAR);
+        assert!(play.seek_song_us(0));
+        assert_eq!(play.now_us(), SHIFT);
+        play.set_loop(0, 0);
+        assert!(!play.goto_bar(1), "refused while looping");
     }
 
     #[test]

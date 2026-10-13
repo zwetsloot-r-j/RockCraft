@@ -42,9 +42,10 @@ intercepts `Esc` before the shell's global `Esc`→menu handler
 | Wait `⏸ w` | HighwayHeader | **real** | `w` | `play_set_wait`; chip reflects state |
 | Restart `↻ r` | HighwayHeader | **real** | `r` | button; fresh take from the top (shown while a take runs) |
 | Edit here `✎ e` | HighwayHeader | **real** | `e` | button (M23-A); opens the bundle in Edit at the playhead's bar → `cursor_to_bar_at` (shown while a take runs) |
+| Seek bar | HighwayHeader (bottom strip) | **real** | `←`/`→` 1 bar · `PgUp`/`PgDn`, `Shift`+`←`/`→` 4 bars | click → `play_seek_us` (pauses on that bar's downbeat; Space plays on) (M24-A) |
 
 The chips are status indicators that reflect the keyboard toggles; `↻` and `✎`
-are buttons. No no-op controls.
+are buttons; the seek bar is clickable. No no-op controls.
 
 ## Menu (`screens/menu/`)
 
