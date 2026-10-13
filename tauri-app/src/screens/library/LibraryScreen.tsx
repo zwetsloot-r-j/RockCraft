@@ -56,6 +56,8 @@ export function LibraryScreen(): JSX.Element {
   const [entries, setEntries] = createSignal<LibraryEntryDto[]>([]);
   const [selected, setSelected] = createSignal(0);
   const [loading, setLoading] = createSignal(true);
+  /** The scrollable list panel; its element children are the rows, in order. */
+  let listEl: HTMLDivElement | undefined;
 
   // Load bundles on mount.
   onMount(() => {
@@ -76,8 +78,13 @@ export function LibraryScreen(): JSX.Element {
     return ((idx % n) + n) % n;
   }
 
+  /** Keyboard move: select, then scroll the row into view. ↑/↓ suppress the
+   * panel's native scrolling, so without this the highlight walks off-screen.
+   * (Hover/click selection never scrolls — the row is already under the mouse.) */
   function moveSelection(delta: number): void {
-    setSelected((s) => clampSel(s + delta));
+    const next = clampSel(selected() + delta);
+    setSelected(next);
+    listEl?.children[next]?.scrollIntoView({ block: "nearest" });
   }
 
   function openPlay(idx: number): void {
@@ -166,6 +173,7 @@ export function LibraryScreen(): JSX.Element {
 
       {/* List panel */}
       <div
+        ref={listEl}
         style={{
           flex: "1 1 auto",
           border: "1px solid rgba(255,255,255,0.1)",

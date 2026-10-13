@@ -7,6 +7,7 @@
 //! chosen bundle directory, and the shell reuses its existing bundle-load path
 //! to enter Play or Edit.
 
+use std::cell::Cell;
 use std::path::PathBuf;
 
 use crossterm::event::KeyCode;
@@ -37,6 +38,10 @@ pub enum LibraryOutcome {
 pub struct LibraryScreen {
     entries: Vec<LibraryEntry>,
     state: ListState,
+    /// The list's scroll offset as of the last draw. `draw` takes `&self`, so
+    /// ratatui's adjusted offset is kept here; without it every frame rescrolls
+    /// from the top and moving up slides the list instead of the cursor.
+    offset: Cell<usize>,
     outcome: Option<LibraryOutcome>,
 }
 
@@ -51,6 +56,7 @@ impl LibraryScreen {
         Self {
             entries,
             state,
+            offset: Cell::new(0),
             outcome: None,
         }
     }
@@ -142,8 +148,9 @@ impl LibraryScreen {
                     .add_modifier(Modifier::BOLD),
             )
             .highlight_symbol("▶ ");
-        let mut state = self.state.clone();
+        let mut state = self.state.clone().with_offset(self.offset.get());
         f.render_stateful_widget(list, chunks[1], &mut state);
+        self.offset.set(state.offset());
 
         f.render_widget(
             Paragraph::new(Line::from(format!("{} track(s)", self.entries.len())))
@@ -201,6 +208,52 @@ mod tests {
         let mut screen = LibraryScreen::new(std::slice::from_ref(&root));
         let outcome = screen.on_key(KeyCode::Char('e')).clone();
         assert_eq!(outcome, LibraryOutcome::OpenEdit(dir));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn scroll_offset_persists_across_frames() {
+        use ratatui::{backend::TestBackend, Terminal};
+        use rockcraft_core::{MidiNote, Note, Velocity};
+
+        let root = std::env::temp_dir().join(format!(
+            "rockcraft_libscr_scroll_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        for i in 0..12 {
+            let mut tl = Timeline::new();
+            tl.insert(Note {
+                pitch: MidiNote::new(60).unwrap(),
+                start_us: 0,
+                dur_us: 500_000,
+                velocity: Velocity::new(80).unwrap(),
+                hand: None,
+            });
+            crate::edit::EditScreen::from_timeline(tl, Grid::default_120())
+                .save_to_library(&root, &format!("song{i:02}"))
+                .expect("save");
+        }
+        let mut screen = LibraryScreen::new(std::slice::from_ref(&root));
+        assert_eq!(screen.len(), 12);
+
+        // 10 rows: 2 header + 1 footer leaves a 7-row bordered list → 5 items.
+        let mut term = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        let mut frame = |s: &LibraryScreen| {
+            term.draw(|f| s.draw(f, f.area())).unwrap();
+        };
+        for _ in 0..8 {
+            screen.on_key(KeyCode::Down);
+            frame(&screen);
+        }
+        let scrolled = screen.offset.get();
+        assert!(scrolled > 0, "deep selection scrolled the list");
+        // Moving up within the visible window moves the cursor, not the list.
+        screen.on_key(KeyCode::Up);
+        frame(&screen);
+        assert_eq!(screen.offset.get(), scrolled);
         std::fs::remove_dir_all(&root).ok();
     }
 
