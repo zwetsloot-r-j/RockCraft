@@ -62,6 +62,7 @@ swapping or detaching one never disturbs the other (M10-E).
 | Control | Keybinding | Status | Notes |
 |---|---|---|---|
 | Choose / **replace** backing | `B` | **real** | native audio picker → `edit_set_backing`; swaps the file in place, leaving the video backdrop visible/playing |
+| Play here | `E` | **real** | save in place → Play paused on the cursor's bar (`play_seek_us`); M24-B |
 | Detach backing | `Backspace` / `Delete` | **real** | `edit_clear_backing`; clears only the audio — the video remains |
 | Backing align nudge | `,` `.` `;` `'` | **real** | `nudge_backing_offset` (±10 ms / ±250 ms) |
 | Attach / detach video backdrop | `V` | **real** | native video picker → `edit_set_video` / `edit_clear_video` |

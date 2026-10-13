@@ -5,8 +5,10 @@
  */
 export type Screen =
   | { kind: "menu" }
-  /** Play mode. `dir` carries the bundle directory when opened from the library. */
-  | { kind: "play"; dir?: string }
+  /** Play mode. `dir` carries the bundle directory when opened from the library.
+   * `atUs` (song µs) opens the take paused on the downbeat of the bar
+   * containing it — Edit's "play here" (M24-B). */
+  | { kind: "play"; dir?: string; atUs?: number }
   /**
    * The unified capture + edit screen (M9-A): both records (StepRecord /
    * LiveRecord input modes) and hand-edits the same timeline. `dir` carries the

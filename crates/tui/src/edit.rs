@@ -449,6 +449,10 @@ pub struct EditScreen {
     /// Background image sources carried for save/split round-trip (M14-D), one
     /// per layer in the composer's stack. The TUI renders none of them.
     background_srcs: Vec<BackgroundSrc>,
+    /// The bundle this piece lives in: the one it was opened from, or the one
+    /// its first save created. `s` saves over it in place and `E` plays it
+    /// (M24-B). `None` for a fresh piece that was never saved.
+    source_dir: Option<PathBuf>,
     /// Background video reference carried for split round-trip (M10-D). `None`
     /// when the loaded piece has no backdrop; never rendered by the TUI.
     video: Option<Video>,
@@ -465,6 +469,18 @@ pub struct EditScreen {
     /// When `Some`, the split-panel rename overlay is active and holds the name
     /// typed so far for the selected segment.
     rename_prompt: Option<String>,
+}
+
+/// Copy a media file into a bundle — unless it already *is* that file. Saving
+/// a bundle in place (M24-B) re-writes it over itself, and `fs::copy` onto the
+/// same path truncates it to zero bytes, destroying the backing/video.
+fn copy_into_bundle(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    if let (Ok(a), Ok(b)) = (src.canonicalize(), dst.canonicalize()) {
+        if a == b {
+            return Ok(());
+        }
+    }
+    std::fs::copy(src, dst).map(|_| ())
 }
 
 impl EditScreen {
@@ -509,6 +525,7 @@ impl EditScreen {
             prev_playhead_us: 0,
             prev_offset_us: 0,
             background_srcs: Vec::new(),
+            source_dir: None,
             video: None,
             split_mode: false,
             splits: Vec::new(),
@@ -654,10 +671,33 @@ impl EditScreen {
         self.prev_playhead_us = self.playhead_us();
     }
 
-    /// Save the timeline as a `take-<stamp>` bundle under `recordings/`.
-    /// Returns the bundle directory. Mirrors `RecordScreen::save`.
-    pub fn save(&self) -> std::io::Result<PathBuf> {
-        self.save_bundle(std::path::Path::new(RECORDINGS_DIR))
+    /// Save the piece **in place** over its bundle ([`source_dir`]); a piece
+    /// that has none yet becomes a new `take-<stamp>` bundle under
+    /// `recordings/`, which is then its home. Returns the bundle directory.
+    ///
+    /// [`source_dir`]: Self::source_dir
+    pub fn save(&mut self) -> std::io::Result<PathBuf> {
+        let dir = match &self.source_dir {
+            Some(dir) => self.write_bundle(dir)?,
+            None => self.save_bundle(std::path::Path::new(RECORDINGS_DIR))?,
+        };
+        self.source_dir = Some(dir.clone());
+        Ok(dir)
+    }
+
+    /// The bundle this piece lives in (opened from, or last saved to).
+    pub fn source_dir(&self) -> Option<&std::path::Path> {
+        self.source_dir.as_deref()
+    }
+
+    /// Record the bundle this piece was opened from, so `s` saves over it.
+    pub fn set_source_dir(&mut self, dir: PathBuf) {
+        self.source_dir = Some(dir);
+    }
+
+    /// The cursor's song time (µs) — what Edit → Play hands over (M24-B).
+    pub fn cursor_song_us(&self) -> u64 {
+        self.composer.cursor_us()
     }
 
     /// Save the timeline as a `take-<stamp>` bundle inside `base`.
@@ -674,7 +714,12 @@ impl EditScreen {
     /// Save into a named bundle directory under `root` (the track library).
     /// The name is slugified into a directory name; an existing bundle of the
     /// same name is overwritten in place. Returns the bundle directory.
-    pub fn save_to_library(&self, root: &std::path::Path, name: &str) -> std::io::Result<PathBuf> {
+    /// The saved bundle becomes the piece's home ([`source_dir`](Self::source_dir)).
+    pub fn save_to_library(
+        &mut self,
+        root: &std::path::Path,
+        name: &str,
+    ) -> std::io::Result<PathBuf> {
         let slug = crate::library::slug(name);
         if slug.is_empty() {
             return Err(std::io::Error::new(
@@ -682,7 +727,9 @@ impl EditScreen {
                 "empty name",
             ));
         }
-        self.write_bundle(&root.join(slug))
+        let dir = self.write_bundle(&root.join(slug))?;
+        self.source_dir = Some(dir.clone());
+        Ok(dir)
     }
 
     /// Write the `song.mid` + `meta.json` bundle into `bundle_dir` (created if
@@ -696,7 +743,7 @@ impl EditScreen {
         // MIDI-only saves keep `backing: None`.
         let backing = if let Some(b) = &self.backing {
             let filename = bundle_backing_filename(&b.path);
-            std::fs::copy(&b.path, bundle_dir.join(&filename))?;
+            copy_into_bundle(&b.path, &bundle_dir.join(&filename))?;
             Some(BackingTrack {
                 file: filename,
                 audio_start_us: self.composer.backing_offset_us(),
@@ -708,7 +755,7 @@ impl EditScreen {
         // file in and record its reference so a loaded backdrop survives a re-save.
         // The TUI never decodes it.
         let video = if let Some(v) = &self.video {
-            std::fs::copy(&v.src, bundle_dir.join(&v.file))?;
+            copy_into_bundle(&v.src, &bundle_dir.join(&v.file))?;
             Some(BackgroundVideo {
                 file: v.file.clone(),
                 offset_us: v.offset_us,
@@ -722,7 +769,7 @@ impl EditScreen {
         let backgrounds = self.composer.backgrounds().layers().to_vec();
         for layer in &backgrounds {
             if let Some(b) = self.background_srcs.iter().find(|b| b.id == layer.id) {
-                std::fs::copy(&b.src, bundle_dir.join(&layer.file))?;
+                copy_into_bundle(&b.src, &bundle_dir.join(&layer.file))?;
             }
         }
         let meta = RecordingMeta {
@@ -1833,7 +1880,7 @@ impl EditScreen {
                     Style::default().fg(Color::Black).bg(Color::Green),
                 ),
                 Span::styled(
-                    "  [s] save  [S] library  [Tab] menu",
+                    "  [s] save  [S] library  [E] play  [Tab] menu",
                     Style::default().fg(Color::DarkGray),
                 ),
             ]);
@@ -2028,7 +2075,7 @@ impl EditScreen {
             ),
             vel_span,
             Span::styled(
-                "[a/d] add/del  [A/Z] insert/cut bar  [Q/W] bar -/+ step  [e/r] bar faster/slower  []/[] size  [+/-] vel  [(/)] tempo  [T] set BPM  [:/\"] origin  [I/O] origin±  [m] grab  [n] hand  [c] chord  [v] select  [y/p/D] yank/paste/del  [u/U] undo/redo  [R] rec  [t] step/live  [C] count-in  [Space] play/stop  [P] play-start  [o] loop  [{/}] loop in/out  [M] metro  [>/<] subdiv  [hjkl] pitch/time  [H/L] bar  [w/b] oct  [g/G] timeline ends  [0/$] pitch ends  [s] save  [S] save to library  [X] split  [x] mix  [Tab] menu",
+                "[a/d] add/del  [A/Z] insert/cut bar  [Q/W] bar -/+ step  [e/r] bar faster/slower  []/[] size  [+/-] vel  [(/)] tempo  [T] set BPM  [:/\"] origin  [I/O] origin±  [m] grab  [n] hand  [c] chord  [v] select  [y/p/D] yank/paste/del  [u/U] undo/redo  [R] rec  [t] step/live  [C] count-in  [Space] play/stop  [P] play-start  [o] loop  [{/}] loop in/out  [M] metro  [>/<] subdiv  [hjkl] pitch/time  [H/L] bar  [w/b] oct  [g/G] timeline ends  [0/$] pitch ends  [s] save  [S] save to library  [E] play here  [X] split  [x] mix  [Tab] menu",
                 Style::default().fg(Color::DarkGray),
             ),
         ]);
