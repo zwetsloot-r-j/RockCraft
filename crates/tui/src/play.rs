@@ -113,6 +113,9 @@ pub struct PlayScreen {
     /// behaviour); armed = freeze `clock` + backing on an unsatisfied due step.
     wait: WaitGate,
     title: String,
+    /// The bundle's `song.mid` this screen was loaded from, so `e` can reopen
+    /// the same piece in Edit (M23-A). `None` for a screen built from bytes.
+    source: Option<PathBuf>,
     finished_pause_us: u64,
     /// The **player** voice: the notes coming off the piano, echoed live.
     synth: Option<SynthHandle>,
@@ -352,6 +355,7 @@ impl PlayScreen {
             last_tick: None,
             wait,
             title,
+            source: None,
             finished_pause_us: LEAD_US,
             synth,
             song_synth,
@@ -1203,6 +1207,24 @@ impl PlayScreen {
             .collect()
     }
 
+    /// Remember the `song.mid` this screen plays, for Play → Edit (M23-A).
+    pub fn with_source(mut self, midi_path: PathBuf) -> Self {
+        self.source = Some(midi_path);
+        self
+    }
+
+    /// The `song.mid` this screen was loaded from, if known.
+    pub fn source(&self) -> Option<&std::path::Path> {
+        self.source.as_deref()
+    }
+
+    /// The playhead in **song** time (file µs): the play clock minus the
+    /// count-in shift, clamped to 0 during the pre-roll. This is the composer's
+    /// time axis, so it hands over to Edit unchanged.
+    pub fn song_us(&self) -> u64 {
+        self.now_us().saturating_sub(self.shift_us)
+    }
+
     /// The bar under the playhead (0-based; the pre-roll is bar 0).
     pub fn current_bar(&self) -> u64 {
         self.bar_map().bar_at(self.now_us())
@@ -1633,7 +1655,7 @@ impl PlayScreen {
                 speed_badge(self.rate_permille),
                 Style::default().fg(Color::Yellow),
             ),
-            Span::raw("[r] restart  [Tab] menu  [x] mix  "),
+            Span::raw("[r] restart  [e] edit here  [Tab] menu  [x] mix  "),
             Span::styled("[Space] pause  ", Style::default().fg(pause_color)),
             Span::styled(
                 format!("[m] {music_label}  "),
@@ -2574,6 +2596,15 @@ mod tests {
         assert!(!play.is_paused());
         play.advance(500_000);
         assert_eq!(play.now_us(), 1_500_000, "resumes from the frozen position");
+    }
+
+    #[test]
+    fn song_us_strips_the_count_in_and_clamps_the_pre_roll() {
+        let mut play = two_note_screen();
+        play.advance(SHIFT / 2);
+        assert_eq!(play.song_us(), 0, "pre-roll is song time 0");
+        play.seek_to(SHIFT + 1_250_000);
+        assert_eq!(play.song_us(), 1_250_000);
     }
 
     #[test]

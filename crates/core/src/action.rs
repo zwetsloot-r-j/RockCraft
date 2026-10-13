@@ -50,6 +50,11 @@ pub enum Action {
         pitch: u8,
         step: u64,
     },
+    /// Jump the cursor to the downbeat of the bar containing song time `us`
+    /// (tempo-map aware). Pitch unchanged. Used by Play → Edit.
+    CursorToBarAt {
+        us: u64,
+    },
     SubdivisionFiner,
     SubdivisionCoarser,
 
@@ -337,6 +342,7 @@ impl Action {
             Action::CursorToPitchMin => "cursor_to_pitch_min",
             Action::CursorToPitchMax => "cursor_to_pitch_max",
             Action::SetCursor { .. } => "set_cursor",
+            Action::CursorToBarAt { .. } => "cursor_to_bar_at",
             Action::SubdivisionFiner => "subdivision_finer",
             Action::SubdivisionCoarser => "subdivision_coarser",
             Action::AddNote => "add_note",
@@ -503,6 +509,7 @@ pub fn action_names() -> &'static [&'static str] {
         "cursor_to_pitch_min",
         "cursor_to_pitch_max",
         "set_cursor",
+        "cursor_to_bar_at",
         "subdivision_finer",
         "subdivision_coarser",
         "add_note",
@@ -624,6 +631,7 @@ static ACTION_HELP: &[ActionInfo] = {
         ActionInfo { name: "cursor_to_pitch_min", params: &[], description: "Jump the cursor pitch to the lowest key (A0, MIDI 21)." },
         ActionInfo { name: "cursor_to_pitch_max", params: &[], description: "Jump the cursor pitch to the highest key (C8, MIDI 108)." },
         ActionInfo { name: "set_cursor", params: &[p("pitch", "u8"), p("step", "u64")], description: "Absolute jump to a (pitch, step) cell — AI-friendly addressing." },
+        ActionInfo { name: "cursor_to_bar_at", params: &[p("us", "u64")], description: "Jump the cursor to the downbeat of the bar containing song time `us` (tempo-map aware). Pitch unchanged." },
         ActionInfo { name: "subdivision_finer", params: &[], description: "Halve the grid step for finer placement." },
         ActionInfo { name: "subdivision_coarser", params: &[], description: "Double the grid step for coarser placement." },
         // ── edit ────────────────────────────────────────────────────────
@@ -727,6 +735,7 @@ mod tests {
             Action::CursorToPitchMin,
             Action::CursorToPitchMax,
             Action::SetCursor { pitch: 60, step: 4 },
+            Action::CursorToBarAt { us: 5 },
             Action::SubdivisionFiner,
             Action::SubdivisionCoarser,
             Action::AddNote,
@@ -944,6 +953,10 @@ mod tests {
             action_from_name("set_cursor", &json!({ "pitch": 60, "step": 4 })).unwrap(),
             Action::SetCursor { pitch: 60, step: 4 }
         );
+        assert_eq!(
+            action_from_name("cursor_to_bar_at", &json!({ "us": 5 })).unwrap(),
+            Action::CursorToBarAt { us: 5 }
+        );
     }
 
     #[test]
@@ -985,6 +998,8 @@ mod tests {
     #[test]
     fn missing_required_param_is_bad_params() {
         let err = action_from_name("set_cursor", &json!({ "pitch": 60 })).unwrap_err();
+        assert!(matches!(err, ActionError::BadParams { .. }));
+        let err = action_from_name("cursor_to_bar_at", &json!({})).unwrap_err();
         assert!(matches!(err, ActionError::BadParams { .. }));
     }
 

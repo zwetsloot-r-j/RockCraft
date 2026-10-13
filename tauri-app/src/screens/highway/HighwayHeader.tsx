@@ -33,6 +33,8 @@ interface HighwayHeaderProps {
   onRestart?: () => void;
   /** Whether the ↻ button shows — only once a take is running. */
   canRestart?: () => boolean;
+  /** Open this bundle in Edit at the playhead's bar (the ✎ button; also `e`). */
+  onEditHere?: () => void;
 }
 
 // 12-dot pitch-class color wheel.
@@ -141,6 +143,28 @@ export function HighwayHeader(props: HighwayHeaderProps) {
               title="r — restart from the top"
             >
               ↻ r
+            </button>
+          </Show>
+          <Show when={props.onEditHere && (props.canRestart?.() ?? true)}>
+            <button
+              type="button"
+              // Same no-focus rule as ↻: Space must stay play/pause.
+              tabIndex={-1}
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => props.onEditHere?.()}
+              style={{
+                "font-size": "11px",
+                "font-family": monoFont,
+                padding: "2px 8px",
+                "border-radius": "6px",
+                border: "none",
+                cursor: "pointer",
+                background: "rgba(255,255,255,0.08)",
+                color: "#b9bccb",
+              }}
+              title="e — edit here: open this piece in Edit at the current bar"
+            >
+              ✎ e
             </button>
           </Show>
           <span

@@ -40,9 +40,11 @@ intercepts `Esc` before the shell's global `Esc`→menu handler
 |---|---|---|---|---|
 | Song audio `♪ bg/piano/off` | HighwayHeader | **real** | `m` | `play_cycle_song_audio` (backing → piano → off; no backing: piano ↔ off); chip shows the mode |
 | Wait `⏸ w` | HighwayHeader | **real** | `w` | `play_set_wait`; chip reflects state |
+| Restart `↻ r` | HighwayHeader | **real** | `r` | button; fresh take from the top (shown while a take runs) |
+| Edit here `✎ e` | HighwayHeader | **real** | `e` | button (M23-A); opens the bundle in Edit at the playhead's bar → `cursor_to_bar_at` (shown while a take runs) |
 
-These are status indicators, not buttons — they reflect the keyboard toggles.
-No no-op controls.
+The chips are status indicators that reflect the keyboard toggles; `↻` and `✎`
+are buttons. No no-op controls.
 
 ## Menu (`screens/menu/`)
 

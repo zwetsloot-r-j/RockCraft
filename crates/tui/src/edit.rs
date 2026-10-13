@@ -517,6 +517,18 @@ impl EditScreen {
         self.composer.set_hand_split(pitch);
     }
 
+    /// Install the piece's tempo map (`meta.bar_starts`, M16) so the editor's
+    /// bars match Play's and a save writes the map back unchanged.
+    pub fn set_bar_starts(&mut self, bars: Vec<u64>) {
+        self.composer.set_bar_starts(bars);
+    }
+
+    /// Put the cursor on the downbeat of the bar containing song time `us`
+    /// (Play → Edit, M23-A). Pitch unchanged.
+    pub fn cursor_to_bar_at(&mut self, us: u64) {
+        self.dispatch(Action::CursorToBarAt { us });
+    }
+
     /// Attach a synth handle so edits are auditioned. Called by the shell after
     /// construction so the existing no-arg `new()` stays usable in tests.
     pub fn attach_synth(&mut self, synth: SynthHandle) {

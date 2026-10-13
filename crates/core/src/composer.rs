@@ -507,6 +507,11 @@ impl Composer {
                 self.cursor.step = step;
                 Vec::new()
             }
+            // Bar downbeat under song time `us`; before the grid origin → bar 0.
+            Action::CursorToBarAt { us } => {
+                self.cursor.step = self.bar_at_us(us) * self.steps_per_bar();
+                Vec::new()
+            }
             Action::SubdivisionFiner => {
                 self.change_subdivision_finer();
                 Vec::new()
@@ -3122,6 +3127,65 @@ mod tests {
         assert_eq!(c.current_bar_bounds(), (1_000_000, 3_000_000));
         // Past the mapped end, bars extrapolate with the last bar's length (2s).
         assert_eq!(c.pos_us_of_step(12), 5_000_000, "bar 3 extrapolated");
+    }
+
+    fn sixteenth_grid(origin_us: u64) -> Grid {
+        // 4/4 @120 (2s bars), sixteenth subdivision → 16 steps per bar.
+        Grid {
+            bpm: Bpm::from_whole(120),
+            time_sig: TimeSig {
+                beats_per_bar: 4,
+                beat_unit: 4,
+            },
+            subdivision: Subdivision::Sixteenth,
+            origin_us,
+        }
+    }
+
+    #[test]
+    fn cursor_to_bar_at_lands_on_the_bar_downbeat_uniform() {
+        let mut c = Composer::from_timeline(Timeline::new(), sixteenth_grid(0));
+        apply(&mut c, Action::SetCursor { pitch: 64, step: 3 });
+        // Mid bar 3 (bars are 2s) → bar 3's downbeat, pitch unchanged.
+        apply(&mut c, Action::CursorToBarAt { us: 7_300_000 });
+        assert_eq!(
+            c.cursor(),
+            Cursor {
+                pitch: 64,
+                step: 48
+            }
+        );
+        apply(&mut c, Action::CursorToBarAt { us: 0 });
+        assert_eq!(c.cursor().step, 0);
+        // Exactly on bar 2's downbeat.
+        apply(&mut c, Action::CursorToBarAt { us: 4_000_000 });
+        assert_eq!(c.cursor().step, 32);
+    }
+
+    #[test]
+    fn cursor_to_bar_at_before_the_origin_is_bar_zero() {
+        let mut c = Composer::from_timeline(Timeline::new(), sixteenth_grid(1_500_000));
+        apply(
+            &mut c,
+            Action::SetCursor {
+                pitch: 60,
+                step: 40,
+            },
+        );
+        apply(&mut c, Action::CursorToBarAt { us: 200_000 });
+        assert_eq!(c.cursor().step, 0);
+        // 1.5s origin + 2s bars: 4.0s is inside bar 1.
+        apply(&mut c, Action::CursorToBarAt { us: 4_000_000 });
+        assert_eq!(c.cursor().step, 16);
+    }
+
+    #[test]
+    fn cursor_to_bar_at_follows_the_tempo_map() {
+        let mut c = Composer::from_timeline(Timeline::new(), sixteenth_grid(0));
+        c.set_bar_starts(vec![0, 2_000_000, 3_500_000, 6_000_000]);
+        // 3.6s falls in the short bar 2 [3.5s, 6s); uniform 2s bars would say bar 1.
+        apply(&mut c, Action::CursorToBarAt { us: 3_600_000 });
+        assert_eq!(c.cursor().step, 2 * 16);
     }
 
     #[test]

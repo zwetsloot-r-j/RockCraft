@@ -284,6 +284,7 @@ export type ActionName =
   | "cursor_to_pitch_min"
   | "cursor_to_pitch_max"
   | "set_cursor"
+  | "cursor_to_bar_at"
   | "subdivision_finer"
   | "subdivision_coarser"
   // ── edit ────────────────────────────────────────────────────────────

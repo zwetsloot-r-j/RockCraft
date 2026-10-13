@@ -53,6 +53,11 @@ function AppShell(): JSX.Element {
               ? (screen() as { kind: "edit"; armed?: boolean }).armed
               : undefined
           }
+          atUs={
+            screen().kind === "edit"
+              ? (screen() as { kind: "edit"; atUs?: number }).atUs
+              : undefined
+          }
         />
       </Match>
       {/* URL input modal — only shown when a fetch command is configured. */}
