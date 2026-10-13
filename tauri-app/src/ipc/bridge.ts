@@ -518,6 +518,18 @@ export function playSeekBar(delta: number): Promise<PlayStatus> {
   return invoke<PlayStatus>("play_seek_bar", { delta });
 }
 
+/** Pause and jump to the start of editor bar `bar` (0 = the piece's first bar;
+ * the count-in is not a bar). A no-op while a practice loop runs (M24-A). */
+export function playGotoBar(bar: number): Promise<PlayStatus> {
+  return invoke<PlayStatus>("play_goto_bar", { bar });
+}
+
+/** Pause and jump to the start of the bar containing song time `us` (the
+ * editor's time axis). A no-op while a practice loop runs (M24-A). */
+export function playSeekUs(us: number): Promise<PlayStatus> {
+  return invoke<PlayStatus>("play_seek_us", { us: Math.max(0, Math.round(us)) });
+}
+
 /** `[` / `]`: mark the loop's first / last bar at the playhead. */
 export function playMarkLoop(edge: LoopEdge): Promise<PlayStatus> {
   return invoke<PlayStatus>("play_mark_loop", { edge });

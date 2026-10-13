@@ -662,6 +662,8 @@ pub fn run() {
             play::play_toggle_monitor,
             play::play_toggle_pause,
             play::play_seek_bar,
+            play::play_goto_bar,
+            play::play_seek_us,
             play::play_mark_loop,
             play::play_set_loop,
             play::play_clear_loop,

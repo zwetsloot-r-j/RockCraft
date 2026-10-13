@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
 import type { LoopView } from "../../ipc/types";
 import {
+  BIG_SKIP_BARS,
   dimmedByLoop,
   loopBadgeText,
   loopBand,
   loopKeyCommand,
+  seekBarSongUs,
 } from "./practiceLoop";
 
 function view(over: Partial<LoopView> = {}): LoopView {
@@ -20,6 +22,27 @@ function view(over: Partial<LoopView> = {}): LoopView {
     ...over,
   };
 }
+
+describe("big skips and the seek bar (M24-A)", () => {
+  it("PageUp/PageDown and Shift+arrows jump four bars", () => {
+    expect(BIG_SKIP_BARS).toBe(4);
+    expect(loopKeyCommand("PageDown", 3, null)).toEqual({ kind: "seek", delta: 4 });
+    expect(loopKeyCommand("PageUp", 3, null)).toEqual({ kind: "seek", delta: -4 });
+    expect(loopKeyCommand("ArrowRight", 3, null, true)).toEqual({ kind: "seek", delta: 4 });
+    expect(loopKeyCommand("ArrowLeft", 3, null, true)).toEqual({ kind: "seek", delta: -4 });
+  });
+
+  it("ignores big skips while the loop runs", () => {
+    expect(loopKeyCommand("PageDown", 3, view({ running: true }))).toBeNull();
+  });
+
+  it("maps a click to song time, count-in clamped to 0", () => {
+    expect(seekBarSongUs(0.5, 20_000_000, 4_000_000)).toBe(6_000_000);
+    expect(seekBarSongUs(0.1, 20_000_000, 4_000_000)).toBe(0);
+    expect(seekBarSongUs(1.7, 20_000_000, 4_000_000)).toBe(16_000_000);
+    expect(seekBarSongUs(-1, 20_000_000, 4_000_000)).toBe(0);
+  });
+});
 
 describe("loopKeyCommand", () => {
   it("steps bars with the arrows outside a loop", () => {
