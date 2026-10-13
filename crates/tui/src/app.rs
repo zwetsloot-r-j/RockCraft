@@ -600,6 +600,13 @@ impl Shell {
                 KeyCode::Right => {
                     play.step_bar(1);
                 }
+                // Bigger skips (M24-A): four bars at a time.
+                KeyCode::PageUp => {
+                    play.step_bar(-4);
+                }
+                KeyCode::PageDown => {
+                    play.step_bar(4);
+                }
                 KeyCode::Char('[') => play.mark_loop_start(),
                 KeyCode::Char(']') => play.mark_loop_end(),
                 KeyCode::Char('l') => play.toggle_loop(),
@@ -1073,6 +1080,12 @@ impl rockcraft_control::HostServices for Shell {
             // The practice loop (M17-B), mirroring the play-screen keys.
             HostCommand::PlaySeekBar { delta } => self.with_play("play_seek_bar", |play| {
                 play.step_bar(delta);
+            }),
+            HostCommand::PlayGotoBar { bar } => self.with_play("play_goto_bar", |play| {
+                play.goto_bar(bar);
+            }),
+            HostCommand::PlaySeekUs { us } => self.with_play("play_seek_us", |play| {
+                play.seek_song_us(us);
             }),
             HostCommand::PlayMarkLoop { edge } => {
                 self.with_play("play_mark_loop", |play| match edge {

@@ -437,6 +437,8 @@ below is an at-a-glance convenience only.
 | `play_finish` | none | Finish the play session; returns the score summary |
 | `play_set_practice` | `{ hand: "left"\|"right"\|null }` | Set the practised hand (the other hand auto-plays and isn't scored); `null` = both. Returns `{ practice }` |
 | `play_seek_bar` | `{ delta: i32 }` | Pause and jump the playhead to the start of the bar `delta` bars from the one under it (`-1` previous, `1` next), clamped to the song. No-op while a practice loop runs. Returns play status |
+| `play_goto_bar` | `{ bar: u64 }` | Pause and jump to the start of bar `bar`, numbered as the editor numbers them (0 = the piece's first bar; the count-in is not a bar), clamped to the song. No-op while a practice loop runs. Returns play status |
+| `play_seek_us` | `{ us: u64 }` | Pause and jump to the start of the bar containing song time `us` (file µs, the editor's time axis). No-op while a practice loop runs. Returns play status |
 | `play_mark_loop` | `{ edge: "start"\|"end" }` | Mark the practice loop's first / last (inclusive) bar as the bar under the playhead. Doesn't pause; a running loop restarts on the new range. Returns play status |
 | `play_set_loop` | `{ first_bar: u32, last_bar: u32 }` | Mark bars `first_bar..=last_bar` (0-based, swapped if reversed) and start the practice loop — see below. Returns play status |
 | `play_clear_loop` | none | Stop a running practice loop, pausing at the loop start with normal play restored; with no loop running, clear the marks. Returns play status |

@@ -616,6 +616,9 @@ pub struct PlaySession {
 
     /// Uniform bar length (µs) used when the piece has no tempo map.
     bar_us: u64,
+    /// The piece's grid origin (song µs; 0 without a grid): where the editor's
+    /// bar 0 starts, for [`song_bar_map`](Self::song_bar_map).
+    song_origin_us: u64,
     /// The player's wait-mode setting. Outside a loop the gate is armed exactly
     /// when this is; inside one only during *your turn* (M17-A).
     wait_mode: bool,
@@ -703,6 +706,7 @@ impl PlaySession {
                 .map(|g| g.bar_us)
                 .filter(|&b| b > 0)
                 .unwrap_or(DEFAULT_BAR_US),
+            song_origin_us: grid.map(|g| g.origin_us).unwrap_or(0),
             wait_mode: false,
             loop_marks: (None, None),
             practice_loop: None,
@@ -1432,6 +1436,39 @@ impl PlaySession {
         self.bar_map().bar_at(self.now_us())
     }
 
+    /// Bars as the **editor** numbers them (play-clock µs): bar 0 is the piece's
+    /// first bar at its grid origin, not the start of the count-in. `bar_map`
+    /// counts whole pre-roll bars, so its indices differ on a uniform grid.
+    fn song_bar_map(&self) -> BarMap<'_> {
+        BarMap::new(&self.bar_starts_us, self.bar_us)
+            .with_origin(self.song_origin_us + self.shift_us)
+    }
+
+    /// Pause, then jump to the start of editor bar `bar`, clamped to the song
+    /// (`HostCommand::PlayGotoBar`, M24-A). Outside a loop only; returns whether
+    /// it moved.
+    pub fn goto_bar(&mut self, bar: u64) -> bool {
+        if self.practice_loop.is_some() {
+            return false;
+        }
+        self.paused = true;
+        if self.clock.is_running() {
+            self.clock.pause();
+        }
+        let map = self.song_bar_map();
+        let target = map.bar_start(bar.min(map.bar_at(self.duration_us)));
+        self.seek_to(target);
+        true
+    }
+
+    /// Pause, then jump to the start of the bar containing **song** time `us`
+    /// (the editor's axis; the count-in is added here) — `HostCommand::PlaySeekUs`,
+    /// used by Edit → Play (M24-B) and the header's seek bar.
+    pub fn seek_song_us(&mut self, us: u64) -> bool {
+        let bar = self.song_bar_map().bar_at(us + self.shift_us);
+        self.goto_bar(bar)
+    }
+
     /// Is the practice loop running? Test-only; the live view is
     /// [`loop_view`](Self::loop_view)'s `running`.
     #[cfg(test)]
@@ -1914,6 +1951,25 @@ fn with_session(state: &PlayState, f: impl FnOnce(&mut PlaySession)) -> PlayStat
 pub fn play_seek_bar(state: tauri::State<'_, PlayState>, delta: i32) -> PlayStatusView {
     with_session(&state, |s| {
         s.step_bar(delta);
+    })
+}
+
+/// Pause and jump to editor bar `bar` (`HostCommand::PlayGotoBar`). Returns
+/// the play status. No-op while a practice loop runs.
+#[tauri::command]
+pub fn play_goto_bar(state: tauri::State<'_, PlayState>, bar: u64) -> PlayStatusView {
+    with_session(&state, |s| {
+        s.goto_bar(bar);
+    })
+}
+
+/// Pause and jump to the bar containing song time `us`
+/// (`HostCommand::PlaySeekUs`). Returns the play status. No-op while a
+/// practice loop runs.
+#[tauri::command]
+pub fn play_seek_us(state: tauri::State<'_, PlayState>, us: u64) -> PlayStatusView {
+    with_session(&state, |s| {
+        s.seek_song_us(us);
     })
 }
 
@@ -3491,6 +3547,46 @@ mod tests {
         // ...and a second clear drops the marks.
         s.clear_loop();
         assert!(s.loop_view().is_none());
+    }
+
+    #[test]
+    fn goto_bar_counts_bars_as_the_editor_does() {
+        // 4 s count-in = two whole 2 s play bars; the editor's bar 0 starts there.
+        let mut s = loop_session();
+        assert!(s.goto_bar(0));
+        assert!(s.is_paused());
+        assert_eq!(s.now_us(), 4_000_000);
+        assert!(s.goto_bar(1));
+        assert_eq!(s.now_us(), 6_000_000);
+        // Song time 2.5 s is in editor bar 1.
+        assert!(s.seek_song_us(2_500_000));
+        assert_eq!(s.now_us(), 6_000_000);
+        assert!(s.goto_bar(10_000), "clamped to the song");
+        assert!(s.now_us() <= s.duration_us);
+        s.set_loop(1, 1);
+        assert!(!s.goto_bar(0), "refused while looping");
+    }
+
+    #[test]
+    fn goto_bar_honours_the_grid_origin() {
+        let ev = vec![
+            on(60, 500_000),
+            off(60, 900_000),
+            on(62, 4_500_000),
+            off(62, 4_900_000),
+        ];
+        let grid = GridInfo {
+            bpm: Bpm::from_whole(120),
+            beats_per_bar: 4,
+            bar_us: 2_000_000,
+            origin_us: 500_000,
+        };
+        let mut s = PlaySession::from_events_with_grid("origin".into(), &ev, Some(grid));
+        let shift = s.shift_us();
+        assert!(s.goto_bar(2));
+        assert_eq!(s.now_us(), shift + 500_000 + 2 * 2_000_000);
+        assert!(s.seek_song_us(0), "before the origin → bar 0");
+        assert_eq!(s.now_us(), shift + 500_000);
     }
 
     #[test]

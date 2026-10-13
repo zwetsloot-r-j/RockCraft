@@ -35,6 +35,10 @@ interface HighwayHeaderProps {
   canRestart?: () => boolean;
   /** Open this bundle in Edit at the playhead's bar (the ✎ button; also `e`). */
   onEditHere?: () => void;
+  /** Play-clock length (µs), count-in included — the seek bar's span. */
+  durationUs?: () => number;
+  /** Seek-bar click at `fraction` (0–1) of its width (M24-A). */
+  onSeek?: (fraction: number) => void;
 }
 
 // 12-dot pitch-class color wheel.
@@ -75,10 +79,18 @@ export function HighwayHeader(props: HighwayHeaderProps) {
     return props.eng()?.score ?? 0;
   };
   const mult = () => 1 + Math.floor(combo() / 8);
+  /** Seek-bar fill (0–1): the playhead's share of the play clock. */
+  const progress = (): number => {
+    props.frame();
+    const d = props.durationUs?.() ?? 0;
+    if (d <= 0) return 0;
+    return Math.min(1, Math.max(0, (props.playState?.()?.time_us ?? 0) / d));
+  };
 
   return (
     <div
       style={{
+        position: "relative",
         display: "flex",
         "align-items": "center",
         gap: "18px",
@@ -416,6 +428,35 @@ export function HighwayHeader(props: HighwayHeaderProps) {
           SCORE
         </div>
       </div>
+      {/* Seek bar (M24-A): click to jump to that bar (paused; Space plays on). */}
+      <Show when={props.live && props.onSeek && (props.durationUs?.() ?? 0) > 0}>
+        <div
+          title="click to jump to that bar"
+          onMouseDown={(e) => {
+            e.preventDefault();
+            const r = e.currentTarget.getBoundingClientRect();
+            if (r.width > 0) props.onSeek?.((e.clientX - r.left) / r.width);
+          }}
+          style={{
+            position: "absolute",
+            left: 0,
+            right: 0,
+            bottom: "-1px",
+            height: "6px",
+            cursor: "pointer",
+            background: "rgba(255,255,255,0.06)",
+          }}
+        >
+          <div
+            style={{
+              width: `${progress() * 100}%`,
+              height: "100%",
+              background: "rgba(79,163,227,0.75)",
+              "pointer-events": "none",
+            }}
+          />
+        </div>
+      </Show>
     </div>
   );
 }
