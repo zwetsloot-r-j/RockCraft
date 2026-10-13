@@ -199,6 +199,9 @@ export function HighwayScreen() {
   const { screen, navigate } = useRouter();
   const scr = screen();
   const dir = scr.kind === "play" ? scr.dir : undefined;
+  // Edit's "play here" (M24-B): the first take opens on this song time's bar.
+  // Consumed once — `r` / replay restart from the top as usual.
+  let openAtUs = scr.kind === "play" ? scr.atUs : undefined;
   const live = dir !== undefined;
 
   let canvasEl!: HTMLCanvasElement;
@@ -512,6 +515,11 @@ export function HighwayScreen() {
         setSongAudio(info.song_audio);
         shiftUs = info.shift_us;
         setDurationUs(info.duration_us);
+        if (openAtUs !== undefined) {
+          // Pauses on the bar's downbeat; the Start prompt (Space) plays on.
+          void playSeekUs(openAtUs);
+          openAtUs = undefined;
+        }
         // The piece's authored split (meta.hand_split) is authoritative: seed
         // the play-mode split from it so moving the splitter in edit mode
         // takes effect here, instead of a machine-global localStorage value
