@@ -70,6 +70,7 @@ import { cursorUsOf, EditCanvas } from "./EditCanvas";
 import { StatusBar } from "./StatusBar";
 import { RecordControls } from "./RecordControls";
 import { DEFAULT_SPLIT } from "./hand";
+import { nudgeRatePermille, rateToPermille, speedKey } from "./speed";
 import {
   GRID_ORIGIN_NUDGE_COARSE_US,
   resolveBackgroundKey,
@@ -604,6 +605,10 @@ export function EditScreen(props: Props): JSX.Element {
     // servo: `want` dropped, so the video is now far *ahead*; slowing it to let
     // the clock "catch up" never converges (the clock is looping), which is the
     // "movie crawls in a loop" bug. One seek per wrap re-seats the frame.
+    // The transport speed (M24-C) is the servo's centre: a slowed editor plays
+    // the backdrop slowed too. HTML video accepts 0.25×, so the floor reaches
+    // the slowest practice speed with room to correct below it.
+    const baseRate = (s.playback_rate ?? 1) > 0 ? (s.playback_rate ?? 1) : 1;
     const backJump = prevVideoWant >= 0 && want < prevVideoWant - 0.2;
     prevVideoWant = want;
     const drift = want - v.currentTime; // +: video behind, must speed up
@@ -613,7 +618,7 @@ export function EditScreen(props: Props): JSX.Element {
     // (it is naturally once-per-loop and must feel snappy).
     if (backJump) {
       v.currentTime = want;
-      v.playbackRate = 1;
+      v.playbackRate = baseRate;
       lastVideoSeekMs = performance.now();
       return;
     }
@@ -622,11 +627,14 @@ export function EditScreen(props: Props): JSX.Element {
       if (now - lastVideoSeekMs >= 1000) {
         lastVideoSeekMs = now;
         v.currentTime = want;
-        v.playbackRate = 1;
+        v.playbackRate = baseRate;
       }
       return;
     }
-    v.playbackRate = Math.max(0.5, Math.min(2, 1 + drift * 0.8));
+    v.playbackRate = Math.max(
+      Math.max(0.25, baseRate * 0.5),
+      Math.min(2, baseRate + drift * 0.8),
+    );
   }
 
   function render(): void {
@@ -694,8 +702,12 @@ export function EditScreen(props: Props): JSX.Element {
     playheadUs: number,
     isPlaying: boolean,
     frozen = false,
+    rate = store.snap?.playback_rate ?? 1,
   ): void {
     const now = performance.now();
+    // The transport speed (M24-C): the servo centres on it, so a slowed
+    // playhead is the clock's resting rate rather than a "drift" to brake.
+    const base = rate > 0 ? rate : 1;
     // A wait-mode freeze is a pause as far as the clock is concerned: hold the
     // playhead at the backend value with rate 1 (the RAF renders the frozen
     // playhead directly), and re-seat cleanly when playback resumes.
@@ -709,7 +721,7 @@ export function EditScreen(props: Props): JSX.Element {
         // or a loop-wrap / deliberate backward seek (very negative). Snap + reset.
         basePlayheadUs = playheadUs;
         baseWallMs = now;
-        clockRate = 1;
+        clockRate = base;
       } else {
         // Ordinary drift: NEVER snap. Re-anchor to the current displayed value
         // (continuous) and servo the *rate* to converge; the floor > 0 keeps the
@@ -718,21 +730,21 @@ export function EditScreen(props: Props): JSX.Element {
         basePlayheadUs = predicted;
         baseWallMs = now;
         clockRate = Math.max(
-          CLOCK_RATE_MIN,
-          Math.min(CLOCK_RATE_MAX, 1 + error / 1_000_000),
+          CLOCK_RATE_MIN * base,
+          Math.min(CLOCK_RATE_MAX * base, base + error / 1_000_000),
         );
       }
     } else {
       // Play just started, or paused/idle: take the backend value directly.
       basePlayheadUs = playheadUs;
       baseWallMs = now;
-      clockRate = 1;
+      clockRate = base;
     }
     clockPlaying = advancing;
   }
 
   function applySnapshot(s: ComposerSnapshot): void {
-    updateClock(s.playhead_us, s.playing, s.frozen ?? false);
+    updateClock(s.playhead_us, s.playing, s.frozen ?? false, s.playback_rate ?? 1);
     setStore("snap", s);
     setRev((r) => r + 1);
     // During playback the RAF loop already redraws every frame with a smoothly
@@ -750,7 +762,7 @@ export function EditScreen(props: Props): JSX.Element {
    * pieces. Mirrors {@link applySnapshot} otherwise.
    */
   function applyMeta(m: ComposerSnapshot): void {
-    updateClock(m.playhead_us, m.playing, m.frozen ?? false);
+    updateClock(m.playhead_us, m.playing, m.frozen ?? false, m.playback_rate ?? 1);
     setStore("snap", (prev) => (prev ? { ...m, notes: prev.notes } : m));
     setRev((r) => r + 1);
     if (!m.playing) render();
@@ -1857,6 +1869,23 @@ export function EditScreen(props: Props): JSX.Element {
         setOverlay("exit-prompt");
       }
       // If not dirty, let the event bubble to the Router's global Esc handler.
+      return;
+    }
+
+    // Transport speed (M24-C): `!` slower / `@` faster through Play's steps.
+    // Stateful (the next speed depends on the current one, from the snapshot),
+    // so it can't live in the static keymap table. Matched on `e.key` — the
+    // produced character — so it works on JIS (`@` own key, `!` = Shift+1).
+    const faster = speedKey(e.key);
+    if (faster !== null && s.chord_preview === null && !e.ctrlKey && !e.metaKey) {
+      e.preventDefault();
+      const rate_permille = nudgeRatePermille(
+        rateToPermille(s.playback_rate ?? 1),
+        faster,
+      );
+      void runAction("set_playback_rate", { rate_permille }).then((reply) => {
+        setDirty(reply.dirty);
+      });
       return;
     }
 
@@ -3047,6 +3076,10 @@ function HelpOverlay(props: { onClose: () => void }): JSX.Element {
         "Space         Play / stop from cursor (toggles — press again to stop)",
         "P             Play from start",
         "              While playing, a PLAYING badge shows in the status bar",
+        "!             Slower (⅞ → ¾ → ⅝ → ½×)",
+        "@             Faster (back up to 1×)",
+        "              Off 1× a speed badge shows; the backing audio is muted",
+        "              and the synth carries the piece",
       ],
     },
     {

@@ -10,6 +10,7 @@ import type { ComposerSnapshot, Subdivision } from "../../ipc/types";
 import { barBeatOf, stepUs } from "./viewport";
 import { formatBpm } from "./bpm";
 import { noteName } from "../highway/utils";
+import { speedLabel } from "./speed";
 
 const FONT_MONO = "'IBM Plex Mono', ui-monospace, monospace";
 
@@ -118,6 +119,10 @@ export function StatusBar(props: Props): JSX.Element {
       <Show when={props.snapshot.playing}>
         <Badge text="▶ PLAYING" bg="#5be7c4" />
       </Show>
+      {/* Practice speed (M24-C, `!` / `@`): shown only off 1×. */}
+      <Show when={speedLabel(props.snapshot.playback_rate ?? 1)}>
+        {(label) => <Badge text={label()} bg="#d96bff" />}
+      </Show>
       <Show when={props.snapshot.looping}>
         <Badge text={loopLabel()} bg="#5be7c4" />
       </Show>
@@ -177,7 +182,7 @@ export function StatusBar(props: Props): JSX.Element {
         }}
       >
         a/x add·del · [/] size · +/- vel · (/) tempo · T set BPM · m grab · c
-        chord · v·y·p·D select · u/U undo · Space play/stop · P play-start · o
+        chord · v·y·p·D select · u/U undo · Space play/stop · P play-start · !/@ speed · o
         loop · {"{"}/{"}"} loop in/out · B backing · O wave · V video · s save · ? help
       </span>
     </div>

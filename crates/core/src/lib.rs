@@ -28,6 +28,7 @@ pub mod scoring;
 pub mod segment;
 pub mod song;
 pub mod song_audio;
+pub mod speed;
 pub mod stats;
 pub mod timeline;
 pub mod wait;
@@ -65,6 +66,7 @@ pub use song::{
     TrackOrigin,
 };
 pub use song_audio::SongAudio;
+pub use speed::{nudge_rate_permille, rate_to_permille, RATE_STEPS, RATE_UNITY};
 pub use stats::Summary;
 pub use timeline::{Note, NoteId, Timeline};
 pub use wait::{GateState, Step, WaitGate, WaitTracker};

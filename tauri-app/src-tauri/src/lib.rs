@@ -120,9 +120,12 @@ fn run_action(
             .0
             .lock()
             .expect("prev_transport mutex poisoned");
+        // The backing only sounds at 1× (M24-C): off-tempo it is paused.
+        let backing_playing =
+            audio::backing_audible(reply.snapshot.playing, reply.snapshot.playback_rate);
         audio::sync_backing(
             &audio,
-            reply.snapshot.playing,
+            backing_playing,
             reply.snapshot.playhead_us,
             reply.snapshot.backing_offset_us,
             prev.playing,
@@ -130,7 +133,8 @@ fn run_action(
             prev.offset_us,
         );
         *prev = TransportSnapshot {
-            playing: reply.snapshot.playing,
+            playing: backing_playing,
+            transport_playing: reply.snapshot.playing,
             playhead_us: reply.snapshot.playhead_us,
             offset_us: reply.snapshot.backing_offset_us,
         };
@@ -391,7 +395,12 @@ fn mock_key(midi: State<'_, MidiState>, key: char, down: bool) -> Result<(), Str
 /// `run_action`. Held behind a `Mutex` so both paths can update it.
 #[derive(Default)]
 struct TransportSnapshot {
+    /// Whether the *backing* was sounding (playing at 1× — see
+    /// [`audio::backing_audible`]); the `prev_playing` of [`audio::sync_backing`].
     playing: bool,
+    /// Whether the transport itself was playing (any speed), for the tick
+    /// thread's play/stop-transition snapshot emit.
+    transport_playing: bool,
     playhead_us: u64,
     offset_us: i64,
 }
@@ -515,8 +524,10 @@ fn spawn_tick_thread(app: tauri::AppHandle) {
             let (playing, playhead_us, backing_offset_us, playback_rate) =
                 state::transport_fields(&app_state);
 
-            // Match backing-audio speed to the transport speed (slow-mo). Only on
-            // change — set_speed resamples, so we avoid re-issuing it every tick.
+            // Off 1× the backing is muted (paused) and the synth carries the
+            // piece, like Play (M24-C) — see `backing_audible` below. The sink
+            // speed still follows on change, so it is back at exactly 1× when
+            // the backing resumes in sync at 1×.
             if playback_rate != last_backing_rate {
                 audio.set_backing_speed(playback_rate as f32);
                 last_backing_rate = playback_rate;
@@ -534,10 +545,14 @@ fn spawn_tick_thread(app: tauri::AppHandle) {
                     .0
                     .lock()
                     .expect("prev_transport mutex poisoned");
-                prev_playing = prev.playing;
+                prev_playing = prev.transport_playing;
+                // "Playing" for the backing means audible: advancing at the
+                // piece's own tempo. Stepping off 1× pauses it; stepping back
+                // re-syncs it at the playhead (a fresh PlayAt).
+                let backing_playing = audio::backing_audible(playing, playback_rate);
                 audio::sync_backing(
                     &audio,
-                    playing,
+                    backing_playing,
                     playhead_us,
                     backing_offset_us,
                     prev.playing,
@@ -545,7 +560,8 @@ fn spawn_tick_thread(app: tauri::AppHandle) {
                     prev.offset_us,
                 );
                 *prev = TransportSnapshot {
-                    playing,
+                    playing: backing_playing,
+                    transport_playing: playing,
                     playhead_us,
                     offset_us: backing_offset_us,
                 };

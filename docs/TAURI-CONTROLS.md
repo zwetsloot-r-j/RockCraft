@@ -67,6 +67,7 @@ swapping or detaching one never disturbs the other (M10-E).
 | Backing align nudge | `,` `.` `;` `'` | **real** | `nudge_backing_offset` (±10 ms / ±250 ms) |
 | Attach / detach video backdrop | `V` | **real** | native video picker → `edit_set_video` / `edit_clear_video` |
 | Video align nudge | `,` `.` `;` `'` (while attached) | **real** | `edit_set_video_offset` (diverts the nudge keys while a backdrop is present) |
+| Playback speed | `!` slower / `@` faster | **real** | `set_playback_rate` through ½ ⅝ ¾ ⅞ 1× (M24-C); a speed badge shows in the StatusBar off 1×; the backing audio is muted below 1× (resumes in sync at 1×) while the video backdrop slows with the playhead |
 
 ## Out of scope
 

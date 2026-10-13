@@ -602,6 +602,15 @@ pub fn backing_pos(playhead_us: u64, offset_us: i64) -> Option<u64> {
 
 // ── Backing transport coupling ───────────────────────────────────────────────
 
+/// Whether the editor's backing should sound: the transport is advancing at
+/// the piece's own tempo. Off 1× a recording cannot follow, so it is muted
+/// (paused) and the synth carries the piece, like Play (M24-C). Feed the result
+/// to [`sync_backing`] as its `playing`, so stepping off 1× pauses the backing
+/// and stepping back re-syncs it at the playhead.
+pub fn backing_audible(playing: bool, playback_rate: f64) -> bool {
+    playing && rockcraft_core::rate_to_permille(playback_rate) == rockcraft_core::RATE_UNITY
+}
+
 /// Decide what the backing should do given the current and previous transport
 /// state, and dispatch the appropriate message to the backing thread.
 ///
@@ -783,6 +792,16 @@ mod tests {
             ],
         );
         // Reached here without panicking — pass.
+    }
+
+    /// The editor backing only sounds while playing at 1× (M24-C).
+    #[test]
+    fn backing_audible_only_at_unity_while_playing() {
+        assert!(backing_audible(true, 1.0));
+        assert!(!backing_audible(false, 1.0));
+        assert!(!backing_audible(true, 0.875));
+        assert!(!backing_audible(true, 0.5));
+        assert!(!backing_audible(true, 1.5));
     }
 
     /// A seek that sat in the queue lands where the transport is *now*: 2 s at

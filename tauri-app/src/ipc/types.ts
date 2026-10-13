@@ -110,6 +110,12 @@ export interface ComposerSnapshot {
   input_mode: InputMode;
   playing: boolean;
   playhead_us: number;
+  /**
+   * Transport speed multiplier (1 = the piece's own tempo, 0.5 = half speed),
+   * set by `set_playback_rate` (the editor's `!` / `@`). The playhead advances
+   * at this rate; the backing audio is muted off 1×.
+   */
+  playback_rate: number;
   looping: boolean;
   loop_start_us: number;
   loop_end_us: number;
@@ -315,6 +321,7 @@ export type ActionName =
   | "stop"
   | "play"
   | "set_playhead"
+  | "set_playback_rate"
   // ── backing alignment ───────────────────────────────────────────────
   | "nudge_backing_offset"
   // ── grid phase (bar lines slide under fixed notes) ──────────────────
