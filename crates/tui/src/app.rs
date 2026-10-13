@@ -435,6 +435,8 @@ impl Shell {
         // The piece's tempo map (M16): without it the editor's bars disagree
         // with Play's, and a save would write an empty map over it.
         edit.set_bar_starts(load_meta_bar_starts(bundle_dir));
+        // `s` saves over this bundle and `E` plays it (M24-B).
+        edit.set_source_dir(bundle_dir.to_path_buf());
         // Preserve the bundle's own provenance; a bundle with no origin recorded
         // becomes `Edited` once reopened in the composer.
         edit.set_origin(load_meta_origin(bundle_dir).unwrap_or(TrackOrigin::Edited));
@@ -476,6 +478,40 @@ impl Shell {
             // so don't strand the player on a silent Play screen.
             _ => self.screen = Screen::Menu,
         }
+    }
+
+    /// Edit → Play (M24-B): save the piece in place if it has unsaved edits (or
+    /// was never saved), then open its bundle in Play, paused on the downbeat
+    /// of the cursor's bar. On a save/load failure the status line says why and
+    /// the editor stays up.
+    fn play_here(&mut self) {
+        let Screen::Edit(edit) = &mut self.screen else {
+            return;
+        };
+        let us = edit.cursor_song_us();
+        if edit.is_dirty() || edit.source_dir().is_none() {
+            match edit.save() {
+                Ok(_) => edit.mark_clean(),
+                Err(e) => {
+                    self.status = format!("save failed: {e}");
+                    return;
+                }
+            }
+        }
+        let Some(dir) = edit.source_dir().map(std::path::Path::to_path_buf) else {
+            return;
+        };
+        let play = match load_play_screen(&dir.join("song.mid"), self.synth.clone()) {
+            Ok(p) => p,
+            Err(e) => {
+                self.status = e;
+                return;
+            }
+        };
+        edit.leave();
+        let mut play = self.tuned(play);
+        play.seek_song_us(us);
+        self.screen = Screen::Play(Box::new(play));
     }
 
     /// Number of notes in the edit screen; `None` if not in edit mode.
@@ -728,6 +764,9 @@ impl Shell {
                         },
                         // Shift-S opens the "save to library" name overlay.
                         KeyCode::Char('S') => edit.start_save_prompt(),
+                        // Back to Play at the cursor's bar (M24-B; Play's `e`
+                        // is the way in), saving in place first if dirty.
+                        KeyCode::Char('E') => self.play_here(),
                         // `X` opens the split panel (drop markers, keep/discard
                         // and name segments, save kept parts — M10-D).
                         KeyCode::Char('X') => edit.enter_split_mode(),
@@ -2495,7 +2534,7 @@ mod tests {
         ));
 
         // Save: a named bundle lands under the library root.
-        let edit = EditScreen::from_timeline(tl, Grid::default_120());
+        let mut edit = EditScreen::from_timeline(tl, Grid::default_120());
         let dir = edit.save_to_library(&root, "My Song").expect("save");
         assert!(dir.join("song.mid").exists(), "bundle midi written");
         assert!(dir.join("meta.json").exists(), "bundle meta written");
@@ -2535,7 +2574,7 @@ mod tests {
                 .unwrap_or_default()
                 .as_nanos()
         ));
-        let edit = EditScreen::from_timeline(tl, Grid::default_120());
+        let mut edit = EditScreen::from_timeline(tl, Grid::default_120());
         edit.save_to_library(&root, "play me").expect("save");
 
         let mut shell = make_shell();
@@ -3395,6 +3434,80 @@ mod tests {
         shell.screen = Screen::Play(Box::new(play));
         shell.on_key(KeyCode::Char('e'));
         assert_eq!(edit_screen(&shell).cursor().step, 0);
+    }
+
+    // ── Edit → Play at the cursor's bar (M24-B) ─────────────────────────────
+
+    #[test]
+    fn saving_an_opened_bundle_in_place_keeps_its_backing() {
+        let dir = bundle_with_backing("inplace", true);
+        std::fs::write(dir.join("backing.ogg"), b"not empty").unwrap();
+        let mut shell = make_shell();
+        shell.open_edit_from_midi(&dir.join("song.mid"));
+        shell.on_key(KeyCode::Char('s'));
+        assert!(
+            shell.status.contains(&dir.display().to_string()),
+            "saved over the opened bundle: {}",
+            shell.status
+        );
+        assert_eq!(
+            std::fs::read(dir.join("backing.ogg")).unwrap(),
+            b"not empty",
+            "copying the backing onto itself must not truncate it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shift_e_in_edit_opens_play_paused_at_the_cursors_bar() {
+        let dir = tempo_mapped_bundle();
+        let mut shell = make_shell();
+        shell.open_edit_from_midi(&dir.join("song.mid"));
+        let Screen::Edit(edit) = &mut shell.screen else {
+            panic!("expected the edit screen");
+        };
+        // The fixture song is under a second long and Play clamps seeks to the
+        // song, so first add a note in bar 3 (making the piece dirty → `E`
+        // saves it in place), then park the cursor in bar 2.
+        edit.cursor_to_bar_at(6_500_000);
+        edit.on_key(KeyCode::Char('a'));
+        edit.cursor_to_bar_at(3_600_000); // mapped bar 2: [3.5 s, 6 s)
+
+        shell.on_key(KeyCode::Char('E'));
+
+        let play = play_screen(&shell);
+        assert_eq!(play.source(), Some(dir.join("song.mid").as_path()));
+        assert!(play.is_paused());
+        assert_eq!(play.song_us(), 3_500_000, "bar 2's downbeat");
+
+        // And Play's `e` goes straight back to the same bar.
+        shell.on_key(KeyCode::Char('e'));
+        assert_eq!(edit_screen(&shell).cursor().step, 2 * 16);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shift_e_on_a_dirty_piece_saves_it_in_place_first() {
+        let dir = tempo_mapped_bundle();
+        let before = std::fs::read(dir.join("song.mid")).unwrap();
+        let mut shell = make_shell();
+        shell.open_edit_from_midi(&dir.join("song.mid"));
+        let Screen::Edit(edit) = &mut shell.screen else {
+            panic!("expected the edit screen");
+        };
+        edit.cursor_to_bar_at(4_000_000);
+        edit.on_key(KeyCode::Char('a'));
+        assert!(edit.is_dirty(), "the edit made the piece dirty");
+
+        shell.on_key(KeyCode::Char('E'));
+
+        assert_eq!(shell.screen_name(), "play");
+        assert_ne!(
+            std::fs::read(dir.join("song.mid")).unwrap(),
+            before,
+            "saved over the bundle"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn play_screen(shell: &Shell) -> &PlayScreen {

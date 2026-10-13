@@ -186,7 +186,7 @@ mod tests {
             velocity: Velocity::new(80).unwrap(),
             hand: None,
         });
-        let edit = EditScreen::from_timeline(tl, Grid::default_120());
+        let mut edit = EditScreen::from_timeline(tl, Grid::default_120());
         let dir = edit.save_to_library(&root, name).expect("save");
         (root, dir)
     }

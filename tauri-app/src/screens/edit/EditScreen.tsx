@@ -1025,6 +1025,26 @@ export function EditScreen(props: Props): JSX.Element {
       });
   }
 
+  /** `E` (M24-B): back to Play, paused on the cursor's bar. The piece is saved
+   * in place first (a never-saved piece becomes a quick-save take). That way
+   * Play shows exactly what is in the editor, and the bundle is the backend's
+   * current one even after a save-as (the route's `dir` may be stale). The
+   * backend never copies a bundle's media onto itself (`is_same_file`). */
+  function playHere(): void {
+    const s = store.snap;
+    if (!s) return;
+    const atUs = cursorUsOf(s);
+    saveBundle({ kind: "in_place" })
+      .then((savedDir) => {
+        setDirty(false);
+        persistAlignment(savedDir);
+        navigate({ kind: "play", dir: savedDir, atUs });
+      })
+      .catch((e: unknown) => {
+        showFlash(`save failed: ${String(e)}`);
+      });
+  }
+
   function doSaveAs(name: string): void {
     saveBundle({ kind: "library", name })
       .then((dir) => {
@@ -1631,6 +1651,13 @@ export function EditScreen(props: Props): JSX.Element {
         e.preventDefault();
         setSaveName("");
         setOverlay("save-as");
+        return;
+      }
+      // `E` = back to Play at the cursor's bar (Play's `e` is the way in).
+      // The background-layer keymap owns `E` while it is open.
+      if (e.key === "E" && !bgMode()) {
+        e.preventDefault();
+        playHere();
         return;
       }
       // Tempo from a checkpoint: Alt + the tempo keys apply from the cursor's
@@ -3084,8 +3111,9 @@ function HelpOverlay(props: { onClose: () => void }): JSX.Element {
     {
       title: "Save / Exit",
       rows: [
-        "s             Quick save (recordings/)",
+        "s             Save (over the opened bundle; new piece → recordings/)",
         "S             Save to library (named)",
+        "E             Save, then Play from the cursor's bar (paused)",
         "?             Toggle help",
         "Esc           Back to menu (save prompt if dirty)",
       ],

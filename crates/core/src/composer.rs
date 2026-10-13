@@ -2288,8 +2288,9 @@ impl Composer {
         (self.bar_start_us(bar), self.bar_start_us(bar + 1))
     }
 
-    /// Microsecond position of the cursor on the time axis.
-    fn cursor_us(&self) -> u64 {
+    /// Microsecond position of the cursor on the time axis (song µs,
+    /// tempo-map aware). Edit → Play hands this over (M24-B).
+    pub fn cursor_us(&self) -> u64 {
         self.pos_us_of_step(self.cursor.step)
     }
 }
