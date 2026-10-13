@@ -72,7 +72,7 @@ pub const PLAY_RATE_MIN: u16 = 250;
 /// Fastest practice speed a host command may set (2×).
 pub const PLAY_RATE_MAX: u16 = 2000;
 /// The speeds `-` / `=` step through — the desktop's presets.
-pub const RATE_STEPS: [u16; 5] = [500, 625, 750, 875, 1000];
+pub const RATE_STEPS: [u16; 5] = rockcraft_core::RATE_STEPS;
 
 /// A backing audio track attached to a bundle, plus the file position that
 /// lines up with recording time 0 (`audio_start_us`, from Task C).
@@ -773,14 +773,12 @@ impl PlayScreen {
     /// 1×. From a speed off the steps (set over the socket) it moves to the
     /// nearest step in that direction. Returns the applied value.
     pub fn nudge_rate(&mut self, faster: bool) -> u16 {
-        let r = self.rate_permille;
-        let next = if faster {
-            RATE_STEPS.iter().copied().find(|&s| s > r)
-        } else {
-            RATE_STEPS.iter().copied().rev().find(|&s| s < r)
-        };
-        // Past either end of the steps (slower than 0.5×, or 1× and up), stay.
-        self.set_rate(next.unwrap_or(r))
+        // Shared with the editor's `!` / `@` (core's stepping helper). Past
+        // either end of the steps (slower than 0.5×, or 1× and up), stay.
+        self.set_rate(rockcraft_core::nudge_rate_permille(
+            self.rate_permille,
+            faster,
+        ))
     }
 
     /// Whether the take runs at anything but the piece's own tempo.

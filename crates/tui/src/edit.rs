@@ -44,16 +44,18 @@ use rockcraft_audio::{
 };
 use rockcraft_control::SegmentSpec;
 use rockcraft_core::{
-    backing_position_us, segments_from_splits, slice_segment, Action, BackgroundImage,
-    BackgroundStack, BackgroundVideo, BackingTrack, Bpm, BpmDelta, Composer, Cursor, Effect, Grid,
-    InputMode, Key, MidiNote, Note, NoteEvent, NoteId, RecordingMeta, Scale as MusicScale, Segment,
-    Subdivision, Timeline, TrackOrigin, Velocity,
+    backing_position_us, nudge_rate_permille, rate_to_permille, segments_from_splits,
+    slice_segment, Action, BackgroundImage, BackgroundStack, BackgroundVideo, BackingTrack, Bpm,
+    BpmDelta, Composer, Cursor, Effect, Grid, InputMode, Key, MidiNote, Note, NoteEvent, NoteId,
+    RecordingMeta, Scale as MusicScale, Segment, Subdivision, Timeline, TrackOrigin, Velocity,
+    RATE_UNITY,
 };
 use rockcraft_import::write_part_bundle;
 use rockcraft_midi::{events_to_smf_bytes, key_map as mock_key_map};
 
 use crate::highway::{build_spans, project, NoteSpan};
 use crate::keyboard::{black_key_col, is_black_key, white_index, Scale, LOWEST_MIDI};
+use crate::play::speed_badge;
 use crate::record::bundle_backing_filename;
 use crate::render::draw_keyboard;
 
@@ -289,6 +291,17 @@ fn key_to_action(code: KeyCode) -> Option<Action> {
 
         _ => return None,
     })
+}
+
+/// The transport-speed keys (M24-C): `Some(false)` for `!` (slower),
+/// `Some(true)` for `@` (faster), `None` otherwise. Matched on the produced
+/// character, so `!` works as Shift+1 on any layout and `@` as its own JIS key.
+fn speed_key(code: KeyCode) -> Option<bool> {
+    match code {
+        KeyCode::Char('!') => Some(false),
+        KeyCode::Char('@') => Some(true),
+        _ => None,
+    }
 }
 
 /// Map a `KeyCode` to the chord-selector [`Action`] it triggers while the
@@ -1091,6 +1104,13 @@ impl EditScreen {
         // degree, `[`/`]` cycle it, `s` toggles quality, Enter/Esc commit/cancel).
         let action = if self.composer.in_chord_mode() {
             chord_key_to_action(code)
+        } else if let Some(faster) = speed_key(code) {
+            // `!` / `@` step the transport speed through Play's presets
+            // (M24-C). Stateful (depends on the current rate), so it is
+            // resolved here rather than in the static keymap.
+            Some(Action::SetPlaybackRate {
+                rate_permille: nudge_rate_permille(self.rate_permille(), faster),
+            })
         } else {
             key_to_action(code)
         };
@@ -1292,11 +1312,26 @@ impl EditScreen {
         backing_position_us(self.playhead_us(), 0, self.composer.backing_offset_us())
     }
 
+    /// The transport speed in permille (1000 = 1×), as `!` / `@` step it.
+    pub fn rate_permille(&self) -> u16 {
+        rate_to_permille(self.composer.playback_rate())
+    }
+
+    /// Whether the backing track should sound: the transport is playing at the
+    /// piece's own tempo. Off-tempo it is muted, like Play.
+    fn backing_audible(&self) -> bool {
+        self.is_playing() && self.rate_permille() == RATE_UNITY
+    }
+
     /// Decide what the backing should do this tick from the transport state, and
     /// record the playing/playhead snapshot for the next call. Pure (touches no
     /// device), so the sync decision is headless-testable.
     fn poll_backing(&mut self) -> BackingCmd {
-        let playing = self.is_playing();
+        // Below (or above) 1× the backing is off-tempo, so it is muted (paused)
+        // and the synth carries the piece — as in Play. Treating "audible" as
+        // the playing signal means a step off 1× pauses it and the step back
+        // re-syncs it at the playhead.
+        let playing = self.backing_audible();
         let ph = self.playhead_us();
         let offset = self.composer.backing_offset_us();
         let Some(target) = self.backing_target_us() else {
@@ -1356,8 +1391,8 @@ impl EditScreen {
         };
         let Some(h) = &self.backing_handle else {
             // Not started yet: the first play (or a decode that finished mid-
-            // play) starts it at the playhead.
-            if self.is_playing() {
+            // play) starts it at the playhead — only at 1×.
+            if self.backing_audible() {
                 if let Some(pos) = self.backing_target_us() {
                     match out.play_at(&track, Duration::from_micros(pos)) {
                         Ok(h) => self.backing_handle = Some(h),
@@ -1870,6 +1905,19 @@ impl EditScreen {
         } else {
             Span::raw("")
         };
+        // Practice speed (M24-C): a badge only when off 1×, as in Play.
+        let speed = speed_badge(self.rate_permille());
+        let speed_span = if speed.is_empty() {
+            Span::raw("")
+        } else {
+            Span::styled(
+                format!(" {} ", speed.trim_end()),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            )
+        };
         let loop_span = if self.composer.is_looping() {
             let (ls, le) = self.composer.loop_bounds();
             let (lb, _) = self.grid.bar_beat_of(ls);
@@ -1950,6 +1998,7 @@ impl EditScreen {
         let line = Line::from(vec![
             Span::styled(badge_text, badge_style),
             playing_span,
+            speed_span,
             loop_span,
             metro_span,
             count_in_span,
@@ -2387,6 +2436,12 @@ impl EditScreen {
             )),
             Line::from(Span::raw(
                 "  (Space toggles — press again to stop; PLAYING shows in status)",
+            )),
+            Line::from(Span::raw(
+                "  ! : Slower (down to ½×)    @ : Faster (back up to 1×)",
+            )),
+            Line::from(Span::raw(
+                "  (backing audio is muted below 1×; the synth carries the piece)",
             )),
             Line::from(Span::raw("")), // Empty line
             Line::from(Span::styled(
@@ -4579,6 +4634,73 @@ mod tests {
         assert!(e.is_playing());
         let target = e.backing_target_us().unwrap();
         assert_eq!(e.poll_backing(), BackingCmd::PlayAt(target));
+    }
+
+    #[test]
+    fn bang_and_at_step_the_playback_rate() {
+        let mut e = EditScreen::new();
+        assert_eq!(e.rate_permille(), 1000);
+        e.on_key(KeyCode::Char('!'));
+        assert_eq!(e.rate_permille(), 875);
+        assert!((e.composer.playback_rate() - 0.875).abs() < 1e-9);
+        for _ in 0..6 {
+            e.on_key(KeyCode::Char('!'));
+        }
+        assert_eq!(e.rate_permille(), 500, "clamps at half speed");
+        e.on_key(KeyCode::Char('@'));
+        assert_eq!(e.rate_permille(), 625);
+        for _ in 0..6 {
+            e.on_key(KeyCode::Char('@'));
+        }
+        assert_eq!(e.rate_permille(), 1000, "never above 1x");
+        // A speed change is not an edit.
+        assert!(!e.is_dirty());
+    }
+
+    #[test]
+    fn rate_survives_stop_and_replay() {
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('!'));
+        e.on_key(KeyCode::Char('P'));
+        e.on_key(KeyCode::Char(' '));
+        e.on_key(KeyCode::Char('P'));
+        assert_eq!(e.rate_permille(), 875);
+    }
+
+    #[test]
+    fn backing_is_muted_below_unity_and_resyncs_at_unity() {
+        let mut e = EditScreen::new().with_backing(PathBuf::from("backing.wav"), 0);
+        // Slowed before play: the backing never starts.
+        e.on_key(KeyCode::Char('!'));
+        e.on_key(KeyCode::Char('P'));
+        assert!(e.is_playing());
+        assert!(!e.backing_audible());
+        assert_eq!(e.poll_backing(), BackingCmd::None);
+        e.advance(1_000_000);
+        assert_eq!(e.poll_backing(), BackingCmd::None);
+        // Back to 1x mid-play: it starts at the (slowed) playhead.
+        e.on_key(KeyCode::Char('@'));
+        let target = e.backing_target_us().unwrap();
+        assert_eq!(target, 875_000);
+        assert_eq!(e.poll_backing(), BackingCmd::PlayAt(target));
+        // Slowing again while playing pauses it.
+        e.on_key(KeyCode::Char('!'));
+        assert_eq!(e.poll_backing(), BackingCmd::Pause);
+    }
+
+    #[test]
+    fn status_shows_speed_badge_only_off_unity() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut e = EditScreen::new();
+        let text = |e: &EditScreen| {
+            let mut term = Terminal::new(TestBackend::new(200, 30)).unwrap();
+            term.draw(|f| e.draw(f, f.area())).unwrap();
+            let buf = term.backend().buffer().clone();
+            buf.content().iter().map(|c| c.symbol()).collect::<String>()
+        };
+        assert!(!text(&e).contains("0.875×"));
+        e.on_key(KeyCode::Char('!'));
+        assert!(text(&e).contains("0.875×"));
     }
 
     #[test]
