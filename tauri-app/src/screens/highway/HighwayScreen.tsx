@@ -300,6 +300,12 @@ export function HighwayScreen() {
         e.preventDefault();
         restart();
         break;
+      case "e":
+      case "E":
+        // Spotted a mis-edit: open this bundle in Edit at the current bar.
+        e.preventDefault();
+        editHere();
+        break;
       case " ":
         // Play/pause toggle once running.
         e.preventDefault();
@@ -649,6 +655,17 @@ export function HighwayScreen() {
     replay(true);
   }
 
+  /** `e` / the ✎ button (M23-A): open this bundle in Edit with the cursor on
+   * the bar the playhead is in. The hand-over is in *song* µs (play clock minus
+   * the count-in shift) because Play's `bar` counts the pre-roll bars and the
+   * composer's doesn't. Leaving unmounts this screen, whose cleanup finishes
+   * the take — so no explicit pause. */
+  function editHere(): void {
+    if (dir === undefined || !started() || summary()) return;
+    const atUs = Math.max(0, (playState()?.time_us ?? 0) - shiftUs);
+    navigate({ kind: "edit", dir, atUs });
+  }
+
   onMount(() => {
     // No bundle → empty-state guard; nothing to drive (Esc → menu via shell).
     if (!live || dir === undefined) return;
@@ -734,6 +751,7 @@ export function HighwayScreen() {
           rate={rate}
           splitName={() => noteName(split())}
           onRestart={restart}
+          onEditHere={editHere}
           canRestart={() => started() && !summary()}
         />
         <div style={{ flex: "1 1 auto", "min-height": 0, position: "relative" }}>

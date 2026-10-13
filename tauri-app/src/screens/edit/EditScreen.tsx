@@ -248,6 +248,11 @@ interface Props {
    * the `R` key dispatches.
    */
   armed?: boolean;
+  /**
+   * Song time (µs) to land on: once the bundle loads, the cursor jumps to the
+   * downbeat of the bar containing it — Play's "edit here" (M23-A).
+   */
+  atUs?: number;
 }
 
 export function EditScreen(props: Props): JSX.Element {
@@ -1911,10 +1916,18 @@ export function EditScreen(props: Props): JSX.Element {
     // otherwise fetch the current state.
     const init = (
       props.dir
-        ? loadBundle(props.dir).then((snap) => {
-            applySnapshot(snap);
-            setDirty(false);
-          })
+        ? loadBundle(props.dir)
+            .then((snap) => {
+              applySnapshot(snap);
+              setDirty(false);
+              // Play → Edit (M23-A): land on the bar the playhead was in. The
+              // backend pushes the moved-cursor snapshot via `onSnapshot`.
+              if (props.atUs !== undefined) {
+                return runAction("cursor_to_bar_at", {
+                  us: Math.max(0, Math.round(props.atUs)),
+                }).then(() => undefined);
+              }
+            })
         : queryState().then(applySnapshot)
     ).then(() => {
       // Re-attach the backend's backdrop video + backing on BOTH paths so a

@@ -12,9 +12,10 @@ export type Screen =
    * LiveRecord input modes) and hand-edits the same timeline. `dir` carries the
    * bundle directory when continuing/opening an existing bundle; `armed` opens
    * it already in record mode (the "New piece" entry point). The standalone
-   * `record` screen was retired into this one.
+   * `record` screen was retired into this one. `atUs` (song µs) puts the cursor
+   * on the downbeat of the bar containing it — Play's "edit here" (M23-A).
    */
-  | { kind: "edit"; dir?: string; armed?: boolean }
+  | { kind: "edit"; dir?: string; armed?: boolean; atUs?: number }
   | { kind: "video-picker" }
   | { kind: "url-input" }
   | { kind: "importing" }

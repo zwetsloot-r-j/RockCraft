@@ -432,6 +432,9 @@ impl Shell {
         let mut edit = EditScreen::from_timeline(timeline, grid);
         edit.set_key(key);
         edit.set_hand_split(hand_split);
+        // The piece's tempo map (M16): without it the editor's bars disagree
+        // with Play's, and a save would write an empty map over it.
+        edit.set_bar_starts(load_meta_bar_starts(bundle_dir));
         // Preserve the bundle's own provenance; a bundle with no origin recorded
         // becomes `Edited` once reopened in the composer.
         edit.set_origin(load_meta_origin(bundle_dir).unwrap_or(TrackOrigin::Edited));
@@ -452,6 +455,27 @@ impl Shell {
             edit = edit.with_video(vpath, file, offset);
         }
         self.screen = Screen::Edit(Box::new(edit));
+    }
+
+    /// Play → Edit (M23-A): stop the take, open the same bundle in the
+    /// composer, and put the cursor on the downbeat of the bar the playhead was
+    /// in. A no-op off the Play screen or when the play screen has no bundle.
+    fn edit_here(&mut self) {
+        let Screen::Play(play) = &mut self.screen else {
+            return;
+        };
+        let Some(midi) = play.source().map(std::path::Path::to_path_buf) else {
+            return;
+        };
+        let us = play.song_us();
+        play.leave();
+        self.open_edit_from_midi(&midi);
+        match &mut self.screen {
+            Screen::Edit(edit) => edit.cursor_to_bar_at(us),
+            // The reopen failed (status says why); the take is already stopped,
+            // so don't strand the player on a silent Play screen.
+            _ => self.screen = Screen::Menu,
+        }
     }
 
     /// Number of notes in the edit screen; `None` if not in edit mode.
@@ -551,6 +575,9 @@ impl Shell {
                     self.screen = Screen::Menu;
                 }
                 KeyCode::Char('r') => play.restart(),
+                // Fix a mis-edit on the spot (M23-A): reopen this bundle in
+                // Edit with the cursor on the bar the playhead is in.
+                KeyCode::Char('e') => self.edit_here(),
                 KeyCode::Char(' ') => play.toggle_pause(),
                 // Song audio: backing → synth → off (backing only if present).
                 KeyCode::Char('m') => {
@@ -1485,6 +1512,16 @@ fn load_meta_grid_key(bundle_dir: &std::path::Path) -> (Grid, Key) {
     )
 }
 
+/// Read a bundle's tempo map (`meta.bar_starts`, M16); empty — i.e. uniform
+/// bars — when there is no manifest, it fails to parse, or it has no map.
+fn load_meta_bar_starts(bundle_dir: &std::path::Path) -> Vec<u64> {
+    std::fs::read_to_string(bundle_dir.join("meta.json"))
+        .ok()
+        .and_then(|json| RecordingMeta::from_json(&json).ok())
+        .map(|meta| meta.bar_starts)
+        .unwrap_or_default()
+}
+
 /// Resolve a bundle's backing track from its `meta.json`, returning the
 /// absolute file path (relative to the bundle dir, so it stays movable) and the
 /// `audio_start_us` offset. `None` when there is no manifest or no backing.
@@ -1625,7 +1662,8 @@ fn load_play_screen(
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "song".into());
     let mut play = PlayScreen::from_smf_bytes(title, &bytes, synth)
-        .map_err(|e| format!("load failed: {e}"))?;
+        .map_err(|e| format!("load failed: {e}"))?
+        .with_source(midi_path.to_path_buf());
 
     // A bundle keeps its manifest next to song.mid; resolve the backing track
     // (if any) relative to that directory so the bundle stays movable.
@@ -3275,6 +3313,75 @@ mod tests {
         shell.on_key(KeyCode::Char('m'));
         assert_eq!(play_screen(&shell).song_audio(), SongAudio::Backing);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Play → Edit at the current bar (M23-A) ──────────────────────────────
+
+    /// A bundle with a tempo map: 4/4 @120 sixteenths (16 steps per bar) whose
+    /// bars are [0,2s) [2s,3.5s) [3.5s,6s) — bar 2 is not where uniform 2s bars
+    /// would put it.
+    fn tempo_mapped_bundle() -> std::path::PathBuf {
+        let dir = bundle_with_backing("edit_here", false);
+        let json = std::fs::read_to_string(dir.join("meta.json")).unwrap();
+        let mut meta = RecordingMeta::from_json(&json).unwrap();
+        meta.grid = Some(Grid {
+            subdivision: rockcraft_core::Subdivision::Sixteenth,
+            ..Grid::default_120()
+        });
+        meta.bar_starts = vec![0, 2_000_000, 3_500_000, 6_000_000];
+        std::fs::write(dir.join("meta.json"), meta.to_json()).unwrap();
+        dir
+    }
+
+    fn edit_screen(shell: &Shell) -> &EditScreen {
+        match &shell.screen {
+            Screen::Edit(edit) => edit,
+            _ => panic!("expected the edit screen, got {}", shell.screen_name()),
+        }
+    }
+
+    #[test]
+    fn opening_a_bundle_in_edit_keeps_its_tempo_map() {
+        let dir = tempo_mapped_bundle();
+        let mut shell = make_shell();
+        shell.open_edit_from_midi(&dir.join("song.mid"));
+        let Screen::Edit(edit) = &mut shell.screen else {
+            panic!("expected the edit screen, got {}", shell.screen_name());
+        };
+        assert_eq!(
+            edit.composer_mut().bar_starts(),
+            &[0, 2_000_000, 3_500_000, 6_000_000]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn e_on_play_opens_edit_at_the_playheads_bar() {
+        let dir = tempo_mapped_bundle();
+        let mut shell = make_shell();
+        let mut play = load_play_screen(&dir.join("song.mid"), None).unwrap();
+        // Learn the count-in shift, then park the playhead at song time 3.6s.
+        play.seek_to(20_000_000);
+        let shift = 20_000_000 - play.song_us();
+        play.seek_to(shift + 3_600_000);
+        play.toggle_pause();
+        shell.screen = Screen::Play(Box::new(play));
+
+        shell.on_key(KeyCode::Char('e'));
+
+        let edit = edit_screen(&shell);
+        // 3.6s is in the mapped bar 2 (uniform 2s bars would say bar 1).
+        assert_eq!(edit.cursor().step, 2 * 16);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn e_during_the_pre_roll_opens_edit_at_bar_zero() {
+        let mut shell = make_shell();
+        let play = load_play_screen(&midi_only_fixture().join("song.mid"), None).unwrap();
+        shell.screen = Screen::Play(Box::new(play));
+        shell.on_key(KeyCode::Char('e'));
+        assert_eq!(edit_screen(&shell).cursor().step, 0);
     }
 
     fn play_screen(shell: &Shell) -> &PlayScreen {
