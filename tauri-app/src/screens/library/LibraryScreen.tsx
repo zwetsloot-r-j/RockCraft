@@ -7,6 +7,8 @@
 //   ArrowDown/j — move selection down
 //   Enter / p   — open in Play
 //   e           — open in Edit
+//   x           — export the selected song as a .rcsong file (M26-A)
+//   i           — import a .rcsong file into the library (M26-A)
 //   Esc / q     — back to menu
 //
 // Mouse: click selects, double-click plays.
@@ -19,7 +21,14 @@ import {
   Show,
   type JSX,
 } from "solid-js";
-import { scanLibrary } from "../../ipc/bridge";
+import {
+  libraryExportSong,
+  libraryImportSong,
+  openSongFilePicker,
+  saveSongFilePicker,
+  scanLibrary,
+} from "../../ipc/bridge";
+import { baseName, existsSlug, freeSlug } from "./songFiles";
 import type { LibraryEntryDto } from "../../ipc/types";
 import { useRouter } from "../../shell/Router";
 
@@ -56,21 +65,107 @@ export function LibraryScreen(): JSX.Element {
   const [entries, setEntries] = createSignal<LibraryEntryDto[]>([]);
   const [selected, setSelected] = createSignal(0);
   const [loading, setLoading] = createSignal(true);
+  /** One-line result of the last export/import, shown in the footer. */
+  const [flash, setFlash] = createSignal<string | null>(null);
+  /** An import whose folder name is taken, awaiting Replace / Keep both. */
+  const [conflict, setConflict] = createSignal<{ path: string; slug: string } | null>(null);
   /** The scrollable list panel; its element children are the rows, in order. */
   let listEl: HTMLDivElement | undefined;
+  let flashTimer: number | undefined;
 
-  // Load bundles on mount.
-  onMount(() => {
-    scanLibrary()
+  function showFlash(msg: string): void {
+    setFlash(msg);
+    window.clearTimeout(flashTimer);
+    flashTimer = window.setTimeout(() => setFlash(null), 4000);
+  }
+  onCleanup(() => window.clearTimeout(flashTimer));
+
+  /** Re-read the library; select the bundle at `dir` when given. */
+  function rescan(dir?: string): Promise<void> {
+    return scanLibrary()
       .then((list) => {
         setEntries(list);
         setLoading(false);
+        if (dir !== undefined) {
+          const norm = (p: string) => p.replace(/\\/g, "/");
+          const idx = list.findIndex(
+            (e) => e.name === baseName(dir) && norm(e.dir).endsWith(norm(dir)),
+          );
+          if (idx >= 0) {
+            setSelected(idx);
+            listEl?.children[idx]?.scrollIntoView({ block: "nearest" });
+          }
+        }
       })
       .catch(() => {
         // Backend not available (e.g. plain Vite without Tauri) — show empty.
         setLoading(false);
       });
-  });
+  }
+
+  // Load bundles on mount.
+  onMount(() => void rescan());
+
+  /** `x`: write the selected song to a .rcsong file the user picks. */
+  async function exportSelected(): Promise<void> {
+    const e = entries()[selected()];
+    if (!e) return;
+    const path = await saveSongFilePicker(e.name);
+    if (path === null) return;
+    try {
+      const written = await libraryExportSong(e.dir, path);
+      showFlash(`exported → ${baseName(written)}`);
+    } catch (err) {
+      showFlash(`export failed: ${String(err)}`);
+    }
+  }
+
+  /** Import `path`; a taken name opens the Replace / Keep both prompt. */
+  async function importFile(path: string, overwrite: boolean, name: string | null): Promise<void> {
+    try {
+      const dir = await libraryImportSong(path, overwrite, name);
+      await rescan(dir);
+      showFlash(`imported ${baseName(dir)}`);
+    } catch (err) {
+      const slug = existsSlug(err);
+      if (slug !== null && !overwrite) {
+        setConflict({ path, slug });
+      } else {
+        showFlash(`import failed: ${String(err)}`);
+      }
+    }
+  }
+
+  /** `i`: pick a .rcsong file and import it. */
+  async function importPicked(): Promise<void> {
+    const path = await openSongFilePicker();
+    if (path !== null) await importFile(path, false, null);
+  }
+
+  /** Keys while the name-conflict prompt is open: it owns the keyboard. */
+  function onConflictKey(ev: KeyboardEvent, c: { path: string; slug: string }): void {
+    ev.preventDefault();
+    ev.stopPropagation();
+    switch (ev.key) {
+      case "r":
+      case "R":
+        setConflict(null);
+        void importFile(c.path, true, null);
+        break;
+      case "k":
+      case "K":
+        setConflict(null);
+        void importFile(c.path, false, freeSlug(c.slug, entries().map((e) => e.name)));
+        break;
+      case "Escape":
+      case "c":
+      case "C":
+        setConflict(null);
+        break;
+      default:
+        break;
+    }
+  }
 
   function clampSel(idx: number): number {
     const n = entries().length;
@@ -100,6 +195,11 @@ export function LibraryScreen(): JSX.Element {
   }
 
   function onKeydown(ev: KeyboardEvent): void {
+    const c = conflict();
+    if (c !== null) {
+      onConflictKey(ev, c);
+      return;
+    }
     switch (ev.key) {
       case "ArrowUp":
       case "k":
@@ -119,6 +219,14 @@ export function LibraryScreen(): JSX.Element {
       case "e":
         ev.preventDefault();
         openEdit(selected());
+        break;
+      case "x":
+        ev.preventDefault();
+        void exportSelected();
+        break;
+      case "i":
+        ev.preventDefault();
+        void importPicked();
         break;
       case "Escape":
       case "q":
@@ -167,7 +275,7 @@ export function LibraryScreen(): JSX.Element {
           Library
         </div>
         <div style={{ "font-size": "12px", color: DIM }}>
-          ↑/↓/j/k move · Enter/p Play · e Edit · Esc back
+          ↑/↓/j/k move · Enter/p Play · e Edit · x export · i import · Esc back
         </div>
       </div>
 
@@ -323,9 +431,29 @@ export function LibraryScreen(): JSX.Element {
         </Show>
       </div>
 
+      {/* Name-conflict prompt (import) */}
+      <Show when={conflict()}>
+        {(c) => (
+          <div
+            style={{
+              border: `1px solid ${ACCENT}`,
+              "border-radius": "8px",
+              padding: "10px 14px",
+              "font-size": "13px",
+            }}
+          >
+            A song named <b>{c().slug}</b> is already in the library. R replace ·
+            K keep both · Esc cancel
+          </div>
+        )}
+      </Show>
+
       {/* Footer */}
-      <div style={{ "font-size": "12px", color: DIM }}>
-        {entries().length} track{entries().length !== 1 ? "s" : ""}
+      <div style={{ "font-size": "12px", color: DIM, display: "flex", gap: "16px" }}>
+        <span>
+          {entries().length} track{entries().length !== 1 ? "s" : ""}
+        </span>
+        <Show when={flash()}>{(m) => <span style={{ color: FG }}>{m()}</span>}</Show>
       </div>
     </div>
   );

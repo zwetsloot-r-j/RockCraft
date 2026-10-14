@@ -191,6 +191,30 @@ fn latest_recording() -> Option<String> {
     library::latest_recording_inner(&rockcraft_midi::bundle::default_scan_roots())
 }
 
+/// Export a library bundle as a `.rcsong` song file (M26-A). Paired with
+/// [`HostCommand::ExportSongFile`](rockcraft_control::HostCommand::ExportSongFile).
+#[tauri::command]
+fn library_export_song(bundle: String, path: String) -> Result<String, String> {
+    library::export_song(&bundle, &path)
+}
+
+/// Import a `.rcsong` song file into the library (M26-A). Paired with
+/// [`HostCommand::ImportSongFile`](rockcraft_control::HostCommand::ImportSongFile).
+/// Fails with `exists:<slug>` when the slug is taken and `overwrite` is false.
+#[tauri::command]
+fn library_import_song(
+    path: String,
+    overwrite: bool,
+    name: Option<String>,
+) -> Result<String, String> {
+    library::import_song(
+        &path,
+        &rockcraft_midi::bundle::library_root(),
+        overwrite,
+        name.as_deref(),
+    )
+}
+
 /// Save the current composer timeline to a bundle.
 ///
 /// `dest` selects the target:
@@ -638,6 +662,8 @@ pub fn run() {
             query_help,
             scan_library,
             latest_recording,
+            library_export_song,
+            library_import_song,
             save_bundle,
             load_bundle,
             query_dirty,

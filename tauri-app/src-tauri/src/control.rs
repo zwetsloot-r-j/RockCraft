@@ -329,6 +329,26 @@ impl HostServices for TauriHost<'_> {
                 }
             }
 
+            HostCommand::ExportSongFile { bundle, path } => {
+                match crate::library::export_song(&bundle, &path) {
+                    Ok(path) => Ok(serde_json::json!({ "path": path })),
+                    Err(e) => failed("export_song_file", e),
+                }
+            }
+            HostCommand::ImportSongFile {
+                path,
+                overwrite,
+                name,
+            } => match crate::library::import_song(
+                &path,
+                &rockcraft_midi::bundle::library_root(),
+                overwrite,
+                name.as_deref(),
+            ) {
+                Ok(dir) => Ok(serde_json::json!({ "dir": dir })),
+                Err(e) => failed("import_song_file", e),
+            },
+
             // ── play ────────────────────────────────────────────────────
             HostCommand::PlayLoad { dir } => {
                 match crate::play::play_load(

@@ -1041,6 +1041,30 @@ impl rockcraft_control::HostServices for Shell {
                     }),
                 }
             }
+            HostCommand::ExportSongFile { bundle, path } => rockcraft_share::export_song_file(
+                std::path::Path::new(&bundle),
+                std::path::Path::new(&path),
+            )
+            .map(|p| json!({ "path": p.to_string_lossy() }))
+            .map_err(|e| HostError::Failed {
+                command: "export_song_file".into(),
+                detail: e.to_string(),
+            }),
+            HostCommand::ImportSongFile {
+                path,
+                overwrite,
+                name,
+            } => rockcraft_share::import_song_file(
+                std::path::Path::new(&path),
+                &rockcraft_midi::bundle::library_root(),
+                overwrite,
+                name.as_deref(),
+            )
+            .map(|d| json!({ "dir": d.to_string_lossy() }))
+            .map_err(|e| HostError::Failed {
+                command: "import_song_file".into(),
+                detail: e.to_string(),
+            }),
             // Interactive, screen-state-machine workflows with no headless entry
             // point in the TUI. Explicit, compiler-checked Unsupported arms.
             HostCommand::SaveBundle { .. } => Err(HostError::Unsupported("save_bundle".into())),
@@ -1763,6 +1787,15 @@ mod tests {
             HostCommand::LoadBundle { dir: "x".into() },
             HostCommand::QueryDirty,
             HostCommand::SplitBundle { segments: vec![] },
+            HostCommand::ExportSongFile {
+                bundle: "does/not/exist".into(),
+                path: "does/not/exist/out.rcsong".into(),
+            },
+            HostCommand::ImportSongFile {
+                path: "does/not/exist.rcsong".into(),
+                overwrite: false,
+                name: None,
+            },
             HostCommand::PlayLoad {
                 dir: "does/not/exist".into(),
             },
