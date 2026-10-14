@@ -1082,6 +1082,9 @@ impl rockcraft_control::HostServices for Shell {
                 Ok(serde_json::Value::Null)
             }
             HostCommand::ShareStatus => Ok(json!(self.share.status())),
+            HostCommand::ShareDiscover { timeout_ms } => Ok(json!(self.share.discover(
+                std::time::Duration::from_millis(timeout_ms.unwrap_or(1500) as u64)
+            ))),
             HostCommand::ShareList { server } => match self.share.list(&server) {
                 Ok(songs) => Ok(json!(songs)),
                 Err(e) => Err(HostError::Failed {
@@ -1879,6 +1882,9 @@ mod tests {
             // Port 0 = any free port; nothing listens on 127.0.0.1:1.
             HostCommand::ShareStart { port: Some(0) },
             HostCommand::ShareStatus,
+            HostCommand::ShareDiscover {
+                timeout_ms: Some(50),
+            },
             HostCommand::ShareList {
                 server: "127.0.0.1:1".into(),
             },

@@ -8,11 +8,13 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde::Serialize;
 
 use crate::archive;
 use crate::client;
+use crate::discovery::{discover, Advertiser, Peer};
 use crate::error::ShareError;
 use crate::net::{host_name, lan_addresses};
 use crate::server::{RemoteSong, ShareServer};
@@ -28,6 +30,11 @@ pub struct ShareStatus {
     /// `ip:port` per LAN address while running; empty when stopped.
     pub addresses: Vec<String>,
     pub name: String,
+    /// Whether other devices can find us automatically (M26-C). False when
+    /// not sharing, or when mDNS couldn't start; then they need an address.
+    pub discoverable: bool,
+    /// Why advertising failed, when it did.
+    pub discovery_error: Option<String>,
 }
 
 /// How a remote song relates to the local library.
@@ -96,6 +103,10 @@ pub struct ShareService {
     roots: Vec<PathBuf>,
     library: PathBuf,
     server: Option<ShareServer>,
+    /// The mDNS advertisement while sharing (M26-C); `None` when stopped or
+    /// when mDNS is unavailable (see `discovery_error`).
+    advertiser: Option<Advertiser>,
+    discovery_error: Option<String>,
     transfers: Table,
     next_id: AtomicU64,
 }
@@ -107,6 +118,8 @@ impl ShareService {
             roots,
             library,
             server: None,
+            advertiser: None,
+            discovery_error: None,
             transfers: Arc::new(Mutex::new(Vec::new())),
             next_id: AtomicU64::new(1),
         }
@@ -129,20 +142,38 @@ impl ShareService {
             (Some(_), None) => false,
         };
         if restart {
-            self.server = None;
-            self.server = Some(ShareServer::start(
-                port,
-                self.roots.clone(),
-                self.library.clone(),
-                host_name(),
-            )?);
+            self.stop();
+            let server =
+                ShareServer::start(port, self.roots.clone(), self.library.clone(), host_name())?;
+            // Sharing works without discovery; remember why it's missing.
+            match Advertiser::start(&host_name(), server.port()) {
+                Ok(ad) => self.advertiser = Some(ad),
+                Err(e) => {
+                    eprintln!("[share] not discoverable: {e}");
+                    self.discovery_error = Some(e);
+                }
+            }
+            self.server = Some(server);
         }
         Ok(self.status())
     }
 
     /// Stop sharing (a no-op when not sharing).
     pub fn stop(&mut self) {
+        self.advertiser = None;
+        self.discovery_error = None;
         self.server = None;
+    }
+
+    /// The port we share on, if sharing — what [`discover`] excludes. Lets a
+    /// frontend browse without holding its lock on the service.
+    pub fn own_port(&self) -> Option<u16> {
+        self.server.as_ref().map(ShareServer::port)
+    }
+
+    /// Browse the network for other sharing instances (M26-C).
+    pub fn discover(&self, timeout: Duration) -> Vec<Peer> {
+        discover(timeout, self.own_port())
     }
 
     /// Whether and where this instance shares.
@@ -160,6 +191,8 @@ impl ShareService {
                 })
                 .unwrap_or_default(),
             name: host_name(),
+            discoverable: self.advertiser.is_some(),
+            discovery_error: self.discovery_error.clone(),
         }
     }
 

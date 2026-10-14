@@ -227,8 +227,13 @@ pub enum HostCommand {
     ShareStart { port: Option<u16> },
     /// Stop sharing.
     ShareStop,
-    /// Whether and where this instance shares: `{ running, port, addresses, name }`.
+    /// Whether and where this instance shares: `{ running, port, addresses,
+    /// name, discoverable, discovery_error }`.
     ShareStatus,
+    /// Browse the home network (mDNS) for other sharing instances for
+    /// `timeout_ms` (default 1500); returns `[{ name, addr, api }]`, this
+    /// instance excluded. Empty when multicast is unavailable (M26-C).
+    ShareDiscover { timeout_ms: Option<u32> },
     /// List the songs another instance (`server` = `host:port`) shares, each
     /// with `local`: `same` / `different` / `absent` against our library.
     ShareList { server: String },
@@ -333,6 +338,7 @@ impl HostCommand {
             HostCommand::ShareStart { .. } => "share_start",
             HostCommand::ShareStop => "share_stop",
             HostCommand::ShareStatus => "share_status",
+            HostCommand::ShareDiscover { .. } => "share_discover",
             HostCommand::ShareList { .. } => "share_list",
             HostCommand::ShareDownload { .. } => "share_download",
             HostCommand::ShareUpload { .. } => "share_upload",
@@ -485,6 +491,7 @@ pub fn host_command_names() -> &'static [&'static str] {
         "share_start",
         "share_stop",
         "share_status",
+        "share_discover",
         "share_list",
         "share_download",
         "share_upload",
@@ -574,7 +581,8 @@ static HOST_HELP: &[HostCommandInfo] = {
         HostCommandInfo { name: "import_score", params: &[p("path", "String")], description: "Start importing a local score file (MusicXML/.xml/.mxl/.abc/.krn) or a scan (.pdf/.png/.jpg/.jpeg/.tif/.tiff/.bmp). A score file is a deterministic transform whose notated tempo, metre and key seed the new bundle's grid. A scan goes through an optical music recognition engine first, which is lossy: its notes carry a derived confidence, the import log reports how many were flagged, and it needs an OMR engine installed (see docs/IMPORT.md)." },
         HostCommandInfo { name: "share_start", params: &[p("port", "u16?")], description: "Share this library on the home network over HTTP: port 47800 (or the next free up to 47809; `port` pins one, 0 = any). Peers outside the home network are refused; no other auth. Already sharing: no-op. Returns {running, port, addresses, name}." },
         HostCommandInfo { name: "share_stop", params: &[], description: "Stop sharing this library (running transfers finish)." },
-        HostCommandInfo { name: "share_status", params: &[], description: "Whether and where this instance shares: {running, port, addresses: [\"ip:port\"], name}." },
+        HostCommandInfo { name: "share_status", params: &[], description: "Whether and where this instance shares: {running, port, addresses: [\"ip:port\"], name, discoverable, discovery_error}. discoverable is false when mDNS could not start (peers then need the address)." },
+        HostCommandInfo { name: "share_discover", params: &[p("timeout_ms", "u32?")], description: "Browse the home network (mDNS, _rockcraft._tcp) for other sharing instances for timeout_ms (default 1500). Returns [{name, addr: \"ip:port\", api}], this instance excluded; empty when multicast is unavailable (type the address instead)." },
         HostCommandInfo { name: "share_list", params: &[p("server", "String")], description: "List the songs another instance shares (`server` = host:port): {id, name, origin, note_count, duration_us, has_backing, has_video, size_bytes, chart_hash, local}, where local is same (a local song has this chart) / different (same name, other chart) / absent." },
         HostCommandInfo { name: "share_download", params: &[p("server", "String"), p("id", "String"), p("overwrite", "bool"), p("rename_to", "String?")], description: "Download song `id` (video included) from `server` into the library, in the background, as `rename_to` or its own name. Returns {transfer_id}; follow it with share_transfers (a taken name ends as state exists unless overwrite)." },
         HostCommandInfo { name: "share_upload", params: &[p("server", "String"), p("bundle", "String"), p("overwrite", "bool"), p("rename_to", "String?")], description: "Upload the bundle folder `bundle` to `server`'s library, in the background, as `rename_to` or its folder name. Returns {transfer_id}; follow it with share_transfers (a taken name ends as state exists unless overwrite)." },
@@ -696,6 +704,9 @@ mod tests {
             HostCommand::ShareStart { port: Some(47800) },
             HostCommand::ShareStop,
             HostCommand::ShareStatus,
+            HostCommand::ShareDiscover {
+                timeout_ms: Some(500),
+            },
             HostCommand::ShareList {
                 server: "192.168.1.5:47800".into(),
             },
@@ -783,7 +794,7 @@ mod tests {
                     "LoopEdge" => json!("start"),
                     "SongAudio" => json!("synth"),
                     "Hand?" => json!("left"),
-                    "u16" | "u16?" => json!(1000),
+                    "u16" | "u16?" | "u32?" => json!(1000),
                     "f32" => json!(0.5),
                     "u8?" | "u64?" | "f64?" => json!(4),
                     "SynthBus" | "MixerBus" => json!("player"),
