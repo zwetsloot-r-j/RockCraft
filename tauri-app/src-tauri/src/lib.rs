@@ -417,6 +417,20 @@ fn share_status(state: State<'_, AppState>) -> rockcraft_share::ShareStatus {
     state::share(&state).status()
 }
 
+/// Browse the network for other sharing instances; see
+/// `HostCommand::ShareDiscover`. Async: browsing blocks for `timeout_ms`.
+#[tauri::command]
+async fn share_discover(
+    state: State<'_, AppState>,
+    timeout_ms: Option<u32>,
+) -> Result<Vec<rockcraft_share::Peer>, String> {
+    let port = state::share(&state).own_port();
+    let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(1500) as u64);
+    tauri::async_runtime::spawn_blocking(move || rockcraft_share::discover(timeout, port))
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// List another instance's songs; see `HostCommand::ShareList`. Runs the
 /// network call off the main thread (async command).
 #[tauri::command]
@@ -751,6 +765,7 @@ pub fn run() {
             share_start,
             share_stop,
             share_status,
+            share_discover,
             share_list,
             share_download,
             share_upload,

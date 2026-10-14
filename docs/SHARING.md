@@ -19,6 +19,24 @@ The server listens on port **47800**, or the next free port up to 47809.
 it on **private networks** (your home network). Without that, other devices
 can't connect.
 
+## Finding each other
+
+While sharing, an instance advertises itself on the network over mDNS (service
+`_rockcraft._tcp`, the mechanism printers use). `share_discover` (or the
+desktop Network panel) lists the sharing instances it finds within 1.5 s,
+excluding itself. Typing `host:port` always works as a fallback.
+
+When peers don't appear:
+
+- Both machines must be on the **same network**: the same Wi-Fi, and not a
+  guest network or a separate VLAN.
+- Some routers have **"AP isolation" / "client isolation"**, which blocks
+  devices from seeing each other. Turn it off, or use a wired connection.
+- **Firewall:** allow RockCraft on private networks (mDNS uses UDP port 5353).
+- `share_status` reports `discoverable: false` plus a `discovery_error` when
+  this machine couldn't advertise at all. Others can still connect by
+  address.
+
 ## Using another instance
 
 | Host command | What it does |

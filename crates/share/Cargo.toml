@@ -23,5 +23,7 @@ futures-util.workspace = true
 ureq = { version = "2", default-features = false }
 # This machine's LAN addresses, for "sharing at 192.168.1.5:47800".
 if-addrs = "0.15"
+# Peer discovery (M26-C): pure-Rust mDNS/DNS-SD, no system daemon.
+mdns-sd = "0.21"
 # Archives in flight live in anonymous temp files (deleted on close).
 tempfile = "3"

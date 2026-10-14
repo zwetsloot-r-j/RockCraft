@@ -463,7 +463,8 @@ below is an at-a-glance convenience only.
 | `import_score` | `{ path: String }` | Start importing a local score file (MusicXML/`.xml`/`.mxl`/`.abc`/`.krn`). The notated tempo, metre and key seed the new bundle's grid |
 | `share_start` | `{ port: u16? }` | Share this library on the home network (port 47800 or the next free up to 47809). Returns `{ running, port, addresses, name }`. See [`SHARING.md`](SHARING.md) |
 | `share_stop` | — | Stop sharing |
-| `share_status` | — | `{ running, port, addresses, name }` |
+| `share_status` | — | `{ running, port, addresses, name, discoverable, discovery_error }` |
+| `share_discover` | `{ timeout_ms: u32? }` | Find other sharing instances over mDNS (default 1.5 s): `[{ name, addr, api }]`, this one excluded; empty without multicast |
 | `share_list` | `{ server: String }` | Another instance's songs (`server` = `host:port`), each with `local`: `same` / `different` / `absent` |
 | `share_download` | `{ server, id, overwrite: bool, rename_to: String? }` | Background download (video included) into the library → `{ transfer_id }` |
 | `share_upload` | `{ server, bundle, overwrite: bool, rename_to: String? }` | Background upload of a bundle folder → `{ transfer_id }` |

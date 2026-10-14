@@ -560,6 +560,11 @@ impl HostServices for TauriHost<'_> {
                 let status = crate::state::share(&app.state::<AppState>()).status();
                 json_payload("share_status", status)
             }
+            HostCommand::ShareDiscover { timeout_ms } => {
+                let port = crate::state::share(&app.state::<AppState>()).own_port();
+                let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(1500) as u64);
+                json_payload("share_discover", rockcraft_share::discover(timeout, port))
+            }
             HostCommand::ShareList { server } => {
                 let lister = crate::state::share(&app.state::<AppState>()).lister();
                 match lister.list(&server) {
