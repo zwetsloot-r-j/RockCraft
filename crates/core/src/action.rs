@@ -193,6 +193,12 @@ pub enum Action {
     YankSelection,
     PasteClipboard,
     DeleteSelection,
+    /// Snap the onset and end of every note in the selection — or, with no
+    /// selection, the note under the cursor — to the nearest grid line at the
+    /// live subdivision (tempo-map aware). Notes stay at least one step long and
+    /// an end stops at the next same-pitch onset. One undo step; the selection
+    /// stays active.
+    SnapNotes,
 
     // ── background images (M14-D) ───────────────────────────────────────
     // Layout + keyframing for the piece's background image layers. Every
@@ -385,6 +391,7 @@ impl Action {
             Action::YankSelection => "yank_selection",
             Action::PasteClipboard => "paste_clipboard",
             Action::DeleteSelection => "delete_selection",
+            Action::SnapNotes => "snap_notes",
             Action::SelectBackground { .. } => "select_background",
             Action::CycleBackground { .. } => "cycle_background",
             Action::NudgeBackgroundPos { .. } => "nudge_background_pos",
@@ -552,6 +559,7 @@ pub fn action_names() -> &'static [&'static str] {
         "yank_selection",
         "paste_clipboard",
         "delete_selection",
+        "snap_notes",
         "select_background",
         "cycle_background",
         "nudge_background_pos",
@@ -681,8 +689,9 @@ static ACTION_HELP: &[ActionInfo] = {
         ActionInfo { name: "start_selection", params: &[], description: "Begin a selection rectangle anchored at the cursor." },
         ActionInfo { name: "clear_selection", params: &[], description: "Clear the active selection." },
         ActionInfo { name: "yank_selection", params: &[], description: "Copy the selected notes to the clipboard." },
-        ActionInfo { name: "paste_clipboard", params: &[], description: "Paste the clipboard at the cursor." },
+        ActionInfo { name: "paste_clipboard", params: &[], description: "Paste the clipboard at the cursor. Notes keep their place in the bar, not their microseconds, so a passage copied at one tempo fits the bar lines where it lands. Existing same-pitch notes that a pasted note overlaps are removed." },
         ActionInfo { name: "delete_selection", params: &[], description: "Delete the notes inside the selection." },
+        ActionInfo { name: "snap_notes", params: &[], description: "Snap the onset and end of every note in the selection (or, with no selection, the note under the cursor) to the nearest grid line at the live subdivision, tempo-map aware. Notes stay at least one step long; an end stops at the next same-pitch onset. One undo step; the selection stays." },
         // ── background images (M14-D) ───────────────────────────────────
         ActionInfo { name: "select_background", params: &[p("index", "u32")], description: "Address background image layer `index` (0 = furthest back). Out of range: no-op." },
         ActionInfo { name: "cycle_background", params: &[p("delta", "i32")], description: "Move the background-layer selection by delta, wrapping in both directions." },
@@ -795,6 +804,7 @@ mod tests {
             Action::YankSelection,
             Action::PasteClipboard,
             Action::DeleteSelection,
+            Action::SnapNotes,
             Action::SelectBackground { index: 0 },
             Action::CycleBackground { delta: 1 },
             Action::NudgeBackgroundPos {

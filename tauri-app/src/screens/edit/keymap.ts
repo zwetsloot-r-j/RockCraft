@@ -189,6 +189,7 @@ export const NORMAL_BINDINGS: Binding[] = [
   { keys: ["y"], action: { name: "yank_selection" } },
   { keys: ["p"], action: { name: "paste_clipboard" } },
   { keys: ["D"], action: { name: "delete_selection" } },
+  { keys: ["q"], action: { name: "snap_notes" } }, // selection, else cursor note
   // Esc → clear_selection is handled specially (see resolveKey) so the router's
   // global Esc still fires when there's nothing to clear.
 

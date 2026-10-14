@@ -62,6 +62,8 @@ interface Props {
   dirty?: boolean;
   /** Backing waveform strip mode (M21-B); null/undefined = no backing. */
   wave?: string | null;
+  /** Pending vim-style count prefix (M25-A); null/undefined = none typed. */
+  count?: number | null;
 }
 
 export function StatusBar(props: Props): JSX.Element {
@@ -159,6 +161,10 @@ export function StatusBar(props: Props): JSX.Element {
         {(w) => <Field label="wave" value={w()} />}
       </Show>
 
+      <Show when={props.count}>
+        {(n) => <Field label="count" value={`${n()}…`} />}
+      </Show>
+
       <Show when={props.dirty}>
         <span
           style={{
@@ -182,7 +188,7 @@ export function StatusBar(props: Props): JSX.Element {
         }}
       >
         a/x add·del · [/] size · +/- vel · (/) tempo · T set BPM · m grab · c
-        chord · v·y·p·D select · u/U undo · Space play/stop · P play-start · !/@ speed · o
+        chord · v·y·p·D·q select · u/U undo · Space play/stop · P play-start · !/@ speed · o
         loop · {"{"}/{"}"} loop in/out · B backing · O wave · V video · s save · ? help
       </span>
     </div>
