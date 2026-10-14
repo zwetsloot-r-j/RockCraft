@@ -25,11 +25,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use rockcraft_core::{
-    backing_position_us, hand::hand_of_pitch_value, interleave_by_time, score, song_shift_us,
-    BackgroundImage, BarMap, Bpm, ExpectedNote, Feedback, GateState, Hand, HandOverride, LoopPhase,
-    LoopStep, MidiNote, NoteEvent, NoteEventKind, NoteJudgment, Pass, PlayClock, PracticeLoop,
-    RecordingMeta, ScoreConfig, ScoreReport, SongAudio, Summary, SustainEvent, SynthBus, Timing,
-    Transform, WaitGate, DEFAULT_SPLIT,
+    backing_position_us, hand::hand_of_pitch_value, interleave_by_time, order_triggers, score,
+    song_shift_us, BackgroundImage, BarMap, Bpm, ExpectedNote, Feedback, GateState, Hand,
+    HandOverride, LoopPhase, LoopStep, MidiNote, NoteEvent, NoteEventKind, NoteJudgment, Pass,
+    PlayClock, PracticeLoop, RecordingMeta, ScoreConfig, ScoreReport, SongAudio, SpanTrigger,
+    Summary, SustainEvent, SynthBus, Timing, Transform, WaitGate, DEFAULT_SPLIT,
 };
 use rockcraft_midi::smf_bytes_to_events;
 use serde::Serialize;
@@ -2268,14 +2268,25 @@ pub fn tick_play(
     };
     if let Some(synth) = song_bus {
         let vel = rockcraft_core::Velocity::new(HEAR_VELOCITY);
-        for &i in &need_on {
-            if let (Some(p), Some(v)) = (session.span_note(i).and_then(MidiNote::new), vel) {
-                synth.note_on(p, v);
-            }
-        }
-        for &i in &need_off {
-            if let Some(p) = session.span_note(i).and_then(MidiNote::new) {
-                synth.note_off(p);
+        // In song-time order, releases first on a tie: a repeated pitch's
+        // note-off must not land after (and cut) its re-strike.
+        let ordered = order_triggers(
+            need_on.iter().map(|&i| (i, session.spans[i].start_us)),
+            need_off.iter().map(|&i| (i, session.spans[i].end_us)),
+        );
+        for trigger in ordered {
+            match trigger {
+                SpanTrigger::On(i) => {
+                    if let (Some(p), Some(v)) = (session.span_note(i).and_then(MidiNote::new), vel)
+                    {
+                        synth.note_on(p, v);
+                    }
+                }
+                SpanTrigger::Off(i) => {
+                    if let Some(p) = session.span_note(i).and_then(MidiNote::new) {
+                        synth.note_off(p);
+                    }
+                }
             }
         }
     }

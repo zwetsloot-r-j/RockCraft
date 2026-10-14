@@ -38,6 +38,7 @@ use crate::grid::{Grid, Subdivision, TimeSig};
 use crate::hand::{Hand, HandSetting, DEFAULT_SPLIT};
 use crate::history::History;
 use crate::timeline::{Note, NoteId, Timeline};
+use crate::trigger::{order_triggers, SpanTrigger};
 use crate::wait::{GateState, WaitGate};
 
 /// Lowest MIDI note on an 88-key piano (A0).
@@ -1868,19 +1869,28 @@ impl Composer {
             &self.audition_on_fired,
             &self.audition_off_fired,
         );
-        for i in need_on {
-            effects.push(Effect::AuditionNote {
-                pitch: self.audition_spans[i].note,
-                velocity: DEFAULT_NOTE_VEL,
-            });
-            self.audition_on_fired.insert(i);
-        }
-        for i in need_off {
-            effects.push(Effect::AuditionNote {
-                pitch: self.audition_spans[i].note,
-                velocity: 0, // velocity 0 == note-off (MIDI convention)
-            });
-            self.audition_off_fired.insert(i);
+        let spans = &self.audition_spans;
+        let ordered = order_triggers(
+            need_on.into_iter().map(|i| (i, spans[i].start_us)),
+            need_off.into_iter().map(|i| (i, spans[i].end_us)),
+        );
+        for trigger in ordered {
+            match trigger {
+                SpanTrigger::On(i) => {
+                    effects.push(Effect::AuditionNote {
+                        pitch: self.audition_spans[i].note,
+                        velocity: DEFAULT_NOTE_VEL,
+                    });
+                    self.audition_on_fired.insert(i);
+                }
+                SpanTrigger::Off(i) => {
+                    effects.push(Effect::AuditionNote {
+                        pitch: self.audition_spans[i].note,
+                        velocity: 0, // velocity 0 == note-off (MIDI convention)
+                    });
+                    self.audition_off_fired.insert(i);
+                }
+            }
         }
         effects
     }

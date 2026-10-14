@@ -22,10 +22,10 @@ use rockcraft_audio::{
     BackingHandle, BackingOut, DecodedTrack, SynthHandle, TrackLoader, TrackStatus,
 };
 use rockcraft_core::{
-    backing_position_us, hand::hand_of_pitch_value, score, BarMap, DriftGuard, ExpectedNote, Gain,
-    GateState, Grid, Hand, HandOverride, LoopPhase, LoopStep, MidiNote, NoteEvent, NoteEventKind,
-    NoteJudgment, Pass, PlayClock, PracticeLoop, ScoreConfig, SongAudio, Summary, SustainEvent,
-    SynthBus, Timing, Velocity, WaitGate, DEFAULT_SPLIT,
+    backing_position_us, hand::hand_of_pitch_value, order_triggers, score, BarMap, DriftGuard,
+    ExpectedNote, Gain, GateState, Grid, Hand, HandOverride, LoopPhase, LoopStep, MidiNote,
+    NoteEvent, NoteEventKind, NoteJudgment, Pass, PlayClock, PracticeLoop, ScoreConfig, SongAudio,
+    SpanTrigger, Summary, SustainEvent, SynthBus, Timing, Velocity, WaitGate, DEFAULT_SPLIT,
 };
 use rockcraft_midi::smf_bytes_to_events;
 
@@ -1101,21 +1101,31 @@ impl PlayScreen {
             .filter(|&i| self.autoplays(i) || self.song_on_fired.contains(&i))
             .collect();
         let velocity = Velocity::new(HEAR_VELOCITY).unwrap();
-        for i in need_on {
-            if let Some(note) = MidiNote::new(self.spans[i].note) {
-                if let Some(s) = &self.song_synth {
-                    s.note_on(note, velocity);
+        // In song-time order, releases first on a tie: a repeated pitch's
+        // note-off must not land after (and cut) its re-strike.
+        let ordered = order_triggers(
+            need_on.into_iter().map(|i| (i, self.spans[i].start_us)),
+            need_off.into_iter().map(|i| (i, self.spans[i].end_us)),
+        );
+        for trigger in ordered {
+            match trigger {
+                SpanTrigger::On(i) => {
+                    if let (Some(s), Some(note)) =
+                        (&self.song_synth, MidiNote::new(self.spans[i].note))
+                    {
+                        s.note_on(note, velocity);
+                    }
+                    self.song_on_fired.insert(i);
+                }
+                SpanTrigger::Off(i) => {
+                    if let (Some(s), Some(note)) =
+                        (&self.song_synth, MidiNote::new(self.spans[i].note))
+                    {
+                        s.note_off(note);
+                    }
+                    self.song_off_fired.insert(i);
                 }
             }
-            self.song_on_fired.insert(i);
-        }
-        for i in need_off {
-            if let Some(note) = MidiNote::new(self.spans[i].note) {
-                if let Some(s) = &self.song_synth {
-                    s.note_off(note);
-                }
-            }
-            self.song_off_fired.insert(i);
         }
     }
 

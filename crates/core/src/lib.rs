@@ -31,6 +31,7 @@ pub mod song_audio;
 pub mod speed;
 pub mod stats;
 pub mod timeline;
+pub mod trigger;
 pub mod wait;
 pub mod waveform;
 
@@ -69,5 +70,6 @@ pub use song_audio::SongAudio;
 pub use speed::{nudge_rate_permille, rate_to_permille, RATE_STEPS, RATE_UNITY};
 pub use stats::Summary;
 pub use timeline::{Note, NoteId, Timeline};
+pub use trigger::{order_triggers, SpanTrigger};
 pub use wait::{GateState, Step, WaitGate, WaitTracker};
 pub use waveform::{analyze as analyze_waveform, Waveform, WAVEFORM_BUCKET_US};
