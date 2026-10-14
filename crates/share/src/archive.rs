@@ -417,12 +417,27 @@ pub fn import_song_file(
     overwrite: bool,
     name: Option<&str>,
 ) -> Result<PathBuf, ArchiveError> {
-    let manifest = read_manifest(File::open(path)?)?;
-    let slug = rockcraft_midi::bundle::slug(name.unwrap_or(&manifest.name));
+    import_song_archive(
+        io::BufReader::new(File::open(path)?),
+        library,
+        overwrite,
+        name,
+    )
+}
+
+/// [`import_song_file`] from any seekable archive stream (a received upload or
+/// download held in a temp file).
+pub fn import_song_archive<R: Read + Seek>(
+    mut archive: R,
+    library: &Path,
+    overwrite: bool,
+    name: Option<&str>,
+) -> Result<PathBuf, ArchiveError> {
+    let manifest = read_manifest(&mut archive)?;
+    let wanted = name.unwrap_or(&manifest.name);
+    let slug = rockcraft_midi::bundle::slug(wanted);
     if slug.is_empty() {
-        return Err(ArchiveError::BadName(
-            name.unwrap_or(&manifest.name).to_string(),
-        ));
+        return Err(ArchiveError::BadName(wanted.to_string()));
     }
     let dest = library.join(&slug);
     if dest.exists() && !overwrite {
@@ -433,7 +448,8 @@ pub fn import_song_file(
     if incoming.exists() {
         fs::remove_dir_all(&incoming)?;
     }
-    unpack(io::BufReader::new(File::open(path)?), &incoming)?;
+    archive.seek(io::SeekFrom::Start(0))?;
+    unpack(archive, &incoming)?;
     if dest.exists() {
         let old = library.join(format!("{slug}.old"));
         if old.exists() {

@@ -2,11 +2,25 @@
 //!
 //! - [`archive`]: the `.rcsong` single-file form of a song bundle — strict
 //!   pack/unpack, a chart fingerprint, and the export/import-to-file helpers
-//!   both frontends call from their host-command dispatch.
+//!   both frontends call from their host-command dispatch (M26-A).
+//! - [`server`] / [`client`]: the peer-to-peer LAN share server every instance
+//!   can run, and the client that lists, downloads and uploads (M26-B).
+//! - [`service`]: [`ShareService`], the sharing state each frontend holds —
+//!   the running server plus background transfers.
 
 pub mod archive;
+pub mod client;
+mod error;
+pub mod net;
+pub mod server;
+pub mod service;
 
 pub use archive::{
-    bundle_files, chart_hash, export_song_file, import_song_file, pack, read_manifest, unpack,
-    ArchiveError, Manifest, PackSummary, ARCHIVE_EXT,
+    bundle_files, chart_hash, export_song_file, import_song_archive, import_song_file, pack,
+    read_manifest, unpack, ArchiveError, Manifest, PackSummary, ARCHIVE_EXT,
+};
+pub use error::ShareError;
+pub use server::{RemoteSong, ServerInfo, ShareServer, DEFAULT_PORT};
+pub use service::{
+    Direction, ListedSong, Lister, LocalState, ShareService, ShareStatus, Transfer, TransferState,
 };

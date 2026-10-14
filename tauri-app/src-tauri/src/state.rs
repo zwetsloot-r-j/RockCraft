@@ -87,6 +87,10 @@ pub struct AppState {
     /// The attached backing track's analysed waveform (M21-A), computed off
     /// thread on the first query for a backing path.
     pub waveform: crate::waveform::WaveformCache,
+    /// LAN sharing (M26-B): the share server, if running, plus background
+    /// transfers. The lock is only held for quick calls — transfers run on
+    /// their own threads.
+    pub share: Mutex<rockcraft_share::ShareService>,
 }
 
 /// A background image attached to the live editor: the layer id it belongs to
@@ -129,6 +133,7 @@ impl AppState {
             background_srcs: Mutex::new(Vec::new()),
             current_dir: Mutex::new(None),
             waveform: crate::waveform::WaveformCache::default(),
+            share: Mutex::new(rockcraft_share::ShareService::with_defaults()),
         }
     }
 }
@@ -775,6 +780,11 @@ pub fn query_backing(state: &AppState) -> Option<BackingRef> {
 /// The attached backing track's waveform (M21-A): `none` without a backing,
 /// `pending` while the first analysis of this path runs, then `ready`. Shared by
 /// the `edit_backing_waveform` IPC and `HostCommand::BackingWaveform`.
+/// The LAN share service (M26-B), locked for one quick call.
+pub fn share(state: &AppState) -> std::sync::MutexGuard<'_, rockcraft_share::ShareService> {
+    state.share.lock().expect("share mutex poisoned")
+}
+
 pub fn query_waveform(state: &AppState) -> crate::waveform::WaveformReply {
     let backing = state
         .backing_path
