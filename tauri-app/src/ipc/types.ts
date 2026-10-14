@@ -609,3 +609,57 @@ export interface PlaySummary {
   best_combo: number;
   score: number;
 }
+
+// ── LAN sharing (M26-B/C/D) — mirrors of `rockcraft_share` types ─────────
+
+/** `share_status` / `share_start`. Source: `crates/share/src/service.rs`. */
+export interface ShareStatus {
+  running: boolean;
+  port: number | null;
+  /** `ip:port` per LAN address while sharing. */
+  addresses: string[];
+  name: string;
+  /** Whether other devices can find us automatically (mDNS). */
+  discoverable: boolean;
+  discovery_error: string | null;
+}
+
+/** A sharing instance found by `share_discover`. */
+export interface SharePeer {
+  name: string;
+  /** `ip:port` (or `[ipv6]:port`). */
+  addr: string;
+  api: number;
+}
+
+/** How a remote song relates to the local library. */
+export type ShareLocal = "same" | "different" | "absent";
+
+/** One row of `share_list`. */
+export interface ListedSong {
+  id: string;
+  name: string;
+  origin: string | null;
+  note_count: number;
+  duration_us: number;
+  has_backing: boolean;
+  has_video: boolean;
+  size_bytes: number;
+  chart_hash: string;
+  local: ShareLocal;
+}
+
+/** One row of `share_transfers`. */
+export type ShareTransfer = {
+  id: number;
+  direction: "down" | "up";
+  server: string;
+  name: string;
+  bytes_done: number;
+  bytes_total: number;
+} & (
+  | { state: "running" }
+  | { state: "done"; dir: string | null }
+  | { state: "failed"; detail: string }
+  | { state: "exists"; slug: string }
+);

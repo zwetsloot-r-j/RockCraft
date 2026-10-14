@@ -21,6 +21,10 @@ import type {
   ComposerSnapshot,
   Effect,
   LibraryEntryDto,
+  ListedSong,
+  SharePeer,
+  ShareStatus,
+  ShareTransfer,
   LoopEdge,
   PlayInfo,
   PlayStateEvent,
@@ -160,6 +164,58 @@ export function libraryImportSong(
   name: string | null = null,
 ): Promise<string> {
   return invoke<string>("library_import_song", { path, overwrite, name });
+}
+
+// ── LAN sharing (M26-B/C) — each paired with its `share_*` host command ──
+
+/** Start sharing this library on the home network. */
+export function shareStart(port: number | null = null): Promise<ShareStatus> {
+  return invoke<ShareStatus>("share_start", { port });
+}
+
+/** Stop sharing. */
+export function shareStop(): Promise<void> {
+  return invoke<void>("share_stop");
+}
+
+/** Whether and where this instance shares. */
+export function shareStatus(): Promise<ShareStatus> {
+  return invoke<ShareStatus>("share_status");
+}
+
+/** Find other sharing instances over mDNS (this one excluded). */
+export function shareDiscover(timeoutMs: number | null = null): Promise<SharePeer[]> {
+  return invoke<SharePeer[]>("share_discover", { timeoutMs });
+}
+
+/** The songs `server` (`host:port`) shares, classified against ours. */
+export function shareList(server: string): Promise<ListedSong[]> {
+  return invoke<ListedSong[]>("share_list", { server });
+}
+
+/** Start a background download; resolves to the transfer id. */
+export function shareDownload(
+  server: string,
+  id: string,
+  overwrite: boolean,
+  renameTo: string | null = null,
+): Promise<number> {
+  return invoke<number>("share_download", { server, id, overwrite, renameTo });
+}
+
+/** Start a background upload of a bundle folder; resolves to the transfer id. */
+export function shareUpload(
+  server: string,
+  bundle: string,
+  overwrite: boolean,
+  renameTo: string | null = null,
+): Promise<number> {
+  return invoke<number>("share_upload", { server, bundle, overwrite, renameTo });
+}
+
+/** The background transfer table. */
+export function shareTransfers(): Promise<ShareTransfer[]> {
+  return invoke<ShareTransfer[]>("share_transfers");
 }
 
 /** Save dialog for exporting a song file; resolves to the path or null. */

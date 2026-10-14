@@ -1,4 +1,4 @@
-import { createSignal, Match, Switch, type JSX } from "solid-js";
+import { createSignal, Match, onMount, Switch, type JSX } from "solid-js";
 import { Router, useRouter } from "./shell/Router";
 import { Placeholder } from "./shell/Placeholder";
 import { MenuScreen } from "./screens/menu/MenuScreen";
@@ -7,7 +7,8 @@ import { LibraryScreen } from "./screens/library/LibraryScreen";
 import { EditScreen } from "./screens/edit/EditScreen";
 import { UrlInput } from "./screens/import/UrlInput";
 import { ImportingScreen } from "./screens/import/ImportingScreen";
-import { importStart } from "./ipc/bridge";
+import { importStart, shareStart } from "./ipc/bridge";
+import { loadShareEnabled } from "./screens/library/network";
 
 function AppShell(): JSX.Element {
   const { screen, navigate } = useRouter();
@@ -15,6 +16,12 @@ function AppShell(): JSX.Element {
   const [importBundleDir, setImportBundleDir] = createSignal<
     string | undefined
   >(undefined);
+
+  // Sharing left on last time (M26-D): resume it at launch, whatever screen
+  // opens, so other devices can reach this library right away.
+  onMount(() => {
+    if (loadShareEnabled()) shareStart().catch(() => {});
+  });
 
   function handleUrlSubmit(url: string): void {
     navigate({ kind: "importing" });

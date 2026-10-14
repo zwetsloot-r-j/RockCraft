@@ -9,9 +9,17 @@
 //   e           — open in Edit
 //   x           — export the selected song as a .rcsong file (M26-A)
 //   i           — import a .rcsong file into the library (M26-A)
-//   Esc / q     — back to menu
+//   N           — open/close the Network panel (M26-D)
+//   Esc / q     — back to menu (Esc closes the Network panel first)
 //
-// Mouse: click selects, double-click plays.
+// With the Network panel open (M26-D), Tab moves the keyboard between the
+// local list, the servers and the remote songs:
+//   u           — (local list) send the selected song to the selected server
+//   S           — share this library on/off
+//   r / + / Del — (servers) search again / add an address / remove an added one
+//   Enter / d   — (remote songs) download
+//
+// Mouse: click selects, double-click plays (a remote song: downloads).
 
 import {
   createSignal,
@@ -29,6 +37,13 @@ import {
   scanLibrary,
 } from "../../ipc/bridge";
 import { baseName, existsSlug, freeSlug } from "./songFiles";
+import {
+  NetworkPanel,
+  TransferStrip,
+  useNetwork,
+  type Conflict,
+  type NetFocus,
+} from "./NetworkPanel";
 import type { LibraryEntryDto } from "../../ipc/types";
 import { useRouter } from "../../shell/Router";
 
@@ -67,8 +82,11 @@ export function LibraryScreen(): JSX.Element {
   const [loading, setLoading] = createSignal(true);
   /** One-line result of the last export/import, shown in the footer. */
   const [flash, setFlash] = createSignal<string | null>(null);
-  /** An import whose folder name is taken, awaiting Replace / Keep both. */
-  const [conflict, setConflict] = createSignal<{ path: string; slug: string } | null>(null);
+  /** A name clash (import, download or send) awaiting Replace / Keep both. */
+  const [conflict, setConflict] = createSignal<Conflict | null>(null);
+  /** The Network panel (M26-D), and which list has the keyboard. */
+  const [netOpen, setNetOpen] = createSignal(false);
+  const [focus, setFocus] = createSignal<"local" | NetFocus>("local");
   /** The scrollable list panel; its element children are the rows, in order. */
   let listEl: HTMLDivElement | undefined;
   let flashTimer: number | undefined;
@@ -129,7 +147,13 @@ export function LibraryScreen(): JSX.Element {
     } catch (err) {
       const slug = existsSlug(err);
       if (slug !== null && !overwrite) {
-        setConflict({ path, slug });
+        setConflict({
+          slug,
+          where: "the library",
+          replace: () => void importFile(path, true, null),
+          keepBoth: () =>
+            void importFile(path, false, freeSlug(slug, entries().map((e) => e.name))),
+        });
       } else {
         showFlash(`import failed: ${String(err)}`);
       }
@@ -142,20 +166,44 @@ export function LibraryScreen(): JSX.Element {
     if (path !== null) await importFile(path, false, null);
   }
 
+  const net = useNetwork({
+    localNames: () => entries().map((e) => e.name),
+    flash: showFlash,
+    onDownloaded: (dir) => void rescan(dir),
+    askConflict: setConflict,
+  });
+
+  function toggleNetwork(): void {
+    if (netOpen()) {
+      setNetOpen(false);
+      setFocus("local");
+    } else {
+      setNetOpen(true);
+      setFocus("servers");
+      net.open();
+    }
+  }
+
+  /** Tab order: local → servers → songs → local. */
+  function cycleFocus(): void {
+    const order: Array<"local" | NetFocus> = ["local", "servers", "songs"];
+    setFocus(order[(order.indexOf(focus()) + 1) % order.length]);
+  }
+
   /** Keys while the name-conflict prompt is open: it owns the keyboard. */
-  function onConflictKey(ev: KeyboardEvent, c: { path: string; slug: string }): void {
+  function onConflictKey(ev: KeyboardEvent, c: Conflict): void {
     ev.preventDefault();
     ev.stopPropagation();
     switch (ev.key) {
       case "r":
       case "R":
         setConflict(null);
-        void importFile(c.path, true, null);
+        c.replace();
         break;
       case "k":
       case "K":
         setConflict(null);
-        void importFile(c.path, false, freeSlug(c.slug, entries().map((e) => e.name)));
+        c.keepBoth();
         break;
       case "Escape":
       case "c":
@@ -200,6 +248,47 @@ export function LibraryScreen(): JSX.Element {
       onConflictKey(ev, c);
       return;
     }
+    // A text field (the "add address" input) owns its keys.
+    const target = ev.target as HTMLElement | null;
+    if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA")) return;
+
+    if (ev.key === "N") {
+      ev.preventDefault();
+      toggleNetwork();
+      return;
+    }
+    if (netOpen()) {
+      if (ev.key === "Escape") {
+        ev.preventDefault();
+        ev.stopPropagation();
+        toggleNetwork();
+        return;
+      }
+      if (ev.key === "Tab") {
+        ev.preventDefault();
+        cycleFocus();
+        return;
+      }
+      if (ev.key === "S") {
+        ev.preventDefault();
+        void net.toggleSharing();
+        return;
+      }
+      if (focus() === "servers") {
+        onServersKey(ev);
+        return;
+      }
+      if (focus() === "songs") {
+        onSongsKey(ev);
+        return;
+      }
+      if (ev.key === "u") {
+        ev.preventDefault();
+        const e = entries()[selected()];
+        if (e) net.uploadBundle(e.dir);
+        return;
+      }
+    }
     switch (ev.key) {
       case "ArrowUp":
       case "k":
@@ -232,6 +321,64 @@ export function LibraryScreen(): JSX.Element {
       case "q":
         ev.preventDefault();
         navigate({ kind: "menu" });
+        break;
+      default:
+        break;
+    }
+  }
+
+  /** Keys while the servers list has focus. */
+  function onServersKey(ev: KeyboardEvent): void {
+    switch (ev.key) {
+      case "ArrowUp":
+      case "k":
+        ev.preventDefault();
+        net.moveServer(-1);
+        break;
+      case "ArrowDown":
+      case "j":
+        ev.preventDefault();
+        net.moveServer(1);
+        break;
+      case "Enter":
+        ev.preventDefault();
+        setFocus("songs");
+        break;
+      case "r":
+        ev.preventDefault();
+        void net.discover();
+        break;
+      case "+":
+        ev.preventDefault();
+        net.setAdding(true);
+        break;
+      case "Delete":
+      case "Backspace":
+        ev.preventDefault();
+        net.removeSelectedServer();
+        break;
+      default:
+        break;
+    }
+  }
+
+  /** Keys while the remote songs list has focus. */
+  function onSongsKey(ev: KeyboardEvent): void {
+    switch (ev.key) {
+      case "ArrowUp":
+      case "k":
+        ev.preventDefault();
+        net.moveSong(-1);
+        break;
+      case "ArrowDown":
+      case "j":
+        ev.preventDefault();
+        net.moveSong(1);
+        break;
+      case "Enter":
+      case "d":
+        ev.preventDefault();
+        net.downloadSong();
         break;
       default:
         break;
@@ -275,16 +422,23 @@ export function LibraryScreen(): JSX.Element {
           Library
         </div>
         <div style={{ "font-size": "12px", color: DIM }}>
-          ↑/↓/j/k move · Enter/p Play · e Edit · x export · i import · Esc back
+          {netOpen()
+            ? "Tab switch list · u send · S share on/off · N close · Esc back"
+            : "↑/↓/j/k move · Enter/p Play · e Edit · x export · i import · N network · Esc back"}
         </div>
       </div>
 
+      <div style={{ flex: "1 1 auto", display: "flex", gap: "12px", "min-height": 0 }}>
       {/* List panel */}
       <div
         ref={listEl}
         style={{
-          flex: "1 1 auto",
-          border: "1px solid rgba(255,255,255,0.1)",
+          flex: "1 1 0",
+          "min-width": 0,
+          border:
+            netOpen() && focus() === "local"
+              ? `1px solid ${ACCENT}`
+              : "1px solid rgba(255,255,255,0.1)",
           "border-radius": "8px",
           overflow: "hidden auto",
           display: "flex",
@@ -346,7 +500,10 @@ export function LibraryScreen(): JSX.Element {
                       "user-select": "none",
                     }}
                     onMouseEnter={() => setSelected(idx())}
-                    onClick={() => setSelected(idx())}
+                    onClick={() => {
+                      setSelected(idx());
+                      setFocus("local");
+                    }}
                     onDblClick={() => openPlay(idx())}
                   >
                     {/* Name */}
@@ -430,8 +587,18 @@ export function LibraryScreen(): JSX.Element {
           </Show>
         </Show>
       </div>
+      <Show when={netOpen()}>
+        <NetworkPanel
+          net={net}
+          focus={focus() === "local" ? null : (focus() as NetFocus)}
+          onFocus={setFocus}
+        />
+      </Show>
+      </div>
 
-      {/* Name-conflict prompt (import) */}
+      <TransferStrip net={net} />
+
+      {/* Name-conflict prompt (import / download / send) */}
       <Show when={conflict()}>
         {(c) => (
           <div
@@ -442,7 +609,7 @@ export function LibraryScreen(): JSX.Element {
               "font-size": "13px",
             }}
           >
-            A song named <b>{c().slug}</b> is already in the library. R replace ·
+            A song named <b>{c().slug}</b> is already in {c().where}. R replace ·
             K keep both · Esc cancel
           </div>
         )}
