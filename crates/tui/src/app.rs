@@ -148,6 +148,9 @@ pub struct Shell {
     /// Practice speed in permille; shell-wide like `color_mode`, so a slowed
     /// piece stays slowed when you come back to it.
     rate_permille: u16,
+    /// LAN sharing (M26-B): the share server, if running, plus background
+    /// transfers. Driven by the `share_*` host commands only.
+    share: rockcraft_share::ShareService,
 }
 
 impl Shell {
@@ -179,6 +182,7 @@ impl Shell {
             save_warned: false,
             save_error: String::new(),
             rate_permille: crate::play::PLAY_RATE_UNITY,
+            share: rockcraft_share::ShareService::with_defaults(),
         }
     }
 
@@ -1041,6 +1045,70 @@ impl rockcraft_control::HostServices for Shell {
                     }),
                 }
             }
+            HostCommand::ExportSongFile { bundle, path } => rockcraft_share::export_song_file(
+                std::path::Path::new(&bundle),
+                std::path::Path::new(&path),
+            )
+            .map(|p| json!({ "path": p.to_string_lossy() }))
+            .map_err(|e| HostError::Failed {
+                command: "export_song_file".into(),
+                detail: e.to_string(),
+            }),
+            HostCommand::ImportSongFile {
+                path,
+                overwrite,
+                name,
+            } => rockcraft_share::import_song_file(
+                std::path::Path::new(&path),
+                &rockcraft_midi::bundle::library_root(),
+                overwrite,
+                name.as_deref(),
+            )
+            .map(|d| json!({ "dir": d.to_string_lossy() }))
+            .map_err(|e| HostError::Failed {
+                command: "import_song_file".into(),
+                detail: e.to_string(),
+            }),
+            // ── LAN sharing (M26-B) ─────────────────────────────────────
+            HostCommand::ShareStart { port } => match self.share.start(port) {
+                Ok(status) => Ok(json!(status)),
+                Err(e) => Err(HostError::Failed {
+                    command: "share_start".into(),
+                    detail: e.to_string(),
+                }),
+            },
+            HostCommand::ShareStop => {
+                self.share.stop();
+                Ok(serde_json::Value::Null)
+            }
+            HostCommand::ShareStatus => Ok(json!(self.share.status())),
+            HostCommand::ShareDiscover { timeout_ms } => Ok(json!(self.share.discover(
+                std::time::Duration::from_millis(timeout_ms.unwrap_or(1500) as u64)
+            ))),
+            HostCommand::ShareList { server } => match self.share.list(&server) {
+                Ok(songs) => Ok(json!(songs)),
+                Err(e) => Err(HostError::Failed {
+                    command: "share_list".into(),
+                    detail: e.to_string(),
+                }),
+            },
+            HostCommand::ShareDownload {
+                server,
+                id,
+                overwrite,
+                rename_to,
+            } => Ok(json!({
+                "transfer_id": self.share.download(&server, &id, overwrite, rename_to)
+            })),
+            HostCommand::ShareUpload {
+                server,
+                bundle,
+                overwrite,
+                rename_to,
+            } => Ok(json!({
+                "transfer_id": self.share.upload(&server, &bundle, overwrite, rename_to)
+            })),
+            HostCommand::ShareTransfers => Ok(json!(self.share.transfers())),
             // Interactive, screen-state-machine workflows with no headless entry
             // point in the TUI. Explicit, compiler-checked Unsupported arms.
             HostCommand::SaveBundle { .. } => Err(HostError::Unsupported("save_bundle".into())),
@@ -1763,6 +1831,15 @@ mod tests {
             HostCommand::LoadBundle { dir: "x".into() },
             HostCommand::QueryDirty,
             HostCommand::SplitBundle { segments: vec![] },
+            HostCommand::ExportSongFile {
+                bundle: "does/not/exist".into(),
+                path: "does/not/exist/out.rcsong".into(),
+            },
+            HostCommand::ImportSongFile {
+                path: "does/not/exist.rcsong".into(),
+                overwrite: false,
+                name: None,
+            },
             HostCommand::PlayLoad {
                 dir: "does/not/exist".into(),
             },
@@ -1802,6 +1879,29 @@ mod tests {
             HostCommand::ImportScore {
                 path: "s.musicxml".into(),
             },
+            // Port 0 = any free port; nothing listens on 127.0.0.1:1.
+            HostCommand::ShareStart { port: Some(0) },
+            HostCommand::ShareStatus,
+            HostCommand::ShareDiscover {
+                timeout_ms: Some(50),
+            },
+            HostCommand::ShareList {
+                server: "127.0.0.1:1".into(),
+            },
+            HostCommand::ShareDownload {
+                server: "127.0.0.1:1".into(),
+                id: "library~x".into(),
+                overwrite: false,
+                rename_to: None,
+            },
+            HostCommand::ShareUpload {
+                server: "127.0.0.1:1".into(),
+                bundle: "does/not/exist".into(),
+                overwrite: false,
+                rename_to: None,
+            },
+            HostCommand::ShareTransfers,
+            HostCommand::ShareStop,
             HostCommand::SetInstrument {
                 bus: rockcraft_core::SynthBus::Song,
                 instrument: "marimba".into(),

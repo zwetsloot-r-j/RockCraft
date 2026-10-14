@@ -8,7 +8,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { open as dialogOpen } from "@tauri-apps/plugin-dialog";
+import { open as dialogOpen, save as dialogSave } from "@tauri-apps/plugin-dialog";
 
 import type { Screen } from "../shell/screens";
 import type {
@@ -21,6 +21,10 @@ import type {
   ComposerSnapshot,
   Effect,
   LibraryEntryDto,
+  ListedSong,
+  SharePeer,
+  ShareStatus,
+  ShareTransfer,
   LoopEdge,
   PlayInfo,
   PlayStateEvent,
@@ -138,6 +142,98 @@ export function onPlayhead(
  */
 export function scanLibrary(): Promise<LibraryEntryDto[]> {
   return invoke<LibraryEntryDto[]>("scan_library");
+}
+
+/**
+ * Export the bundle folder `bundle` as a `.rcsong` song file at `path`
+ * (M26-A, paired with `export_song_file`). Resolves to the written path.
+ */
+export function libraryExportSong(bundle: string, path: string): Promise<string> {
+  return invoke<string>("library_export_song", { bundle, path });
+}
+
+/**
+ * Import the `.rcsong` song file `path` into the library (M26-A, paired with
+ * `import_song_file`). `name` overrides the folder name (a "keep both" pick).
+ * Rejects with `exists:<slug>` when the folder is taken and `overwrite` is off.
+ * Resolves to the new bundle folder.
+ */
+export function libraryImportSong(
+  path: string,
+  overwrite: boolean,
+  name: string | null = null,
+): Promise<string> {
+  return invoke<string>("library_import_song", { path, overwrite, name });
+}
+
+// ── LAN sharing (M26-B/C) — each paired with its `share_*` host command ──
+
+/** Start sharing this library on the home network. */
+export function shareStart(port: number | null = null): Promise<ShareStatus> {
+  return invoke<ShareStatus>("share_start", { port });
+}
+
+/** Stop sharing. */
+export function shareStop(): Promise<void> {
+  return invoke<void>("share_stop");
+}
+
+/** Whether and where this instance shares. */
+export function shareStatus(): Promise<ShareStatus> {
+  return invoke<ShareStatus>("share_status");
+}
+
+/** Find other sharing instances over mDNS (this one excluded). */
+export function shareDiscover(timeoutMs: number | null = null): Promise<SharePeer[]> {
+  return invoke<SharePeer[]>("share_discover", { timeoutMs });
+}
+
+/** The songs `server` (`host:port`) shares, classified against ours. */
+export function shareList(server: string): Promise<ListedSong[]> {
+  return invoke<ListedSong[]>("share_list", { server });
+}
+
+/** Start a background download; resolves to the transfer id. */
+export function shareDownload(
+  server: string,
+  id: string,
+  overwrite: boolean,
+  renameTo: string | null = null,
+): Promise<number> {
+  return invoke<number>("share_download", { server, id, overwrite, renameTo });
+}
+
+/** Start a background upload of a bundle folder; resolves to the transfer id. */
+export function shareUpload(
+  server: string,
+  bundle: string,
+  overwrite: boolean,
+  renameTo: string | null = null,
+): Promise<number> {
+  return invoke<number>("share_upload", { server, bundle, overwrite, renameTo });
+}
+
+/** The background transfer table. */
+export function shareTransfers(): Promise<ShareTransfer[]> {
+  return invoke<ShareTransfer[]>("share_transfers");
+}
+
+/** Save dialog for exporting a song file; resolves to the path or null. */
+export async function saveSongFilePicker(defaultName: string): Promise<string | null> {
+  const chosen = await dialogSave({
+    defaultPath: `${defaultName}.rcsong`,
+    filters: [{ name: "RockCraft song", extensions: ["rcsong"] }],
+  });
+  return chosen ?? null;
+}
+
+/** Open dialog for importing a song file; resolves to the path or null. */
+export async function openSongFilePicker(): Promise<string | null> {
+  const selected = await dialogOpen({
+    multiple: false,
+    filters: [{ name: "RockCraft song", extensions: ["rcsong"] }],
+  });
+  return typeof selected === "string" ? selected : null;
 }
 
 /**

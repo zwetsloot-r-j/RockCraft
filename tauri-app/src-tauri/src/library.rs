@@ -106,6 +106,27 @@ fn dir_mtime_secs(dir: &std::path::Path) -> u64 {
         .unwrap_or(0)
 }
 
+/// Export the bundle `bundle` as a `.rcsong` song file at `path` (M26-A).
+/// Returns the written path.
+pub fn export_song(bundle: &str, path: &str) -> Result<String, String> {
+    rockcraft_share::export_song_file(std::path::Path::new(bundle), std::path::Path::new(path))
+        .map(|p| p.to_string_lossy().into_owned())
+        .map_err(|e| e.to_string())
+}
+
+/// Import the `.rcsong` song file `path` into `library` (M26-A). Returns the
+/// new bundle dir; a taken slug fails with `exists:<slug>` unless `overwrite`.
+pub fn import_song(
+    path: &str,
+    library: &std::path::Path,
+    overwrite: bool,
+    name: Option<&str>,
+) -> Result<String, String> {
+    rockcraft_share::import_song_file(std::path::Path::new(path), library, overwrite, name)
+        .map(|d| d.to_string_lossy().into_owned())
+        .map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,5 +205,31 @@ mod tests {
     #[test]
     fn newest_empty_is_none() {
         assert_eq!(newest(&[]), None);
+    }
+
+    #[test]
+    fn export_then_import_reports_exists_until_overwrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("tune");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(bundle.join("meta.json"), r#"{"midi_file":"song.mid"}"#).unwrap();
+        std::fs::write(bundle.join("song.mid"), b"MThd").unwrap();
+        let file = export_song(
+            bundle.to_str().unwrap(),
+            tmp.path()
+                .join("tune")
+                .with_extension("x")
+                .to_str()
+                .unwrap(),
+        )
+        .unwrap();
+        let library = tmp.path().join("library");
+        let dir = import_song(&file, &library, false, None).unwrap();
+        assert!(std::path::Path::new(&dir).join("song.mid").is_file());
+        assert_eq!(
+            import_song(&file, &library, false, None).unwrap_err(),
+            "exists:tune"
+        );
+        assert_eq!(import_song(&file, &library, true, None).unwrap(), dir);
     }
 }

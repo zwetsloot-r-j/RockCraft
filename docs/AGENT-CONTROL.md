@@ -429,6 +429,8 @@ below is an at-a-glance convenience only.
 | `load_bundle` | `{ dir: String }` | Load a bundle into the composer. Returns the new snapshot |
 | `query_dirty` | none | Whether the timeline has unsaved changes |
 | `split_bundle` | `{ segments: [{ start_us, end_us, name }] }` | Slice the loaded piece into the kept parts, each a new library bundle (subset MIDI + copied media + derived offsets, `origin=Edited`). Discarded parts are omitted (= trimming). Returns the created bundle dirs; the source is untouched |
+| `export_song_file` | `{ bundle: String, path: String }` | Pack a bundle folder into one `.rcsong` song file (`.rcsong` appended without an extension): `meta.json`, `song.mid`, referenced media and sidecars — never backups. Returns `{ path }` |
+| `import_song_file` | `{ path: String, overwrite: bool, name: String? }` | Unpack a `.rcsong` into `<library>/<slug>` (slug from `name`, else the archive). Strict file checks. A taken slug fails with `exists:<slug>` unless `overwrite`. Returns `{ dir }` |
 | `play_load` | `{ dir: String }` | Load a bundle as a play session. Returns play info |
 | `play_set_wait` | `{ on: bool }` | Arm/disarm note-by-note wait mode |
 | `play_cycle_song_audio` | none | Cycle the song audio (the `m` key): `"backing"` → `"synth"` → `"off"` → `"backing"`; a piece without a backing track cycles `"synth"` ↔ `"off"`. Returns `{ song_audio }` — see below |
@@ -459,6 +461,14 @@ below is an at-a-glance convenience only.
 | `query_backgrounds` | none | Every background layer — id, bundle file, absolute path, selection, keyframes, and the transform at the playhead |
 | `import_start` | `{ url: String }` | Start importing from a URL |
 | `import_score` | `{ path: String }` | Start importing a local score file (MusicXML/`.xml`/`.mxl`/`.abc`/`.krn`). The notated tempo, metre and key seed the new bundle's grid |
+| `share_start` | `{ port: u16? }` | Share this library on the home network (port 47800 or the next free up to 47809). Returns `{ running, port, addresses, name }`. See [`SHARING.md`](SHARING.md) |
+| `share_stop` | — | Stop sharing |
+| `share_status` | — | `{ running, port, addresses, name, discoverable, discovery_error }` |
+| `share_discover` | `{ timeout_ms: u32? }` | Find other sharing instances over mDNS (default 1.5 s): `[{ name, addr, api }]`, this one excluded; empty without multicast |
+| `share_list` | `{ server: String }` | Another instance's songs (`server` = `host:port`), each with `local`: `same` / `different` / `absent` |
+| `share_download` | `{ server, id, overwrite: bool, rename_to: String? }` | Background download (video included) into the library → `{ transfer_id }` |
+| `share_upload` | `{ server, bundle, overwrite: bool, rename_to: String? }` | Background upload of a bundle folder → `{ transfer_id }` |
+| `share_transfers` | — | Transfer table: `{ id, direction, server, name, bytes_done, bytes_total, state, … }` |
 | `import_score` (scan) | `{ path: String }` | The same command with a `.pdf`/`.png`/`.jpg`/`.jpeg`/`.tif`/`.tiff`/`.bmp` path runs optical music recognition first. Lossy: notes carry a derived `confidence`, and the import log emits `omr: imported N notes, M flagged …`. Needs an OMR engine installed — see [`IMPORT.md`](IMPORT.md#scanned-sheet-music-omr-m13-b) |
 | `audio_status` / `midi_status` / `record_status` | none | Read-only status snapshots |
 | `midi_rescan` | none | Re-scan for a live USB-MIDI device and adopt it if one is now present — reconnect a piano powered on or replugged after launch, without restarting the app. Leaves the current source untouched when none is found. Returns the resulting MIDI status |

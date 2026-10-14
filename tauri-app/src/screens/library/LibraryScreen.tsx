@@ -7,9 +7,19 @@
 //   ArrowDown/j — move selection down
 //   Enter / p   — open in Play
 //   e           — open in Edit
-//   Esc / q     — back to menu
+//   x           — export the selected song as a .rcsong file (M26-A)
+//   i           — import a .rcsong file into the library (M26-A)
+//   N           — open/close the Network panel (M26-D)
+//   Esc / q     — back to menu (Esc closes the Network panel first)
 //
-// Mouse: click selects, double-click plays.
+// With the Network panel open (M26-D), Tab moves the keyboard between the
+// local list, the servers and the remote songs:
+//   u           — (local list) send the selected song to the selected server
+//   S           — share this library on/off
+//   r / + / Del — (servers) search again / add an address / remove an added one
+//   Enter / d   — (remote songs) download
+//
+// Mouse: click selects, double-click plays (a remote song: downloads).
 
 import {
   createSignal,
@@ -19,7 +29,21 @@ import {
   Show,
   type JSX,
 } from "solid-js";
-import { scanLibrary } from "../../ipc/bridge";
+import {
+  libraryExportSong,
+  libraryImportSong,
+  openSongFilePicker,
+  saveSongFilePicker,
+  scanLibrary,
+} from "../../ipc/bridge";
+import { baseName, existsSlug, freeSlug } from "./songFiles";
+import {
+  NetworkPanel,
+  TransferStrip,
+  useNetwork,
+  type Conflict,
+  type NetFocus,
+} from "./NetworkPanel";
 import type { LibraryEntryDto } from "../../ipc/types";
 import { useRouter } from "../../shell/Router";
 
@@ -56,21 +80,140 @@ export function LibraryScreen(): JSX.Element {
   const [entries, setEntries] = createSignal<LibraryEntryDto[]>([]);
   const [selected, setSelected] = createSignal(0);
   const [loading, setLoading] = createSignal(true);
+  /** One-line result of the last export/import, shown in the footer. */
+  const [flash, setFlash] = createSignal<string | null>(null);
+  /** A name clash (import, download or send) awaiting Replace / Keep both. */
+  const [conflict, setConflict] = createSignal<Conflict | null>(null);
+  /** The Network panel (M26-D), and which list has the keyboard. */
+  const [netOpen, setNetOpen] = createSignal(false);
+  const [focus, setFocus] = createSignal<"local" | NetFocus>("local");
   /** The scrollable list panel; its element children are the rows, in order. */
   let listEl: HTMLDivElement | undefined;
+  let flashTimer: number | undefined;
 
-  // Load bundles on mount.
-  onMount(() => {
-    scanLibrary()
+  function showFlash(msg: string): void {
+    setFlash(msg);
+    window.clearTimeout(flashTimer);
+    flashTimer = window.setTimeout(() => setFlash(null), 4000);
+  }
+  onCleanup(() => window.clearTimeout(flashTimer));
+
+  /** Re-read the library; select the bundle at `dir` when given. */
+  function rescan(dir?: string): Promise<void> {
+    return scanLibrary()
       .then((list) => {
         setEntries(list);
         setLoading(false);
+        if (dir !== undefined) {
+          const norm = (p: string) => p.replace(/\\/g, "/");
+          const idx = list.findIndex(
+            (e) => e.name === baseName(dir) && norm(e.dir).endsWith(norm(dir)),
+          );
+          if (idx >= 0) {
+            setSelected(idx);
+            listEl?.children[idx]?.scrollIntoView({ block: "nearest" });
+          }
+        }
       })
       .catch(() => {
         // Backend not available (e.g. plain Vite without Tauri) — show empty.
         setLoading(false);
       });
+  }
+
+  // Load bundles on mount.
+  onMount(() => void rescan());
+
+  /** `x`: write the selected song to a .rcsong file the user picks. */
+  async function exportSelected(): Promise<void> {
+    const e = entries()[selected()];
+    if (!e) return;
+    const path = await saveSongFilePicker(e.name);
+    if (path === null) return;
+    try {
+      const written = await libraryExportSong(e.dir, path);
+      showFlash(`exported → ${baseName(written)}`);
+    } catch (err) {
+      showFlash(`export failed: ${String(err)}`);
+    }
+  }
+
+  /** Import `path`; a taken name opens the Replace / Keep both prompt. */
+  async function importFile(path: string, overwrite: boolean, name: string | null): Promise<void> {
+    try {
+      const dir = await libraryImportSong(path, overwrite, name);
+      await rescan(dir);
+      showFlash(`imported ${baseName(dir)}`);
+    } catch (err) {
+      const slug = existsSlug(err);
+      if (slug !== null && !overwrite) {
+        setConflict({
+          slug,
+          where: "the library",
+          replace: () => void importFile(path, true, null),
+          keepBoth: () =>
+            void importFile(path, false, freeSlug(slug, entries().map((e) => e.name))),
+        });
+      } else {
+        showFlash(`import failed: ${String(err)}`);
+      }
+    }
+  }
+
+  /** `i`: pick a .rcsong file and import it. */
+  async function importPicked(): Promise<void> {
+    const path = await openSongFilePicker();
+    if (path !== null) await importFile(path, false, null);
+  }
+
+  const net = useNetwork({
+    localNames: () => entries().map((e) => e.name),
+    flash: showFlash,
+    onDownloaded: (dir) => void rescan(dir),
+    askConflict: setConflict,
   });
+
+  function toggleNetwork(): void {
+    if (netOpen()) {
+      setNetOpen(false);
+      setFocus("local");
+    } else {
+      setNetOpen(true);
+      setFocus("servers");
+      net.open();
+    }
+  }
+
+  /** Tab order: local → servers → songs → local. */
+  function cycleFocus(): void {
+    const order: Array<"local" | NetFocus> = ["local", "servers", "songs"];
+    setFocus(order[(order.indexOf(focus()) + 1) % order.length]);
+  }
+
+  /** Keys while the name-conflict prompt is open: it owns the keyboard. */
+  function onConflictKey(ev: KeyboardEvent, c: Conflict): void {
+    ev.preventDefault();
+    ev.stopPropagation();
+    switch (ev.key) {
+      case "r":
+      case "R":
+        setConflict(null);
+        c.replace();
+        break;
+      case "k":
+      case "K":
+        setConflict(null);
+        c.keepBoth();
+        break;
+      case "Escape":
+      case "c":
+      case "C":
+        setConflict(null);
+        break;
+      default:
+        break;
+    }
+  }
 
   function clampSel(idx: number): number {
     const n = entries().length;
@@ -100,6 +243,52 @@ export function LibraryScreen(): JSX.Element {
   }
 
   function onKeydown(ev: KeyboardEvent): void {
+    const c = conflict();
+    if (c !== null) {
+      onConflictKey(ev, c);
+      return;
+    }
+    // A text field (the "add address" input) owns its keys.
+    const target = ev.target as HTMLElement | null;
+    if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA")) return;
+
+    if (ev.key === "N") {
+      ev.preventDefault();
+      toggleNetwork();
+      return;
+    }
+    if (netOpen()) {
+      if (ev.key === "Escape") {
+        ev.preventDefault();
+        ev.stopPropagation();
+        toggleNetwork();
+        return;
+      }
+      if (ev.key === "Tab") {
+        ev.preventDefault();
+        cycleFocus();
+        return;
+      }
+      if (ev.key === "S") {
+        ev.preventDefault();
+        void net.toggleSharing();
+        return;
+      }
+      if (focus() === "servers") {
+        onServersKey(ev);
+        return;
+      }
+      if (focus() === "songs") {
+        onSongsKey(ev);
+        return;
+      }
+      if (ev.key === "u") {
+        ev.preventDefault();
+        const e = entries()[selected()];
+        if (e) net.uploadBundle(e.dir);
+        return;
+      }
+    }
     switch (ev.key) {
       case "ArrowUp":
       case "k":
@@ -120,10 +309,76 @@ export function LibraryScreen(): JSX.Element {
         ev.preventDefault();
         openEdit(selected());
         break;
+      case "x":
+        ev.preventDefault();
+        void exportSelected();
+        break;
+      case "i":
+        ev.preventDefault();
+        void importPicked();
+        break;
       case "Escape":
       case "q":
         ev.preventDefault();
         navigate({ kind: "menu" });
+        break;
+      default:
+        break;
+    }
+  }
+
+  /** Keys while the servers list has focus. */
+  function onServersKey(ev: KeyboardEvent): void {
+    switch (ev.key) {
+      case "ArrowUp":
+      case "k":
+        ev.preventDefault();
+        net.moveServer(-1);
+        break;
+      case "ArrowDown":
+      case "j":
+        ev.preventDefault();
+        net.moveServer(1);
+        break;
+      case "Enter":
+        ev.preventDefault();
+        setFocus("songs");
+        break;
+      case "r":
+        ev.preventDefault();
+        void net.discover();
+        break;
+      case "+":
+        ev.preventDefault();
+        net.setAdding(true);
+        break;
+      case "Delete":
+      case "Backspace":
+        ev.preventDefault();
+        net.removeSelectedServer();
+        break;
+      default:
+        break;
+    }
+  }
+
+  /** Keys while the remote songs list has focus. */
+  function onSongsKey(ev: KeyboardEvent): void {
+    switch (ev.key) {
+      case "ArrowUp":
+      case "k":
+        ev.preventDefault();
+        net.moveSong(-1);
+        break;
+      case "ArrowDown":
+      case "j":
+        ev.preventDefault();
+        net.moveSong(1);
+        break;
+      case "Enter":
+      case "d":
+        ev.preventDefault();
+        net.downloadSong();
         break;
       default:
         break;
@@ -167,16 +422,23 @@ export function LibraryScreen(): JSX.Element {
           Library
         </div>
         <div style={{ "font-size": "12px", color: DIM }}>
-          ↑/↓/j/k move · Enter/p Play · e Edit · Esc back
+          {netOpen()
+            ? "Tab switch list · u send · S share on/off · N close · Esc back"
+            : "↑/↓/j/k move · Enter/p Play · e Edit · x export · i import · N network · Esc back"}
         </div>
       </div>
 
+      <div style={{ flex: "1 1 auto", display: "flex", gap: "12px", "min-height": 0 }}>
       {/* List panel */}
       <div
         ref={listEl}
         style={{
-          flex: "1 1 auto",
-          border: "1px solid rgba(255,255,255,0.1)",
+          flex: "1 1 0",
+          "min-width": 0,
+          border:
+            netOpen() && focus() === "local"
+              ? `1px solid ${ACCENT}`
+              : "1px solid rgba(255,255,255,0.1)",
           "border-radius": "8px",
           overflow: "hidden auto",
           display: "flex",
@@ -238,7 +500,10 @@ export function LibraryScreen(): JSX.Element {
                       "user-select": "none",
                     }}
                     onMouseEnter={() => setSelected(idx())}
-                    onClick={() => setSelected(idx())}
+                    onClick={() => {
+                      setSelected(idx());
+                      setFocus("local");
+                    }}
                     onDblClick={() => openPlay(idx())}
                   >
                     {/* Name */}
@@ -322,10 +587,40 @@ export function LibraryScreen(): JSX.Element {
           </Show>
         </Show>
       </div>
+      <Show when={netOpen()}>
+        <NetworkPanel
+          net={net}
+          focus={focus() === "local" ? null : (focus() as NetFocus)}
+          onFocus={setFocus}
+        />
+      </Show>
+      </div>
+
+      <TransferStrip net={net} />
+
+      {/* Name-conflict prompt (import / download / send) */}
+      <Show when={conflict()}>
+        {(c) => (
+          <div
+            style={{
+              border: `1px solid ${ACCENT}`,
+              "border-radius": "8px",
+              padding: "10px 14px",
+              "font-size": "13px",
+            }}
+          >
+            A song named <b>{c().slug}</b> is already in {c().where}. R replace ·
+            K keep both · Esc cancel
+          </div>
+        )}
+      </Show>
 
       {/* Footer */}
-      <div style={{ "font-size": "12px", color: DIM }}>
-        {entries().length} track{entries().length !== 1 ? "s" : ""}
+      <div style={{ "font-size": "12px", color: DIM, display: "flex", gap: "16px" }}>
+        <span>
+          {entries().length} track{entries().length !== 1 ? "s" : ""}
+        </span>
+        <Show when={flash()}>{(m) => <span style={{ color: FG }}>{m()}</span>}</Show>
       </div>
     </div>
   );

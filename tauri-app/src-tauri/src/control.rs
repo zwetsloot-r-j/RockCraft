@@ -329,6 +329,26 @@ impl HostServices for TauriHost<'_> {
                 }
             }
 
+            HostCommand::ExportSongFile { bundle, path } => {
+                match crate::library::export_song(&bundle, &path) {
+                    Ok(path) => Ok(serde_json::json!({ "path": path })),
+                    Err(e) => failed("export_song_file", e),
+                }
+            }
+            HostCommand::ImportSongFile {
+                path,
+                overwrite,
+                name,
+            } => match crate::library::import_song(
+                &path,
+                &rockcraft_midi::bundle::library_root(),
+                overwrite,
+                name.as_deref(),
+            ) {
+                Ok(dir) => Ok(serde_json::json!({ "dir": dir })),
+                Err(e) => failed("import_song_file", e),
+            },
+
             // ── play ────────────────────────────────────────────────────
             HostCommand::PlayLoad { dir } => {
                 match crate::play::play_load(
@@ -522,6 +542,59 @@ impl HostServices for TauriHost<'_> {
                     Ok(()) => Ok(serde_json::Value::Null),
                     Err(e) => failed("import_start", e),
                 }
+            }
+            // ── LAN sharing (M26-B) ─────────────────────────────────────
+            HostCommand::ShareStart { port } => {
+                let state = app.state::<AppState>();
+                let started = crate::state::share(&state).start(port);
+                match started {
+                    Ok(status) => json_payload("share_start", status),
+                    Err(e) => failed("share_start", e.to_string()),
+                }
+            }
+            HostCommand::ShareStop => {
+                crate::state::share(&app.state::<AppState>()).stop();
+                Ok(serde_json::Value::Null)
+            }
+            HostCommand::ShareStatus => {
+                let status = crate::state::share(&app.state::<AppState>()).status();
+                json_payload("share_status", status)
+            }
+            HostCommand::ShareDiscover { timeout_ms } => {
+                let port = crate::state::share(&app.state::<AppState>()).own_port();
+                let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(1500) as u64);
+                json_payload("share_discover", rockcraft_share::discover(timeout, port))
+            }
+            HostCommand::ShareList { server } => {
+                let lister = crate::state::share(&app.state::<AppState>()).lister();
+                match lister.list(&server) {
+                    Ok(songs) => json_payload("share_list", songs),
+                    Err(e) => failed("share_list", e.to_string()),
+                }
+            }
+            HostCommand::ShareDownload {
+                server,
+                id,
+                overwrite,
+                rename_to,
+            } => {
+                let id = crate::state::share(&app.state::<AppState>())
+                    .download(&server, &id, overwrite, rename_to);
+                Ok(serde_json::json!({ "transfer_id": id }))
+            }
+            HostCommand::ShareUpload {
+                server,
+                bundle,
+                overwrite,
+                rename_to,
+            } => {
+                let id = crate::state::share(&app.state::<AppState>())
+                    .upload(&server, &bundle, overwrite, rename_to);
+                Ok(serde_json::json!({ "transfer_id": id }))
+            }
+            HostCommand::ShareTransfers => {
+                let transfers = crate::state::share(&app.state::<AppState>()).transfers();
+                json_payload("share_transfers", transfers)
             }
             HostCommand::DetectTempoMap {
                 beats_per_bar,

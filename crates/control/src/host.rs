@@ -98,6 +98,20 @@ pub enum HostCommand {
     /// `origin = Edited`); returns the created bundle dir paths. Discarded
     /// parts are omitted (= trimming); the source piece is left untouched.
     SplitBundle { segments: Vec<SegmentSpec> },
+    /// Pack the bundle folder `bundle` into a single `.rcsong` song file at
+    /// `path` (`.rcsong` appended when `path` has no extension); returns the
+    /// written path (M26-A).
+    ExportSongFile { bundle: String, path: String },
+    /// Unpack the `.rcsong` song file `path` into the library as
+    /// `<library_root>/<slug>`, the slug taken from `name` when given (a
+    /// "keep both" pick) else from the archive. An existing folder fails with
+    /// `exists:<slug>` unless `overwrite`, which replaces it only after the new
+    /// copy unpacked. Returns the new bundle dir (M26-A).
+    ImportSongFile {
+        path: String,
+        overwrite: bool,
+        name: Option<String>,
+    },
 
     // ── play ────────────────────────────────────────────────────────────
     /// Load a bundle dir as a play session; returns play info.
@@ -206,6 +220,42 @@ pub enum HostCommand {
     /// sidecar decides which an input is, so the frontends never have to.
     ImportScore { path: String },
 
+    // ── LAN sharing (M26-B) ─────────────────────────────────────────────
+    /// Share this library on the home network (port 47800, or the next free
+    /// of 47801..=47809; `port` pins one). Already sharing: a no-op. Returns
+    /// `{ running, port, addresses, name }`.
+    ShareStart { port: Option<u16> },
+    /// Stop sharing.
+    ShareStop,
+    /// Whether and where this instance shares: `{ running, port, addresses,
+    /// name, discoverable, discovery_error }`.
+    ShareStatus,
+    /// Browse the home network (mDNS) for other sharing instances for
+    /// `timeout_ms` (default 1500); returns `[{ name, addr, api }]`, this
+    /// instance excluded. Empty when multicast is unavailable (M26-C).
+    ShareDiscover { timeout_ms: Option<u32> },
+    /// List the songs another instance (`server` = `host:port`) shares, each
+    /// with `local`: `same` / `different` / `absent` against our library.
+    ShareList { server: String },
+    /// Download song `id` (with its video) from `server` into the library in
+    /// the background, as `rename_to` or its own name; returns `{ transfer_id }`.
+    ShareDownload {
+        server: String,
+        id: String,
+        overwrite: bool,
+        rename_to: Option<String>,
+    },
+    /// Upload the bundle folder `bundle` to `server` in the background, as
+    /// `rename_to` or its folder name; returns `{ transfer_id }`.
+    ShareUpload {
+        server: String,
+        bundle: String,
+        overwrite: bool,
+        rename_to: Option<String>,
+    },
+    /// The background transfer table (progress and outcome of each).
+    ShareTransfers,
+
     // ── tempo ───────────────────────────────────────────────────────────
     /// Detect a per-bar tempo map from the loaded piece's backing audio (runs
     /// the `tools/tempo-map` sidecar) and install it via
@@ -250,6 +300,8 @@ impl HostCommand {
             HostCommand::LoadBundle { .. } => "load_bundle",
             HostCommand::QueryDirty => "query_dirty",
             HostCommand::SplitBundle { .. } => "split_bundle",
+            HostCommand::ExportSongFile { .. } => "export_song_file",
+            HostCommand::ImportSongFile { .. } => "import_song_file",
             HostCommand::PlayLoad { .. } => "play_load",
             HostCommand::PlaySetWait { .. } => "play_set_wait",
             HostCommand::PlaySetRate { .. } => "play_set_rate",
@@ -283,6 +335,14 @@ impl HostCommand {
             HostCommand::QueryBackgrounds => "query_backgrounds",
             HostCommand::ImportStart { .. } => "import_start",
             HostCommand::ImportScore { .. } => "import_score",
+            HostCommand::ShareStart { .. } => "share_start",
+            HostCommand::ShareStop => "share_stop",
+            HostCommand::ShareStatus => "share_status",
+            HostCommand::ShareDiscover { .. } => "share_discover",
+            HostCommand::ShareList { .. } => "share_list",
+            HostCommand::ShareDownload { .. } => "share_download",
+            HostCommand::ShareUpload { .. } => "share_upload",
+            HostCommand::ShareTransfers => "share_transfers",
             HostCommand::DetectTempoMap { .. } => "detect_tempo_map",
             HostCommand::AudioStatus => "audio_status",
             HostCommand::MidiStatus => "midi_status",
@@ -393,6 +453,8 @@ pub fn host_command_names() -> &'static [&'static str] {
         "load_bundle",
         "query_dirty",
         "split_bundle",
+        "export_song_file",
+        "import_song_file",
         "play_load",
         "play_set_wait",
         "play_set_rate",
@@ -426,6 +488,14 @@ pub fn host_command_names() -> &'static [&'static str] {
         "query_backgrounds",
         "import_start",
         "import_score",
+        "share_start",
+        "share_stop",
+        "share_status",
+        "share_discover",
+        "share_list",
+        "share_download",
+        "share_upload",
+        "share_transfers",
         "detect_tempo_map",
         "audio_status",
         "midi_status",
@@ -467,6 +537,8 @@ static HOST_HELP: &[HostCommandInfo] = {
         HostCommandInfo { name: "load_bundle", params: &[p("dir", "String")], description: "Load a bundle directory into the composer, replacing its timeline. Returns the new snapshot." },
         HostCommandInfo { name: "query_dirty", params: &[], description: "Return whether the timeline has unsaved changes." },
         HostCommandInfo { name: "split_bundle", params: &[p("segments", "Vec<SegmentSpec>")], description: "Slice the loaded piece into the given kept parts, writing each as a new library bundle (subset MIDI + copied media + derived offsets, origin=Edited). Each segment is {start_us,end_us,name}; discarded parts are omitted (= trimming). Returns the created bundle directory paths; the source piece is left untouched." },
+        HostCommandInfo { name: "export_song_file", params: &[p("bundle", "String"), p("path", "String")], description: "Pack the bundle folder `bundle` into one .rcsong song file at `path` (.rcsong appended when there is no extension): meta.json, song.mid, the media meta.json references and the app's sidecars — never backups. Returns {path}." },
+        HostCommandInfo { name: "import_song_file", params: &[p("path", "String"), p("overwrite", "bool"), p("name", "String?")], description: "Unpack the .rcsong song file `path` into the library as <library>/<slug> (slug from `name` when given, else from the archive). Strict: flat names and only files the song accounts for. An existing folder fails with `exists:<slug>` unless overwrite (replaced only after the new copy unpacked). Returns {dir}." },
         // ── play ──────────────────────────────────────────────────────────
         HostCommandInfo { name: "play_load", params: &[p("dir", "String")], description: "Load a bundle directory as a play session. Returns play info." },
         HostCommandInfo { name: "play_set_wait", params: &[p("on", "bool")], description: "Arm (true) or disarm (false) note-by-note wait mode for the play session." },
@@ -507,6 +579,14 @@ static HOST_HELP: &[HostCommandInfo] = {
         // ── import ──────────────────────────────────────────────────────
         HostCommandInfo { name: "import_start", params: &[p("url", "String")], description: "Start importing audio/video from a URL." },
         HostCommandInfo { name: "import_score", params: &[p("path", "String")], description: "Start importing a local score file (MusicXML/.xml/.mxl/.abc/.krn) or a scan (.pdf/.png/.jpg/.jpeg/.tif/.tiff/.bmp). A score file is a deterministic transform whose notated tempo, metre and key seed the new bundle's grid. A scan goes through an optical music recognition engine first, which is lossy: its notes carry a derived confidence, the import log reports how many were flagged, and it needs an OMR engine installed (see docs/IMPORT.md)." },
+        HostCommandInfo { name: "share_start", params: &[p("port", "u16?")], description: "Share this library on the home network over HTTP: port 47800 (or the next free up to 47809; `port` pins one, 0 = any). Peers outside the home network are refused; no other auth. Already sharing: no-op. Returns {running, port, addresses, name}." },
+        HostCommandInfo { name: "share_stop", params: &[], description: "Stop sharing this library (running transfers finish)." },
+        HostCommandInfo { name: "share_status", params: &[], description: "Whether and where this instance shares: {running, port, addresses: [\"ip:port\"], name, discoverable, discovery_error}. discoverable is false when mDNS could not start (peers then need the address)." },
+        HostCommandInfo { name: "share_discover", params: &[p("timeout_ms", "u32?")], description: "Browse the home network (mDNS, _rockcraft._tcp) for other sharing instances for timeout_ms (default 1500). Returns [{name, addr: \"ip:port\", api}], this instance excluded; empty when multicast is unavailable (type the address instead)." },
+        HostCommandInfo { name: "share_list", params: &[p("server", "String")], description: "List the songs another instance shares (`server` = host:port): {id, name, origin, note_count, duration_us, has_backing, has_video, size_bytes, chart_hash, local}, where local is same (a local song has this chart) / different (same name, other chart) / absent." },
+        HostCommandInfo { name: "share_download", params: &[p("server", "String"), p("id", "String"), p("overwrite", "bool"), p("rename_to", "String?")], description: "Download song `id` (video included) from `server` into the library, in the background, as `rename_to` or its own name. Returns {transfer_id}; follow it with share_transfers (a taken name ends as state exists unless overwrite)." },
+        HostCommandInfo { name: "share_upload", params: &[p("server", "String"), p("bundle", "String"), p("overwrite", "bool"), p("rename_to", "String?")], description: "Upload the bundle folder `bundle` to `server`'s library, in the background, as `rename_to` or its folder name. Returns {transfer_id}; follow it with share_transfers (a taken name ends as state exists unless overwrite)." },
+        HostCommandInfo { name: "share_transfers", params: &[], description: "The background transfer table: {id, direction (down/up), server, name, bytes_done, bytes_total, state (running/done/failed/exists), dir?/detail?/slug?} per transfer." },
         // ── tempo ───────────────────────────────────────────────────────
         HostCommandInfo { name: "detect_tempo_map", params: &[p("beats_per_bar", "u8?"), p("anchor_us", "u64?"), p("tempo_hint_bpm", "f64?")], description: "Detect a per-bar tempo map from the loaded piece's backing audio and install it (set_bar_starts): bar lines then follow a performance whose tempo breathes. beats_per_bar defaults to the grid's; anchor_us is a known downbeat in song time (snapped to the nearest detected beat; omitted = picked from bass accents); tempo_hint_bpm resolves half/double time (e.g. 86 vs 172). Grid-only: no note moves. Needs an attached backing track and python3 with numpy. Returns {bars, bpm, pulse_bpm, anchor_us}." },
         // ── status / device ──────────────────────────────────────────────
@@ -550,6 +630,15 @@ mod tests {
                         name: "Chorus".into(),
                     },
                 ],
+            },
+            HostCommand::ExportSongFile {
+                bundle: "some/dir".into(),
+                path: "out.rcsong".into(),
+            },
+            HostCommand::ImportSongFile {
+                path: "in.rcsong".into(),
+                overwrite: false,
+                name: Some("tune-2".into()),
             },
             HostCommand::PlayLoad {
                 dir: "some/dir".into(),
@@ -612,6 +701,28 @@ mod tests {
             HostCommand::ImportScore {
                 path: "score.musicxml".into(),
             },
+            HostCommand::ShareStart { port: Some(47800) },
+            HostCommand::ShareStop,
+            HostCommand::ShareStatus,
+            HostCommand::ShareDiscover {
+                timeout_ms: Some(500),
+            },
+            HostCommand::ShareList {
+                server: "192.168.1.5:47800".into(),
+            },
+            HostCommand::ShareDownload {
+                server: "192.168.1.5:47800".into(),
+                id: "library~frog-song".into(),
+                overwrite: false,
+                rename_to: Some("frog-song-2".into()),
+            },
+            HostCommand::ShareUpload {
+                server: "192.168.1.5:47800".into(),
+                bundle: "library/waltz".into(),
+                overwrite: true,
+                rename_to: None,
+            },
+            HostCommand::ShareTransfers,
             HostCommand::DetectTempoMap {
                 beats_per_bar: Some(4),
                 anchor_us: None,
@@ -683,7 +794,7 @@ mod tests {
                     "LoopEdge" => json!("start"),
                     "SongAudio" => json!("synth"),
                     "Hand?" => json!("left"),
-                    "u16" => json!(1000),
+                    "u16" | "u16?" | "u32?" => json!(1000),
                     "f32" => json!(0.5),
                     "u8?" | "u64?" | "f64?" => json!(4),
                     "SynthBus" | "MixerBus" => json!("player"),

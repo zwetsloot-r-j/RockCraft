@@ -191,6 +191,30 @@ fn latest_recording() -> Option<String> {
     library::latest_recording_inner(&rockcraft_midi::bundle::default_scan_roots())
 }
 
+/// Export a library bundle as a `.rcsong` song file (M26-A). Paired with
+/// [`HostCommand::ExportSongFile`](rockcraft_control::HostCommand::ExportSongFile).
+#[tauri::command]
+fn library_export_song(bundle: String, path: String) -> Result<String, String> {
+    library::export_song(&bundle, &path)
+}
+
+/// Import a `.rcsong` song file into the library (M26-A). Paired with
+/// [`HostCommand::ImportSongFile`](rockcraft_control::HostCommand::ImportSongFile).
+/// Fails with `exists:<slug>` when the slug is taken and `overwrite` is false.
+#[tauri::command]
+fn library_import_song(
+    path: String,
+    overwrite: bool,
+    name: Option<String>,
+) -> Result<String, String> {
+    library::import_song(
+        &path,
+        &rockcraft_midi::bundle::library_root(),
+        overwrite,
+        name.as_deref(),
+    )
+}
+
 /// Save the current composer timeline to a bundle.
 ///
 /// `dest` selects the target:
@@ -368,6 +392,88 @@ fn edit_query_backing(state: State<'_, AppState>) -> Option<BackingRef> {
 #[tauri::command]
 fn edit_backing_waveform(state: State<'_, AppState>) -> waveform::WaveformReply {
     state::query_waveform(&state)
+}
+
+// ── LAN sharing (M26-B) — each paired with its `share_*` host command ────
+
+/// Share this library on the home network; see `HostCommand::ShareStart`.
+#[tauri::command]
+fn share_start(
+    state: State<'_, AppState>,
+    port: Option<u16>,
+) -> Result<rockcraft_share::ShareStatus, String> {
+    state::share(&state).start(port).map_err(|e| e.to_string())
+}
+
+/// Stop sharing; see `HostCommand::ShareStop`.
+#[tauri::command]
+fn share_stop(state: State<'_, AppState>) {
+    state::share(&state).stop();
+}
+
+/// Whether and where this instance shares; see `HostCommand::ShareStatus`.
+#[tauri::command]
+fn share_status(state: State<'_, AppState>) -> rockcraft_share::ShareStatus {
+    state::share(&state).status()
+}
+
+/// Browse the network for other sharing instances; see
+/// `HostCommand::ShareDiscover`. Async: browsing blocks for `timeout_ms`.
+#[tauri::command]
+async fn share_discover(
+    state: State<'_, AppState>,
+    timeout_ms: Option<u32>,
+) -> Result<Vec<rockcraft_share::Peer>, String> {
+    let port = state::share(&state).own_port();
+    let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(1500) as u64);
+    tauri::async_runtime::spawn_blocking(move || rockcraft_share::discover(timeout, port))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// List another instance's songs; see `HostCommand::ShareList`. Runs the
+/// network call off the main thread (async command).
+#[tauri::command]
+async fn share_list(
+    state: State<'_, AppState>,
+    server: String,
+) -> Result<Vec<rockcraft_share::ListedSong>, String> {
+    // Detach from the service so the HTTP call never holds its lock.
+    let lister = state::share(&state).lister();
+    tauri::async_runtime::spawn_blocking(move || lister.list(&server))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+/// Start a background download; see `HostCommand::ShareDownload`.
+#[tauri::command]
+fn share_download(
+    state: State<'_, AppState>,
+    server: String,
+    id: String,
+    overwrite: bool,
+    rename_to: Option<String>,
+) -> u64 {
+    state::share(&state).download(&server, &id, overwrite, rename_to)
+}
+
+/// Start a background upload; see `HostCommand::ShareUpload`.
+#[tauri::command]
+fn share_upload(
+    state: State<'_, AppState>,
+    server: String,
+    bundle: String,
+    overwrite: bool,
+    rename_to: Option<String>,
+) -> u64 {
+    state::share(&state).upload(&server, &bundle, overwrite, rename_to)
+}
+
+/// The background transfer table; see `HostCommand::ShareTransfers`.
+#[tauri::command]
+fn share_transfers(state: State<'_, AppState>) -> Vec<rockcraft_share::Transfer> {
+    state::share(&state).transfers()
 }
 
 /// Return the current MIDI input status (`kind` + optional `port` name).
@@ -638,6 +744,8 @@ pub fn run() {
             query_help,
             scan_library,
             latest_recording,
+            library_export_song,
+            library_import_song,
             save_bundle,
             load_bundle,
             query_dirty,
@@ -654,6 +762,14 @@ pub fn run() {
             edit_clear_backing,
             edit_query_backing,
             edit_backing_waveform,
+            share_start,
+            share_stop,
+            share_status,
+            share_discover,
+            share_list,
+            share_download,
+            share_upload,
+            share_transfers,
             midi_status,
             midi_rescan,
             mock_key,
