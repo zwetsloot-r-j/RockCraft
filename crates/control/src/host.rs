@@ -98,6 +98,20 @@ pub enum HostCommand {
     /// `origin = Edited`); returns the created bundle dir paths. Discarded
     /// parts are omitted (= trimming); the source piece is left untouched.
     SplitBundle { segments: Vec<SegmentSpec> },
+    /// Pack the bundle folder `bundle` into a single `.rcsong` song file at
+    /// `path` (`.rcsong` appended when `path` has no extension); returns the
+    /// written path (M26-A).
+    ExportSongFile { bundle: String, path: String },
+    /// Unpack the `.rcsong` song file `path` into the library as
+    /// `<library_root>/<slug>`, the slug taken from `name` when given (a
+    /// "keep both" pick) else from the archive. An existing folder fails with
+    /// `exists:<slug>` unless `overwrite`, which replaces it only after the new
+    /// copy unpacked. Returns the new bundle dir (M26-A).
+    ImportSongFile {
+        path: String,
+        overwrite: bool,
+        name: Option<String>,
+    },
 
     // ── play ────────────────────────────────────────────────────────────
     /// Load a bundle dir as a play session; returns play info.
@@ -250,6 +264,8 @@ impl HostCommand {
             HostCommand::LoadBundle { .. } => "load_bundle",
             HostCommand::QueryDirty => "query_dirty",
             HostCommand::SplitBundle { .. } => "split_bundle",
+            HostCommand::ExportSongFile { .. } => "export_song_file",
+            HostCommand::ImportSongFile { .. } => "import_song_file",
             HostCommand::PlayLoad { .. } => "play_load",
             HostCommand::PlaySetWait { .. } => "play_set_wait",
             HostCommand::PlaySetRate { .. } => "play_set_rate",
@@ -393,6 +409,8 @@ pub fn host_command_names() -> &'static [&'static str] {
         "load_bundle",
         "query_dirty",
         "split_bundle",
+        "export_song_file",
+        "import_song_file",
         "play_load",
         "play_set_wait",
         "play_set_rate",
@@ -467,6 +485,8 @@ static HOST_HELP: &[HostCommandInfo] = {
         HostCommandInfo { name: "load_bundle", params: &[p("dir", "String")], description: "Load a bundle directory into the composer, replacing its timeline. Returns the new snapshot." },
         HostCommandInfo { name: "query_dirty", params: &[], description: "Return whether the timeline has unsaved changes." },
         HostCommandInfo { name: "split_bundle", params: &[p("segments", "Vec<SegmentSpec>")], description: "Slice the loaded piece into the given kept parts, writing each as a new library bundle (subset MIDI + copied media + derived offsets, origin=Edited). Each segment is {start_us,end_us,name}; discarded parts are omitted (= trimming). Returns the created bundle directory paths; the source piece is left untouched." },
+        HostCommandInfo { name: "export_song_file", params: &[p("bundle", "String"), p("path", "String")], description: "Pack the bundle folder `bundle` into one .rcsong song file at `path` (.rcsong appended when there is no extension): meta.json, song.mid, the media meta.json references and the app's sidecars — never backups. Returns {path}." },
+        HostCommandInfo { name: "import_song_file", params: &[p("path", "String"), p("overwrite", "bool"), p("name", "String?")], description: "Unpack the .rcsong song file `path` into the library as <library>/<slug> (slug from `name` when given, else from the archive). Strict: flat names and only files the song accounts for. An existing folder fails with `exists:<slug>` unless overwrite (replaced only after the new copy unpacked). Returns {dir}." },
         // ── play ──────────────────────────────────────────────────────────
         HostCommandInfo { name: "play_load", params: &[p("dir", "String")], description: "Load a bundle directory as a play session. Returns play info." },
         HostCommandInfo { name: "play_set_wait", params: &[p("on", "bool")], description: "Arm (true) or disarm (false) note-by-note wait mode for the play session." },
@@ -550,6 +570,15 @@ mod tests {
                         name: "Chorus".into(),
                     },
                 ],
+            },
+            HostCommand::ExportSongFile {
+                bundle: "some/dir".into(),
+                path: "out.rcsong".into(),
+            },
+            HostCommand::ImportSongFile {
+                path: "in.rcsong".into(),
+                overwrite: false,
+                name: Some("tune-2".into()),
             },
             HostCommand::PlayLoad {
                 dir: "some/dir".into(),

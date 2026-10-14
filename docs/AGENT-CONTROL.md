@@ -429,6 +429,8 @@ below is an at-a-glance convenience only.
 | `load_bundle` | `{ dir: String }` | Load a bundle into the composer. Returns the new snapshot |
 | `query_dirty` | none | Whether the timeline has unsaved changes |
 | `split_bundle` | `{ segments: [{ start_us, end_us, name }] }` | Slice the loaded piece into the kept parts, each a new library bundle (subset MIDI + copied media + derived offsets, `origin=Edited`). Discarded parts are omitted (= trimming). Returns the created bundle dirs; the source is untouched |
+| `export_song_file` | `{ bundle: String, path: String }` | Pack a bundle folder into one `.rcsong` song file (`.rcsong` appended without an extension): `meta.json`, `song.mid`, referenced media and sidecars — never backups. Returns `{ path }` |
+| `import_song_file` | `{ path: String, overwrite: bool, name: String? }` | Unpack a `.rcsong` into `<library>/<slug>` (slug from `name`, else the archive). Strict file checks. A taken slug fails with `exists:<slug>` unless `overwrite`. Returns `{ dir }` |
 | `play_load` | `{ dir: String }` | Load a bundle as a play session. Returns play info |
 | `play_set_wait` | `{ on: bool }` | Arm/disarm note-by-note wait mode |
 | `play_cycle_song_audio` | none | Cycle the song audio (the `m` key): `"backing"` → `"synth"` → `"off"` → `"backing"`; a piece without a backing track cycles `"synth"` ↔ `"off"`. Returns `{ song_audio }` — see below |
