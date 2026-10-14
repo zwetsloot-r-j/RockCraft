@@ -339,6 +339,7 @@ export type ActionName =
   | "yank_selection"
   | "paste_clipboard"
   | "delete_selection"
+  | "snap_notes"
   // ── background images (M14-D) ───────────────────────────────────────
   | "select_background"
   | "cycle_background"

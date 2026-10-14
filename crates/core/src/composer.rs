@@ -50,6 +50,21 @@ const DEFAULT_CURSOR_PITCH: u8 = 60;
 const DEFAULT_NOTE_VEL: u8 = 80;
 /// Maximum entries on the undo stack; oldest checkpoints drop past this.
 const HISTORY_CAPACITY: usize = 100;
+/// Resolution of a clipboard position: ticks per bar. Far finer than a
+/// microsecond for any real bar, so positions round-trip exactly.
+const CLIP_TICKS_PER_BAR: i128 = 1 << 40;
+
+/// One clipboard note. The pitch is relative to the selection's lowest pitch;
+/// `start`/`end` are bar positions ([`Composer::bar_pos`]) relative to the
+/// selection's start, so a paste lays the notes out by beat, not by time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClipNote {
+    pitch: u8,
+    start: i128,
+    end: i128,
+    velocity: Velocity,
+    hand: Option<Hand>,
+}
 /// MIDI note value used for metronome clicks (E5 — a bright piano tone).
 const CLICK_MIDI_VALUE: u8 = 76;
 /// Duration of each metronome click note in µs (50 ms).
@@ -171,8 +186,10 @@ pub struct Composer {
     // ── selection / clipboard ──────────────────────────────────────────────
     /// Anchor of a visual selection. `None` = no selection in progress.
     selection_anchor: Option<Cursor>,
-    /// In-editor clipboard: notes normalised to the selection's top-left (0, 0).
-    clipboard: Vec<Note>,
+    /// In-editor clipboard: notes normalised to the selection's top-left, timed
+    /// in bars (see [`ClipNote`]) so a paste re-fits them to the destination's
+    /// bar lines.
+    clipboard: Vec<ClipNote>,
 
     // ── backing alignment ───────────────────────────────────────────────────
     /// File position (µs) in the attached backing track that lines up with song
@@ -780,6 +797,7 @@ impl Composer {
                 self.delete_selection();
                 Vec::new()
             }
+            Action::SnapNotes => self.snap_notes(),
 
             // ── history ─────────────────────────────────────────────────
             Action::Undo => self.undo(),
@@ -1992,7 +2010,9 @@ impl Composer {
     }
 
     /// Copy the selected notes into the clipboard, normalised to the selection's
-    /// top-left. Clears the selection on success; no-op when empty/inactive.
+    /// top-left. Times are kept as bar positions relative to the selection's
+    /// start (see [`ClipNote`]). Clears the selection on success; no-op when
+    /// empty/inactive.
     fn yank_selection(&mut self) {
         let Some((pitch_lo, _, us_lo, _)) = self.selection_bounds() else {
             return;
@@ -2001,35 +2021,118 @@ impl Composer {
         if ids.is_empty() {
             return;
         }
-        let notes: Vec<Note> = ids
+        let origin = self.bar_pos(us_lo);
+        self.clipboard = ids
             .iter()
             .filter_map(|&id| self.timeline().get(id).copied())
-            .collect();
-        self.clipboard = notes
-            .into_iter()
-            .map(|n| Note {
-                pitch: MidiNote::new(n.pitch.value().saturating_sub(pitch_lo))
-                    .expect("relative pitch always 0..=127"),
-                start_us: n.start_us.saturating_sub(us_lo),
-                ..n
+            .map(|n| ClipNote {
+                pitch: n.pitch.value() - pitch_lo,
+                start: self.bar_pos(n.start_us) - origin,
+                end: self.bar_pos(n.start_us + n.dur_us) - origin,
+                velocity: n.velocity,
+                hand: n.hand,
             })
             .collect();
         self.selection_anchor = None;
     }
 
-    /// Paste the clipboard at the cursor (top-left lands at the cursor). No-op
-    /// when the clipboard is empty.
+    /// Paste the clipboard at the cursor (top-left lands at the cursor). The
+    /// notes keep their place **in the bar**, not their microseconds, so a
+    /// passage copied at one tempo fits the bar lines where it lands. Any
+    /// existing note of the same pitch that a pasted note overlaps is removed
+    /// first (the paste replaces it). One undo step. No-op when the clipboard
+    /// is empty or every note would fall off the keyboard.
     fn paste_clipboard(&mut self) {
-        if self.clipboard.is_empty() {
+        let base_pitch = self.cursor.pitch as u16;
+        let base = self.bar_pos(self.cursor_us());
+        let pasted: Vec<Note> = self
+            .clipboard
+            .iter()
+            .filter_map(|c| {
+                let pitch = MidiNote::new(u8::try_from(base_pitch + c.pitch as u16).ok()?)?;
+                let start_us = self.us_of_bar_pos(base + c.start);
+                let end_us = self.us_of_bar_pos(base + c.end).max(start_us + 1);
+                Some(Note {
+                    pitch,
+                    start_us,
+                    dur_us: end_us - start_us,
+                    velocity: c.velocity,
+                    hand: c.hand,
+                })
+            })
+            .collect();
+        if pasted.is_empty() {
             return;
         }
         self.history.checkpoint();
-        let d_pitch = self.cursor.pitch as i8;
-        let d_us = self.cursor_us();
-        let clipboard = self.clipboard.clone();
-        self.history
-            .current_mut()
-            .insert_shifted(&clipboard, d_pitch, d_us);
+        let overlapped: Vec<NoteId> = self
+            .timeline()
+            .notes()
+            .filter(|(_, n)| {
+                pasted.iter().any(|p| {
+                    p.pitch == n.pitch
+                        && p.start_us < n.start_us + n.dur_us
+                        && n.start_us < p.start_us + p.dur_us
+                })
+            })
+            .map(|(id, _)| id)
+            .collect();
+        for id in overlapped {
+            self.history.current_mut().remove(id);
+            if self.grabbed == Some(id) {
+                self.grabbed = None;
+            }
+        }
+        for note in pasted {
+            self.history.current_mut().insert(note);
+        }
+    }
+
+    /// [`Action::SnapNotes`]: snap the onset and the end of every note in the
+    /// selection — or, with no selection, the note under the cursor — to the
+    /// nearest grid line at the live subdivision (tempo-map aware). A note
+    /// stays at least one step long, and its end stops at the next same-pitch
+    /// onset so snapping never makes two notes of one key overlap. One undo
+    /// step (none when nothing moves); the selection stays active.
+    fn snap_notes(&mut self) -> Vec<Effect> {
+        let ids: Vec<NoteId> = if self.selection_anchor.is_some() {
+            self.selection_ids()
+        } else {
+            self.note_under_cursor().into_iter().collect()
+        };
+        let mut snapped: Vec<(NoteId, u64, u64)> = ids
+            .iter()
+            .filter_map(|&id| {
+                let n = self.timeline().get(id)?;
+                let start = self.pos_snap(n.start_us);
+                let min_end = self.pos_us_of_step(self.pos_step_index(start) + 1);
+                let end = self.pos_snap(n.start_us + n.dur_us).max(min_end);
+                Some((id, start, end))
+            })
+            .collect();
+        if snapped.iter().all(|&(id, s, e)| {
+            self.timeline()
+                .get(id)
+                .is_some_and(|n| n.start_us == s && n.dur_us == e - s)
+        }) {
+            return Vec::new();
+        }
+        self.history.checkpoint();
+        snapped.sort_by_key(|&(_, s, _)| s);
+        for &(id, start, _) in &snapped {
+            self.history.current_mut().set_start(id, start);
+        }
+        for (id, start, end) in snapped {
+            let Some(pitch) = self.timeline().get(id).map(|n| n.pitch.value()) else {
+                continue;
+            };
+            let end = match self.timeline().next_onset_after(pitch, start) {
+                Some(next) if next > start => end.min(next),
+                _ => end,
+            };
+            self.history.current_mut().resize(id, end - start);
+        }
+        Vec::new()
     }
 
     /// Delete all notes in the current selection. Clears the selection. No-op
@@ -2228,6 +2331,37 @@ impl Composer {
             .set_bpm(Bpm::from_milli(milli.min(u32::MAX as u128) as u32));
         self.grid.set_origin_us(bars[0]);
         self.set_bar_starts(bars);
+    }
+
+    /// Musical position of song time `us`: bars × [`CLIP_TICKS_PER_BAR`] plus
+    /// the fraction of its (tempo-mapped) bar. Times before the first downbeat
+    /// extend bar 0's length backwards and come out negative. The tick is far
+    /// finer than a microsecond, so [`us_of_bar_pos`](Self::us_of_bar_pos)
+    /// round-trips any time exactly.
+    fn bar_pos(&self, us: u64) -> i128 {
+        let first = self.bar_start_us(0);
+        if us < first {
+            let d = self.bar_dur_us(0) as i128;
+            return -(((first - us) as i128 * CLIP_TICKS_PER_BAR + d / 2) / d);
+        }
+        let bar = self.bar_at_us(us);
+        let d = self.bar_dur_us(bar) as i128;
+        let into = (us - self.bar_start_us(bar)) as i128;
+        bar as i128 * CLIP_TICKS_PER_BAR + (into * CLIP_TICKS_PER_BAR + d / 2) / d
+    }
+
+    /// Song time (µs) of a [`bar_pos`](Self::bar_pos) position, in the bar it
+    /// lands in now — the inverse that makes a paste follow the local tempo.
+    fn us_of_bar_pos(&self, pos: i128) -> u64 {
+        if pos < 0 {
+            let d = self.bar_dur_us(0) as i128;
+            let back = (-pos * d + CLIP_TICKS_PER_BAR / 2) / CLIP_TICKS_PER_BAR;
+            return self.bar_start_us(0).saturating_sub(back as u64);
+        }
+        let bar = (pos / CLIP_TICKS_PER_BAR) as u64;
+        let d = self.bar_dur_us(bar) as i128;
+        let frac = pos % CLIP_TICKS_PER_BAR;
+        self.bar_start_us(bar) + ((frac * d + CLIP_TICKS_PER_BAR / 2) / CLIP_TICKS_PER_BAR) as u64
     }
 
     /// Snap `us` to the nearest of `divs` equal divisions of the (tempo-mapped)
@@ -4630,6 +4764,144 @@ mod tests {
         let mut c = Composer::new();
         apply(&mut c, Action::PasteClipboard);
         assert_eq!(c.note_count(), 0);
+    }
+
+    /// Copy the rectangle `(p_lo..=p_hi) × (step_lo..=step_hi)` to the clipboard.
+    fn yank_rect(c: &mut Composer, p_lo: u8, step_lo: u64, p_hi: u8, step_hi: u64) {
+        apply(
+            c,
+            Action::SetCursor {
+                pitch: p_lo,
+                step: step_lo,
+            },
+        );
+        apply(c, Action::StartSelection);
+        apply(
+            c,
+            Action::SetCursor {
+                pitch: p_hi,
+                step: step_hi,
+            },
+        );
+        apply(c, Action::YankSelection);
+    }
+
+    #[test]
+    fn paste_at_the_same_tempo_is_an_exact_copy() {
+        let mut tl = Timeline::new();
+        tl.insert(note(60, 123_457, 333_333));
+        let mut c = Composer::from_timeline(tl, grid_4_4(120, Subdivision::Eighth));
+        yank_rect(&mut c, 60, 0, 60, 1);
+        apply(
+            &mut c,
+            Action::SetCursor {
+                pitch: 60,
+                step: 16,
+            },
+        );
+        apply(&mut c, Action::PasteClipboard);
+        let snap = c.snapshot();
+        let copy = snap.notes.iter().find(|n| n.start_us > 1_000_000).unwrap();
+        assert_eq!((copy.start_us, copy.dur_us), (4_123_457, 333_333));
+    }
+
+    #[test]
+    fn paste_refits_notes_to_the_destination_tempo() {
+        // Bar 0 is 2 s long (120 BPM), bar 1 only 1 s (240 BPM).
+        let mut tl = Timeline::new();
+        tl.insert(note(60, 0, 500_000)); // a quarter
+        tl.insert(note(62, 500_000, 250_000)); // an eighth
+        let mut c = Composer::from_timeline(tl, grid_4_4(120, Subdivision::Eighth));
+        apply(
+            &mut c,
+            Action::SetBarStarts {
+                bars_us: vec![0, 2_000_000, 3_000_000, 5_000_000],
+            },
+        );
+        yank_rect(&mut c, 60, 0, 62, 7);
+        apply(&mut c, Action::SetCursor { pitch: 72, step: 8 }); // bar 1's downbeat
+        apply(&mut c, Action::PasteClipboard);
+        let snap = c.snapshot();
+        let by = |p: u8| snap.notes.iter().find(|n| n.pitch == p).copied().unwrap();
+        assert_eq!((by(72).start_us, by(72).dur_us), (2_000_000, 250_000));
+        assert_eq!((by(74).start_us, by(74).dur_us), (2_250_000, 125_000));
+    }
+
+    #[test]
+    fn paste_replaces_overlapped_same_pitch_notes() {
+        let mut tl = Timeline::new();
+        tl.insert(note(60, 0, 500_000)); // the source
+        tl.insert(note(60, 3_800_000, 300_000)); // overlaps the paste → removed
+        tl.insert(note(60, 4_500_000, 200_000)); // only touches its end → kept
+        tl.insert(note(64, 4_000_000, 500_000)); // another key → kept
+        let mut c = Composer::from_timeline(tl, grid_4_4(120, Subdivision::Eighth));
+        yank_rect(&mut c, 60, 0, 60, 0);
+        apply(
+            &mut c,
+            Action::SetCursor {
+                pitch: 60,
+                step: 16,
+            },
+        ); // 4.0 s
+        apply(&mut c, Action::PasteClipboard);
+        let starts = |c: &Composer| {
+            let mut v: Vec<(u8, u64)> = c
+                .snapshot()
+                .notes
+                .iter()
+                .map(|n| (n.pitch, n.start_us))
+                .collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(
+            starts(&c),
+            vec![(60, 0), (60, 4_000_000), (60, 4_500_000), (64, 4_000_000)]
+        );
+        // One undo brings the overlapped note back and drops the paste.
+        apply(&mut c, Action::Undo);
+        assert_eq!(
+            starts(&c),
+            vec![(60, 0), (60, 3_800_000), (60, 4_500_000), (64, 4_000_000)]
+        );
+    }
+
+    #[test]
+    fn snap_notes_snaps_onsets_and_ends_in_the_selection() {
+        let mut tl = Timeline::new();
+        tl.insert(note(60, 260_000, 230_000)); // → 250k..500k
+        tl.insert(note(62, 740_000, 20_000)); // → 750k, at least one step long
+        tl.insert(note(64, 2_010_000, 100_000)); // outside the selection
+        let mut c = Composer::from_timeline(tl, grid_4_4(120, Subdivision::Eighth));
+        apply(&mut c, Action::SetCursor { pitch: 60, step: 0 });
+        apply(&mut c, Action::StartSelection);
+        apply(&mut c, Action::SetCursor { pitch: 64, step: 3 });
+        apply(&mut c, Action::SnapNotes);
+        assert!(c.in_visual_mode(), "the selection stays");
+        let snap = c.snapshot();
+        let by = |p: u8| snap.notes.iter().find(|n| n.pitch == p).copied().unwrap();
+        assert_eq!((by(60).start_us, by(60).dur_us), (250_000, 250_000));
+        assert_eq!((by(62).start_us, by(62).dur_us), (750_000, 250_000));
+        assert_eq!((by(64).start_us, by(64).dur_us), (2_010_000, 100_000));
+        apply(&mut c, Action::Undo);
+        let snap = c.snapshot();
+        let by = |p: u8| snap.notes.iter().find(|n| n.pitch == p).copied().unwrap();
+        assert_eq!((by(60).start_us, by(60).dur_us), (260_000, 230_000));
+        assert_eq!((by(62).start_us, by(62).dur_us), (740_000, 20_000));
+    }
+
+    #[test]
+    fn snap_notes_without_selection_snaps_the_note_under_the_cursor() {
+        let mut tl = Timeline::new();
+        tl.insert(note(60, 10_000, 700_000)); // end would snap to 750k…
+        tl.insert(note(60, 520_000, 200_000)); // …but stops at this onset
+        let mut c = Composer::from_timeline(tl, grid_4_4(120, Subdivision::Eighth));
+        apply(&mut c, Action::SetCursor { pitch: 60, step: 0 });
+        apply(&mut c, Action::SnapNotes);
+        let mut notes = c.snapshot().notes.clone();
+        notes.sort_by_key(|n| n.start_us);
+        assert_eq!((notes[0].start_us, notes[0].dur_us), (0, 520_000));
+        assert_eq!((notes[1].start_us, notes[1].dur_us), (520_000, 200_000));
     }
 
     // ── backing alignment ──────────────────────────────────────────────────

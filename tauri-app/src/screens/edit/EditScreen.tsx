@@ -76,6 +76,7 @@ import {
   resolveBackgroundKey,
   resolveKey,
 } from "./keymap";
+import { countAfterKey, keepsCount, repeatsFor } from "./count";
 import { IDENTITY_TRANSFORM, layerStyle } from "../highway/backgrounds";
 import { HIGHEST_MIDI, LOWEST_MIDI } from "./viewport";
 import {
@@ -311,6 +312,8 @@ export function EditScreen(props: Props): JSX.Element {
   const [waveStatus, setWaveStatus] = createSignal<
     "none" | "pending" | "ready" | "failed"
   >("none");
+  // Vim-style count prefix (M25-A): digits typed before a move key.
+  const [pendingCount, setPendingCount] = createSignal<number | null>(null);
   const [waveMode, setWaveMode] = createSignal<WaveMode>(
     loadWaveMode(() => localStorage),
   );
@@ -1615,6 +1618,29 @@ export function EditScreen(props: Props): JSX.Element {
     // ── Normal / chord mode ─────────────────────────────────────────────
     if (!s) return;
 
+    // ── Count prefix (M25-A) ────────────────────────────────────────────
+    // Digits build a count (`0` only extends one, so a bare `0` keeps its
+    // lowest-pitch binding); the next key consumes it. Cursor moves repeat by
+    // the count (see keymap routing below); anything else just drops it, and
+    // Esc cancels a pending count without doing anything else.
+    const countPrefix = pendingCount();
+    if (s.chord_preview === null) {
+      const next = countAfterKey(countPrefix, e.key);
+      if (next !== null) {
+        e.preventDefault();
+        setPendingCount(next);
+        return;
+      }
+    }
+    if (countPrefix !== null && !keepsCount(e.key)) {
+      setPendingCount(null);
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+    }
+
     // ── Split editor (M10-C) — owns a few keys while open ────────────────
     // Only the split-specific keys are intercepted; navigation/transport keys
     // fall through to the normal keymap so the user can move the cursor/playhead
@@ -1892,12 +1918,17 @@ export function EditScreen(props: Props): JSX.Element {
     // Route through the keymap (normal / chord).
     const res = resolveKey(e.key, s.chord_preview !== null, s.selection !== null);
     switch (res.kind) {
-      case "action":
+      case "action": {
         e.preventDefault();
-        void runAction(res.dispatch.name, res.dispatch.params).then((reply) => {
+        const { name, params } = res.dispatch;
+        const times = repeatsFor(name, countPrefix);
+        void (async () => {
+          let reply = await runAction(name, params);
+          for (let i = 1; i < times; i++) reply = await runAction(name, params);
           setDirty(reply.dirty);
-        });
+        })();
         break;
+      }
       case "action-swallow":
         e.preventDefault();
         e.stopPropagation();
@@ -2118,6 +2149,7 @@ export function EditScreen(props: Props): JSX.Element {
                 snapshot={snap()}
                 dirty={dirty()}
                 wave={backingName() === null ? null : waveLabel()}
+                count={pendingCount()}
               />
             )}
           </Show>
@@ -3006,6 +3038,8 @@ function HelpOverlay(props: { onClose: () => void }): JSX.Element {
         "$             Highest pitch (C8)",
         ">             Finer subdivision",
         "<             Coarser subdivision",
+        "<count><move> Repeat a move: type a number, then h/j/k/l, H/L or",
+        "              w/b (e.g. 9k = nine steps later, 4L = four bars later)",
       ],
     },
     {
@@ -3065,8 +3099,11 @@ function HelpOverlay(props: { onClose: () => void }): JSX.Element {
       rows: [
         "v             Start visual selection",
         "y             Yank selection",
-        "p             Paste clipboard",
+        "p             Paste clipboard (fits the bar lines where it lands;",
+        "              replaces same-key notes it overlaps)",
         "D             Delete selection",
+        "q             Snap the selection's notes (or the note under the",
+        "              cursor) to the nearest grid lines, start and end",
         "Esc           Clear selection",
       ],
     },
