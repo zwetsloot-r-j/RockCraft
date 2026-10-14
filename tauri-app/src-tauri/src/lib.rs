@@ -394,6 +394,74 @@ fn edit_backing_waveform(state: State<'_, AppState>) -> waveform::WaveformReply 
     state::query_waveform(&state)
 }
 
+// ── LAN sharing (M26-B) — each paired with its `share_*` host command ────
+
+/// Share this library on the home network; see `HostCommand::ShareStart`.
+#[tauri::command]
+fn share_start(
+    state: State<'_, AppState>,
+    port: Option<u16>,
+) -> Result<rockcraft_share::ShareStatus, String> {
+    state::share(&state).start(port).map_err(|e| e.to_string())
+}
+
+/// Stop sharing; see `HostCommand::ShareStop`.
+#[tauri::command]
+fn share_stop(state: State<'_, AppState>) {
+    state::share(&state).stop();
+}
+
+/// Whether and where this instance shares; see `HostCommand::ShareStatus`.
+#[tauri::command]
+fn share_status(state: State<'_, AppState>) -> rockcraft_share::ShareStatus {
+    state::share(&state).status()
+}
+
+/// List another instance's songs; see `HostCommand::ShareList`. Runs the
+/// network call off the main thread (async command).
+#[tauri::command]
+async fn share_list(
+    state: State<'_, AppState>,
+    server: String,
+) -> Result<Vec<rockcraft_share::ListedSong>, String> {
+    // Detach from the service so the HTTP call never holds its lock.
+    let lister = state::share(&state).lister();
+    tauri::async_runtime::spawn_blocking(move || lister.list(&server))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+/// Start a background download; see `HostCommand::ShareDownload`.
+#[tauri::command]
+fn share_download(
+    state: State<'_, AppState>,
+    server: String,
+    id: String,
+    overwrite: bool,
+    rename_to: Option<String>,
+) -> u64 {
+    state::share(&state).download(&server, &id, overwrite, rename_to)
+}
+
+/// Start a background upload; see `HostCommand::ShareUpload`.
+#[tauri::command]
+fn share_upload(
+    state: State<'_, AppState>,
+    server: String,
+    bundle: String,
+    overwrite: bool,
+    rename_to: Option<String>,
+) -> u64 {
+    state::share(&state).upload(&server, &bundle, overwrite, rename_to)
+}
+
+/// The background transfer table; see `HostCommand::ShareTransfers`.
+#[tauri::command]
+fn share_transfers(state: State<'_, AppState>) -> Vec<rockcraft_share::Transfer> {
+    state::share(&state).transfers()
+}
+
 /// Return the current MIDI input status (`kind` + optional `port` name).
 #[tauri::command]
 fn midi_status(midi: State<'_, MidiState>) -> MidiStatus {
@@ -680,6 +748,13 @@ pub fn run() {
             edit_clear_backing,
             edit_query_backing,
             edit_backing_waveform,
+            share_start,
+            share_stop,
+            share_status,
+            share_list,
+            share_download,
+            share_upload,
+            share_transfers,
             midi_status,
             midi_rescan,
             mock_key,

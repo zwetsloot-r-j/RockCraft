@@ -543,6 +543,54 @@ impl HostServices for TauriHost<'_> {
                     Err(e) => failed("import_start", e),
                 }
             }
+            // ── LAN sharing (M26-B) ─────────────────────────────────────
+            HostCommand::ShareStart { port } => {
+                let state = app.state::<AppState>();
+                let started = crate::state::share(&state).start(port);
+                match started {
+                    Ok(status) => json_payload("share_start", status),
+                    Err(e) => failed("share_start", e.to_string()),
+                }
+            }
+            HostCommand::ShareStop => {
+                crate::state::share(&app.state::<AppState>()).stop();
+                Ok(serde_json::Value::Null)
+            }
+            HostCommand::ShareStatus => {
+                let status = crate::state::share(&app.state::<AppState>()).status();
+                json_payload("share_status", status)
+            }
+            HostCommand::ShareList { server } => {
+                let lister = crate::state::share(&app.state::<AppState>()).lister();
+                match lister.list(&server) {
+                    Ok(songs) => json_payload("share_list", songs),
+                    Err(e) => failed("share_list", e.to_string()),
+                }
+            }
+            HostCommand::ShareDownload {
+                server,
+                id,
+                overwrite,
+                rename_to,
+            } => {
+                let id = crate::state::share(&app.state::<AppState>())
+                    .download(&server, &id, overwrite, rename_to);
+                Ok(serde_json::json!({ "transfer_id": id }))
+            }
+            HostCommand::ShareUpload {
+                server,
+                bundle,
+                overwrite,
+                rename_to,
+            } => {
+                let id = crate::state::share(&app.state::<AppState>())
+                    .upload(&server, &bundle, overwrite, rename_to);
+                Ok(serde_json::json!({ "transfer_id": id }))
+            }
+            HostCommand::ShareTransfers => {
+                let transfers = crate::state::share(&app.state::<AppState>()).transfers();
+                json_payload("share_transfers", transfers)
+            }
             HostCommand::DetectTempoMap {
                 beats_per_bar,
                 anchor_us,
