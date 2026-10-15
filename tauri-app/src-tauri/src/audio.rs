@@ -183,8 +183,9 @@ impl AudioState {
             // (a new BackingHandle starts at 1.0×) so slow-mo survives a restart.
             let mut speed: f32 = 1.0;
             // Current backing level, re-applied for the same reason (a fresh
-            // sink starts at unity) so the fader survives a restart.
-            let mut gain = Gain::UNITY;
+            // sink starts at unity) so the fader survives a restart. Starts at
+            // the mixer's default so it matches `mixer` below.
+            let mut gain = Mixer::default().backing_gain;
             // Off-tempo mute, orthogonal to the fader above (see SetMuted).
             let mut muted = false;
 
@@ -606,9 +607,13 @@ pub fn backing_pos(playhead_us: u64, offset_us: i64) -> Option<u64> {
 /// the piece's own tempo. Off 1× a recording cannot follow, so it is muted
 /// (paused) and the synth carries the piece, like Play (M24-C). Feed the result
 /// to [`sync_backing`] as its `playing`, so stepping off 1× pauses the backing
-/// and stepping back re-syncs it at the playhead.
-pub fn backing_audible(playing: bool, playback_rate: f64) -> bool {
-    playing && rockcraft_core::rate_to_permille(playback_rate) == rockcraft_core::RATE_UNITY
+/// and stepping back re-syncs it at the playhead. `backing_on` is the editor's
+/// backing switch (`toggle_backing_audio`): off, the backing is paused the same
+/// way and the synth plays the chart on its own.
+pub fn backing_audible(playing: bool, playback_rate: f64, backing_on: bool) -> bool {
+    playing
+        && backing_on
+        && rockcraft_core::rate_to_permille(playback_rate) == rockcraft_core::RATE_UNITY
 }
 
 /// Decide what the backing should do given the current and previous transport
@@ -797,11 +802,17 @@ mod tests {
     /// The editor backing only sounds while playing at 1× (M24-C).
     #[test]
     fn backing_audible_only_at_unity_while_playing() {
-        assert!(backing_audible(true, 1.0));
-        assert!(!backing_audible(false, 1.0));
-        assert!(!backing_audible(true, 0.875));
-        assert!(!backing_audible(true, 0.5));
-        assert!(!backing_audible(true, 1.5));
+        assert!(backing_audible(true, 1.0, true));
+        assert!(!backing_audible(false, 1.0, true));
+        assert!(!backing_audible(true, 0.875, true));
+        assert!(!backing_audible(true, 0.5, true));
+        assert!(!backing_audible(true, 1.5, true));
+    }
+
+    /// Switching the backing off silences it even at 1× while playing.
+    #[test]
+    fn backing_switched_off_is_not_audible() {
+        assert!(!backing_audible(true, 1.0, false));
     }
 
     /// A seek that sat in the queue lands where the transport is *now*: 2 s at

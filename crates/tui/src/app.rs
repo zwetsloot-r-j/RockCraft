@@ -1469,6 +1469,7 @@ pub fn run_loop<B: ratatui::backend::Backend>(
         // the backing arms on transport play and re-syncs on stop/seek/loop-wrap.
         if let Screen::Edit(edit) = &mut shell.screen {
             edit.tick_audition();
+            edit.set_backing_gain(shell.mixer.backing_gain);
             edit.tick_backing(shell.backing_out.as_ref());
         }
 
@@ -3678,8 +3679,11 @@ mod tests {
         shell.on_key(KeyCode::End);
         assert_eq!(shell.mixer().song.gain, Gain::UNITY);
 
-        // Backing level reaches the live play screen.
+        // Backing level reaches the live play screen. It starts below unity
+        // (Gain::BACKING_DEFAULT), so open it fully first.
         shell.on_key(KeyCode::Down);
+        assert_eq!(shell.mixer().backing_gain, Gain::BACKING_DEFAULT);
+        shell.on_key(KeyCode::End);
         shell.on_key(KeyCode::Left);
         assert_eq!(shell.mixer().backing_gain.value(), 0.95);
         assert_eq!(play_screen(&shell).backing_gain().value(), 0.95);

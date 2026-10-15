@@ -60,6 +60,8 @@ interface Props {
   snapshot: ComposerSnapshot;
   /** Whether the timeline has unsaved changes (shows a dirty indicator). */
   dirty?: boolean;
+  /** A backing is attached but switched off for playback (`Y`). */
+  backingOff?: boolean;
   /** Backing waveform strip mode (M21-B); null/undefined = no backing. */
   wave?: string | null;
   /** Pending vim-style count prefix (M25-A); null/undefined = none typed. */
@@ -161,6 +163,10 @@ export function StatusBar(props: Props): JSX.Element {
         {(w) => <Field label="wave" value={w()} />}
       </Show>
 
+      <Show when={props.backingOff}>
+        <Field label="backing" value="off" />
+      </Show>
+
       <Show when={props.count}>
         {(n) => <Field label="count" value={`${n()}…`} />}
       </Show>
@@ -189,7 +195,7 @@ export function StatusBar(props: Props): JSX.Element {
       >
         a/x add·del · [/] size · +/- vel · (/) tempo · T set BPM · m grab · c
         chord · v·y·p·D·q select · u/U undo · Space play/stop · P play-start · !/@ speed · o
-        loop · {"{"}/{"}"} loop in/out · B backing · O wave · V video · s save · ? help
+        loop · {"{"}/{"}"} loop in/out · B backing · Y backing on/off · X mixer · O wave · V video · s save · ? help
       </span>
     </div>
   );

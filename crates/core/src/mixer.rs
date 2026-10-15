@@ -122,6 +122,10 @@ impl Gain {
     pub const UNITY: Gain = Gain(1.0);
     /// Silence.
     pub const SILENT: Gain = Gain(0.0);
+    /// The backing track's starting level. A mastered recording is far louder
+    /// than the piano synth at unity, so it starts at 30% to sit level with
+    /// the piano; the fader goes back up from there.
+    pub const BACKING_DEFAULT: Gain = Gain(0.3);
 
     /// Build a gain from a raw multiplier, clamping into `0.0..=1.0`.
     ///
@@ -297,7 +301,7 @@ impl Default for BusMix {
 /// Pure settings. A frontend owns one, mutates it through the setters below,
 /// and pushes the result at `crates/audio` (program change + channel volume on
 /// the synth, sink volume on the backing). Nothing here makes a sound.
-#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct Mixer {
     /// The player's own notes.
     pub player: BusMix,
@@ -327,8 +331,19 @@ impl std::fmt::Display for MixerError {
 
 impl std::error::Error for MixerError {}
 
+impl Default for Mixer {
+    fn default() -> Self {
+        Mixer {
+            player: BusMix::default(),
+            song: BusMix::default(),
+            backing_gain: Gain::BACKING_DEFAULT,
+        }
+    }
+}
+
 impl Mixer {
-    /// A fresh mix: every bus on the default instrument at unity gain.
+    /// A fresh mix: both synth buses on the default instrument at unity gain,
+    /// the backing at [`Gain::BACKING_DEFAULT`].
     pub fn new() -> Self {
         Mixer::default()
     }
@@ -495,14 +510,14 @@ mod tests {
     }
 
     #[test]
-    fn fresh_mixer_is_unity_piano_everywhere() {
+    fn fresh_mixer_is_unity_piano_with_a_quieter_backing() {
         let m = Mixer::new();
         for &bus in SynthBus::all() {
             assert_eq!(m.bus(bus).instrument.id, DEFAULT_INSTRUMENT);
+            assert_eq!(m.bus(bus).gain, Gain::UNITY);
         }
-        for &bus in MixerBus::all() {
-            assert_eq!(m.gain(bus), Gain::UNITY);
-        }
+        assert_eq!(m.backing_gain, Gain::BACKING_DEFAULT);
+        assert_eq!(m.backing_gain.value(), 0.3);
     }
 
     #[test]
@@ -514,7 +529,7 @@ mod tests {
         assert_eq!(m.song.gain.value(), 0.25);
         assert_eq!(m.player.instrument.id, DEFAULT_INSTRUMENT);
         assert_eq!(m.player.gain, Gain::UNITY);
-        assert_eq!(m.backing_gain, Gain::UNITY);
+        assert_eq!(m.backing_gain, Gain::BACKING_DEFAULT);
     }
 
     #[test]

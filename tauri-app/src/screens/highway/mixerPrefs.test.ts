@@ -43,7 +43,7 @@ describe("parseMixerPrefs", () => {
     );
     expect(prefs.song).toEqual({ instrument: "marimba", gain: 0.4 });
     expect(prefs.player).toEqual(DEFAULT_MIXER_PREFS.player);
-    expect(prefs.backingGain).toBe(1);
+    expect(prefs.backingGain).toBe(0.3);
   });
 
   it("clamps stored gains and rejects non-numeric ones", () => {
@@ -56,7 +56,7 @@ describe("parseMixerPrefs", () => {
     );
     expect(prefs.player).toEqual({ instrument: null, gain: 1 });
     expect(prefs.song.gain).toBe(0);
-    expect(prefs.backingGain).toBe(1);
+    expect(prefs.backingGain).toBe(0.3);
   });
 
   it("round-trips what it serialised", () => {

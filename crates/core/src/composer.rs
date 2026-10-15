@@ -175,6 +175,9 @@ pub struct Composer {
 
     // ── metronome ──────────────────────────────────────────────────────────
     metronome_enabled: bool,
+    /// Whether editor playback sounds the backing track (see
+    /// [`Composer::is_backing_audio_on`]).
+    backing_audio_enabled: bool,
     last_click_beat: Option<u64>,
     click_pending_off: Option<u64>,
     click_count: usize,
@@ -278,6 +281,7 @@ impl Composer {
             loop_start_us: 0,
             loop_end_us: 0,
             metronome_enabled: false,
+            backing_audio_enabled: true,
             last_click_beat: None,
             click_pending_off: None,
             click_count: 0,
@@ -762,6 +766,10 @@ impl Composer {
                 self.metronome_enabled = !self.metronome_enabled;
                 Vec::new()
             }
+            Action::ToggleBackingAudio => {
+                self.backing_audio_enabled = !self.backing_audio_enabled;
+                Vec::new()
+            }
             Action::StartCountInRecord => self.start_count_in_record(),
             Action::SetLoopBounds { start_us, end_us } => {
                 self.loop_start_us = start_us;
@@ -930,6 +938,7 @@ impl Composer {
             loop_start_us: self.loop_start_us,
             loop_end_us: self.loop_end_us,
             metronome: self.metronome_enabled,
+            backing_audio: self.backing_audio_enabled,
             selection,
             chord_preview,
             clipboard_len: self.clipboard.len(),
@@ -1257,6 +1266,13 @@ impl Composer {
     /// Whether the metronome click is armed.
     pub fn is_metronome_on(&self) -> bool {
         self.metronome_enabled
+    }
+
+    /// Whether editor playback should sound the backing track. A frontend
+    /// mutes (pauses) its backing while this is off; the synth still plays
+    /// the chart, so the piano can be heard on its own.
+    pub fn is_backing_audio_on(&self) -> bool {
+        self.backing_audio_enabled
     }
 
     /// Whether a count-in phase is currently in progress.
@@ -2470,6 +2486,11 @@ pub struct SelectionView {
     pub us_hi: u64,
 }
 
+/// Serde default for snapshot flags that are on unless said otherwise.
+fn default_true() -> bool {
+    true
+}
+
 /// A serialisable, read-only snapshot of a [`Composer`] for `query state` and
 /// rendering. Everything a frontend needs to draw, without exposing internals.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2499,6 +2520,9 @@ pub struct ComposerSnapshot {
     pub loop_start_us: u64,
     pub loop_end_us: u64,
     pub metronome: bool,
+    /// Whether editor playback sounds the backing track (`toggle_backing_audio`).
+    #[serde(default = "default_true")]
+    pub backing_audio: bool,
     pub selection: Option<SelectionView>,
     pub chord_preview: Option<Vec<u8>>,
     pub clipboard_len: usize,
@@ -4614,6 +4638,18 @@ mod tests {
         // 4 clicks across bar 0, then one per second across bar 1.
         assert_eq!(counts[3], 4, "bar 0 beats every 500ms");
         assert_eq!(counts[11], 8, "bar 1 beats every 1s");
+    }
+
+    #[test]
+    fn backing_audio_is_on_by_default_and_toggles() {
+        let mut c = Composer::new();
+        assert!(c.is_backing_audio_on());
+        assert!(c.snapshot().backing_audio);
+        apply(&mut c, Action::ToggleBackingAudio);
+        assert!(!c.is_backing_audio_on());
+        assert!(!c.snapshot().backing_audio);
+        apply(&mut c, Action::ToggleBackingAudio);
+        assert!(c.is_backing_audio_on());
     }
 
     #[test]

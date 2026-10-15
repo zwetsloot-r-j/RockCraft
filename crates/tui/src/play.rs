@@ -359,7 +359,7 @@ impl PlayScreen {
             finished_pause_us: LEAD_US,
             synth,
             song_synth,
-            backing_gain: Gain::UNITY,
+            backing_gain: rockcraft_core::Mixer::default().backing_gain,
             shift_us: offset,
             backing: None,
             backing_handle: None,

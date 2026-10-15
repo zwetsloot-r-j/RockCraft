@@ -1080,13 +1080,14 @@ pub fn is_playing(state: &AppState) -> bool {
 /// playhead push stops, exactly like a manual pause. The full snapshot still
 /// reports `playing = true` (with `frozen = true`) so the highway stays anchored
 /// on the playhead.
-pub fn transport_fields(state: &AppState) -> (bool, u64, i64, f64) {
+pub fn transport_fields(state: &AppState) -> (bool, u64, i64, f64, bool) {
     let composer = state.composer.lock().expect("composer mutex poisoned");
     (
         composer.is_advancing(),
         composer.playhead_us(),
         composer.backing_offset_us(),
         composer.playback_rate(),
+        composer.is_backing_audio_on(),
     )
 }
 

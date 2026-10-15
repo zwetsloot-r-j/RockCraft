@@ -46,9 +46,9 @@ use rockcraft_control::SegmentSpec;
 use rockcraft_core::{
     backing_position_us, nudge_rate_permille, rate_to_permille, segments_from_splits,
     slice_segment, Action, BackgroundImage, BackgroundStack, BackgroundVideo, BackingTrack, Bpm,
-    BpmDelta, Composer, Cursor, Effect, Grid, InputMode, Key, MidiNote, Note, NoteEvent, NoteId,
-    RecordingMeta, Scale as MusicScale, Segment, Subdivision, Timeline, TrackOrigin, Velocity,
-    RATE_UNITY,
+    BpmDelta, Composer, Cursor, Effect, Gain, Grid, InputMode, Key, MidiNote, Note, NoteEvent,
+    NoteId, RecordingMeta, Scale as MusicScale, Segment, Subdivision, Timeline, TrackOrigin,
+    Velocity, RATE_UNITY,
 };
 use rockcraft_import::write_part_bundle;
 use rockcraft_midi::{events_to_smf_bytes, key_map as mock_key_map};
@@ -270,6 +270,7 @@ fn key_to_action(code: KeyCode) -> Option<Action> {
         KeyCode::Char('{') => Action::SetLoopStart, // loop-in at cursor
         KeyCode::Char('}') => Action::SetLoopEnd,   // loop-out at cursor
         KeyCode::Char('M') => Action::ToggleMetronome,
+        KeyCode::Char('Y') => Action::ToggleBackingAudio,
         KeyCode::Char('C') => Action::StartCountInRecord,
 
         // ── selection / clipboard ───────────────────────────────────────
@@ -435,6 +436,9 @@ pub struct EditScreen {
     /// Live playback handle once the backing track has started; `None` until the
     /// transport first plays. Paused (not torn down) when the transport stops.
     backing_handle: Option<BackingHandle>,
+    /// The mixer's backing level, applied to `backing_handle` (the shell keeps
+    /// it in step with its mix via [`set_backing_gain`](Self::set_backing_gain)).
+    backing_gain: Gain,
     /// The attached backing file decoding (then decoded) in the background,
     /// started on the first tick after attaching so play starts instantly.
     backing_track: Option<TrackLoader>,
@@ -521,6 +525,7 @@ impl EditScreen {
             bpm_prompt: None,
             backing: None,
             backing_handle: None,
+            backing_gain: rockcraft_core::Mixer::default().backing_gain,
             backing_track: None,
             prev_playing: false,
             prev_playhead_us: 0,
@@ -1366,9 +1371,29 @@ impl EditScreen {
     }
 
     /// Whether the backing track should sound: the transport is playing at the
-    /// piece's own tempo. Off-tempo it is muted, like Play.
+    /// piece's own tempo and the backing is switched on (`Y`). Off-tempo it is
+    /// muted, like Play; switched off, the synth plays the chart on its own.
     fn backing_audible(&self) -> bool {
-        self.is_playing() && self.rate_permille() == RATE_UNITY
+        self.is_playing()
+            && self.rate_permille() == RATE_UNITY
+            && self.composer.is_backing_audio_on()
+    }
+
+    /// Set the backing level from the mixer, applying it to the live track
+    /// when it changes.
+    pub fn set_backing_gain(&mut self, gain: Gain) {
+        if gain == self.backing_gain {
+            return;
+        }
+        self.backing_gain = gain;
+        if let Some(h) = &self.backing_handle {
+            h.set_gain(gain);
+        }
+    }
+
+    /// The backing level this screen plays its track at.
+    pub fn backing_gain(&self) -> Gain {
+        self.backing_gain
     }
 
     /// Decide what the backing should do this tick from the transport state, and
@@ -1443,7 +1468,10 @@ impl EditScreen {
             if self.backing_audible() {
                 if let Some(pos) = self.backing_target_us() {
                     match out.play_at(&track, Duration::from_micros(pos)) {
-                        Ok(h) => self.backing_handle = Some(h),
+                        Ok(h) => {
+                            h.set_gain(self.backing_gain);
+                            self.backing_handle = Some(h);
+                        }
                         Err(_) => {
                             self.backing = None;
                             self.backing_track = None;
@@ -2499,6 +2527,12 @@ impl EditScreen {
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::raw("  B : Choose / replace the backing audio track")),
+            Line::from(Span::raw(
+                "  Y : Backing on/off while playing (the piano keeps playing)",
+            )),
+            Line::from(Span::raw(
+                "  x : Mixer (levels for you, the song and the backing)",
+            )),
             Line::from(Span::raw(
                 "  , / . : Nudge -/+10ms      ; / ' : Nudge -/+250ms",
             )),
@@ -4734,6 +4768,35 @@ mod tests {
         // Slowing again while playing pauses it.
         e.on_key(KeyCode::Char('!'));
         assert_eq!(e.poll_backing(), BackingCmd::Pause);
+    }
+
+    #[test]
+    fn y_switches_the_backing_off_and_back_on_mid_play() {
+        let mut e = EditScreen::new().with_backing(PathBuf::from("backing.wav"), 0);
+        e.on_key(KeyCode::Char('P'));
+        assert!(e.backing_audible());
+        assert!(matches!(e.poll_backing(), BackingCmd::PlayAt(_)));
+        // Off while playing: the backing pauses, the transport keeps going.
+        e.on_key(KeyCode::Char('Y'));
+        assert!(e.is_playing());
+        assert!(!e.backing_audible());
+        assert_eq!(e.poll_backing(), BackingCmd::Pause);
+        e.advance(500_000);
+        assert_eq!(e.poll_backing(), BackingCmd::None);
+        // Back on: it resumes in step at the playhead.
+        e.on_key(KeyCode::Char('Y'));
+        let target = e.backing_target_us().unwrap();
+        assert_eq!(e.poll_backing(), BackingCmd::PlayAt(target));
+        // Switching the backing is not an edit.
+        assert!(!e.is_dirty());
+    }
+
+    #[test]
+    fn backing_gain_starts_at_the_mixer_default() {
+        let mut e = EditScreen::new();
+        assert_eq!(e.backing_gain(), Gain::BACKING_DEFAULT);
+        e.set_backing_gain(Gain::UNITY);
+        assert_eq!(e.backing_gain(), Gain::UNITY);
     }
 
     #[test]

@@ -182,6 +182,7 @@ export const NORMAL_BINDINGS: Binding[] = [
   { keys: ["{"], action: { name: "set_loop_start" } }, // loop-in at cursor
   { keys: ["}"], action: { name: "set_loop_end" } }, // loop-out at cursor
   { keys: ["M"], action: { name: "toggle_metronome" } },
+  { keys: ["Y"], action: { name: "toggle_backing_audio" } },
   { keys: ["C"], action: { name: "start_count_in_record" } },
 
   // ── selection / clipboard ─────────────────────────────────────────────
