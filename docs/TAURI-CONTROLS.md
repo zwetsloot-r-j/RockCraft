@@ -65,6 +65,8 @@ swapping or detaching one never disturbs the other (M10-E).
 | Play here | `E` | **real** | save in place → Play paused on the cursor's bar (`play_seek_us`); M24-B |
 | Detach backing | `Backspace` / `Delete` | **real** | `edit_clear_backing`; clears only the audio — the video remains |
 | Backing align nudge | `,` `.` `;` `'` | **real** | `nudge_backing_offset` (±10 ms / ±250 ms) |
+| Backing on/off | `Y` / `BACKING ON·OFF` button | **real** | `toggle_backing_audio`; pauses the backing during playback (resumes in sync when switched back on) while the piano synth keeps playing the chart; a `backing off` badge shows in the StatusBar |
+| Mixer | `X` / `MIX` button | **real** | the Play screen's mixer panel (`mixer_status` / `set_bus_gain` / `set_instrument`); `Esc` closes it. The backing fader starts at 30% |
 | Attach / detach video backdrop | `V` | **real** | native video picker → `edit_set_video` / `edit_clear_video` |
 | Video align nudge | `,` `.` `;` `'` (while attached) | **real** | `edit_set_video_offset` (diverts the nudge keys while a backdrop is present) |
 | Playback speed | `!` slower / `@` faster | **real** | `set_playback_rate` through ½ ⅝ ¾ ⅞ 1× (M24-C); a speed badge shows in the StatusBar off 1×; the backing audio is muted below 1× (resumes in sync at 1×) while the video backdrop slows with the playhead |

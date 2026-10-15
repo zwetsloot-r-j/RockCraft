@@ -120,9 +120,13 @@ fn run_action(
             .0
             .lock()
             .expect("prev_transport mutex poisoned");
-        // The backing only sounds at 1× (M24-C): off-tempo it is paused.
-        let backing_playing =
-            audio::backing_audible(reply.snapshot.playing, reply.snapshot.playback_rate);
+        // The backing only sounds at 1× (M24-C) and while switched on:
+        // otherwise it is paused.
+        let backing_playing = audio::backing_audible(
+            reply.snapshot.playing,
+            reply.snapshot.playback_rate,
+            reply.snapshot.backing_audio,
+        );
         audio::sync_backing(
             &audio,
             backing_playing,
@@ -627,7 +631,7 @@ fn spawn_tick_thread(app: tauri::AppHandle) {
             let all_effects: Vec<_> = midi_effects.into_iter().chain(effects).collect();
             // Cheap transport read (no note list); the full snapshot is built
             // only when the notes actually change (see the emit below).
-            let (playing, playhead_us, backing_offset_us, playback_rate) =
+            let (playing, playhead_us, backing_offset_us, playback_rate, backing_on) =
                 state::transport_fields(&app_state);
 
             // Off 1× the backing is muted (paused) and the synth carries the
@@ -655,7 +659,7 @@ fn spawn_tick_thread(app: tauri::AppHandle) {
                 // "Playing" for the backing means audible: advancing at the
                 // piece's own tempo. Stepping off 1× pauses it; stepping back
                 // re-syncs it at the playhead (a fresh PlayAt).
-                let backing_playing = audio::backing_audible(playing, playback_rate);
+                let backing_playing = audio::backing_audible(playing, playback_rate, backing_on);
                 audio::sync_backing(
                     &audio,
                     backing_playing,

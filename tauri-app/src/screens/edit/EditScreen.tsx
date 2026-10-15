@@ -68,6 +68,7 @@ import {
 } from "./waveform";
 import { cursorUsOf, EditCanvas } from "./EditCanvas";
 import { StatusBar } from "./StatusBar";
+import { MixerPanel } from "../highway/MixerPanel";
 import { RecordControls } from "./RecordControls";
 import { DEFAULT_SPLIT } from "./hand";
 import { nudgeRatePermille, rateToPermille, speedKey } from "./speed";
@@ -380,6 +381,8 @@ export function EditScreen(props: Props): JSX.Element {
 
   // Overlay state.
   const [overlay, setOverlay] = createSignal<Overlay>("none");
+  // The sound mixer (shared with Play): `X` or its MIX button opens it.
+  const [mixerOpen, setMixerOpen] = createSignal(false);
 
   // Save-as prompt: name typed so far.
   const [saveName, setSaveName] = createSignal("");
@@ -1087,6 +1090,12 @@ export function EditScreen(props: Props): JSX.Element {
   // These wrap `run_action` so the on-screen Record⇄Edit control and the `R` /
   // `t` keys drive the exact same path.
 
+  /** Switch the backing track on/off for playback (`Y` / the BACKING button);
+   * the piano synth keeps playing the chart either way. */
+  function toggleBackingAudio(): void {
+    void runAction("toggle_backing_audio");
+  }
+
   /** Dispatch `toggle_record_arm` (arm ⇄ disarm), then refresh dirty state. */
   function toggleRecordArm(): void {
     void runAction("toggle_record_arm").then((reply) => setDirty(reply.dirty));
@@ -1671,6 +1680,14 @@ export function EditScreen(props: Props): JSX.Element {
       }
     }
 
+    // `X` opens / closes the mixer (levels for you, the song and the
+    // backing). Background mode owns `X` (detach layer) while it is open.
+    if (e.key === "X" && s.chord_preview === null && !bgMode()) {
+      e.preventDefault();
+      setMixerOpen(!mixerOpen());
+      return;
+    }
+
     // `?` toggles help regardless of mode.
     if (e.key === "?" && s.chord_preview === null) {
       e.preventDefault();
@@ -2149,6 +2166,7 @@ export function EditScreen(props: Props): JSX.Element {
                 snapshot={snap()}
                 dirty={dirty()}
                 wave={backingName() === null ? null : waveLabel()}
+                backingOff={backingName() !== null && !snap().backing_audio}
                 count={pendingCount()}
               />
             )}
@@ -2320,6 +2338,20 @@ export function EditScreen(props: Props): JSX.Element {
             onExit={exitSplitMode}
           />
         </Show>
+        {/* Sound + levels, shared with Play: a MIX button (X) and, with a
+            backing attached, its on/off switch (Y). */}
+        <MixerPanel
+          open={mixerOpen()}
+          onOpenChange={setMixerOpen}
+          backing={
+            backingName() === null
+              ? undefined
+              : {
+                  on: store.snap?.backing_audio ?? true,
+                  onToggle: toggleBackingAudio,
+                }
+          }
+        />
       </div>
 
       {/* Help overlay */}
@@ -3123,6 +3155,10 @@ function HelpOverlay(props: { onClose: () => void }): JSX.Element {
       title: "Backing track",
       rows: [
         "B             Choose / replace the backing audio track",
+        "Y             Backing on / off while playing (the piano synth",
+        "              keeps playing the chart)",
+        "X             Open / close the mixer: levels for your notes, the",
+        "              song and the backing (Esc closes it)",
         "O             Cycle the waveform strips: both → loudness (right",
         "              edge) → onsets (left edge) → off",
         "Backspace     Detach the backing (keeps the video backdrop)",

@@ -201,7 +201,7 @@ mod tests {
         assert_eq!(s.mixer.player.gain, Gain::new(0.5).unwrap());
         assert_eq!(s.mixer.song.instrument.id, "flute");
         assert_eq!(s.mixer.song.gain, Gain::UNITY);
-        assert_eq!(s.mixer.backing_gain, Gain::UNITY);
+        assert_eq!(s.mixer.backing_gain, Gain::BACKING_DEFAULT);
         assert_eq!(w.len(), 3, "{w:?}");
     }
 

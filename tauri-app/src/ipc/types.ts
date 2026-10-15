@@ -120,6 +120,8 @@ export interface ComposerSnapshot {
   loop_start_us: number;
   loop_end_us: number;
   metronome: boolean;
+  /** Whether editor playback sounds the backing track (`toggle_backing_audio`). */
+  backing_audio: boolean;
   selection: SelectionView | null;
   chord_preview: number[] | null;
   clipboard_len: number;
@@ -329,6 +331,7 @@ export type ActionName =
   // ── loop / metronome / count-in ─────────────────────────────────────
   | "toggle_loop"
   | "toggle_metronome"
+  | "toggle_backing_audio"
   | "start_count_in_record"
   | "set_loop_bounds"
   | "set_loop_start"

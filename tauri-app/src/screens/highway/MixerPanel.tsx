@@ -1,8 +1,10 @@
 // MixerPanel.tsx — sound selection + the three faders (M14-C).
 //
-// Sits over the top-right of the highway, collapsed to a "Mix" button until
-// clicked. Inside: an instrument dropdown per synth voice (You / Song) and a
-// level slider for each of the three sources — You, Song, Backing.
+// Sits over the top-right of the highway (and the editor), collapsed to a
+// "Mix" button until clicked. Inside: an instrument dropdown per synth voice
+// (You / Song) and a level slider for each of the three sources — You, Song,
+// Backing. A host screen may drive the open state itself (so a key can open
+// it) and add a backing on/off switch beside the button (the editor does).
 //
 // The backend owns the mix (`core::Mixer`, applied by `crates/audio`); this
 // panel is a view over it. Every control calls straight through and re-renders
@@ -47,8 +49,30 @@ const VOICES: { bus: SynthBus; label: string }[] = [
   { bus: "song", label: "Song" },
 ];
 
-export function MixerPanel() {
-  const [open, setOpen] = createSignal(false);
+/** The backing on/off switch a host screen can put beside the MIX button. */
+export interface BackingSwitch {
+  /** Whether the backing currently sounds during playback. */
+  on: boolean;
+  /** Flip it. */
+  onToggle: () => void;
+}
+
+export interface MixerPanelProps {
+  /** Controlled open state; omit to let the panel own it. */
+  open?: boolean;
+  /** Called when the panel asks to open or close (button / Escape). */
+  onOpenChange?: (open: boolean) => void;
+  /** Show a backing on/off button beside MIX. */
+  backing?: BackingSwitch;
+}
+
+export function MixerPanel(props: MixerPanelProps = {}) {
+  const [ownOpen, setOwnOpen] = createSignal(false);
+  const open = (): boolean => props.open ?? ownOpen();
+  const setOpen = (next: boolean): void => {
+    if (props.open === undefined) setOwnOpen(next);
+    props.onOpenChange?.(next);
+  };
   const [mix, setMix] = createSignal<MixerReport | null>(null);
   const [err, setErr] = createSignal<string | null>(null);
 
@@ -117,8 +141,18 @@ export function MixerPanel() {
   const gainOf = (report: MixerReport, bus: MixerBus): number =>
     bus === "backing" ? report.backing_gain : report[bus].gain;
 
+  /** Escape closes the open panel, even from a focused slider or dropdown. */
+  function onPanelKey(e: KeyboardEvent): void {
+    if (e.key !== "Escape" || !open()) return;
+    e.preventDefault();
+    e.stopPropagation();
+    (document.activeElement as HTMLElement | null)?.blur();
+    setOpen(false);
+  }
+
   return (
     <div
+      onKeyDown={onPanelKey}
       style={{
         position: "absolute",
         top: "10px",
@@ -126,27 +160,55 @@ export function MixerPanel() {
         "z-index": 3,
         "font-family": "'Space Grotesk', system-ui, sans-serif",
         color: "#e7e8ef",
+        display: "flex",
+        "flex-direction": "column",
+        "align-items": "flex-end",
       }}
     >
-      <button
-        type="button"
-        onClick={() => setOpen(!open())}
-        aria-expanded={open()}
-        title="Sound + levels"
-        style={{
-          "font-family": monoFont,
-          "font-size": "11px",
-          "letter-spacing": "0.08em",
-          padding: "5px 10px",
-          color: "#aab2d0",
-          background: "rgba(24,25,34,0.88)",
-          border: "1px solid rgba(255,255,255,0.12)",
-          "border-radius": "6px",
-          cursor: "pointer",
-        }}
-      >
-        MIX
-      </button>
+      <div style={{ display: "flex", gap: "6px" }}>
+        <Show when={props.backing}>
+          {(sw) => (
+            <button
+              type="button"
+              onClick={() => sw().onToggle()}
+              aria-pressed={sw().on}
+              title="Backing track on/off during playback (the piano keeps playing)"
+              style={{
+                "font-family": monoFont,
+                "font-size": "11px",
+                "letter-spacing": "0.08em",
+                padding: "5px 10px",
+                color: sw().on ? "#aab2d0" : "#f5c542",
+                background: "rgba(24,25,34,0.88)",
+                border: `1px solid ${sw().on ? "rgba(255,255,255,0.12)" : "rgba(245,197,66,0.5)"}`,
+                "border-radius": "6px",
+                cursor: "pointer",
+              }}
+            >
+              {sw().on ? "BACKING ON" : "BACKING OFF"}
+            </button>
+          )}
+        </Show>
+        <button
+          type="button"
+          onClick={() => setOpen(!open())}
+          aria-expanded={open()}
+          title="Sound + levels"
+          style={{
+            "font-family": monoFont,
+            "font-size": "11px",
+            "letter-spacing": "0.08em",
+            padding: "5px 10px",
+            color: "#aab2d0",
+            background: "rgba(24,25,34,0.88)",
+            border: "1px solid rgba(255,255,255,0.12)",
+            "border-radius": "6px",
+            cursor: "pointer",
+          }}
+        >
+          MIX
+        </button>
+      </div>
 
       <Show when={open()}>
         <div

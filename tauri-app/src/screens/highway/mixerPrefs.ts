@@ -34,11 +34,15 @@ export interface MixerPrefs {
   backingGain: number;
 }
 
-/** A first run: no instrument opinion, every fader open. */
+/**
+ * A first run: no instrument opinion, the synth faders open and the backing at
+ * 30% — a mastered recording drowns the piano at unity. Mirrors
+ * `core::Gain::BACKING_DEFAULT`.
+ */
 export const DEFAULT_MIXER_PREFS: MixerPrefs = {
   player: { instrument: null, gain: 1 },
   song: { instrument: null, gain: 1 },
-  backingGain: 1,
+  backingGain: 0.3,
 };
 
 /** Clamp a stored number into 0.0–1.0, falling back for anything non-finite. */

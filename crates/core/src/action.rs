@@ -175,6 +175,9 @@ pub enum Action {
     // ── loop / metronome / count-in ─────────────────────────────────────
     ToggleLoop,
     ToggleMetronome,
+    /// Switch the backing track on/off during editor playback; the piano
+    /// synth keeps playing the chart either way.
+    ToggleBackingAudio,
     StartCountInRecord,
     SetLoopBounds {
         start_us: u64,
@@ -382,6 +385,7 @@ impl Action {
             Action::SetPlaybackRate { .. } => "set_playback_rate",
             Action::ToggleLoop => "toggle_loop",
             Action::ToggleMetronome => "toggle_metronome",
+            Action::ToggleBackingAudio => "toggle_backing_audio",
             Action::StartCountInRecord => "start_count_in_record",
             Action::SetLoopBounds { .. } => "set_loop_bounds",
             Action::SetLoopStart => "set_loop_start",
@@ -550,6 +554,7 @@ pub fn action_names() -> &'static [&'static str] {
         "set_playback_rate",
         "toggle_loop",
         "toggle_metronome",
+        "toggle_backing_audio",
         "start_count_in_record",
         "set_loop_bounds",
         "set_loop_start",
@@ -681,6 +686,7 @@ static ACTION_HELP: &[ActionInfo] = {
         // ── loop / metronome / count-in ─────────────────────────────────
         ActionInfo { name: "toggle_loop", params: &[], description: "Toggle looped playback over the loop region." },
         ActionInfo { name: "toggle_metronome", params: &[], description: "Toggle the metronome click." },
+        ActionInfo { name: "toggle_backing_audio", params: &[], description: "Switch the backing track on/off during editor playback (the piano synth keeps playing the chart). On by default." },
         ActionInfo { name: "start_count_in_record", params: &[], description: "Begin a metronome count-in, then start recording." },
         ActionInfo { name: "set_loop_bounds", params: &[p("start_us", "u64"), p("end_us", "u64")], description: "Set the loop region to [start_us, end_us) microseconds." },
         ActionInfo { name: "set_loop_start", params: &[], description: "Set the loop region's start to the cursor position." },
@@ -792,6 +798,7 @@ mod tests {
             Action::SetPlaybackRate { rate_permille: 500 },
             Action::ToggleLoop,
             Action::ToggleMetronome,
+            Action::ToggleBackingAudio,
             Action::StartCountInRecord,
             Action::SetLoopBounds {
                 start_us: 0,
