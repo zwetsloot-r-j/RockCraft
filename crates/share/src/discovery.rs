@@ -176,16 +176,16 @@ mod tests {
         let peers = select_peers(
             vec![resolved(
                 "piano-pc",
-                47800,
+                27800,
                 &["fe80::1", "127.0.0.1", "192.168.1.7"],
             )],
             None,
             &[],
         );
-        assert_eq!(peers[0].addr, "192.168.1.7:47800");
-        let v6 = select_peers(vec![resolved("v6", 47800, &["fd00::7"])], None, &[]);
-        assert_eq!(v6[0].addr, "[fd00::7]:47800");
-        let none = select_peers(vec![resolved("lo", 47800, &["127.0.0.1"])], None, &[]);
+        assert_eq!(peers[0].addr, "192.168.1.7:27800");
+        let v6 = select_peers(vec![resolved("v6", 27800, &["fd00::7"])], None, &[]);
+        assert_eq!(v6[0].addr, "[fd00::7]:27800");
+        let none = select_peers(vec![resolved("lo", 27800, &["127.0.0.1"])], None, &[]);
         assert!(none.is_empty());
     }
 
@@ -194,11 +194,11 @@ mod tests {
         let own: Vec<IpAddr> = vec!["192.168.1.5".parse().unwrap()];
         let peers = select_peers(
             vec![
-                resolved("me", 47800, &["192.168.1.5"]),
-                resolved("me-too", 47801, &["192.168.1.5"]), // a second instance here
-                resolved("other", 47800, &["192.168.1.9"]),
+                resolved("me", 27800, &["192.168.1.5"]),
+                resolved("me-too", 27801, &["192.168.1.5"]), // a second instance here
+                resolved("other", 27800, &["192.168.1.9"]),
             ],
-            Some(47800),
+            Some(27800),
             &own,
         );
         let names: Vec<&str> = peers.iter().map(|p| p.name.as_str()).collect();
@@ -209,9 +209,9 @@ mod tests {
     fn deduplicates_and_sorts() {
         let peers = select_peers(
             vec![
-                resolved("zeta", 47800, &["192.168.1.9"]),
-                resolved("alpha", 47800, &["192.168.1.8"]),
-                resolved("zeta", 47800, &["192.168.1.9"]),
+                resolved("zeta", 27800, &["192.168.1.9"]),
+                resolved("alpha", 27800, &["192.168.1.8"]),
+                resolved("zeta", 27800, &["192.168.1.9"]),
             ],
             None,
             &[],

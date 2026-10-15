@@ -13,14 +13,14 @@ import {
 
 describe("parseServer", () => {
   it("accepts host:port and fills in the default port", () => {
-    expect(parseServer("192.168.1.5:47800")).toBe("192.168.1.5:47800");
-    expect(parseServer(" piano-pc.local ")).toBe("piano-pc.local:47800");
-    expect(parseServer("[::1]:47801")).toBe("[::1]:47801");
-    expect(parseServer("[fd00::7]")).toBe("[fd00::7]:47800");
+    expect(parseServer("192.168.1.5:27800")).toBe("192.168.1.5:27800");
+    expect(parseServer(" piano-pc.local ")).toBe("piano-pc.local:27800");
+    expect(parseServer("[::1]:27801")).toBe("[::1]:27801");
+    expect(parseServer("[fd00::7]")).toBe("[fd00::7]:27800");
   });
 
   it("rejects bad ports and shapes", () => {
-    for (const bad of ["", "host:0", "host:65536", "host:12ab", "a b:1", "::1:47800", "[]:1", "x:1:2"]) {
+    for (const bad of ["", "host:0", "host:65536", "host:12ab", "a b:1", "::1:27800", "[]:1", "x:1:2"]) {
       expect(parseServer(bad), bad).toBeNull();
     }
   });
@@ -69,8 +69,8 @@ describe("settings", () => {
     expect(loadShareEnabled()).toBe(false);
     saveShareEnabled(true);
     expect(loadShareEnabled()).toBe(true);
-    saveServers(["192.168.1.5:47800", "bogus address"]);
-    expect(loadServers()).toEqual(["192.168.1.5:47800"]);
+    saveServers(["192.168.1.5:27800", "bogus address"]);
+    expect(loadServers()).toEqual(["192.168.1.5:27800"]);
   });
 
   it("survives a throwing localStorage", () => {

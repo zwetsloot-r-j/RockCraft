@@ -221,8 +221,9 @@ pub enum HostCommand {
     ImportScore { path: String },
 
     // ── LAN sharing (M26-B) ─────────────────────────────────────────────
-    /// Share this library on the home network (port 47800, or the next free
-    /// of 47801..=47809; `port` pins one). Already sharing: a no-op. Returns
+    /// Share this library on the home network (port 27800, or the next free
+    /// of 27801..=27809, else any free port; `port` pins one). Already
+    /// sharing: a no-op. Returns
     /// `{ running, port, addresses, name }`.
     ShareStart { port: Option<u16> },
     /// Stop sharing.
@@ -579,7 +580,7 @@ static HOST_HELP: &[HostCommandInfo] = {
         // ── import ──────────────────────────────────────────────────────
         HostCommandInfo { name: "import_start", params: &[p("url", "String")], description: "Start importing audio/video from a URL." },
         HostCommandInfo { name: "import_score", params: &[p("path", "String")], description: "Start importing a local score file (MusicXML/.xml/.mxl/.abc/.krn) or a scan (.pdf/.png/.jpg/.jpeg/.tif/.tiff/.bmp). A score file is a deterministic transform whose notated tempo, metre and key seed the new bundle's grid. A scan goes through an optical music recognition engine first, which is lossy: its notes carry a derived confidence, the import log reports how many were flagged, and it needs an OMR engine installed (see docs/IMPORT.md)." },
-        HostCommandInfo { name: "share_start", params: &[p("port", "u16?")], description: "Share this library on the home network over HTTP: port 47800 (or the next free up to 47809; `port` pins one, 0 = any). Peers outside the home network are refused; no other auth. Already sharing: no-op. Returns {running, port, addresses, name}." },
+        HostCommandInfo { name: "share_start", params: &[p("port", "u16?")], description: "Share this library on the home network over HTTP: port 27800 (or the next free up to 27809, else any free port; `port` pins one, 0 = any). Peers outside the home network are refused; no other auth. Already sharing: no-op. Returns {running, port, addresses, name}." },
         HostCommandInfo { name: "share_stop", params: &[], description: "Stop sharing this library (running transfers finish)." },
         HostCommandInfo { name: "share_status", params: &[], description: "Whether and where this instance shares: {running, port, addresses: [\"ip:port\"], name, discoverable, discovery_error}. discoverable is false when mDNS could not start (peers then need the address)." },
         HostCommandInfo { name: "share_discover", params: &[p("timeout_ms", "u32?")], description: "Browse the home network (mDNS, _rockcraft._tcp) for other sharing instances for timeout_ms (default 1500). Returns [{name, addr: \"ip:port\", api}], this instance excluded; empty when multicast is unavailable (type the address instead)." },
@@ -701,23 +702,23 @@ mod tests {
             HostCommand::ImportScore {
                 path: "score.musicxml".into(),
             },
-            HostCommand::ShareStart { port: Some(47800) },
+            HostCommand::ShareStart { port: Some(27800) },
             HostCommand::ShareStop,
             HostCommand::ShareStatus,
             HostCommand::ShareDiscover {
                 timeout_ms: Some(500),
             },
             HostCommand::ShareList {
-                server: "192.168.1.5:47800".into(),
+                server: "192.168.1.5:27800".into(),
             },
             HostCommand::ShareDownload {
-                server: "192.168.1.5:47800".into(),
+                server: "192.168.1.5:27800".into(),
                 id: "library~frog-song".into(),
                 overwrite: false,
                 rename_to: Some("frog-song-2".into()),
             },
             HostCommand::ShareUpload {
-                server: "192.168.1.5:47800".into(),
+                server: "192.168.1.5:27800".into(),
                 bundle: "library/waltz".into(),
                 overwrite: true,
                 rename_to: None,

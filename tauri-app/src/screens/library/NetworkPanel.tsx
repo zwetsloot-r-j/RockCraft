@@ -67,6 +67,8 @@ const POLL_MS = 500;
 /** Network state and actions; call once inside the library screen. */
 export function useNetwork(deps: NetworkDeps) {
   const [status, setStatus] = createSignal<ShareStatus | null>(null);
+  /** Why the last attempt to start sharing failed; stays until the next try. */
+  const [shareError, setShareError] = createSignal<string | null>(null);
   const [peers, setPeers] = createSignal<SharePeer[]>([]);
   const [manual, setManual] = createSignal<string[]>(loadServers());
   const [discovering, setDiscovering] = createSignal(false);
@@ -103,6 +105,7 @@ export function useNetwork(deps: NetworkDeps) {
   }
 
   async function toggleSharing(): Promise<void> {
+    setShareError(null);
     try {
       if (status()?.running) {
         await shareStop();
@@ -114,7 +117,8 @@ export function useNetwork(deps: NetworkDeps) {
         deps.flash(`sharing at ${s.addresses[0] ?? `port ${s.port}`}`);
       }
     } catch (err) {
-      deps.flash(`sharing failed: ${String(err)}`);
+      setShareError(String(err));
+      deps.flash("sharing failed");
     }
     refreshStatus();
   }
@@ -179,7 +183,7 @@ export function useNetwork(deps: NetworkDeps) {
   function addServer(text: string): boolean {
     const addr = parseServer(text);
     if (addr === null) {
-      deps.flash("enter an address like 192.168.1.5:47800");
+      deps.flash("enter an address like 192.168.1.5:27800");
       return false;
     }
     if (!manual().includes(addr)) {
@@ -337,6 +341,7 @@ export function useNetwork(deps: NetworkDeps) {
 
   return {
     status,
+    shareError,
     servers,
     serverIdx,
     songs,
@@ -433,14 +438,21 @@ export function NetworkPanel(props: {
             cursor: "pointer",
             "flex-shrink": 0,
           }}
-          title="S toggles sharing"
+          title="Shift+S toggles sharing"
         >
           {net.status()?.running ? "Sharing on" : "Sharing off"}
         </button>
         <div style={{ "font-size": "12px", color: DIM, "min-width": 0 }}>
           <Show
             when={net.status()?.running}
-            fallback={<>Share my library on the network (S)</>}
+            fallback={
+              <>
+                Share my library on the network (Shift+S)
+                <Show when={net.shareError()}>
+                  {(err) => <div style={{ color: "#e3a14f" }}>Couldn't start sharing: {err()}</div>}
+                </Show>
+              </>
+            }
           >
             Sharing as <b style={{ color: FG }}>{net.status()?.name}</b> at{" "}
             <span style={{ color: FG }}>{net.status()?.addresses.join(", ") || `port ${net.status()?.port}`}</span>
@@ -490,7 +502,7 @@ export function NetworkPanel(props: {
                 addInput = el;
                 queueMicrotask(() => el.focus());
               }}
-              placeholder="192.168.1.5:47800"
+              placeholder="192.168.1.5:27800"
               style={{
                 flex: "1 1 auto",
                 background: "#1a1c26",

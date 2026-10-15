@@ -10,10 +10,15 @@ and import use, see M26-A).
 
 - **Agent socket:** `share_start` (optionally `{ "port": 47900 }`),
   `share_stop`, `share_status`. `share_start` returns the addresses other
-  devices connect to, e.g. `"192.168.1.5:47800"`.
+  devices connect to, e.g. `"192.168.1.5:27800"`.
 - **Desktop app:** the library's Network panel (M26-D).
 
-The server listens on port **47800**, or the next free port up to 47809.
+The server listens on port **27800**, or the next free port up to 27809.
+When all ten are taken it takes any free port the OS offers; discovery
+advertises the real port, and `share_status` shows it for manual entry.
+(The default sits below the OS ephemeral port ranges: WSL2 in mirrored
+networking mode reserves Linux's ephemeral range — e.g. 44620–48715 — on the
+Windows side, so a default inside it could never bind there.)
 
 **Windows Firewall** asks for permission the first time sharing starts. Allow
 it on **private networks** (your home network). Without that, other devices
