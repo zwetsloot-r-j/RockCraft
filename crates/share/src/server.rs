@@ -28,7 +28,10 @@ use crate::error::ShareError;
 use crate::net::is_home_network;
 
 /// The port sharing tries first; the next nine are fallbacks when it's busy.
-pub const DEFAULT_PORT: u16 = 47800;
+/// Kept below the OS ephemeral ranges (Linux 32768+, Windows 49152+): WSL2 in
+/// mirrored mode reserves Linux's ephemeral range on the Windows side, and
+/// 47800 fell inside it there, so every bind failed.
+pub const DEFAULT_PORT: u16 = 27800;
 /// How many ports from [`DEFAULT_PORT`] up to try.
 const PORT_TRIES: u16 = 10;
 /// HTTP API version, served by `/api/v1/info`.
@@ -86,8 +89,9 @@ pub struct ShareServer {
 impl ShareServer {
     /// Share `roots` (listed and downloadable) on `0.0.0.0:<port>`, with
     /// uploads landing in `library` under the machine name `name`. `port`
-    /// `None` tries [`DEFAULT_PORT`] and the nine above it; `Some(0)` takes
-    /// any free port (tests).
+    /// `None` tries [`DEFAULT_PORT`] and the nine above it, then any free
+    /// port (discovery advertises whichever it got); `Some(0)` takes any free
+    /// port (tests).
     pub fn start(
         port: Option<u16>,
         roots: Vec<PathBuf>,
@@ -164,7 +168,10 @@ impl Drop for ShareServer {
 fn bind(port: Option<u16>) -> Result<TcpListener, ShareError> {
     let ports: Vec<u16> = match port {
         Some(p) => vec![p],
-        None => (DEFAULT_PORT..DEFAULT_PORT + PORT_TRIES).collect(),
+        // Last resort 0: the OS picks a free port.
+        None => (DEFAULT_PORT..DEFAULT_PORT + PORT_TRIES)
+            .chain([0])
+            .collect(),
     };
     let mut last = String::new();
     for p in ports {
@@ -390,5 +397,28 @@ async fn upload(
         Ok(Err(ArchiveError::Io(e))) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
         Ok(Err(e)) => error(StatusCode::BAD_REQUEST, &e.to_string()),
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bind_falls_back_to_any_port_when_the_range_is_taken() {
+        // Hold every default port we can; ones we can't are taken already.
+        let _held: Vec<TcpListener> = (DEFAULT_PORT..DEFAULT_PORT + PORT_TRIES)
+            .filter_map(|p| TcpListener::bind(("0.0.0.0", p)).ok())
+            .collect();
+        let listener = bind(None).expect("falls back to an OS-picked port");
+        let port = listener.local_addr().unwrap().port();
+        assert!(!(DEFAULT_PORT..DEFAULT_PORT + PORT_TRIES).contains(&port));
+    }
+
+    #[test]
+    fn a_pinned_port_does_not_fall_back() {
+        let held = TcpListener::bind(("0.0.0.0", 0)).unwrap();
+        let port = held.local_addr().unwrap().port();
+        assert!(matches!(bind(Some(port)), Err(ShareError::Bind(_))));
     }
 }

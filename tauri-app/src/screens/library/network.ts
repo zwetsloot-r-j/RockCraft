@@ -49,8 +49,8 @@ export function saveServers(servers: string[]): void {
 
 /**
  * Normalise a typed server address, or null when it isn't `host:port` with a
- * port of 1–65535. A bare host gets the default share port 47800. IPv6 must
- * be bracketed: `[::1]:47800`.
+ * port of 1–65535. A bare host gets the default share port 27800. IPv6 must
+ * be bracketed: `[::1]:27800`.
  */
 export function parseServer(input: string): string | null {
   const text = input.trim();
@@ -73,7 +73,7 @@ export function parseServer(input: string): string | null {
     port = parts[1];
     if (!/^[A-Za-z0-9.-]+$/.test(host)) return null;
   }
-  const p = port === undefined ? 47800 : Number(port);
+  const p = port === undefined ? 27800 : Number(port);
   if (!Number.isInteger(p) || p < 1 || p > 65535 || (port !== undefined && !/^\d+$/.test(port))) {
     return null;
   }

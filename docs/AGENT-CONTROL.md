@@ -461,7 +461,7 @@ below is an at-a-glance convenience only.
 | `query_backgrounds` | none | Every background layer — id, bundle file, absolute path, selection, keyframes, and the transform at the playhead |
 | `import_start` | `{ url: String }` | Start importing from a URL |
 | `import_score` | `{ path: String }` | Start importing a local score file (MusicXML/`.xml`/`.mxl`/`.abc`/`.krn`). The notated tempo, metre and key seed the new bundle's grid |
-| `share_start` | `{ port: u16? }` | Share this library on the home network (port 47800 or the next free up to 47809). Returns `{ running, port, addresses, name }`. See [`SHARING.md`](SHARING.md) |
+| `share_start` | `{ port: u16? }` | Share this library on the home network (port 27800, the next free up to 27809, else any free port). Returns `{ running, port, addresses, name }`. See [`SHARING.md`](SHARING.md) |
 | `share_stop` | — | Stop sharing |
 | `share_status` | — | `{ running, port, addresses, name, discoverable, discovery_error }` |
 | `share_discover` | `{ timeout_ms: u32? }` | Find other sharing instances over mDNS (default 1.5 s): `[{ name, addr, api }]`, this one excluded; empty without multicast |
