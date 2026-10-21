@@ -514,7 +514,14 @@ export function HighwayScreen() {
     const e = eng();
     // Engine time is ms; backend time is µs.
     if (e) {
-      e.setLiveState(s.time_us / 1000, s.frozen, s.held, s.awaiting);
+      e.setLiveState(
+        s.time_us / 1000,
+        s.frozen,
+        s.held,
+        s.awaiting,
+        s.rate_permille,
+        s.stop_us === null ? null : s.stop_us / 1000,
+      );
       // Per-note hit/near/miss effects (M14-B). The backend sends each judged
       // note once, so pushing whatever arrived spawns exactly one effect each.
       if (s.judgments.length > 0) e.pushJudgments(s.judgments);

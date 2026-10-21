@@ -502,6 +502,11 @@ export interface PlayStateEvent {
   time_us: number;
   /** Whether wait mode has frozen the clock. */
   frozen: boolean;
+  /** Practice speed in permille: song µs per wall-clock µs × 1000. */
+  rate_permille: number;
+  /** The next song time the clock stops at (an armed wait step) or jumps from
+   * (a loop boundary); the highway never interpolates past it. */
+  stop_us: number | null;
   score: number;
   combo: number;
   best_combo: number;
