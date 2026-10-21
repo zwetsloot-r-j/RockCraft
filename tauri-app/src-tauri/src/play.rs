@@ -27,9 +27,10 @@ use std::sync::Mutex;
 use rockcraft_core::{
     backing_position_us, hand::hand_of_pitch_value, interleave_by_time, order_triggers, score,
     song_shift_us, BackgroundImage, BarMap, Bpm, ExpectedNote, Feedback, GateState, Hand,
-    HandOverride, LoopPhase, LoopStep, MidiNote, NoteEvent, NoteEventKind, NoteJudgment, Pass,
-    PlayClock, PracticeLoop, RecordingMeta, ScoreConfig, ScoreReport, SongAudio, SpanTrigger,
-    Summary, SustainEvent, SynthBus, Timing, Transform, WaitGate, DEFAULT_SPLIT,
+    HandOverride, LiveScorer, LoopPhase, LoopStep, MidiNote, NoteEvent, NoteEventKind,
+    NoteJudgment, Pass, PlayClock, PracticeLoop, RecordingMeta, ScoreConfig, ScoreReport,
+    SongAudio, SpanTrigger, Summary, SustainEvent, SynthBus, Timing, Transform, WaitGate,
+    DEFAULT_SPLIT,
 };
 use rockcraft_midi::smf_bytes_to_events;
 use serde::Serialize;
@@ -60,6 +61,10 @@ const CLICK_DUR_US: u64 = 50_000;
 
 /// Bar length used when a piece has no grid (120 BPM, 4/4).
 const DEFAULT_BAR_US: u64 = 2_000_000;
+
+/// Most clamped steps one tick may take (each ends on a wait onset or loop
+/// boundary) — far more than a tick's worth of notes.
+const MAX_STEPS_PER_TICK: usize = 64;
 
 /// Ceiling on undelivered per-note judgments (M14-B). At ~60 Hz a tick closes a
 /// handful of notes at most, so this only ever trips when nothing is draining
@@ -243,6 +248,13 @@ impl HitFeedbackView {
 pub struct PlayStateEvent {
     pub time_us: u64,
     pub frozen: bool,
+    /// Practice speed in permille: how fast `time_us` moves per wall-clock
+    /// µs, so the webview can interpolate between snapshots at the right pace.
+    pub rate_permille: u16,
+    /// The next time the clock stops at (an armed wait step's onset) or jumps
+    /// from (a loop boundary), if any. The webview never interpolates past it,
+    /// so the highway does not overshoot a freeze and then snap back.
+    pub stop_us: Option<u64>,
     pub score: u64,
     pub combo: u32,
     pub best_combo: u32,
@@ -485,17 +497,6 @@ fn expected_notes_for(spans: &[NoteSpan], practice: Option<Hand>, split: u8) -> 
         .collect()
 }
 
-/// Per-note score award. Perfect = 100 + combo·2, Good (early/late) = 50 +
-/// combo. A miss zeroes the combo. Mirrors the webview prototype's economy so
-/// the header reads the same range as the old mock, but driven by real timing.
-fn award(perfect: bool, combo: u32) -> u64 {
-    if perfect {
-        100 + combo as u64 * 2
-    } else {
-        50 + combo as u64
-    }
-}
-
 /// A running practice loop (M17-A): the core phase machine plus the loop's own
 /// per-pass scoring state, kept apart from the whole-take `played`/`scored` so
 /// stopping the loop restores the take exactly.
@@ -591,6 +592,13 @@ pub struct PlaySession {
     /// its good-window close, so the header combo/score is live. Indices into
     /// `spans`.
     scored: HashSet<usize>,
+    /// Span indices sorted by start (then index): the order notes close in.
+    by_start: Vec<usize>,
+    /// How many of `by_start` [`score_due`](Self::score_due) has looked at;
+    /// back to 0 whenever which spans count, or the clock, jumps.
+    scan_from: usize,
+    /// Judges newly closed spans without re-scoring the take.
+    scorer: LiveScorer,
     score: u64,
     combo: u32,
     best_combo: u32,
@@ -666,6 +674,8 @@ impl PlaySession {
             .collect();
         let duration_us = song_duration_us(&spans);
         let wait = WaitGate::from_expected(&expected_steps(&spans));
+        let mut by_start: Vec<usize> = (0..spans.len()).collect();
+        by_start.sort_by_key(|&i| (spans[i].start_us, i));
 
         Self {
             spans,
@@ -692,6 +702,9 @@ impl PlaySession {
             held: BTreeSet::new(),
             played: Vec::new(),
             scored: HashSet::new(),
+            by_start,
+            scan_from: 0,
+            scorer: LiveScorer::new(ScoreConfig::default()),
             score: 0,
             combo: 0,
             best_combo: 0,
@@ -938,9 +951,41 @@ impl PlaySession {
         } else {
             dt_us * self.rate_permille as u64 / PLAY_RATE_UNITY as u64
         };
-        // The loop wraps BEFORE the gate poll, so a step at exactly `end_us` (the
-        // next bar's first note) never freezes the loop.
+        // A tick is cut into steps that each end on the next wait onset or loop
+        // boundary, and the transport is re-checked at each one: the time left
+        // after a wait step the player has already satisfied carries on into the
+        // next, instead of being lost (which pulled the highway back after a
+        // stall). Bounded, in case a gate never stops handing out boundaries.
+        let mut left_us = dt_us;
+        let mut frozen = false;
+        for _ in 0..MAX_STEPS_PER_TICK {
+            // The loop wraps BEFORE the gate poll, so a step at exactly `end_us`
+            // (the next bar's first note) never freezes the loop.
+            self.tick_loop();
+            frozen = self.update_transport();
+            if frozen || left_us == 0 {
+                break;
+            }
+            let step_us = self.step_limit(left_us);
+            let prev_us = self.clock.now_us();
+            self.clock.advance(step_us);
+            self.loop_clicks(prev_us, self.clock.now_us());
+            left_us -= step_us;
+            // A loop boundary ends the tick: the jump it makes is the pass's
+            // own, and time carried past it would skip the downbeat.
+            if self.loop_boundary() == Some(self.clock.now_us()) {
+                break;
+            }
+        }
         self.tick_loop();
+        self.score_due();
+        frozen
+    }
+
+    /// Feed the held set to the wait gate and pause / resume the clock to
+    /// match. Returns whether the transport is frozen (a manual pause or an
+    /// unsatisfied wait step).
+    fn update_transport(&mut self) -> bool {
         self.wait.set_held(self.held.clone(), self.clock.now_us());
         let wait_frozen = self.wait.poll(self.clock.now_us()) == GateState::Frozen;
         // A manual pause freezes the transport just like an unsatisfied wait step.
@@ -950,80 +995,97 @@ impl PlaySession {
         } else if !frozen && !self.clock.is_running() {
             self.clock.resume();
         }
-        // Clamp this tick so an armed wait never carries the clock *past* the next
-        // note's onset. The tick thread feeds a wall-clock `dt` (~4 ms nominal),
-        // but a stall — a WebView2 video decode, GC, lock contention — spikes it
-        // to tens/hundreds of ms. Without the clamp the clock leaps past the
-        // onset and the gate freezes wherever it landed, so the note you must
-        // play sits in the past (at/after its end) — the "wait mode pauses after
-        // the fact" bug. Landing exactly on the onset makes the next tick freeze
-        // there, pinning the note at the hit line. Only while advancing (a freeze
-        // already parks the clock) and armed (free play is untouched).
-        let mut step_us = dt_us;
-        if !frozen && self.wait.is_armed() {
-            if let Some(next) = self.wait.next_step_time() {
-                let now = self.clock.now_us();
-                if next > now {
-                    step_us = step_us.min(next - now);
-                }
-            }
-        }
-        // Likewise land exactly on the loop's next boundary (loop start after a
-        // count-in, loop end after a pass), so phases switch on the downbeat.
-        if !frozen {
-            if let Some(boundary) = self.loop_boundary() {
-                let now = self.clock.now_us();
-                if boundary > now {
-                    step_us = step_us.min(boundary - now);
-                }
-            }
-        }
-        let prev_us = self.clock.now_us();
-        self.clock.advance(step_us);
-        self.loop_clicks(prev_us, self.clock.now_us());
-        self.tick_loop();
-        self.score_due();
         frozen
     }
 
+    /// Where the running clock stops (the armed wait gate's next onset) or
+    /// jumps (the loop's next boundary), if anywhere.
+    fn stops(&self) -> [Option<u64>; 2] {
+        let onset = self
+            .wait
+            .is_armed()
+            .then(|| self.wait.next_step_time())
+            .flatten();
+        [onset, self.loop_boundary()]
+    }
+
+    /// The soonest of [`stops`](Self::stops) not already behind the clock.
+    fn next_stop_us(&self) -> Option<u64> {
+        let now = self.clock.now_us();
+        self.stops()
+            .into_iter()
+            .flatten()
+            .filter(|&t| t >= now)
+            .min()
+    }
+
+    /// How far the running clock may move of `left_us`: never *past* the next
+    /// armed wait onset or loop boundary.
+    ///
+    /// The tick thread feeds a wall-clock `dt` (~4 ms nominal), but a stall — a
+    /// WebView2 video decode, GC, lock contention — spikes it to tens/hundreds
+    /// of ms. Without the clamp the clock leaps past the onset and the gate
+    /// freezes wherever it landed, so the note you must play sits in the past
+    /// (at/after its end) — the "wait mode pauses after the fact" bug. Landing
+    /// exactly on the onset lets the gate freeze there, pinning the note at the
+    /// hit line. Likewise a loop boundary (loop start after a count-in, loop end
+    /// after a pass), so phases switch on the downbeat.
+    fn step_limit(&self, left_us: u64) -> u64 {
+        let now = self.clock.now_us();
+        self.stops()
+            .into_iter()
+            .flatten()
+            .filter(|&limit| limit > now)
+            .fold(left_us, |step, limit| step.min(limit - now))
+    }
+
     /// Score every span whose good-window has closed since the last call. A span
-    /// at shifted start `t` is final once the clock passes `t + good_us`: by
-    /// then any in-window strike has arrived. We re-score the closed prefix with
-    /// `core::score` (cheap; few notes) and recompute the live combo/score so the
-    /// figures match the final report exactly.
+    /// at shifted start `t` is final once the clock is past `t + good_us`: by
+    /// then any in-window strike has arrived (one struck at exactly that time
+    /// still counts). Spans close in start order, so only the ones that closed
+    /// since the last scan are looked at, and judged incrementally
+    /// ([`LiveScorer`]) — the same judgments `core::score` gives, without
+    /// re-scoring the take, so a long song costs no more at its end.
     fn score_due(&mut self) {
         let now = self.now_us();
+        let good_us = self.cfg.good_us;
         let split = self.split_pitch;
+        let spans = &self.spans;
+        let closed = self
+            .by_start
+            .partition_point(|&i| spans[i].start_us + good_us < now);
+        let from = self.scan_from.min(closed);
+        let candidates = &self.by_start[from..closed];
         let newly: Vec<usize> = match &self.practice_loop {
-            None => self
-                .spans
+            None => candidates
                 .iter()
-                .enumerate()
-                .filter(|(i, s)| {
+                .copied()
+                .filter(|i| {
                     !self.scored.contains(i)
-                        && now >= s.start_us + self.cfg.good_us
                         // When practicing one hand, the other hand auto-plays — don't score it.
                         && !self
                             .practice
-                            .is_some_and(|h| s.effective_hand(split) != h)
+                            .is_some_and(|h| spans[*i].effective_hand(split) != h)
                 })
-                .map(|(i, _)| i)
                 .collect(),
             // In a loop only *your turn* scores, and only the loop's spans.
-            Some(rl) if rl.lp.phase() == LoopPhase::YourTurn => self
-                .spans
+            Some(rl) if rl.lp.phase() == LoopPhase::YourTurn => candidates
                 .iter()
-                .enumerate()
-                .filter(|(i, s)| {
+                .copied()
+                .filter(|i| {
                     !rl.scored.contains(i)
-                        && rl.contains(s)
-                        && now >= s.start_us + self.cfg.good_us
-                        && rl.practice.is_none_or(|h| s.effective_hand(split) == h)
+                        && rl.contains(&spans[*i])
+                        && rl
+                            .practice
+                            .is_none_or(|h| spans[*i].effective_hand(split) == h)
                 })
-                .map(|(i, _)| i)
                 .collect(),
-            Some(_) => return,
+            Some(_) => {
+                self.scan_from = 0;
+                return;
+            }
         };
+        self.scan_from = closed;
         if newly.is_empty() {
             return;
         }
@@ -1031,7 +1093,33 @@ impl PlaySession {
             None => self.scored.extend(newly.iter().copied()),
             Some(rl) => rl.scored.extend(newly.iter().copied()),
         }
-        let judged = self.recompute_live();
+        // `newly` is in (start, index) order. If it follows every note judged
+        // so far, judge just it; otherwise (the practised hand changed, so
+        // earlier notes joined) re-score the take.
+        let notes: Vec<(usize, ExpectedNote)> = newly
+            .iter()
+            .filter_map(|&i| {
+                let s = &self.spans[i];
+                MidiNote::new(s.note).map(|n| (i, ExpectedNote::new(n, s.start_us)))
+            })
+            .collect();
+        let judged = match notes.first() {
+            Some(&(i, e)) if self.scorer.can_follow((e.time_us, i)) => {
+                let played = match &self.practice_loop {
+                    Some(rl) => &rl.played,
+                    None => &self.played,
+                };
+                let judgments = self.scorer.judge(&notes, played);
+                self.adopt_tally();
+                notes.iter().map(|&(i, _)| i).zip(judgments).collect()
+            }
+            Some(_) => {
+                let all = self.recompute_live();
+                self.scan_from = closed;
+                all
+            }
+            None => Vec::new(),
+        };
         self.queue_feedback(judged, &newly);
     }
 
@@ -1059,7 +1147,9 @@ impl PlaySession {
     }
 
     /// Recompute the live combo/score over the scored prefix (spans whose window
-    /// has closed), in time order, using the authoritative `core::score`.
+    /// has closed), in time order, from scratch: after a seek, a loop pass, or a
+    /// change to which spans count. Also restarts [`score_due`](Self::score_due)'s
+    /// scan, since the set of closed spans may have jumped.
     ///
     /// Returns `(span index, judgment)` in that same time order so the caller can
     /// attribute each judgment back to the note it belongs to (M14-B).
@@ -1078,36 +1168,22 @@ impl PlaySession {
                 MidiNote::new(s.note).map(|n| (i, ExpectedNote::new(n, s.start_us)))
             })
             .collect();
-        closed.sort_by_key(|(_, e)| e.time_us);
-        let expected: Vec<ExpectedNote> = closed.iter().map(|(_, e)| *e).collect();
-        let report = score(&expected, played, self.cfg);
+        closed.sort_by_key(|&(i, e)| (e.time_us, i));
+        self.scorer = LiveScorer::new(self.cfg);
+        let judgments = self.scorer.judge(&closed, played);
+        self.adopt_tally();
+        self.scan_from = 0;
+        closed.into_iter().map(|(i, _)| i).zip(judgments).collect()
+    }
 
-        self.score = 0;
-        self.combo = 0;
-        self.best_combo = 0;
-        self.live_hits = 0;
-        self.live_misses = 0;
-        for j in &report.judgments {
-            match j {
-                NoteJudgment::Hit { timing, .. } => {
-                    let perfect = matches!(timing, Timing::Perfect);
-                    self.score += award(perfect, self.combo);
-                    self.combo += 1;
-                    self.best_combo = self.best_combo.max(self.combo);
-                    self.live_hits += 1;
-                }
-                NoteJudgment::Miss => {
-                    self.combo = 0;
-                    self.live_misses += 1;
-                }
-            }
-        }
-
-        closed
-            .into_iter()
-            .map(|(i, _)| i)
-            .zip(report.judgments)
-            .collect()
+    /// Copy the scorer's running figures into the live fields.
+    fn adopt_tally(&mut self) {
+        let t = self.scorer.tally();
+        self.score = t.score;
+        self.combo = t.combo;
+        self.best_combo = t.best_combo;
+        self.live_hits = t.hits as usize;
+        self.live_misses = t.misses as usize;
     }
 
     /// Toggle a manual pause of the play session (`HostCommand::PlayTogglePause`),
@@ -1232,6 +1308,8 @@ impl PlaySession {
     /// hand's notes are waited on; the other hand auto-plays via `tick_play`.
     pub fn set_practice(&mut self, practice: Option<Hand>) {
         self.practice = practice;
+        // Spans of the other hand may count now: look at every closed one.
+        self.scan_from = 0;
         self.rebuild_wait_gate();
     }
 
@@ -1247,6 +1325,7 @@ impl PlaySession {
     /// hand — and rebuilds the wait gate.
     pub fn set_split(&mut self, split: u8) {
         self.split_pitch = split;
+        self.scan_from = 0;
         self.rebuild_wait_gate();
     }
 
@@ -1404,6 +1483,8 @@ impl PlaySession {
         PlayStateEvent {
             time_us: self.now_us(),
             frozen,
+            rate_permille: self.rate_permille,
+            stop_us: self.next_stop_us(),
             score: self.score,
             combo: self.combo,
             best_combo: self.best_combo,
@@ -2346,6 +2427,58 @@ mod tests {
     /// Targets, after the pre-roll shift, fall at SHIFT + k·250ms.
     fn target_us(k: u64) -> u64 {
         SHIFT + k * 250_000
+    }
+
+    /// A stalled tick spanning a wait step the player already struck carries
+    /// on past it instead of dropping the rest of the tick — the lost time
+    /// was a highway pull-back. An unstruck step still stops it on its onset.
+    #[test]
+    fn a_long_tick_carries_on_past_a_wait_step_already_struck() {
+        let mut s = session();
+        s.set_wait_mode(true);
+        s.advance(target_us(0) - 10_000);
+        s.ingest(on(60, s.now_us()));
+        s.advance(50_000);
+        assert_eq!(s.now_us(), target_us(0) + 40_000);
+        s.advance(5_000_000);
+        assert_eq!(s.now_us(), target_us(1), "D unstruck: lands on its onset");
+    }
+
+    /// `play_state` tells the webview how fast song time moves and where the
+    /// clock will next stop, so it can interpolate without overshooting.
+    #[test]
+    fn live_state_reports_the_rate_and_the_next_stop() {
+        let mut s = session();
+        s.advance(1_000);
+        let st = s.live_state();
+        assert_eq!((st.rate_permille, st.stop_us), (PLAY_RATE_UNITY, None));
+        s.set_wait_mode(true);
+        s.set_rate(750);
+        let st = s.live_state();
+        assert_eq!((st.rate_permille, st.stop_us), (750, Some(target_us(0))));
+    }
+
+    /// Live figures are judged incrementally; a take with hits, a late note,
+    /// a wrong note and a miss must still end equal to the full re-score.
+    #[test]
+    fn incremental_live_figures_equal_the_final_score() {
+        let mut s = session();
+        s.advance(target_us(0));
+        s.ingest(on(60, s.now_us()));
+        s.advance(target_us(1) + 90_000 - s.now_us());
+        s.ingest(on(62, s.now_us())); // late
+        s.ingest(on(61, s.now_us())); // wrong
+        s.advance(target_us(3) - s.now_us());
+        s.ingest(on(65, s.now_us())); // E missed, F hit
+        s.advance(1_000_000);
+        let st = s.status();
+        let full = score(
+            &expected_notes_for(&s.spans, None, DEFAULT_SPLIT),
+            &s.played,
+            s.cfg,
+        );
+        assert_eq!((st.hits, st.misses), (full.hits, full.misses));
+        assert_eq!((st.hits, st.misses), (3, 1));
     }
 
     /// `status` reports the wait gate's demand alongside what is actually held —

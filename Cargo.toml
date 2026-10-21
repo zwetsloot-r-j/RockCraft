@@ -66,3 +66,7 @@ symphonia-bundle-mp3 = { opt-level = 3 }
 # seconds and rendering eats into the audio thread's deadline (glitches, and a
 # fuller output buffer — i.e. late notes). Same fix as the decoders.
 rustysynth = { opt-level = 3 }
+# The pure engine (clock, wait gate, scoring) runs on the play loop's 4 ms tick
+# under the session lock. Unoptimized it costs several times more per tick; the
+# desktop and TUI are usually run as dev builds, so optimize it there too.
+rockcraft-core = { opt-level = 3 }

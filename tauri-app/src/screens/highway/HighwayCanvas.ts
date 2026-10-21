@@ -18,6 +18,7 @@ import { visibleRange } from "../cull";
 import { mappedGridLines, uniformGridLines } from "./gridLines";
 import { dimmedByLoop, type LoopBand } from "./practiceLoop";
 import { nextPerLane } from "./laneGuides";
+import { LiveClock } from "./liveClock";
 import {
   clamp,
   feedbackFx,
@@ -127,13 +128,11 @@ export class HighwayCanvas {
   // clock and `runScoring` sim; instead the song time, freeze flag, and held
   // notes come from the backend `play_state` event (driven by `core::PlayClock`
   // off MIDI timestamps). The header reads score/combo from `play_state`, not
-  // these fields. `liveTimeMs` is interpolated between events with the wall
-  // clock so the scroll stays smooth at the render rate without owning timing.
+  // these fields. `liveClock` interpolates between events with the wall clock
+  // so the scroll stays smooth at the render rate without owning timing — at
+  // the practice speed, never past the next freeze, never backwards.
   private live = false;
-  private liveTimeMs = 0;
-  /** Wall-clock anchor (performance.now) for the last `setLiveState` call. */
-  private liveAnchor = 0;
-  private liveFrozen = false;
+  private liveClock = new LiveClock();
   private liveHeld = new Set<number>();
   private liveAwaiting = new Set<number>();
 
@@ -191,17 +190,18 @@ export class HighwayCanvas {
 
   /** Push the latest backend `play_state`. `timeMs` is the authoritative song
    * time; render interpolates forward from here using the wall clock unless
-   * `frozen`. `held` highlights the player's keys; `awaiting` pulses the notes
-   * the player must hold to un-freeze. */
+   * `frozen`, at `ratePermille` and never past `stopMs` (see `LiveClock`).
+   * `held` highlights the player's keys; `awaiting` pulses the notes the
+   * player must hold to un-freeze. */
   setLiveState(
     timeMs: number,
     frozen: boolean,
     held: number[],
     awaiting: number[] = [],
+    ratePermille = 1000,
+    stopMs: number | null = null,
   ): void {
-    this.liveTimeMs = timeMs;
-    this.liveAnchor = performance.now();
-    this.liveFrozen = frozen;
+    this.liveClock.update(timeMs, frozen, performance.now(), ratePermille, stopMs);
     this.liveHeld = new Set(held);
     this.liveAwaiting = new Set(awaiting);
   }
@@ -349,8 +349,7 @@ export class HighwayCanvas {
   // holds it steady); otherwise the demo-only internal clock.
   private elapsed(): number {
     if (this.live) {
-      if (this.liveFrozen) return this.liveTimeMs;
-      return this.liveTimeMs + (performance.now() - this.liveAnchor);
+      return this.liveClock.now(performance.now());
     }
     return performance.now() - this.t0;
   }

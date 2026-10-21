@@ -131,13 +131,7 @@ pub fn score(expected: &[ExpectedNote], played: &[NoteEvent], config: ScoreConfi
     // MIDI convention, and explicit note-offs never count as a strike). Track
     // which ones get consumed so each played note matches at most one expected
     // note and the leftovers can be reported as extras.
-    let candidates: Vec<&NoteEvent> = played
-        .iter()
-        .filter(|e| match e.kind {
-            NoteEventKind::On { velocity } => !velocity.is_note_off(),
-            NoteEventKind::Off => false,
-        })
-        .collect();
+    let candidates: Vec<&NoteEvent> = played.iter().filter(|e| is_strike(e)).collect();
     let mut consumed = vec![false; candidates.len()];
 
     let mut judgments = Vec::with_capacity(expected.len());
@@ -163,17 +157,9 @@ pub fn score(expected: &[ExpectedNote], played: &[NoteEvent], config: ScoreConfi
         }
 
         match best {
-            Some((i, abs_err)) => {
+            Some((i, _)) => {
                 consumed[i] = true;
-                let error_us = candidates[i].timestamp_us as i64 - exp.time_us as i64;
-                let timing = if abs_err <= config.perfect_us {
-                    Timing::Perfect
-                } else if error_us < 0 {
-                    Timing::Early
-                } else {
-                    Timing::Late
-                };
-                judgments.push(NoteJudgment::Hit { timing, error_us });
+                judgments.push(hit(exp, candidates[i], config));
                 hits += 1;
             }
             None => {
@@ -191,6 +177,29 @@ pub fn score(expected: &[ExpectedNote], played: &[NoteEvent], config: ScoreConfi
         misses,
         extras,
     }
+}
+
+/// Is `ev` a strike — a real note-on? A note-on with velocity 0 is a note-off
+/// by MIDI convention, and explicit note-offs never count.
+pub(crate) fn is_strike(ev: &NoteEvent) -> bool {
+    match ev.kind {
+        NoteEventKind::On { velocity } => !velocity.is_note_off(),
+        NoteEventKind::Off => false,
+    }
+}
+
+/// The hit `strike` makes on `exp` (already known to be inside the good
+/// window): its timing class and signed error.
+pub(crate) fn hit(exp: &ExpectedNote, strike: &NoteEvent, config: ScoreConfig) -> NoteJudgment {
+    let error_us = strike.timestamp_us as i64 - exp.time_us as i64;
+    let timing = if error_us.unsigned_abs() <= config.perfect_us {
+        Timing::Perfect
+    } else if error_us < 0 {
+        Timing::Early
+    } else {
+        Timing::Late
+    };
+    NoteJudgment::Hit { timing, error_us }
 }
 
 #[cfg(test)]
