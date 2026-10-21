@@ -473,9 +473,11 @@ below is an at-a-glance convenience only.
 | `audio_status` / `midi_status` / `record_status` | none | Read-only status snapshots |
 | `midi_rescan` | none | Re-scan for a live USB-MIDI device and adopt it if one is now present — reconnect a piano powered on or replugged after launch, without restarting the app. Leaves the current source untouched when none is found. Returns the resulting MIDI status |
 | `detect_tempo_map` | `{ beats_per_bar?: u8, anchor_us?: u64, tempo_hint_bpm?: f64 }` | Detect a per-bar tempo map from the loaded piece's backing audio (`tools/tempo-map`, python3 + numpy) and install it via `set_bar_starts` — bar lines follow a performance whose tempo breathes. `anchor_us` is a known downbeat in song time; `tempo_hint_bpm` resolves half/double time. Grid-only: no note moves. Returns `{ bars, bpm, pulse_bpm, anchor_us, snapshot }` |
+| `set_fullscreen` | `{ on: bool }` | Enter / leave full screen (desktop app; the TUI reports it unsupported). Remembered for the next launch. Returns `{ fullscreen }` |
+| `toggle_fullscreen` | none | Toggle full screen, like F11 / Alt+Enter. Returns `{ fullscreen }` |
 | `app_quit` | none | Shut the app down gracefully (exit 0); the socket closes as the process exits |
 
-The TUI remembers the mix: every change (from its `x` mixer overlay or from `set_instrument` / `set_bus_gain` over the socket) is saved to `tui-settings.json` (`$ROCKCRAFT_CONFIG_DIR`, else the platform config dir) and loaded on the next start.
+The TUI remembers the mix and its play-screen choices (colours, scrolling, speed, song audio, wait mode): every change (from a key, its `x` mixer overlay, or the socket) is saved to `tui-settings.json` (`$ROCKCRAFT_CONFIG_DIR`, else the platform config dir) and loaded on the next start.
 
 Not every frontend supports every command: the TUI's record/import/backing
 flows are interactive screen state machines, so it returns `unsupported:` for

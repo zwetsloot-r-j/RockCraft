@@ -638,6 +638,16 @@ impl HostServices for TauriHost<'_> {
                 crate::record::record_status(app.state::<RecordState>()),
             ),
 
+            // ── app window ──────────────────────────────────────────────
+            HostCommand::SetFullscreen { on } => match crate::window::apply_fullscreen(app, on) {
+                Ok(on) => Ok(serde_json::json!({ "fullscreen": on })),
+                Err(e) => failed("set_fullscreen", e),
+            },
+            HostCommand::ToggleFullscreen => match crate::window::flip_fullscreen(app) {
+                Ok(on) => Ok(serde_json::json!({ "fullscreen": on })),
+                Err(e) => failed("toggle_fullscreen", e),
+            },
+
             // ── app lifecycle ───────────────────────────────────────────
             HostCommand::AppQuit => {
                 // Exit gracefully. The reply may not flush before the process
