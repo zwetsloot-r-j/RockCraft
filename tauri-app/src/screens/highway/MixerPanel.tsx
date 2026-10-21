@@ -1,7 +1,8 @@
 // MixerPanel.tsx — sound selection + the three faders (M14-C).
 //
-// Sits over the top-right of the highway (and the editor), collapsed to a
-// "Mix" button until clicked. Inside: an instrument dropdown per synth voice
+// Sits over the top-right of the highway, collapsed to a "Mix" button until
+// clicked; a host with its own top-right toolbar (the editor) lays it out
+// `inline` in that row instead, so the two never overlap. Inside: an instrument dropdown per synth voice
 // (You / Song) and a level slider for each of the three sources — You, Song,
 // Backing. A host screen may drive the open state itself (so a key can open
 // it) and add a backing on/off switch beside the button (the editor does).
@@ -64,6 +65,12 @@ export interface MixerPanelProps {
   onOpenChange?: (open: boolean) => void;
   /** Show a backing on/off button beside MIX. */
   backing?: BackingSwitch;
+  /**
+   * Flow inside the host's own toolbar instead of floating over the top-right
+   * corner. The opened panel then drops down below the buttons without
+   * changing the toolbar's height.
+   */
+  inline?: boolean;
 }
 
 export function MixerPanel(props: MixerPanelProps = {}) {
@@ -154,10 +161,9 @@ export function MixerPanel(props: MixerPanelProps = {}) {
     <div
       onKeyDown={onPanelKey}
       style={{
-        position: "absolute",
-        top: "10px",
-        right: "10px",
-        "z-index": 3,
+        ...(props.inline
+          ? { position: "relative" }
+          : { position: "absolute", top: "10px", right: "10px", "z-index": 3 }),
         "font-family": "'Space Grotesk', system-ui, sans-serif",
         color: "#e7e8ef",
         display: "flex",
@@ -213,6 +219,9 @@ export function MixerPanel(props: MixerPanelProps = {}) {
       <Show when={open()}>
         <div
           style={{
+            ...(props.inline
+              ? { position: "absolute", top: "100%", right: 0 }
+              : {}),
             "margin-top": "6px",
             width: "230px",
             padding: "12px",

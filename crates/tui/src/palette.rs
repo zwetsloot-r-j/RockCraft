@@ -42,6 +42,13 @@ impl ColorMode {
             ColorMode::Accent => "accent",
         }
     }
+
+    /// The mode a [`label`](Self::label) names (the settings file uses it).
+    pub fn from_label(label: &str) -> Option<Self> {
+        [ColorMode::Hands, ColorMode::Spectrum, ColorMode::Accent]
+            .into_iter()
+            .find(|m| m.label() == label)
+    }
 }
 
 /// An sRGB colour as 8-bit channels; converted to a terminal colour at the end.

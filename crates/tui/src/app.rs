@@ -148,6 +148,11 @@ pub struct Shell {
     /// Practice speed in permille; shell-wide like `color_mode`, so a slowed
     /// piece stays slowed when you come back to it.
     rate_permille: u16,
+    /// The song audio last picked with `m`, carried onto each new piece
+    /// (clamped to what it offers); `None` keeps each piece's own default.
+    song_audio: Option<SongAudio>,
+    /// Wait mode (`w`), shell-wide like `color_mode`.
+    wait_mode: bool,
     /// LAN sharing (M26-B): the share server, if running, plus background
     /// transfers. Driven by the `share_*` host commands only.
     share: rockcraft_share::ShareService,
@@ -182,6 +187,8 @@ impl Shell {
             save_warned: false,
             save_error: String::new(),
             rate_permille: crate::play::PLAY_RATE_UNITY,
+            song_audio: None,
+            wait_mode: false,
             share: rockcraft_share::ShareService::with_defaults(),
         }
     }
@@ -192,7 +199,29 @@ impl Shell {
         self.push_mixer();
     }
 
-    /// Remember the mix at `path` after every change from now on.
+    /// Start from remembered settings: the mix plus the play-screen choices.
+    pub fn set_settings(&mut self, settings: crate::settings::TuiSettings) {
+        self.set_mixer(settings.mixer);
+        self.color_mode = settings.color_mode;
+        self.scroll_mode = settings.scroll_mode;
+        self.rate_permille = settings.rate_permille;
+        self.song_audio = settings.song_audio;
+        self.wait_mode = settings.wait_mode;
+    }
+
+    /// Everything the shell remembers between runs.
+    fn settings(&self) -> crate::settings::TuiSettings {
+        crate::settings::TuiSettings {
+            mixer: self.mixer,
+            color_mode: self.color_mode,
+            scroll_mode: self.scroll_mode,
+            rate_permille: self.rate_permille,
+            song_audio: self.song_audio,
+            wait_mode: self.wait_mode,
+        }
+    }
+
+    /// Remember the settings at `path` after every change from now on.
     pub fn set_settings_path(&mut self, path: Option<PathBuf>) {
         self.settings_path = path;
     }
@@ -229,6 +258,14 @@ impl Shell {
         play.set_color_mode(self.color_mode);
         play.set_scroll_mode(self.scroll_mode);
         play.set_rate(self.rate_permille);
+        if let Some(mode) = self.song_audio {
+            // Infallible once clamped: a backing pick becomes the synth on a
+            // piece without a backing track.
+            let _ = play.set_song_audio(mode.clamp_to(play.has_backing()));
+        }
+        if self.wait_mode {
+            play.set_wait_mode(true);
+        }
         play
     }
 
@@ -249,7 +286,6 @@ impl Shell {
     {
         change(&mut self.mixer).map_err(|e| e.to_string())?;
         self.push_mixer();
-        self.persist_mixer();
         Ok(rockcraft_core::MixerReport::from(self.mixer))
     }
 
@@ -268,20 +304,31 @@ impl Shell {
         }
     }
 
-    /// Write the mix to the settings file, if one is configured. Runs on the
-    /// app thread after a change; a failure shows once in the status bar.
-    fn persist_mixer(&mut self) {
+    /// Write the settings file, if one is configured. Runs on the app thread
+    /// after a key or control command changed a setting; a failure shows once
+    /// in the status bar.
+    fn persist_settings(&mut self) {
         let Some(path) = &self.settings_path else {
             return;
         };
-        let settings = crate::settings::TuiSettings { mixer: self.mixer };
-        if let Err(e) = crate::settings::save(path, &settings) {
+        if let Err(e) = crate::settings::save(path, &self.settings()) {
             if !self.save_warned {
                 self.save_warned = true;
                 self.save_error = format!("could not save settings: {e}");
-                self.status = format!("could not save mixer settings: {e}");
+                self.status = format!("could not save settings: {e}");
             }
         }
+    }
+
+    /// Run `f`, then save the settings if it changed any. Every key and control
+    /// command goes through here, so no change path can forget to save.
+    fn persisting<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let before = self.settings();
+        let out = f(self);
+        if self.settings() != before {
+            self.persist_settings();
+        }
+        out
     }
 
     /// Whether `x` may open the mixer now: on the play screen, or on the edit
@@ -574,6 +621,10 @@ impl Shell {
 
     /// Handle a key press; returns to the menu on Tab/Esc from a screen.
     pub(crate) fn on_key(&mut self, code: KeyCode) {
+        self.persisting(|shell| shell.handle_key(code));
+    }
+
+    fn handle_key(&mut self, code: KeyCode) {
         if self.mixer_ui.is_some() {
             self.on_mixer_key(code);
             return;
@@ -621,9 +672,12 @@ impl Shell {
                 KeyCode::Char(' ') => play.toggle_pause(),
                 // Song audio: backing → synth → off (backing only if present).
                 KeyCode::Char('m') => {
-                    play.cycle_song_audio();
+                    self.song_audio = Some(play.cycle_song_audio());
                 }
-                KeyCode::Char('w') => play.toggle_wait_mode(),
+                KeyCode::Char('w') => {
+                    play.toggle_wait_mode();
+                    self.wait_mode = play.is_wait_mode();
+                }
                 // Practise one hand (M18-C): both → right → left.
                 KeyCode::Char('h') => play.cycle_practice(),
                 // Practice speed, one step slower / faster (never past 1×).
@@ -1007,6 +1061,15 @@ impl rockcraft_control::HostServices for Shell {
         &mut self,
         cmd: rockcraft_control::HostCommand,
     ) -> Result<serde_json::Value, rockcraft_control::HostError> {
+        self.persisting(|shell| shell.dispatch_command(cmd))
+    }
+}
+
+impl Shell {
+    fn dispatch_command(
+        &mut self,
+        cmd: rockcraft_control::HostCommand,
+    ) -> Result<serde_json::Value, rockcraft_control::HostError> {
         use rockcraft_control::{HostCommand, HostError};
         use serde_json::json;
 
@@ -1138,7 +1201,9 @@ impl rockcraft_control::HostServices for Shell {
             // Cycle / set the song audio over the socket, mirroring the `m` key.
             HostCommand::PlayCycleSongAudio => {
                 if let Screen::Play(play) = &mut self.screen {
-                    Ok(json!({ "song_audio": play.cycle_song_audio() }))
+                    let mode = play.cycle_song_audio();
+                    self.song_audio = Some(mode);
+                    Ok(json!({ "song_audio": mode }))
                 } else {
                     Err(HostError::Failed {
                         command: "play_cycle_song_audio".into(),
@@ -1151,6 +1216,9 @@ impl rockcraft_control::HostServices for Shell {
                     Screen::Play(play) => play.set_song_audio(mode),
                     _ => Err("no active play session".into()),
                 };
+                if let Ok(mode) = result {
+                    self.song_audio = Some(mode);
+                }
                 result
                     .map(|mode| json!({ "song_audio": mode }))
                     .map_err(|detail| HostError::Failed {
@@ -1296,7 +1364,7 @@ impl rockcraft_control::HostServices for Shell {
 #[derive(Debug, Default)]
 pub struct Remembered {
     pub path: Option<PathBuf>,
-    pub mixer: Option<Mixer>,
+    pub settings: Option<crate::settings::TuiSettings>,
 }
 
 /// Run the app shell until the user quits.
@@ -1319,8 +1387,8 @@ pub fn run(
     let mut terminal = ratatui::init();
     let mut shell = Shell::new(input, audio.synth, backing_path);
     shell.set_audio_links(audio.backing_out, audio.echo);
-    if let Some(mixer) = remembered.mixer {
-        shell.set_mixer(mixer);
+    if let Some(settings) = remembered.settings {
+        shell.set_settings(settings);
     }
     shell.set_settings_path(remembered.path);
     if start_edit {
@@ -3774,6 +3842,47 @@ mod tests {
         fresh.set_mixer(loaded.mixer);
         assert_eq!(fresh.mixer(), shell.mixer(), "a new shell starts with it");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn play_choices_are_saved_and_reopen_in_a_fresh_shell() {
+        let dir = std::env::temp_dir().join(format!("rockcraft-play-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("tui-settings.json");
+
+        let mut shell = shell_with_play();
+        shell.set_settings_path(Some(path.clone()));
+        assert_eq!(play_screen(&shell).song_audio(), SongAudio::Synth);
+        shell.on_key(KeyCode::Char('c'));
+        shell.on_key(KeyCode::Char('m'));
+        shell.on_key(KeyCode::Char('w'));
+
+        let (loaded, warnings) = crate::settings::load(&path);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(loaded.color_mode, ColorMode::Spectrum);
+        assert_eq!(loaded.song_audio, Some(SongAudio::Off));
+        assert!(loaded.wait_mode);
+
+        // A restart: a new shell from the file, then a song.
+        let mut fresh = make_shell();
+        fresh.set_settings(loaded);
+        let play = load_play_screen(&midi_only_fixture().join("song.mid"), None).unwrap();
+        fresh.screen = Screen::Play(Box::new(fresh.tuned(play)));
+        let play = play_screen(&fresh);
+        assert_eq!(play.color_mode(), ColorMode::Spectrum);
+        assert_eq!(play.song_audio(), SongAudio::Off);
+        assert!(play.is_wait_mode());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_remembered_backing_pick_falls_back_to_the_synth_without_one() {
+        let mut shell = make_shell();
+        shell.song_audio = Some(SongAudio::Backing);
+        let play = load_play_screen(&midi_only_fixture().join("song.mid"), None).unwrap();
+        shell.screen = Screen::Play(Box::new(shell.tuned(play)));
+        assert_eq!(play_screen(&shell).song_audio(), SongAudio::Synth);
+        assert_eq!(shell.song_audio, Some(SongAudio::Backing), "pick kept");
     }
 
     #[test]

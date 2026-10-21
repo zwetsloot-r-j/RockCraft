@@ -1077,6 +1077,11 @@ impl PlayScreen {
         self.song_audio
     }
 
+    /// Does this piece have a backing track?
+    pub fn has_backing(&self) -> bool {
+        self.backing.is_some()
+    }
+
     /// Check the playback clock and fire synth note_on / note_off commands for
     /// any song spans whose boundaries we've crossed since the last call.
     /// Call this once per event-loop iteration (not per render frame) to keep
@@ -1966,6 +1971,21 @@ impl ScrollMode {
             ScrollMode::Smooth => "smooth",
             ScrollMode::Sixteenths => "16th steps",
         }
+    }
+
+    /// Stable name for the settings file (the label is for display).
+    pub const fn name(self) -> &'static str {
+        match self {
+            ScrollMode::Smooth => "smooth",
+            ScrollMode::Sixteenths => "sixteenths",
+        }
+    }
+
+    /// The mode a [`name`](Self::name) names.
+    pub fn from_name(name: &str) -> Option<Self> {
+        [ScrollMode::Smooth, ScrollMode::Sixteenths]
+            .into_iter()
+            .find(|m| m.name() == name)
     }
 }
 

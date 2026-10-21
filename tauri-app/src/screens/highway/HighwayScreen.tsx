@@ -26,6 +26,7 @@ import {
   playSetSplit,
   playSetWait,
   playCycleSongAudio,
+  playSetSongAudio,
   playToggleMonitor,
   playTogglePause,
 } from "../../ipc/bridge";
@@ -164,6 +165,29 @@ function readSplit(): number {
     return 60;
   }
 }
+/**
+ * The song audio the player last picked with `m`, re-applied to every piece
+ * loaded after it (a backing pick becomes the synth on a piece without one).
+ * `null` when never set: the backend's per-piece default stands.
+ */
+const SONG_AUDIO_KEY = "rc.play.songAudio";
+function readSongAudio(): SongAudio | null {
+  try {
+    const v = localStorage.getItem(SONG_AUDIO_KEY);
+    return v === "backing" || v === "synth" || v === "off" ? v : null;
+  } catch {
+    return null;
+  }
+}
+/** Input monitor (`n`): hear your own key presses. Off until switched on. */
+const MONITOR_KEY = "rc.play.monitor";
+function readMonitor(): boolean {
+  try {
+    return localStorage.getItem(MONITOR_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
 function writeLS(key: string, value: string): void {
   try {
     localStorage.setItem(key, value);
@@ -239,8 +263,8 @@ export function HighwayScreen() {
   const [loadErr, setLoadErr] = createSignal<string | null>(null);
   // Song audio (`m`): the backing recording, the synth replay, or neither.
   const [songAudio, setSongAudio] = createSignal<SongAudio>("off");
-  // Input monitor: synthesise the player's own key presses (`n`), off by default.
-  const [monitor, setMonitor] = createSignal(false);
+  // Input monitor: synthesise the player's own key presses (`n`), persisted.
+  const [monitor, setMonitor] = createSignal(readMonitor());
   // Wait-mode preference persists across takes/sessions (defaults on).
   const [waitMode, setWaitMode] = createSignal(readWaitPref());
   // Hand-practice mode + the left/right split pitch, both persisted.
@@ -321,7 +345,10 @@ export function HighwayScreen() {
       case "m":
       case "M":
         e.preventDefault();
-        void playCycleSongAudio().then(setSongAudio);
+        void playCycleSongAudio().then((mode) => {
+          setSongAudio(mode);
+          writeLS(SONG_AUDIO_KEY, mode);
+        });
         break;
       case "w":
       case "W":
@@ -335,7 +362,10 @@ export function HighwayScreen() {
       case "N":
         // Input monitor: hear your own key presses through the synth.
         e.preventDefault();
-        void playToggleMonitor().then(setMonitor);
+        void playToggleMonitor().then((on) => {
+          setMonitor(on);
+          writeLS(MONITOR_KEY, on ? "1" : "0");
+        });
         break;
       case "h":
       case "H":
@@ -513,6 +543,16 @@ export function HighwayScreen() {
     playLoad(bundleDir)
       .then((info) => {
         setSongAudio(info.song_audio);
+        // A fresh session opens on the piece's default; re-apply the player's
+        // last pick instead (kept across Replay, re-entry and restarts).
+        const savedAudio = readSongAudio();
+        if (savedAudio !== null) {
+          const want =
+            savedAudio === "backing" && !info.has_backing ? "synth" : savedAudio;
+          if (want !== info.song_audio) {
+            void playSetSongAudio(want).then(setSongAudio);
+          }
+        }
         shiftUs = info.shift_us;
         setDurationUs(info.duration_us);
         if (openAtUs !== undefined) {
@@ -565,7 +605,7 @@ export function HighwayScreen() {
         // so it is remembered across takes/sessions and Replay.
         void playSetWait(waitMode()).then(setWaitMode);
         // A fresh session has monitor off; re-enable it if the player had it on
-        // (keeps the input-monitor setting across Replay/re-entry).
+        // (persisted, so it survives Replay, re-entry and restarts).
         if (monitor()) void playToggleMonitor().then(setMonitor);
         // Apply the persisted hand-practice mode + split to the fresh session.
         void playSetSplit(split());
