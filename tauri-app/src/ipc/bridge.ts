@@ -109,6 +109,25 @@ export function onNavigate(cb: (screen: Screen) => void): Promise<UnlistenFn> {
   return listen<Screen>(EVENT_NAVIGATE, (e) => cb(e.payload));
 }
 
+/** Enter or leave full screen (`set_fullscreen`). Returns the new state. */
+export function setFullscreen(on: boolean): Promise<boolean> {
+  return invoke<boolean>("set_fullscreen", { on });
+}
+
+/** Toggle full screen — F11 / Alt+Enter (`toggle_fullscreen`). Returns the
+ * new state. */
+export function toggleFullscreen(): Promise<boolean> {
+  return invoke<boolean>("toggle_fullscreen");
+}
+
+/**
+ * Subscribe to backend `fullscreen` events: the new state after every change,
+ * from a key or over the control socket. Returns the Tauri unlisten function.
+ */
+export function onFullscreen(cb: (on: boolean) => void): Promise<UnlistenFn> {
+  return listen<boolean>("fullscreen", (e) => cb(e.payload));
+}
+
 /**
  * Subscribe to `effects` events. Returns the Tauri unlisten function; call it
  * in `onCleanup`.

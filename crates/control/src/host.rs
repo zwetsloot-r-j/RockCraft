@@ -283,6 +283,13 @@ pub enum HostCommand {
     /// frontends without a rescannable handle (the TUI) report it Unsupported.
     MidiRescan,
 
+    // ── app window ──────────────────────────────────────────────────────
+    /// Enter (`true`) or leave (`false`) full screen. Returns `{fullscreen}`.
+    /// Frontends without a window of their own (the TUI) report it Unsupported.
+    SetFullscreen { on: bool },
+    /// Toggle full screen (F11 / Alt+Enter). Returns `{fullscreen}`.
+    ToggleFullscreen,
+
     // ── app lifecycle ───────────────────────────────────────────────────
     /// Shut the application down gracefully (exit code 0). Lets an agent close
     /// the app over the socket; the connection closes as the process exits.
@@ -349,6 +356,8 @@ impl HostCommand {
             HostCommand::MidiStatus => "midi_status",
             HostCommand::MidiRescan => "midi_rescan",
             HostCommand::RecordStatus => "record_status",
+            HostCommand::SetFullscreen { .. } => "set_fullscreen",
+            HostCommand::ToggleFullscreen => "toggle_fullscreen",
             HostCommand::AppQuit => "app_quit",
         }
     }
@@ -502,6 +511,8 @@ pub fn host_command_names() -> &'static [&'static str] {
         "midi_status",
         "midi_rescan",
         "record_status",
+        "set_fullscreen",
+        "toggle_fullscreen",
         "app_quit",
     ]
 }
@@ -595,6 +606,9 @@ static HOST_HELP: &[HostCommandInfo] = {
         HostCommandInfo { name: "midi_status", params: &[], description: "Return the current MIDI input status." },
         HostCommandInfo { name: "midi_rescan", params: &[], description: "Re-scan for a live USB-MIDI device and adopt it if one is now present — reconnect a piano powered on or replugged after launch, without restarting the app. Leaves the current source untouched when none is found. Returns the resulting MIDI input status." },
         HostCommandInfo { name: "record_status", params: &[], description: "Return the current record session status." },
+        // ── app window ───────────────────────────────────────────────────
+        HostCommandInfo { name: "set_fullscreen", params: &[p("on", "bool")], description: "Enter (true) or leave (false) full screen; the app remembers it for the next launch. Desktop app only. Returns {fullscreen}." },
+        HostCommandInfo { name: "toggle_fullscreen", params: &[], description: "Toggle full screen, like F11 / Alt+Enter; the app remembers it for the next launch. Desktop app only. Returns {fullscreen}." },
         // ── app lifecycle ────────────────────────────────────────────────
         HostCommandInfo { name: "app_quit", params: &[], description: "Shut the application down gracefully (exit code 0). The connection closes as the process exits." },
     ]
@@ -733,6 +747,8 @@ mod tests {
             HostCommand::MidiStatus,
             HostCommand::MidiRescan,
             HostCommand::RecordStatus,
+            HostCommand::SetFullscreen { on: true },
+            HostCommand::ToggleFullscreen,
             HostCommand::AppQuit,
         ]
     }

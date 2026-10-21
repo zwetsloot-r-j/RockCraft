@@ -1351,6 +1351,13 @@ impl Shell {
             // reconnect a piano here. The Tauri backend performs the real rescan.
             HostCommand::MidiRescan => Err(HostError::Unsupported("midi_rescan".into())),
             HostCommand::RecordStatus => Err(HostError::Unsupported("record_status".into())),
+            // A terminal app owns no window: full screen is the terminal's.
+            HostCommand::SetFullscreen { .. } => {
+                Err(HostError::Unsupported("set_fullscreen".into()))
+            }
+            HostCommand::ToggleFullscreen => {
+                Err(HostError::Unsupported("toggle_fullscreen".into()))
+            }
             HostCommand::AppQuit => Err(HostError::Unsupported("app_quit".into())),
         }
     }
@@ -1989,6 +1996,8 @@ mod tests {
                 tempo_hint_bpm: None,
             },
             HostCommand::RecordStatus,
+            HostCommand::SetFullscreen { on: true },
+            HostCommand::ToggleFullscreen,
             HostCommand::AppQuit,
         ]
     }

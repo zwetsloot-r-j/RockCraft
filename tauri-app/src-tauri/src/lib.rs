@@ -25,6 +25,7 @@ mod record;
 mod state;
 mod transcription;
 mod waveform;
+mod window;
 
 use std::sync::Mutex;
 use std::time::Instant;
@@ -810,6 +811,8 @@ pub fn run() {
             transcription::transcription_load,
             alignment::alignment_save,
             alignment::alignment_load,
+            window::set_fullscreen,
+            window::toggle_fullscreen,
         ])
         .setup(|app| {
             spawn_tick_thread(app.handle().clone());

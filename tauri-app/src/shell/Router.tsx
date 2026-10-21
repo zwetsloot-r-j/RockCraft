@@ -15,7 +15,13 @@ import {
   MOCK_KEY_SET,
   type MidiStatus,
 } from "../ipc/midi";
-import { onNavigate } from "../ipc/bridge";
+import {
+  onFullscreen,
+  onNavigate,
+  setFullscreen,
+  toggleFullscreen,
+} from "../ipc/bridge";
+import { isFullscreenKey, readFullscreen, writeFullscreen } from "./fullscreen";
 
 // ── Context ────────────────────────────────────────────────────────────────
 
@@ -63,6 +69,16 @@ export function Router(props: RouterProps): JSX.Element {
       });
   }
 
+  // F11 / Alt+Enter toggle full screen on every screen. Caught in the capture
+  // phase and stopped there, so no screen also acts on the key (Alt+Enter is
+  // Enter to a screen that ignores modifiers).
+  function onFullscreenKey(e: KeyboardEvent): void {
+    if (!isFullscreenKey(e)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (!e.repeat) void toggleFullscreen();
+  }
+
   // Global Escape: return to menu from any non-menu screen.
   // The importing screen manages its own Escape (only after failure) — skip it
   // here so the pipeline is never aborted mid-run from this global handler.
@@ -104,6 +120,7 @@ export function Router(props: RouterProps): JSX.Element {
   }
 
   onMount(() => {
+    window.addEventListener("keydown", onFullscreenKey, true);
     window.addEventListener("keydown", onKeydown);
     window.addEventListener("keyup", onKeyup);
     refreshMidiStatus();
@@ -112,6 +129,14 @@ export function Router(props: RouterProps): JSX.Element {
     // control request changes the active context, so a remote session is
     // watchable. Dedup screens we're already on so a burst of edits (each emits
     // `navigate → edit`) doesn't remount the screen.
+    // Remember full screen however it changed (key or control socket), and
+    // reopen the way the app was left.
+    let unlistenFullscreen: UnlistenFn | undefined;
+    void onFullscreen(writeFullscreen).then((fn) => {
+      unlistenFullscreen = fn;
+    });
+    if (readFullscreen()) void setFullscreen(true);
+
     let unlistenNav: UnlistenFn | undefined;
     void onNavigate((next) => {
       const cur = screen();
@@ -124,9 +149,11 @@ export function Router(props: RouterProps): JSX.Element {
     });
 
     onCleanup(() => {
+      window.removeEventListener("keydown", onFullscreenKey, true);
       window.removeEventListener("keydown", onKeydown);
       window.removeEventListener("keyup", onKeyup);
       unlistenNav?.();
+      unlistenFullscreen?.();
     });
   });
 
