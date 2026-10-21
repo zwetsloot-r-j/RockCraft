@@ -6,7 +6,8 @@
 // recording-mode feedback the standalone record screen used to provide: a red
 // REC indicator and a live input-level meter. It dispatches no edit logic — the
 // buttons call back into `toggle_record_arm` / `toggle_record_flavour`, exactly
-// what the `R` / `t` keys do.
+// what the `R` / `t` keys do. It flows in the editor's top-right toolbar,
+// which positions it (beside the mixer's buttons).
 
 import { For, Show, type JSX } from "solid-js";
 import type { InputMode } from "../../ipc/types";
@@ -67,9 +68,6 @@ export function RecordControls(props: RecordControlsProps): JSX.Element {
   return (
     <div
       style={{
-        position: "absolute",
-        top: "12px",
-        right: "16px",
         display: "flex",
         "align-items": "center",
         gap: "10px",
@@ -77,7 +75,6 @@ export function RecordControls(props: RecordControlsProps): JSX.Element {
         border: `1px solid ${recording() ? "#ff5d6c" : "rgba(255,255,255,0.14)"}`,
         "border-radius": "8px",
         padding: "6px 10px",
-        "z-index": 90,
         "font-family": "'Space Grotesk', system-ui, sans-serif",
       }}
     >

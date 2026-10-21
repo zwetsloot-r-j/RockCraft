@@ -2310,17 +2310,45 @@ export function EditScreen(props: Props): JSX.Element {
           <ChordSelectorPanel snap={store.snap!} />
         </Show>
 
-        {/* Record ⇄ Edit controls (M9-A): a discoverable on-screen toggle, a
-            record indicator, and the live input-level meter folded in from the
+        {/* Top-right toolbar: one row, so its controls can never overlap.
+            Sound + levels, shared with Play: a MIX button (X) and, with a
+            backing attached, its on/off switch (Y). Then the Record ⇄ Edit
+            controls (M9-A): a discoverable on-screen toggle, a record
+            indicator, and the live input-level meter folded in from the
             standalone record screen. Reuses the existing toggle actions. */}
-        <Show when={store.snap}>
-          <RecordControls
-            inputMode={store.snap!.input_mode}
-            level={inputLevel()}
-            onToggleArm={toggleRecordArm}
-            onToggleFlavour={toggleRecordFlavour}
+        <div
+          style={{
+            position: "absolute",
+            top: "12px",
+            right: "16px",
+            display: "flex",
+            "align-items": "center",
+            gap: "8px",
+            "z-index": 90,
+          }}
+        >
+          <MixerPanel
+            inline
+            open={mixerOpen()}
+            onOpenChange={setMixerOpen}
+            backing={
+              backingName() === null
+                ? undefined
+                : {
+                    on: store.snap?.backing_audio ?? true,
+                    onToggle: toggleBackingAudio,
+                  }
+            }
           />
-        </Show>
+          <Show when={store.snap}>
+            <RecordControls
+              inputMode={store.snap!.input_mode}
+              level={inputLevel()}
+              onToggleArm={toggleRecordArm}
+              onToggleFlavour={toggleRecordFlavour}
+            />
+          </Show>
+        </div>
 
         {/* Split & trim strip (M10-C) — markers + per-segment keep/discard/name,
             docked at the bottom so the grid and video backdrop stay visible. */}
@@ -2338,20 +2366,6 @@ export function EditScreen(props: Props): JSX.Element {
             onExit={exitSplitMode}
           />
         </Show>
-        {/* Sound + levels, shared with Play: a MIX button (X) and, with a
-            backing attached, its on/off switch (Y). */}
-        <MixerPanel
-          open={mixerOpen()}
-          onOpenChange={setMixerOpen}
-          backing={
-            backingName() === null
-              ? undefined
-              : {
-                  on: store.snap?.backing_audio ?? true,
-                  onToggle: toggleBackingAudio,
-                }
-          }
-        />
       </div>
 
       {/* Help overlay */}

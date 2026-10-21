@@ -1,4 +1,5 @@
-//! The TUI's remembered settings (M18-A): today just the mixer.
+//! The TUI's remembered settings (M18-A): the mixer, plus the play screen's
+//! shell-wide choices (note colours, scrolling, speed, song audio, wait mode).
 //!
 //! A small JSON file in the user's config directory. Loading is forgiving —
 //! a missing file means defaults, and a bad field falls back to its default
@@ -9,8 +10,11 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use rockcraft_core::{Mixer, MixerBus, SynthBus};
+use rockcraft_core::{Mixer, MixerBus, SongAudio, SynthBus};
 use serde_json::{json, Value};
+
+use crate::palette::ColorMode;
+use crate::play::{ScrollMode, PLAY_RATE_MAX, PLAY_RATE_MIN, PLAY_RATE_UNITY};
 
 /// File name inside the config directory.
 const FILE_NAME: &str = "tui-settings.json";
@@ -19,10 +23,34 @@ const FILE_NAME: &str = "tui-settings.json";
 const VERSION: u64 = 1;
 
 /// Everything the TUI remembers between runs.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TuiSettings {
     /// The play-time mix.
     pub mixer: Mixer,
+    /// How play-screen notes are coloured (`c`).
+    pub color_mode: ColorMode,
+    /// How the play highway scrolls (`v`).
+    pub scroll_mode: ScrollMode,
+    /// Practice speed in permille (`-` / `=`).
+    pub rate_permille: u16,
+    /// The song audio last picked with `m`; `None` keeps each piece's default.
+    /// Re-applied per piece via [`SongAudio::clamp_to`].
+    pub song_audio: Option<SongAudio>,
+    /// Whether wait mode is armed (`w`).
+    pub wait_mode: bool,
+}
+
+impl Default for TuiSettings {
+    fn default() -> Self {
+        Self {
+            mixer: Mixer::default(),
+            color_mode: ColorMode::default(),
+            scroll_mode: ScrollMode::default(),
+            rate_permille: PLAY_RATE_UNITY,
+            song_audio: None,
+            wait_mode: false,
+        }
+    }
 }
 
 /// Where the settings file lives, or `None` when no home/config directory can
@@ -74,6 +102,9 @@ pub fn load(path: &Path) -> (TuiSettings, Vec<String>) {
             return (settings, warnings);
         }
     };
+    if let Some(play) = root.get("play") {
+        load_play(&mut settings, play, &mut warnings);
+    }
     let Some(mixer) = root.get("mixer") else {
         return (settings, warnings);
     };
@@ -99,6 +130,46 @@ pub fn load(path: &Path) -> (TuiSettings, Vec<String>) {
     (settings, warnings)
 }
 
+/// Apply the `play` section, field by field.
+fn load_play(settings: &mut TuiSettings, play: &Value, warnings: &mut Vec<String>) {
+    let mut bad = |field: &str, value: &Value| {
+        warnings.push(format!("play.{field}: bad value {value}"));
+    };
+    if let Some(v) = play.get("color_mode") {
+        match v.as_str().and_then(ColorMode::from_label) {
+            Some(mode) => settings.color_mode = mode,
+            None => bad("color_mode", v),
+        }
+    }
+    if let Some(v) = play.get("scroll_mode") {
+        match v.as_str().and_then(ScrollMode::from_name) {
+            Some(mode) => settings.scroll_mode = mode,
+            None => bad("scroll_mode", v),
+        }
+    }
+    if let Some(v) = play.get("rate_permille") {
+        match v
+            .as_u64()
+            .filter(|r| (PLAY_RATE_MIN as u64..=PLAY_RATE_MAX as u64).contains(r))
+        {
+            Some(rate) => settings.rate_permille = rate as u16,
+            None => bad("rate_permille", v),
+        }
+    }
+    if let Some(v) = play.get("song_audio") {
+        match serde_json::from_value::<Option<SongAudio>>(v.clone()) {
+            Ok(mode) => settings.song_audio = mode,
+            Err(_) => bad("song_audio", v),
+        }
+    }
+    if let Some(v) = play.get("wait_mode") {
+        match v.as_bool() {
+            Some(on) => settings.wait_mode = on,
+            None => bad("wait_mode", v),
+        }
+    }
+}
+
 /// Apply one gain field; only a number in `0.0..=1.0` is accepted.
 fn load_gain(mixer: &mut Mixer, bus: MixerBus, value: &Value, warnings: &mut Vec<String>) {
     let ok = value
@@ -122,6 +193,13 @@ fn to_json(settings: &TuiSettings) -> Value {
             "player": bus(SynthBus::Player),
             "song": bus(SynthBus::Song),
             "backing_gain": settings.mixer.backing_gain.value(),
+        },
+        "play": {
+            "color_mode": settings.color_mode.label(),
+            "scroll_mode": settings.scroll_mode.name(),
+            "rate_permille": settings.rate_permille,
+            "song_audio": settings.song_audio,
+            "wait_mode": settings.wait_mode,
         }
     })
 }
@@ -168,6 +246,55 @@ mod tests {
         let (loaded, warnings) = load(&path);
         assert_eq!(loaded, s);
         assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn play_choices_round_trip() {
+        let path = temp_file("play-round-trip");
+        let s = TuiSettings {
+            color_mode: ColorMode::Spectrum,
+            scroll_mode: ScrollMode::Sixteenths,
+            rate_permille: 750,
+            song_audio: Some(SongAudio::Synth),
+            wait_mode: true,
+            ..TuiSettings::default()
+        };
+        save(&path, &s).unwrap();
+        let (loaded, warnings) = load(&path);
+        assert_eq!(loaded, s);
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn a_mixer_only_file_keeps_play_defaults() {
+        let path = temp_file("mixer-only");
+        write(
+            &path,
+            r#"{ "version": 1, "mixer": { "backing_gain": 0.5 } }"#,
+        );
+        let (s, w) = load(&path);
+        assert_eq!(s.color_mode, ColorMode::Hands);
+        assert_eq!(s.rate_permille, PLAY_RATE_UNITY);
+        assert_eq!(s.song_audio, None);
+        assert!(w.is_empty(), "{w:?}");
+    }
+
+    #[test]
+    fn bad_play_fields_default_and_keep_the_rest() {
+        let path = temp_file("bad-play");
+        write(
+            &path,
+            r#"{ "version": 1, "play": {
+                "color_mode": "plaid", "scroll_mode": "smooth",
+                "rate_permille": 9000, "song_audio": "kazoo", "wait_mode": true } }"#,
+        );
+        let (s, w) = load(&path);
+        assert_eq!(s.color_mode, ColorMode::Hands);
+        assert_eq!(s.scroll_mode, ScrollMode::Smooth);
+        assert_eq!(s.rate_permille, PLAY_RATE_UNITY);
+        assert_eq!(s.song_audio, None);
+        assert!(s.wait_mode);
+        assert_eq!(w.len(), 3, "{w:?}");
     }
 
     #[test]

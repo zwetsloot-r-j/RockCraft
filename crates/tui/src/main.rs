@@ -61,15 +61,15 @@ fn main() {
     };
     let synth = audio.as_ref().map(AudioOut::synth);
 
-    // The remembered mix (M18-A). A bad file never stops startup: warn once
+    // The remembered settings (M18-A). A bad file never stops startup: warn once
     // here, before the terminal UI takes over, and use defaults per bad field.
     let settings_path = settings::settings_path();
-    let saved_mixer = settings_path.as_deref().map(|path| {
+    let saved = settings_path.as_deref().map(|path| {
         let (loaded, warnings) = settings::load(path);
         for w in &warnings {
             eprintln!("Settings: {w}");
         }
-        loaded.mixer
+        loaded
     });
     let backing_out = audio.as_ref().map(AudioOut::backing_out);
 
@@ -147,7 +147,7 @@ fn main() {
         commands,
         app::Remembered {
             path: settings_path,
-            mixer: saved_mixer,
+            settings: saved,
         },
     );
 
