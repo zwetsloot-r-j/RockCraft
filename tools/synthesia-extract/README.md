@@ -88,6 +88,34 @@ python extract.py --in tutorial.mp4 --scroll 180                    # override s
 pluggable hook in M6-D; audio fusion is M6-F. Do not point this at, or commit,
 any copyrighted video, frames, or extracted song.
 
+## Rocksmith+ captures (M6-G)
+
+A screen capture of a song in **Rocksmith+'s piano path** is read by a separate
+module, `synthesia_extract/rsplus.py` (spec: `specs/M6-G-rsplus-extractor.md`).
+`--layout auto` (the default) picks it when the frames show Rocksmith+'s cyan
+hit line and converging highway edges; `--layout synthesia|rsplus` forces one.
+
+```bash
+python extract.py --in capture.mp4 --out chart.json            # auto-detects
+python extract.py --in capture.mp4 --layout rsplus --octave-shift -1   # fix a wrong octave guess
+```
+
+Rocksmith+ draws a 3D perspective highway, so instead of stitching the falling
+roll it reads **one thin band just above the hit line** per frame — a bar is
+sounding exactly while it crosses the line, and there every lane sits over its
+key. Geometry (vanishing point, keys, the boxed middle-C label as octave
+anchor) is calibrated once per video, because the keyboard does not move within
+a song; lane centres are then snapped to where bars actually cross. Hands come
+from the floor tint of each lane around the note (left zone purple-magenta,
+right zone teal). It handles hollow black-key bars, pale missed notes, "MISS"
+text, the hit effect and fog glows; see the spec for the thresholds and their
+measurements.
+
+**Capturing:** turn off exclusive audio mode in Rocksmith+ so Windows' recorder
+gets the sound, and **don't play along** — notes you hit are consumed early and
+read as very short, while missed notes keep their full length. Timing is
+frame-quantised (33 ms at 30 fps).
+
 ## How it works
 
 A Synthesia bar is a *rigid* falling rectangle, so a colored pixel at row `y` in
