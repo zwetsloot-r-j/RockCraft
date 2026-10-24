@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-"""Synthesia visual note extractor — CLI (RockCraft M6-C).
+"""Visual note extractor — CLI (RockCraft M6-C, M6-G).
 
-Turns a local Synthesia-style tutorial video into the M6-A ``ExtractedChart``
-JSON.  No downloading, no audio, no network — a local file path in, JSON out.
+Turns a local piano-chart video into the M6-A ``ExtractedChart`` JSON.  Two
+layouts are understood: a Synthesia-style falling roll (M6-C) and the
+Rocksmith+ perspective piano highway (M6-G, ``synthesia_extract.rsplus``).
+``--layout auto`` (the default) recognises a Rocksmith+ video by its cyan hit
+line and converging highway edges; anything else takes the Synthesia path.
+No downloading, no network — a local file path in, JSON out.
 
 Usage:
     python extract.py --in <video|frames_dir> --out <chart.json> [--debug]
                       [--fps F] [--anchor-c4-x X] [--scroll PX_PER_S]
+                      [--layout auto|synthesia|rsplus] [--octave-shift N]
                       [--audio-fusion --audio <track.wav>]
 
 When ``--in`` is a directory of numbered frames, ``--fps`` is required.
@@ -25,6 +30,7 @@ import sys
 
 from synthesia_extract.audio import fuse_chart
 from synthesia_extract.io import is_frame_dir, load_frames, read_wav
+from synthesia_extract import rsplus
 from synthesia_extract.pipeline import extract_chart, extract_chart_streaming
 
 DEBUG_DIR = "debug-out"  # gitignored; see .gitignore
@@ -98,16 +104,53 @@ def main(argv: list[str] | None = None) -> int:
         "full-width ruler (for stylized/animated charts whose backdrop defeats "
         "the white/black-key calibration); also via ROCKCRAFT_LINEAR_KEYBOARD=1",
     )
+    parser.add_argument(
+        "--layout", choices=("auto", "synthesia", "rsplus"), default="auto",
+        help="chart layout: a Synthesia falling roll, a Rocksmith+ piano "
+        "highway, or auto-detect (default)",
+    )
+    parser.add_argument(
+        "--octave-shift", dest="octave_shift", type=int, default=0,
+        help="Rocksmith+ only: shift every pitch by N octaves, for a video whose "
+        "middle-C label is out of view and the octave guess is wrong",
+    )
     args = parser.parse_args(argv)
 
     _limit_memory()
+
+    try:
+        layout = args.layout
+        if layout == "auto":
+            if is_frame_dir(args.inp):
+                probe, _ = load_frames(args.inp, fps_override=args.fps)
+                layout = "rsplus" if rsplus.is_rsplus(probe[:: max(1, len(probe) // 8)]) else "synthesia"
+            else:
+                layout = "rsplus" if rsplus.detect_video(args.inp, args.fps) else "synthesia"
+            print(f"layout: {layout} (auto-detected)", file=sys.stderr)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
 
     # Default to the streaming extractor for video files (full fps, bounded RAM);
     # a frames directory or --no-stream uses the in-memory decimating path.
     use_stream = not is_frame_dir(args.inp) and not args.no_stream
 
     try:
-        if use_stream:
+        if layout == "rsplus":
+            if is_frame_dir(args.inp):
+                frames, fps = load_frames(args.inp, fps_override=args.fps)
+                calib = frames[:: max(1, len(frames) // 40)]
+                chart = rsplus.extract_frames(
+                    frames, fps, calib, title=args.title, octave_shift=args.octave_shift
+                )
+            else:
+                chart = rsplus.extract_video(
+                    args.inp,
+                    fps_override=args.fps,
+                    title=args.title,
+                    octave_shift=args.octave_shift,
+                )
+        elif use_stream:
             chart = extract_chart_streaming(
                 args.inp,
                 fps_override=args.fps,
