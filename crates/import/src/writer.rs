@@ -12,7 +12,7 @@ use serde::Serialize;
 
 use crate::{
     error::ImportError,
-    parser::chart_to_timeline,
+    parser::{chart_to_timeline, hand_assignment},
     schema::{ExtractedChart, NotationMeta, SourceMeta},
 };
 
@@ -93,6 +93,12 @@ pub fn write_chart_bundle_full(
     if let Some(notation) = chart.notation {
         meta.grid = Some(grid_from_notation(&notation));
         meta.key = notation.key;
+    }
+    // The hands the extractor detected become the piece's split line plus
+    // exceptions (M6-H), which the author can still change (M14-E).
+    if let Some(hands) = hand_assignment(chart) {
+        meta.hand_split = Some(hands.split);
+        meta.hand_overrides = hands.overrides;
     }
     std::fs::write(dir.join("meta.json"), meta.to_json())?;
 
@@ -492,6 +498,77 @@ mod tests {
                 scale: rockcraft_core::Scale::Major,
             })
         );
+    }
+
+    /// Detected hands land in `meta.json` as the split line plus the notes it
+    /// gets wrong, keyed exactly as the reloaded `song.mid` keys its notes.
+    #[test]
+    fn detected_hands_become_split_and_overrides() {
+        let tmp = TempDir::new().unwrap();
+        let mut chart = chart_with_source(geometry_source());
+        let note = |pitch, start_us, hand| ExtractedNote {
+            pitch,
+            start_us,
+            dur_us: 200_000,
+            hand,
+            velocity: None,
+            confidence: None,
+        };
+        chart.notes = vec![
+            note(41, 1_000, Hand::Left),
+            note(48, 250_000, Hand::Left),
+            note(53, 500_000, Hand::Right),
+            note(55, 750_000, Hand::Right),
+            note(57, 1_000_000, Hand::Left), // a crossover
+            note(52, 1_250_000, Hand::Unknown),
+        ];
+        write_chart_bundle(&chart, tmp.path()).unwrap();
+        let meta = RecordingMeta::from_json(
+            &std::fs::read_to_string(tmp.path().join("meta.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(meta.hand_split, Some(53));
+        let pinned = vec![rockcraft_core::HandOverride {
+            pitch: 57,
+            start_us: 1_000_000,
+            hand: rockcraft_core::Hand::Left,
+        }];
+        assert_eq!(meta.hand_overrides, pinned);
+
+        let smf = std::fs::read(tmp.path().join("song.mid")).unwrap();
+        let mut timeline = rockcraft_core::Timeline::from_events(&smf_events(&smf));
+        timeline.apply_hand_overrides(&meta.hand_overrides);
+        assert_eq!(timeline.hand_overrides(), pinned);
+    }
+
+    /// `song.mid` back to note events (1 tick = 1 µs, as written).
+    fn smf_events(bytes: &[u8]) -> Vec<NoteEvent> {
+        let smf = Smf::parse(bytes).unwrap();
+        let mut now = 0u64;
+        let mut out = Vec::new();
+        for ev in &smf.tracks[0] {
+            now += u64::from(u32::from(ev.delta));
+            if let TrackEventKind::Midi { message, .. } = ev.kind {
+                let (key, kind) = match message {
+                    MidiMessage::NoteOn { key, vel } if vel > 0 => (
+                        key,
+                        NoteEventKind::On {
+                            velocity: rockcraft_core::Velocity::new(vel.as_int()).unwrap(),
+                        },
+                    ),
+                    MidiMessage::NoteOn { key, .. } | MidiMessage::NoteOff { key, .. } => {
+                        (key, NoteEventKind::Off)
+                    }
+                    _ => continue,
+                };
+                out.push(NoteEvent {
+                    timestamp_us: now,
+                    note: rockcraft_core::MidiNote::new(key.as_int()).unwrap(),
+                    kind,
+                });
+            }
+        }
+        out
     }
 
     /// The video path carries no notation, and must keep writing `grid`/`key`

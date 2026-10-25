@@ -1,8 +1,10 @@
-use rockcraft_core::{MidiNote, Note, Timeline, Velocity};
+use rockcraft_core::{
+    hand::hand_of_pitch_value, HandOverride, MidiNote, Note, Timeline, Velocity, DEFAULT_SPLIT,
+};
 
 use crate::{
     error::ImportError,
-    schema::{ExtractedChart, ExtractedNote},
+    schema::{ExtractedChart, ExtractedNote, Hand},
 };
 
 /// Velocity used for notes whose extractor did not supply one.
@@ -23,8 +25,8 @@ pub fn to_json(chart: &ExtractedChart) -> String {
 ///
 /// - Pitches > 127 are rejected with [`ImportError::InvalidPitch`].
 /// - Missing velocity defaults to [`DEFAULT_VELOCITY`].
-/// - `Hand` is not stored in `Timeline`; it remains available on the original
-///   [`ExtractedNote`] for the M6-E review step.
+/// - `Hand` is not stored on the notes: the bundle carries it as a split line
+///   plus exceptions, see [`hand_assignment`].
 pub fn chart_to_timeline(chart: &ExtractedChart) -> Result<Timeline, ImportError> {
     let mut timeline = Timeline::new();
     for note in &chart.notes {
@@ -36,11 +38,61 @@ pub fn chart_to_timeline(chart: &ExtractedChart) -> Result<Timeline, ImportError
             start_us: note.start_us,
             dur_us: note.dur_us.max(1),
             velocity,
-            // Hand is authored in the composer (M14-E), not sniffed on import.
+            // Detected hands travel as the bundle's split line + overrides
+            // (`hand_assignment`), editable in the composer (M14-E).
             hand: None,
         });
     }
     Ok(timeline)
+}
+
+/// The hand assignment a chart's detected hands imply (M6-H).
+///
+/// `split` is the split line that agrees with the most notes of known hand
+/// (ties go to the one nearest [`DEFAULT_SPLIT`]); `overrides` pins each
+/// known-hand note the split gets wrong. [`Hand::Unknown`] notes follow the
+/// split.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandAssignment {
+    pub split: u8,
+    pub overrides: Vec<HandOverride>,
+}
+
+/// [`HandAssignment`] for `chart`, or `None` when no note has a known hand.
+pub fn hand_assignment(chart: &ExtractedChart) -> Option<HandAssignment> {
+    let known: Vec<(u8, u64, rockcraft_core::Hand)> = chart
+        .notes
+        .iter()
+        .filter_map(|n| {
+            let hand = match n.hand {
+                Hand::Left => rockcraft_core::Hand::Left,
+                Hand::Right => rockcraft_core::Hand::Right,
+                Hand::Unknown => return None,
+            };
+            Some((n.pitch, n.start_us, hand))
+        })
+        .collect();
+    if known.is_empty() {
+        return None;
+    }
+    let wrong = |split: u8| {
+        known
+            .iter()
+            .filter(|(pitch, _, hand)| hand_of_pitch_value(*pitch, split) != *hand)
+            .count()
+    };
+    let split = (0..=127u8).min_by_key(|&s| (wrong(s), s.abs_diff(DEFAULT_SPLIT)))?;
+    let mut overrides: Vec<HandOverride> = known
+        .iter()
+        .filter(|(pitch, _, hand)| hand_of_pitch_value(*pitch, split) != *hand)
+        .map(|&(pitch, start_us, hand)| HandOverride {
+            pitch,
+            start_us,
+            hand,
+        })
+        .collect();
+    overrides.sort_by_key(|o| (o.start_us, o.pitch));
+    Some(HandAssignment { split, overrides })
 }
 
 fn note_velocity(note: &ExtractedNote) -> Option<Velocity> {
@@ -138,6 +190,56 @@ mod tests {
             chart_to_timeline(&chart),
             Err(ImportError::InvalidPitch(200))
         ));
+    }
+
+    fn handed(pitch: u8, start_us: u64, hand: Hand) -> ExtractedNote {
+        ExtractedNote {
+            start_us,
+            hand,
+            ..note(pitch)
+        }
+    }
+
+    #[test]
+    fn hand_assignment_picks_the_split_between_the_hands() {
+        let chart = chart_with_notes(vec![
+            handed(41, 0, Hand::Left),
+            handed(48, 0, Hand::Left),
+            handed(53, 0, Hand::Right),
+            handed(55, 0, Hand::Right),
+            handed(72, 0, Hand::Unknown),
+        ]);
+        // 49..=53 all agree with every note; 53 is nearest middle C.
+        let hands = hand_assignment(&chart).unwrap();
+        assert_eq!(hands.split, 53);
+        assert!(hands.overrides.is_empty());
+    }
+
+    #[test]
+    fn hand_assignment_pins_a_crossover() {
+        let chart = chart_with_notes(vec![
+            handed(48, 0, Hand::Left),
+            handed(50, 0, Hand::Left),
+            handed(64, 0, Hand::Right),
+            handed(67, 0, Hand::Right),
+            handed(65, 500_000, Hand::Left),
+        ]);
+        let hands = hand_assignment(&chart).unwrap();
+        assert_eq!(hands.split, 60);
+        assert_eq!(
+            hands.overrides,
+            vec![HandOverride {
+                pitch: 65,
+                start_us: 500_000,
+                hand: rockcraft_core::Hand::Left,
+            }]
+        );
+    }
+
+    #[test]
+    fn hand_assignment_needs_a_known_hand() {
+        let chart = chart_with_notes(vec![handed(60, 0, Hand::Unknown)]);
+        assert_eq!(hand_assignment(&chart), None);
     }
 
     #[test]
