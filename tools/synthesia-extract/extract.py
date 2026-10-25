@@ -20,6 +20,9 @@ When ``--in`` is a directory of numbered frames, ``--fps`` is required.
 ``--audio-fusion`` runs the optional M6-F pass: when ``--audio`` points at a
 clean-piano WAV, it fills in velocity and tightens onsets; on a full mix it
 safely no-ops, leaving the visual notes untouched (see ``synthesia_extract.audio``).
+On a Rocksmith+ video the audio is the game playing the chart, so the pass
+instead anchors every note to its attack in the audio (M6-H,
+``synthesia_extract.rsplus_audio``).
 """
 
 from __future__ import annotations
@@ -31,6 +34,7 @@ import sys
 from synthesia_extract.audio import fuse_chart
 from synthesia_extract.io import is_frame_dir, load_frames, read_wav
 from synthesia_extract import rsplus
+from synthesia_extract.rsplus_audio import fuse_rsplus_chart
 from synthesia_extract.pipeline import extract_chart, extract_chart_streaming
 
 DEBUG_DIR = "debug-out"  # gitignored; see .gitignore
@@ -195,7 +199,8 @@ def main(argv: list[str] | None = None) -> int:
         except (FileNotFoundError, ValueError, OSError) as e:
             print(f"error: could not read audio: {e}", file=sys.stderr)
             return 2
-        chart = fuse_chart(chart, samples, sample_rate)
+        fuse = fuse_rsplus_chart if layout == "rsplus" else fuse_chart
+        chart = fuse(chart, samples, sample_rate)
         print(f"audio-fusion: {chart.source.audio_fusion}", file=sys.stderr)
 
     json_str = chart.to_json(indent=2)
