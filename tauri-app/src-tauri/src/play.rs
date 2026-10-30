@@ -1325,11 +1325,6 @@ impl PlaySession {
         self.rebuild_wait_gate();
     }
 
-    /// Whether the practice loop demos each pass before your turn.
-    pub fn demo(&self) -> bool {
-        self.demo
-    }
-
     /// Switch the loop's demo on or off. A running loop skips a demo its
     /// count-in leads into at once; a demo already playing finishes.
     pub fn set_demo(&mut self, demo: bool) {
