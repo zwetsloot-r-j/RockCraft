@@ -282,6 +282,8 @@ pub struct PlayStateEvent {
     /// The practice loop: the marked bars, and while it runs its phase, pass
     /// and last pass score. `None` when nothing is marked (M17-A).
     pub practice_loop: Option<LoopView>,
+    /// Whether the practice loop demos each pass before your turn (`d`).
+    pub demo: bool,
 }
 
 /// One finished *your turn* pass of the practice loop (M17-A).
@@ -313,6 +315,10 @@ pub struct LoopView {
     pub pass: u32,
     /// The last finished *your turn* pass, if any.
     pub last_pass: Option<PassSummary>,
+    /// The bar marked with `[` / `]` (0-based), if set. A lone mark loops
+    /// just that bar.
+    pub start_mark: Option<u64>,
+    pub end_mark: Option<u64>,
 }
 
 /// A complete read-only picture of the live take, for the agent-control socket.
@@ -367,6 +373,8 @@ pub struct PlayStatusView {
     pub bar: u64,
     /// The practice loop, or `None` when nothing is marked (M17-A).
     pub practice_loop: Option<LoopView>,
+    /// Whether the practice loop demos each pass before your turn.
+    pub demo: bool,
 }
 
 /// The end-of-take summary returned by `play_finish`.
@@ -563,6 +571,9 @@ pub struct PlaySession {
     /// authored override (M14-E) when it has one, else its pitch relative to
     /// `split_pitch` — see [`NoteSpan::effective_hand`].
     practice: Option<Hand>,
+    /// Whether the practice loop demos the passage before each *your turn*
+    /// (`d`); off, it goes straight from count-in to your turn.
+    demo: bool,
     /// Pitch dividing left/right hands for [`practice`](Self::practice), from
     /// the piece's `meta.json` (or [`DEFAULT_SPLIT`]). Per-note overrides win.
     split_pitch: u8,
@@ -693,6 +704,7 @@ impl PlaySession {
             monitor: false,
             sustain: false,
             practice: None,
+            demo: true,
             split_pitch: DEFAULT_SPLIT,
             paused: false,
             cfg: ScoreConfig::default(),
@@ -1313,6 +1325,15 @@ impl PlaySession {
         self.rebuild_wait_gate();
     }
 
+    /// Switch the loop's demo on or off. A running loop skips a demo its
+    /// count-in leads into at once; a demo already playing finishes.
+    pub fn set_demo(&mut self, demo: bool) {
+        self.demo = demo;
+        if let Some(rl) = self.practice_loop.as_mut() {
+            rl.lp.set_demo(demo);
+        }
+    }
+
     /// Set the practice speed in permille, clamped to
     /// [`PLAY_RATE_MIN`]..=[`PLAY_RATE_MAX`]. Returns the applied value.
     pub fn set_rate(&mut self, rate_permille: u16) -> u16 {
@@ -1458,6 +1479,7 @@ impl PlaySession {
             note_count: self.spans.len(),
             bar: self.current_bar(),
             practice_loop: self.loop_view(),
+            demo: self.demo,
         }
     }
 
@@ -1500,6 +1522,7 @@ impl PlaySession {
             finished: self.is_finished(),
             bar: self.current_bar(),
             practice_loop: self.loop_view(),
+            demo: self.demo,
         }
     }
 
@@ -1661,8 +1684,9 @@ impl PlaySession {
         let map = self.bar_map();
         let (start_us, end_us) = map.bar_range_us(first_bar, last_bar);
         let count_in_us = map.bar_len(first_bar);
-        let lp = PracticeLoop::new(start_us, end_us, count_in_us, self.beats_per_bar);
-        let entry_us = lp.entry_us();
+        let lp = PracticeLoop::new(start_us, end_us, count_in_us, self.beats_per_bar)
+            .with_demo(self.demo);
+        let (entry_us, phase) = (lp.entry_us(), lp.phase());
         self.practice_loop = Some(RunningLoop {
             lp,
             first_bar,
@@ -1673,7 +1697,7 @@ impl PlaySession {
         });
         self.last_pass = None;
         self.seek_to(entry_us);
-        self.enter_phase(LoopPhase::CountIn { next: Pass::Demo });
+        self.enter_phase(phase);
         self.recompute_live();
         self.paused = false;
         if !self.clock.is_running() {
@@ -1838,6 +1862,8 @@ impl PlaySession {
                 phase: Some(rl.lp.phase().name()),
                 pass: rl.lp.pass(),
                 last_pass: self.last_pass,
+                start_mark: self.loop_marks.0,
+                end_mark: self.loop_marks.1,
             });
         }
         let (first_bar, last_bar) = self.marked_range()?;
@@ -1851,6 +1877,8 @@ impl PlaySession {
             phase: None,
             pass: 0,
             last_pass: self.last_pass,
+            start_mark: self.loop_marks.0,
+            end_mark: self.loop_marks.1,
         })
     }
 
@@ -2014,6 +2042,7 @@ fn status_of(session: Option<&PlaySession>) -> PlayStatusView {
         note_count: 0,
         bar: 0,
         practice_loop: None,
+        demo: true,
     })
 }
 
@@ -2124,6 +2153,18 @@ pub fn play_set_practice(state: tauri::State<'_, PlayState>, hand: Option<String
         None => "both",
     }
     .to_string()
+}
+
+/// Switch the practice loop's demo on or off (`HostCommand::PlaySetDemo`).
+/// Returns the applied value; with no session loaded nothing changes and the
+/// webview re-applies its saved choice on the next load.
+#[tauri::command]
+pub fn play_set_demo(state: tauri::State<'_, PlayState>, on: bool) -> bool {
+    let mut guard = state.0.lock().expect("play state mutex poisoned");
+    if let Some(s) = guard.as_mut() {
+        s.set_demo(on);
+    }
+    on
 }
 
 /// Set the left/right split pitch (0..=127). Returns the applied value.
@@ -3537,6 +3578,33 @@ mod tests {
         );
         assert_eq!((s.live_hits, s.live_misses, s.score), (0, 0, 0));
         assert!(s.pending_feedback.is_empty());
+    }
+
+    #[test]
+    fn without_the_demo_the_loop_goes_straight_to_your_turn() {
+        let mut s = loop_session();
+        s.set_demo(false);
+        s.set_loop(2, 2);
+        let fired = tick_until(&mut s, "your_turn");
+        assert!(
+            fired.iter().all(|&(p, _)| p == "count_in"),
+            "no demo before your turn: {fired:?}"
+        );
+        play_your_turn(&mut s, &[]);
+        tick_until(&mut s, "count_in");
+        let fired = tick_until(&mut s, "your_turn");
+        assert!(fired.iter().all(|&(p, _)| p == "count_in"), "{fired:?}");
+        assert!(!s.status().demo);
+        assert!(!s.live_state().demo);
+    }
+
+    #[test]
+    fn the_loop_view_reports_its_marks() {
+        let mut s = loop_session();
+        s.mark_loop_start();
+        let view = s.loop_view().unwrap();
+        assert_eq!(view.start_mark, Some(view.first_bar));
+        assert_eq!(view.end_mark, None);
     }
 
     #[test]

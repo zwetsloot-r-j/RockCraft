@@ -609,6 +609,12 @@ export function playSetPractice(
   return invoke<string>("play_set_practice", { hand });
 }
 
+/** Switch the practice loop's demo pass on or off (`d`). Off, a loop goes
+ * count-in → your turn → … with no demo. Returns the applied value. */
+export function playSetDemo(on: boolean): Promise<boolean> {
+  return invoke<boolean>("play_set_demo", { on });
+}
+
 /** Set the play-session practice speed in permille (1000 = 1x), clamped
  * 0.25x..=2x. The highway, wait gate and scoring stretch together; the backing
  * recording mutes off-tempo. Returns the applied value. */

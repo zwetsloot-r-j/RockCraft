@@ -536,6 +536,8 @@ export interface PlayStateEvent {
   bar: number;
   /** The practice loop, or `null` when nothing is marked (M17-A). */
   practice_loop: LoopView | null;
+  /** Whether the practice loop demos each pass before your turn (`d`). */
+  demo: boolean;
 }
 
 /** Which end of the practice loop `play_mark_loop` sets. */
@@ -568,6 +570,10 @@ export interface LoopView {
   /** 1-based pass number (0 unless running). */
   pass: number;
   last_pass: PassSummary | null;
+  /** The bars marked with `[` / `]` (0-based), or `null` when unset. A lone
+   * mark loops just that bar. */
+  start_mark: number | null;
+  end_mark: number | null;
 }
 
 /** The live take's status — mirror of `play::PlayStatusView` (the fields the

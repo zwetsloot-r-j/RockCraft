@@ -1,5 +1,6 @@
 //! Play-mode practice loop: the pure phase machine behind
-//! **count-in → demo → count-in → your turn → …** over a range of bars.
+//! **count-in → demo → count-in → your turn → …** over a range of bars, or
+//! **count-in → your turn → …** with the demo switched off.
 //!
 //! Clock-agnostic: the session feeds it the play clock's `now` each tick and
 //! acts on the returned [`LoopStep`] (enter a phase, or jump the clock). It
@@ -71,6 +72,8 @@ pub struct PracticeLoop {
     beats_per_bar: u8,
     phase: LoopPhase,
     pass: u32,
+    /// Whether the app demos the loop before each *your turn* pass.
+    demo: bool,
 }
 
 impl PracticeLoop {
@@ -85,6 +88,31 @@ impl PracticeLoop {
             beats_per_bar: beats_per_bar.max(1),
             phase: LoopPhase::CountIn { next: Pass::Demo },
             pass: 1,
+            demo: true,
+        }
+    }
+
+    /// The same loop with the demo on or off (see [`set_demo`](Self::set_demo)).
+    pub fn with_demo(mut self, demo: bool) -> Self {
+        self.set_demo(demo);
+        self
+    }
+
+    /// Whether the app demos the loop before each *your turn* pass.
+    pub fn demo(&self) -> bool {
+        self.demo
+    }
+
+    /// Switch the demo on or off. Switching it off turns a count-in that
+    /// leads into a demo into one that leads into *your turn*; a demo already
+    /// playing finishes. Switching it on takes effect after the next *your
+    /// turn* pass.
+    pub fn set_demo(&mut self, demo: bool) {
+        self.demo = demo;
+        if !demo && self.phase == (LoopPhase::CountIn { next: Pass::Demo }) {
+            self.phase = LoopPhase::CountIn {
+                next: Pass::YourTurn,
+            };
         }
     }
 
@@ -136,7 +164,11 @@ impl PracticeLoop {
                 let pass_done = self.phase == LoopPhase::YourTurn;
                 let next = if pass_done {
                     self.pass += 1;
-                    Pass::Demo
+                    if self.demo {
+                        Pass::Demo
+                    } else {
+                        Pass::YourTurn
+                    }
                 } else {
                     Pass::YourTurn
                 };
@@ -225,6 +257,73 @@ mod tests {
         );
         assert_eq!(l.pass(), 2);
         assert_eq!(l.tick(10_000), LoopStep::Enter(LoopPhase::Demo));
+    }
+
+    #[test]
+    fn without_the_demo_every_pass_is_your_turn() {
+        let mut l = lp().with_demo(false);
+        assert!(!l.demo());
+        assert_eq!(
+            l.phase(),
+            LoopPhase::CountIn {
+                next: Pass::YourTurn
+            }
+        );
+        assert_eq!(l.tick(10_000), LoopStep::Enter(LoopPhase::YourTurn));
+        assert_eq!(
+            l.tick(18_000),
+            LoopStep::JumpTo {
+                us: 6_000,
+                phase: LoopPhase::CountIn {
+                    next: Pass::YourTurn
+                },
+                pass_done: true,
+            }
+        );
+        assert_eq!(l.pass(), 2);
+        assert_eq!(l.tick(10_000), LoopStep::Enter(LoopPhase::YourTurn));
+    }
+
+    #[test]
+    fn switching_the_demo_off_skips_a_pending_demo() {
+        let mut l = lp();
+        l.set_demo(false);
+        assert_eq!(l.tick(10_000), LoopStep::Enter(LoopPhase::YourTurn));
+    }
+
+    #[test]
+    fn switching_the_demo_off_lets_a_playing_demo_finish() {
+        let mut l = lp();
+        assert_eq!(l.tick(10_000), LoopStep::Enter(LoopPhase::Demo));
+        l.set_demo(false);
+        assert_eq!(l.phase(), LoopPhase::Demo);
+        assert!(matches!(
+            l.tick(18_000),
+            LoopStep::JumpTo {
+                phase: LoopPhase::CountIn {
+                    next: Pass::YourTurn
+                },
+                pass_done: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn switching_the_demo_on_waits_for_the_next_your_turn_to_end() {
+        let mut l = lp().with_demo(false);
+        l.set_demo(true);
+        // The pending count-in still leads into your turn ...
+        assert_eq!(l.tick(10_000), LoopStep::Enter(LoopPhase::YourTurn));
+        // ... and the demo comes back after it.
+        assert!(matches!(
+            l.tick(18_000),
+            LoopStep::JumpTo {
+                phase: LoopPhase::CountIn { next: Pass::Demo },
+                pass_done: true,
+                ..
+            }
+        ));
     }
 
     #[test]

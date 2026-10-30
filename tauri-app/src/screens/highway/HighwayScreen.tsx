@@ -20,6 +20,7 @@ import {
   playMarkLoop,
   playSeekBar,
   playSeekUs,
+  playSetDemo,
   playSetLoop,
   playSetPractice,
   playSetRate,
@@ -188,6 +189,16 @@ function readMonitor(): boolean {
     return false;
   }
 }
+
+/** The practice loop's demo pass (`d`); defaults to **on** when never set. */
+const DEMO_KEY = "rc.play.loopDemo";
+function readDemo(): boolean {
+  try {
+    return localStorage.getItem(DEMO_KEY) !== "0";
+  } catch {
+    return true;
+  }
+}
 function writeLS(key: string, value: string): void {
   try {
     localStorage.setItem(key, value);
@@ -269,6 +280,8 @@ export function HighwayScreen() {
   const [waitMode, setWaitMode] = createSignal(readWaitPref());
   // Hand-practice mode + the left/right split pitch, both persisted.
   const [practice, setPractice] = createSignal<Practice>(readPractice());
+  // The practice loop's demo pass, persisted.
+  const [demo, setDemo] = createSignal(readDemo());
   const [split, setSplit] = createSignal(readSplit());
   // How much of the backdrop movie to show, persisted across takes/sessions.
   const [backdrop, setBackdrop] = createSignal<Backdrop>(readBackdrop());
@@ -373,6 +386,18 @@ export function HighwayScreen() {
         e.preventDefault();
         cyclePractice();
         break;
+      case "d":
+      case "D": {
+        // The practice loop's demo pass, on / off. Starts from what the
+        // session reports, so a change made over the control socket counts.
+        e.preventDefault();
+        const next = !(playState()?.demo ?? demo());
+        void playSetDemo(next).then((on) => {
+          setDemo(on);
+          writeLS(DEMO_KEY, on ? "1" : "0");
+        });
+        break;
+      }
       case "-":
       case "_":
         // Slow the take down one step.
@@ -617,6 +642,8 @@ export function HighwayScreen() {
         // Apply the persisted hand-practice mode + split to the fresh session.
         void playSetSplit(split());
         void playSetPractice(practiceArg(practice()));
+        // A fresh session demos its loops; apply the persisted choice.
+        void playSetDemo(demo());
         // Re-apply the persisted practice speed to the fresh session.
         if (rate() !== 1000) void playSetRate(rate());
       })
@@ -807,6 +834,7 @@ export function HighwayScreen() {
           waitMode={waitMode}
           monitor={monitor}
           practice={practice}
+          demo={() => playState()?.demo ?? demo()}
           backdrop={backdrop}
           rate={rate}
           splitName={() => noteName(split())}

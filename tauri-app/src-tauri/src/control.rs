@@ -433,6 +433,10 @@ impl HostServices for TauriHost<'_> {
                 let applied = crate::play::play_set_practice(app.state::<PlayState>(), wire);
                 Ok(serde_json::json!({ "practice": applied }))
             }
+            HostCommand::PlaySetDemo { on } => {
+                let applied = crate::play::play_set_demo(app.state::<PlayState>(), on);
+                Ok(serde_json::json!({ "demo": applied }))
+            }
             HostCommand::PlayFinish => {
                 let summary =
                     crate::play::play_finish(app.state::<PlayState>(), app.state::<AudioState>());

@@ -523,28 +523,48 @@ export class HighwayCanvas {
     }
   }
 
-  /** Loop band: a faint fill between the marked bars plus edge lines, brighter
-   * while the loop runs. */
+  /** Loop band: a faint fill between the marked bars, brighter while the loop
+   * runs, plus a solid line on each marked edge labelled with its bar — "[ 5"
+   * at the left of the loop start, "8 ]" at the right of the loop end — so a
+   * `[` / `]` press shows where it landed. */
   private drawLoopBand(now: number): void {
     const band = this.loop;
     if (!band) return;
-    const yTop = clamp(this.yOf(band.endMs, now), 0, this.hitY);
-    const yBot = clamp(this.yOf(band.startMs, now), 0, this.hitY);
-    if (yBot <= yTop) return;
     const ctx = this.ctx;
     const half = this.boardW / 2;
-    ctx.fillStyle = band.running ? "rgba(143,182,255,0.07)" : "rgba(143,182,255,0.04)";
-    ctx.fillRect(this.centerX - half, yTop, this.boardW, yBot - yTop);
-    ctx.strokeStyle = band.running ? "rgba(143,182,255,0.45)" : "rgba(143,182,255,0.25)";
-    ctx.lineWidth = 1.5;
-    for (const t of [band.startMs, band.endMs]) {
+    const yTop = clamp(this.yOf(band.endMs, now), 0, this.hitY);
+    const yBot = clamp(this.yOf(band.startMs, now), 0, this.hitY);
+    if (yBot > yTop) {
+      ctx.fillStyle = band.running ? "rgba(143,182,255,0.08)" : "rgba(143,182,255,0.06)";
+      ctx.fillRect(this.centerX - half, yTop, this.boardW, yBot - yTop);
+    }
+    const edges: [number, string | null, boolean][] = [
+      [band.startMs, band.startLabel, true],
+      [band.endMs, band.endLabel, false],
+    ];
+    ctx.font = `600 11px ${this.cfg.fontMono}`;
+    ctx.textBaseline = "bottom";
+    for (const [t, label, start] of edges) {
+      if (label === null) continue;
       const y = this.yOf(t, now);
       if (y < 0 || y > this.hitY) continue;
       const s = this.sAt(y);
+      const left = this.centerX - half * s;
+      const right = this.centerX + half * s;
+      ctx.strokeStyle = "rgba(143,182,255,0.85)";
+      ctx.lineWidth = 2;
       ctx.beginPath();
-      ctx.moveTo(this.centerX - half * s, y);
-      ctx.lineTo(this.centerX + half * s, y);
+      ctx.moveTo(left, y);
+      ctx.lineTo(right, y);
       ctx.stroke();
+      // A tag sitting on the line, inside the board's edge.
+      const w = ctx.measureText(label).width + 10;
+      const x = start ? left + 4 : right - 4 - w;
+      ctx.fillStyle = "rgba(143,182,255,0.9)";
+      ctx.fillRect(x, y - 16, w, 15);
+      ctx.fillStyle = "#11121a";
+      ctx.textAlign = "left";
+      ctx.fillText(label, x + 5, y - 2);
     }
   }
 
