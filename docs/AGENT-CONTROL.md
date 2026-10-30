@@ -444,6 +444,7 @@ below is an at-a-glance convenience only.
 | `play_mark_loop` | `{ edge: "start"\|"end" }` | Mark the practice loop's first / last (inclusive) bar as the bar under the playhead. Doesn't pause; a running loop restarts on the new range. Returns play status |
 | `play_set_loop` | `{ first_bar: u32, last_bar: u32 }` | Mark bars `first_bar..=last_bar` (0-based, swapped if reversed) and start the practice loop — see below. Returns play status |
 | `play_clear_loop` | none | Stop a running practice loop, pausing at the loop start with normal play restored; with no loop running, clear the marks. Returns play status |
+| `play_set_demo` | `{ on: bool }` | Switch the practice loop's demo pass on (the default) or off — see below. Returns `{ demo }` |
 | `record_start` | `{ backing: String? }` | Start a record session, optionally over a backing file |
 | `record_stop` | none | Stop recording without saving |
 | `record_save` | none | Save the session as a bundle. Returns the dir |
@@ -523,22 +524,38 @@ notes starting in the loop are scored) → back to the demo with the pass counte
 bumped. Speed (`play_set_rate`) applies at once; a practice-hand or wait-mode
 change takes effect at the next phase boundary. The loop never finishes the take.
 
+**Without the demo** (`play_set_demo {on:false}`, the `d` key) every pass is
+yours: **count-in → your turn → count-in → your turn → …**. Switching it off
+skips a demo the current count-in leads into at once; a demo already playing
+finishes. Switching it back on brings the demo back after the next *your turn*.
+`play_status` (and every loop command's reply) carries the setting as `demo`.
+The TUI remembers it in its settings file, however it was set, and also takes
+it off the play screen. The desktop remembers the choice made with `d` and
+re-applies it on every load, so a `play_set_demo` there lasts for the loaded
+session only.
+
 `play_status` (and every loop command's reply) carries `bar` — the bar under the
 playhead, 0-based — and `practice_loop`, `null` when nothing is marked, else:
 
 ```json
 { "first_bar": 4, "last_bar": 7, "start_us": 12000000, "end_us": 20000000,
   "running": true, "phase": "your_turn", "pass": 3,
-  "last_pass": { "pass": 2, "hits": 11, "misses": 1, "accuracy_bp": 9167 } }
+  "last_pass": { "pass": 2, "hits": 11, "misses": 1, "accuracy_bp": 9167 },
+  "start_mark": 4, "end_mark": 7 }
 ```
 
 `phase` is `"count_in"`, `"demo"` or `"your_turn"` (`null` while only marked).
-`last_pass` is the most recent finished your-turn pass.
+`last_pass` is the most recent finished your-turn pass. `start_mark` /
+`end_mark` are the bars marked with `[` / `]` (`null` when unset); a lone mark
+loops just that bar, and the badge reads `Loop 5–?` / `Loop ?–8` until the other
+edge is marked. Both frontends draw each marked edge on the highway as a line
+tagged with its bar (`[ 5` on the loop start, `8 ]` on the loop end); the desktop
+also shows the marked range on the seek bar.
 
 **In the TUI (M17-B)** the four loop commands work on the play screen (off it
 they fail with `failed:`) and reply `{ paused, bar, practice_loop }`. The TUI
 scores each *your turn* pass into `last_pass` as on the desktop. On the TUI
-play screen the same keys work: `←`/`→`, `[`, `]` and `l`.
+play screen the same keys work: `←`/`→`, `[`, `]`, `l` and `d`.
 `play_set_practice` (M18-C) works on the TUI play screen too — `h` cycles
 both → right → left — and fails with `failed:` off it.
 

@@ -9,7 +9,7 @@ import { For, Show } from "solid-js";
 import type { HighwayCanvas } from "./HighwayCanvas";
 import type { PlayStateEvent, SongAudio } from "../../ipc/types";
 import type { SongData } from "./types";
-import { loopBadgeText } from "./practiceLoop";
+import { demoChipText, loopBadgeText, seekBarLoop } from "./practiceLoop";
 import { spectrumColor } from "./utils";
 
 interface HighwayHeaderProps {
@@ -24,6 +24,8 @@ interface HighwayHeaderProps {
   waitMode?: () => boolean;
   monitor?: () => boolean;
   practice?: () => "both" | "left" | "right";
+  /** The practice loop's demo pass, switched with `d`. */
+  demo?: () => boolean;
   /** Backdrop-movie visibility, cycled with `v`. */
   backdrop?: () => "on" | "dim" | "off";
   /** Practice speed in permille (1000 = 1x), stepped with `-` / `=`. */
@@ -309,6 +311,28 @@ export function HighwayHeader(props: HighwayHeaderProps) {
               </span>
             )}
           </Show>
+          <Show
+            when={demoChipText(
+              props.demo?.() ?? true,
+              props.playState?.()?.practice_loop ?? null,
+            )}
+          >
+            {(text) => (
+              <span
+                style={{
+                  "font-size": "11px",
+                  "font-family": monoFont,
+                  padding: "2px 8px",
+                  "border-radius": "6px",
+                  background: "rgba(255,255,255,0.05)",
+                  color: (props.demo?.() ?? true) ? "#b9bccb" : "#7c7f8e",
+                }}
+                title="d — demo each loop pass first, or go straight to your turn"
+              >
+                ▶ {text()}
+              </span>
+            )}
+          </Show>
           <Show when={(props.practice?.() ?? "both") !== "both"}>
             <span
               style={{
@@ -455,6 +479,33 @@ export function HighwayHeader(props: HighwayHeaderProps) {
               "pointer-events": "none",
             }}
           />
+          {/* The marked loop bars: a band with a bracket tick on each marked
+              edge, standing above the bar so a mark off-screen still shows. */}
+          <Show
+            when={seekBarLoop(
+              props.playState?.()?.practice_loop ?? null,
+              props.durationUs?.() ?? 0,
+            )}
+          >
+            {(lp) => (
+              <div
+                style={{
+                  position: "absolute",
+                  left: `${lp().left * 100}%`,
+                  width: `${lp().width * 100}%`,
+                  bottom: 0,
+                  height: "10px",
+                  "box-sizing": "border-box",
+                  background: lp().running
+                    ? "rgba(143,182,255,0.45)"
+                    : "rgba(143,182,255,0.3)",
+                  "border-left": lp().startMarked ? "2px solid #8fb6ff" : "none",
+                  "border-right": lp().endMarked ? "2px solid #8fb6ff" : "none",
+                  "pointer-events": "none",
+                }}
+              />
+            )}
+          </Show>
         </div>
       </Show>
     </div>

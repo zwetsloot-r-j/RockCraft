@@ -31,7 +31,7 @@ use rockcraft_midi::smf_bytes_to_events;
 
 use crate::highway::{
     build_spans, cells_of_extent, grid_rows, line_cell, lower_block, next_per_lane,
-    song_duration_us, span_extent8, step_to_sixteenth, CellFill, NoteSpan, SUB,
+    song_duration_us, span_extent8, step_to_sixteenth, y8_of_time, CellFill, NoteSpan, SUB,
 };
 use crate::keyboard::{black_key_col, is_black_key, white_index, HeldNotes, Scale};
 use crate::palette::{note_color, ColorMode, Rgb, BACKGROUND};
@@ -170,6 +170,9 @@ pub struct PlayScreen {
     /// The practised hand (`h`, M18-C): `None` = both hands. The app plays the
     /// other hand, and only this hand's notes are waited on.
     practice: Option<Hand>,
+    /// Whether the practice loop demos the passage before each *your turn*
+    /// (`d`); off, it goes straight from count-in to your turn.
+    demo: bool,
     /// When the sounding count-in click is released (play-clock µs).
     click_off_at: Option<u64>,
     /// Practice speed in permille ([`PLAY_RATE_UNITY`] = 1×). Scales the time
@@ -242,6 +245,10 @@ pub struct LoopView {
     pub pass: u32,
     /// The last finished *your turn* pass, if any.
     pub last_pass: Option<PassSummary>,
+    /// The bar marked with `[` / `]` (0-based), if set. A lone mark loops
+    /// just that bar.
+    pub start_mark: Option<u64>,
+    pub end_mark: Option<u64>,
 }
 
 /// One finished *your turn* pass of the practice loop — the desktop's
@@ -298,6 +305,8 @@ pub struct PlayStatus {
     pub beats_per_bar: u8,
     pub note_count: usize,
     pub bar: u64,
+    /// Whether the practice loop demos each pass before your turn (`d`).
+    pub demo: bool,
     pub practice_loop: Option<LoopView>,
 }
 
@@ -377,6 +386,7 @@ impl PlayScreen {
             loop_marks: (None, None),
             practice_loop: None,
             practice: None,
+            demo: true,
             click_off_at: None,
             rate_permille: PLAY_RATE_UNITY,
             cfg: ScoreConfig::default(),
@@ -1070,6 +1080,7 @@ impl PlayScreen {
             beats_per_bar: self.beats_per_bar,
             note_count: self.spans.len(),
             bar: self.current_bar(),
+            demo: self.demo,
             practice_loop: self.loop_view(),
         }
     }
@@ -1272,6 +1283,25 @@ impl PlayScreen {
         });
     }
 
+    /// Whether the practice loop demos each pass before your turn.
+    pub fn demo(&self) -> bool {
+        self.demo
+    }
+
+    /// Switch the loop's demo on or off. A running loop skips a demo its
+    /// count-in leads into at once; a demo already playing finishes.
+    pub fn set_demo(&mut self, demo: bool) {
+        self.demo = demo;
+        if let Some(rl) = self.practice_loop.as_mut() {
+            rl.lp.set_demo(demo);
+        }
+    }
+
+    /// `d`: the demo on ↔ off.
+    pub fn toggle_demo(&mut self) {
+        self.set_demo(!self.demo);
+    }
+
     /// Wait-gate steps for the notes of `practice` (every note when `None`)
     /// that `keep` accepts.
     fn steps_for(
@@ -1461,8 +1491,9 @@ impl PlayScreen {
         let map = self.bar_map();
         let (start_us, end_us) = map.bar_range_us(first_bar, last_bar);
         let count_in_us = map.bar_len(first_bar);
-        let lp = PracticeLoop::new(start_us, end_us, count_in_us, self.beats_per_bar);
-        let entry_us = lp.entry_us();
+        let lp = PracticeLoop::new(start_us, end_us, count_in_us, self.beats_per_bar)
+            .with_demo(self.demo);
+        let (entry_us, phase) = (lp.entry_us(), lp.phase());
         self.practice_loop = Some(RunningLoop {
             lp,
             first_bar,
@@ -1473,7 +1504,7 @@ impl PlayScreen {
         });
         self.last_pass = None;
         self.seek_to(entry_us);
-        self.enter_phase(LoopPhase::CountIn { next: Pass::Demo });
+        self.enter_phase(phase);
         self.recompute_live();
         self.paused = false;
         if !self.clock.is_running() {
@@ -1625,6 +1656,8 @@ impl PlayScreen {
                 phase: Some(rl.lp.phase()),
                 pass: rl.lp.pass(),
                 last_pass: self.last_pass,
+                start_mark: self.loop_marks.0,
+                end_mark: self.loop_marks.1,
             });
         }
         let (first_bar, last_bar) = self.marked_range()?;
@@ -1638,6 +1671,8 @@ impl PlayScreen {
             phase: None,
             pass: 0,
             last_pass: self.last_pass,
+            start_mark: self.loop_marks.0,
+            end_mark: self.loop_marks.1,
         })
     }
 
@@ -1767,7 +1802,20 @@ impl PlayScreen {
             Span::raw(format!("[v] {}  ", self.scroll_mode.label())),
         ];
         // The loop badge sits by the clock, where a narrow terminal still
-        // shows it; with nothing marked, a key hint joins the others instead.
+        // shows it, with the demo switch beside it; with nothing marked, a
+        // key hint joins the others instead.
+        let demo = Span::styled(
+            if self.demo {
+                "[d] demo  "
+            } else {
+                "[d] no demo  "
+            },
+            Style::default().fg(if self.demo {
+                Color::Green
+            } else {
+                Color::DarkGray
+            }),
+        );
         match self.loop_view() {
             Some(view) => {
                 let style = if view.running {
@@ -1777,8 +1825,12 @@ impl PlayScreen {
                 };
                 spans.insert(2, Span::styled(loop_badge(&view), style));
                 spans.insert(3, Span::raw("  "));
+                spans.insert(4, demo);
             }
-            None => spans.push(Span::raw("[←→] bar  [ ] mark  [l] loop  ")),
+            None => {
+                spans.push(Span::raw("[←→] bar  [ ] mark  [l] loop  "));
+                spans.push(demo);
+            }
         }
         if self.backing_playing() {
             // How often the backing had to be pulled back in step: a count
@@ -1920,6 +1972,15 @@ impl PlayScreen {
             }
         }
 
+        // 3b. The loop's marked edges, over the bar lines in the loop colour.
+        let edges = self.loop_edges(view, area.height);
+        for edge in &edges {
+            let y = area.y + edge.row;
+            for x in board.left()..board.right() {
+                buf[(x, y)].set_symbol(edge.glyph).set_fg(LOOP_BADGE.into());
+            }
+        }
+
         // 4. Notes, their edges to the eighth of a row: a partial top or
         //    bottom cell is a lower-block glyph (for a top edge, drawn inverted:
         //    the cell's background as the glyph, the note as the cell). The
@@ -1970,6 +2031,57 @@ impl PlayScreen {
                 }
             }
         }
+
+        // 5. The edges' labels on top of everything: `[ 5` at the board's
+        //    left on the loop start, `8 ]` at its right on the loop end.
+        let label_style = Style::default().fg(Color::Black).bg(LOOP_BADGE.into());
+        for edge in &edges {
+            let width = edge.label.chars().count() as u16;
+            if width > board.width {
+                continue;
+            }
+            let x = if edge.start {
+                board.left()
+            } else {
+                board.right() - width
+            };
+            buf.set_string(x, area.y + edge.row, &edge.label, label_style);
+        }
+    }
+
+    /// The marked loop edges on screen at view time `view`: the start of the
+    /// first bar when it is marked (`[`), the end of the last when that is
+    /// (`]`) — both while the loop runs. An edge in the past or beyond the
+    /// highway's top is left out.
+    fn loop_edges(&self, view: u64, height: u16) -> Vec<LoopEdgeRow> {
+        let Some(lv) = self.loop_view() else {
+            return Vec::new();
+        };
+        if height == 0 {
+            return Vec::new();
+        }
+        let both = lv.running || (lv.start_mark.is_some() && lv.end_mark.is_some());
+        let mut edges = Vec::new();
+        if both || lv.start_mark.is_some() {
+            edges.push((lv.start_us, true, format!(" [ {} ", lv.first_bar + 1)));
+        }
+        if both || lv.end_mark.is_some() {
+            edges.push((lv.end_us, false, format!(" {} ] ", lv.last_bar + 1)));
+        }
+        edges
+            .into_iter()
+            .filter(|&(t, _, _)| view <= t && t <= view + LEAD_US)
+            .map(|(t, start, label)| {
+                let y8 = y8_of_time(t, view, LEAD_US, height).clamp(0, height as i64 * SUB - 1);
+                let (row, glyph) = line_cell(y8);
+                LoopEdgeRow {
+                    row: row as u16,
+                    glyph,
+                    start,
+                    label,
+                }
+            })
+            .collect()
     }
 
     /// The song time the highway is drawn at: the clock itself when scrolling
@@ -2056,7 +2168,17 @@ impl ScrollMode {
     }
 }
 
-/// The loop's colour: its status badge and (faintly) its highway band.
+/// A marked loop edge as the highway draws it.
+struct LoopEdgeRow {
+    row: u16,
+    glyph: &'static str,
+    /// The loop start (`[`, labelled at the left) or end (`]`, at the right).
+    start: bool,
+    label: String,
+}
+
+/// The loop's colour: its status badge, its edge lines and (faintly) its
+/// highway band.
 const LOOP_BADGE: Rgb = Rgb(0xff, 0xd1, 0x66);
 /// How strongly the loop band tints the highway.
 const LOOP_BAND: f32 = 0.08;
@@ -2086,10 +2208,12 @@ pub fn speed_badge(rate_permille: u16) -> String {
 /// The status-line loop badge: `Loop 5–8` when marked, plus the phase and pass
 /// while running (bars shown 1-based).
 pub fn loop_badge(view: &LoopView) -> String {
-    let bars = if view.first_bar == view.last_bar {
-        format!("Loop {}", view.first_bar + 1)
-    } else {
-        format!("Loop {}–{}", view.first_bar + 1, view.last_bar + 1)
+    let bars = match (view.running, view.start_mark, view.end_mark) {
+        // A lone mark: show which edge is still open.
+        (false, Some(a), None) => format!("Loop {}–?", a + 1),
+        (false, None, Some(b)) => format!("Loop ?–{}", b + 1),
+        _ if view.first_bar == view.last_bar => format!("Loop {}", view.first_bar + 1),
+        _ => format!("Loop {}–{}", view.first_bar + 1, view.last_bar + 1),
     };
     match view.phase {
         None => bars,
@@ -3143,6 +3267,63 @@ mod tests {
         assert_eq!((view.first_bar, view.last_bar), (1, 1));
         assert_eq!(phase(&play), Some(LoopPhase::CountIn { next: Pass::Demo }));
         assert_eq!(play.now_us(), SHIFT, "restarted from its count-in");
+    }
+
+    #[test]
+    fn without_the_demo_a_loop_goes_straight_to_your_turn() {
+        let mut play = loop_screen();
+        play.set_demo(false);
+        play.set_loop(1, 1);
+        assert_eq!(
+            phase(&play),
+            Some(LoopPhase::CountIn {
+                next: Pass::YourTurn
+            })
+        );
+        play.advance(BAR);
+        assert_eq!(phase(&play), Some(LoopPhase::YourTurn));
+        assert!(!play.status().demo);
+    }
+
+    #[test]
+    fn the_demo_switch_reaches_a_running_loop() {
+        let mut play = loop_screen();
+        play.set_loop(1, 1);
+        play.toggle_demo();
+        assert!(!play.demo());
+        assert_eq!(
+            phase(&play),
+            Some(LoopPhase::CountIn {
+                next: Pass::YourTurn
+            })
+        );
+    }
+
+    #[test]
+    fn a_lone_mark_shows_its_open_edge() {
+        let mut play = loop_screen();
+        play.advance(SHIFT + BAR + 1);
+        play.mark_loop_start();
+        let view = play.loop_view().unwrap();
+        assert_eq!((view.start_mark, view.end_mark), (Some(1), None));
+        assert_eq!(loop_badge(&view), "Loop 2–?");
+        play.clear_loop();
+        play.mark_loop_end();
+        assert_eq!(loop_badge(&play.loop_view().unwrap()), "Loop ?–2");
+    }
+
+    #[test]
+    fn marked_edges_draw_labelled_lines_on_the_highway() {
+        let mut play = loop_screen();
+        // Bar 2 under the playhead: its start sits on the keys, its end at
+        // the top of the highway.
+        play.seek_to(SHIFT + BAR);
+        play.mark_loop_start();
+        play.mark_loop_end();
+        let now = play.now_us();
+        let screen = rows(&render(&mut play, now, 120, 30))[1..].join("\n");
+        assert!(screen.contains("[ 2"), "{screen}");
+        assert!(screen.contains("2 ]"), "{screen}");
     }
 
     #[test]

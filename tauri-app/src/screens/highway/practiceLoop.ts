@@ -73,8 +73,13 @@ const PHASE_LABEL: Record<LoopPhaseName, string> = {
   your_turn: "YOUR TURN",
 };
 
-/** "Loop 5–8" (1-based bars; one bar reads "Loop 5"). */
+/** "Loop 5–8" (1-based bars; one bar reads "Loop 5"). A lone mark shows
+ * which edge is still open: "Loop 5–?" / "Loop ?–8". */
 export function loopRangeText(loop: LoopView): string {
+  if (!loop.running) {
+    if (loop.start_mark !== null && loop.end_mark === null) return `Loop ${loop.start_mark + 1}–?`;
+    if (loop.start_mark === null && loop.end_mark !== null) return `Loop ?–${loop.end_mark + 1}`;
+  }
   const a = loop.first_bar + 1;
   const b = loop.last_bar + 1;
   return a === b ? `Loop ${a}` : `Loop ${a}–${b}`;
@@ -104,12 +109,56 @@ export interface LoopBand {
   startMs: number;
   endMs: number;
   running: boolean;
+  /** The marked edges' labels — "[ 5" on the start, "8 ]" on the end — or
+   * `null` for an edge that is not marked (a lone mark has one edge). */
+  startLabel: string | null;
+  endLabel: string | null;
 }
 
 /** Project the backend loop view onto the highway's ms clock. */
 export function loopBand(loop: LoopView | null): LoopBand | null {
   if (!loop) return null;
-  return { startMs: loop.start_us / 1000, endMs: loop.end_us / 1000, running: loop.running };
+  const both = loop.running || (loop.start_mark !== null && loop.end_mark !== null);
+  return {
+    startMs: loop.start_us / 1000,
+    endMs: loop.end_us / 1000,
+    running: loop.running,
+    startLabel: both || loop.start_mark !== null ? `[ ${loop.first_bar + 1}` : null,
+    endLabel: both || loop.end_mark !== null ? `${loop.last_bar + 1} ]` : null,
+  };
+}
+
+/** The marked range on the seek bar: its left edge and width as fractions
+ * (0–1) of the play clock, and which of its edges are marked. `null` with
+ * nothing marked or an empty clock. */
+export interface SeekBarLoop {
+  left: number;
+  width: number;
+  running: boolean;
+  startMarked: boolean;
+  endMarked: boolean;
+}
+
+export function seekBarLoop(loop: LoopView | null, durationUs: number): SeekBarLoop | null {
+  const band = loopBand(loop);
+  if (!band || durationUs <= 0) return null;
+  const clamp = (f: number) => Math.min(1, Math.max(0, f));
+  const left = clamp((band.startMs * 1000) / durationUs);
+  const right = clamp((band.endMs * 1000) / durationUs);
+  return {
+    left,
+    width: Math.max(0, right - left),
+    running: band.running,
+    startMarked: band.startLabel !== null,
+    endMarked: band.endLabel !== null,
+  };
+}
+
+/** The header's demo chip: shown while a loop is marked, or whenever the demo
+ * is off (so a switched-off demo never surprises). */
+export function demoChipText(demo: boolean, loop: LoopView | null): string | null {
+  if (!demo) return "no demo";
+  return loop ? "demo" : null;
 }
 
 /** Whether a note starting at `startMs` is dimmed: outside a running loop. */

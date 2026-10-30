@@ -6,6 +6,8 @@ import {
   loopBadgeText,
   loopBand,
   loopKeyCommand,
+  demoChipText,
+  seekBarLoop,
   seekBarSongUs,
 } from "./practiceLoop";
 
@@ -19,6 +21,8 @@ function view(over: Partial<LoopView> = {}): LoopView {
     phase: null,
     pass: 0,
     last_pass: null,
+    start_mark: 4,
+    end_mark: 7,
     ...over,
   };
 }
@@ -88,7 +92,15 @@ describe("loopBadgeText", () => {
 
   it("names the marked range 1-based", () => {
     expect(loopBadgeText(view())).toBe("Loop 5–8");
-    expect(loopBadgeText(view({ first_bar: 2, last_bar: 2 }))).toBe("Loop 3");
+    expect(loopBadgeText(view({ first_bar: 2, last_bar: 2, start_mark: 2, end_mark: 2 }))).toBe(
+      "Loop 3",
+    );
+  });
+
+  it("shows a lone mark's open edge", () => {
+    const lone = { first_bar: 2, last_bar: 2 };
+    expect(loopBadgeText(view({ ...lone, start_mark: 2, end_mark: null }))).toBe("Loop 3–?");
+    expect(loopBadgeText(view({ ...lone, start_mark: null, end_mark: 2 }))).toBe("Loop ?–3");
   });
 
   it("adds the phase and pass while running", () => {
@@ -113,8 +125,42 @@ describe("loopBadgeText", () => {
 
 describe("loop band", () => {
   it("projects µs onto the engine's ms", () => {
-    expect(loopBand(view())).toEqual({ startMs: 8000, endMs: 16000, running: false });
+    expect(loopBand(view())).toEqual({
+      startMs: 8000,
+      endMs: 16000,
+      running: false,
+      startLabel: "[ 5",
+      endLabel: "8 ]",
+    });
     expect(loopBand(null)).toBeNull();
+  });
+
+  it("labels only the marked edge of a lone mark", () => {
+    const start = loopBand(view({ last_bar: 4, end_mark: null }));
+    expect([start?.startLabel, start?.endLabel]).toEqual(["[ 5", null]);
+    const end = loopBand(view({ first_bar: 7, start_mark: null }));
+    expect([end?.startLabel, end?.endLabel]).toEqual([null, "8 ]"]);
+  });
+
+  it("places the marks on the seek bar", () => {
+    expect(seekBarLoop(view(), 32_000_000)).toEqual({
+      left: 0.25,
+      width: 0.25,
+      running: false,
+      startMarked: true,
+      endMarked: true,
+    });
+    expect(seekBarLoop(null, 32_000_000)).toBeNull();
+    expect(seekBarLoop(view(), 0)).toBeNull();
+  });
+});
+
+describe("demo chip", () => {
+  it("shows with a loop marked, or whenever the demo is off", () => {
+    expect(demoChipText(true, null)).toBeNull();
+    expect(demoChipText(true, view())).toBe("demo");
+    expect(demoChipText(false, null)).toBe("no demo");
+    expect(demoChipText(false, view())).toBe("no demo");
   });
 
   it("dims notes outside a running loop only", () => {

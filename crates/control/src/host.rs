@@ -161,6 +161,8 @@ pub enum HostCommand {
     PlayClearLoop,
     /// Set the practised hand (`"left"` / `"right"`; `null` = both).
     PlaySetPractice { hand: Option<Hand> },
+    /// Switch the practice loop's demo pass on or off (`d`).
+    PlaySetDemo { on: bool },
 
     // ── record ──────────────────────────────────────────────────────────
     /// Start a record session, optionally over a backing audio file.
@@ -325,6 +327,7 @@ impl HostCommand {
             HostCommand::PlaySetLoop { .. } => "play_set_loop",
             HostCommand::PlayClearLoop => "play_clear_loop",
             HostCommand::PlaySetPractice { .. } => "play_set_practice",
+            HostCommand::PlaySetDemo { .. } => "play_set_demo",
             HostCommand::RecordStart { .. } => "record_start",
             HostCommand::RecordStop => "record_stop",
             HostCommand::RecordSave => "record_save",
@@ -480,6 +483,7 @@ pub fn host_command_names() -> &'static [&'static str] {
         "play_set_loop",
         "play_clear_loop",
         "play_set_practice",
+        "play_set_demo",
         "record_start",
         "record_stop",
         "record_save",
@@ -567,6 +571,7 @@ static HOST_HELP: &[HostCommandInfo] = {
         HostCommandInfo { name: "play_set_loop", params: &[p("first_bar", "u32"), p("last_bar", "u32")], description: "Mark bars first_bar..=last_bar (0-based; swapped if reversed) and start the practice loop: a one-bar count-in, a demo (the app plays the practised hand), another count-in, then your turn (scored, wait mode applies), repeating. Each finished your-turn pass is published as practice_loop.last_pass. Returns play status." },
         HostCommandInfo { name: "play_clear_loop", params: &[], description: "Stop a running practice loop, pausing at the loop start with normal play restored; with no loop running, clear the loop marks. Returns play status." },
         HostCommandInfo { name: "play_set_practice", params: &[p("hand", "Hand?")], description: "Set the practised hand: \"left\" or \"right\" (the other hand auto-plays and isn't scored), or null for both. Returns the applied hand (\"left\"/\"right\"/\"both\")." },
+        HostCommandInfo { name: "play_set_demo", params: &[p("on", "bool")], description: "Switch the practice loop's demo on (true: count-in, demo, count-in, your turn, repeat) or off (false: count-in, your turn, repeat). Off skips a demo the count-in leads into; a demo already playing finishes. Returns {demo}." },
         // ── record ────────────────────────────────────────────────────────
         HostCommandInfo { name: "record_start", params: &[p("backing", "String?")], description: "Start a record session, optionally over a backing audio file path." },
         HostCommandInfo { name: "record_stop", params: &[], description: "Stop the record session without saving." },
@@ -681,6 +686,7 @@ mod tests {
             HostCommand::PlaySetPractice {
                 hand: Some(Hand::Left),
             },
+            HostCommand::PlaySetDemo { on: false },
             HostCommand::RecordStart { backing: None },
             HostCommand::RecordStop,
             HostCommand::RecordSave,
@@ -944,6 +950,10 @@ mod tests {
             HostCommand::PlaySetPractice {
                 hand: Some(Hand::Right)
             }
+        );
+        assert_eq!(
+            host_command_from_name("play_set_demo", &json!({ "on": false })).unwrap(),
+            HostCommand::PlaySetDemo { on: false }
         );
         assert!(host_command_from_name("play_mark_loop", &json!({ "edge": "middle" })).is_err());
     }

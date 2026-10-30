@@ -38,6 +38,8 @@ pub struct TuiSettings {
     pub song_audio: Option<SongAudio>,
     /// Whether wait mode is armed (`w`).
     pub wait_mode: bool,
+    /// Whether the practice loop demos each pass before your turn (`d`).
+    pub demo: bool,
 }
 
 impl Default for TuiSettings {
@@ -49,6 +51,7 @@ impl Default for TuiSettings {
             rate_permille: PLAY_RATE_UNITY,
             song_audio: None,
             wait_mode: false,
+            demo: true,
         }
     }
 }
@@ -168,6 +171,12 @@ fn load_play(settings: &mut TuiSettings, play: &Value, warnings: &mut Vec<String
             None => bad("wait_mode", v),
         }
     }
+    if let Some(v) = play.get("demo") {
+        match v.as_bool() {
+            Some(on) => settings.demo = on,
+            None => bad("demo", v),
+        }
+    }
 }
 
 /// Apply one gain field; only a number in `0.0..=1.0` is accepted.
@@ -200,6 +209,7 @@ fn to_json(settings: &TuiSettings) -> Value {
             "rate_permille": settings.rate_permille,
             "song_audio": settings.song_audio,
             "wait_mode": settings.wait_mode,
+            "demo": settings.demo,
         }
     })
 }
@@ -257,6 +267,7 @@ mod tests {
             rate_permille: 750,
             song_audio: Some(SongAudio::Synth),
             wait_mode: true,
+            demo: false,
             ..TuiSettings::default()
         };
         save(&path, &s).unwrap();
@@ -276,6 +287,7 @@ mod tests {
         assert_eq!(s.color_mode, ColorMode::Hands);
         assert_eq!(s.rate_permille, PLAY_RATE_UNITY);
         assert_eq!(s.song_audio, None);
+        assert!(s.demo);
         assert!(w.is_empty(), "{w:?}");
     }
 

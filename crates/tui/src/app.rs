@@ -153,6 +153,8 @@ pub struct Shell {
     song_audio: Option<SongAudio>,
     /// Wait mode (`w`), shell-wide like `color_mode`.
     wait_mode: bool,
+    /// The practice loop's demo pass (`d`), shell-wide like `wait_mode`.
+    demo: bool,
     /// LAN sharing (M26-B): the share server, if running, plus background
     /// transfers. Driven by the `share_*` host commands only.
     share: rockcraft_share::ShareService,
@@ -189,6 +191,7 @@ impl Shell {
             rate_permille: crate::play::PLAY_RATE_UNITY,
             song_audio: None,
             wait_mode: false,
+            demo: true,
             share: rockcraft_share::ShareService::with_defaults(),
         }
     }
@@ -207,6 +210,7 @@ impl Shell {
         self.rate_permille = settings.rate_permille;
         self.song_audio = settings.song_audio;
         self.wait_mode = settings.wait_mode;
+        self.demo = settings.demo;
     }
 
     /// Everything the shell remembers between runs.
@@ -218,6 +222,7 @@ impl Shell {
             rate_permille: self.rate_permille,
             song_audio: self.song_audio,
             wait_mode: self.wait_mode,
+            demo: self.demo,
         }
     }
 
@@ -266,6 +271,7 @@ impl Shell {
         if self.wait_mode {
             play.set_wait_mode(true);
         }
+        play.set_demo(self.demo);
         play
     }
 
@@ -378,6 +384,7 @@ impl Shell {
         Ok(serde_json::json!({
             "paused": play.is_paused(),
             "bar": play.current_bar(),
+            "demo": play.demo(),
             "practice_loop": play.loop_view().map(|v| loop_json(&v)),
         }))
     }
@@ -680,6 +687,11 @@ impl Shell {
                 }
                 // Practise one hand (M18-C): both → right → left.
                 KeyCode::Char('h') => play.cycle_practice(),
+                // The practice loop's demo pass, on / off.
+                KeyCode::Char('d') => {
+                    play.toggle_demo();
+                    self.demo = play.demo();
+                }
                 // Practice speed, one step slower / faster (never past 1×).
                 KeyCode::Char('-') | KeyCode::Char('_') => {
                     self.rate_permille = play.nudge_rate(false);
@@ -1288,6 +1300,15 @@ impl Shell {
                 play.set_practice(hand);
                 Ok(serde_json::json!({ "practice": practice_name(play.practice()) }))
             }
+            // The loop's demo pass, mirroring the `d` key. Shell-wide, so it
+            // also works before a song is loaded.
+            HostCommand::PlaySetDemo { on } => {
+                self.demo = on;
+                if let Screen::Play(play) = &mut self.screen {
+                    play.set_demo(on);
+                }
+                Ok(serde_json::json!({ "demo": on }))
+            }
             HostCommand::RecordStart { .. } => Err(HostError::Unsupported("record_start".into())),
             HostCommand::RecordStop => Err(HostError::Unsupported("record_stop".into())),
             HostCommand::RecordSave => Err(HostError::Unsupported("record_save".into())),
@@ -1581,6 +1602,8 @@ fn loop_json(v: &crate::play::LoopView) -> serde_json::Value {
         "running": v.running,
         "phase": v.phase.map(|p| p.name()),
         "pass": v.pass,
+        "start_mark": v.start_mark,
+        "end_mark": v.end_mark,
         "last_pass": v.last_pass.map(|p| serde_json::json!({
             "pass": p.pass,
             "hits": p.hits,
@@ -1613,6 +1636,7 @@ fn status_json(s: &crate::play::PlayStatus) -> serde_json::Value {
         "beats_per_bar": s.beats_per_bar,
         "note_count": s.note_count,
         "bar": s.bar,
+        "demo": s.demo,
         "practice_loop": s.practice_loop.as_ref().map(loop_json),
     })
 }
@@ -1936,6 +1960,7 @@ mod tests {
             },
             HostCommand::PlayClearLoop,
             HostCommand::PlaySetPractice { hand: None },
+            HostCommand::PlaySetDemo { on: false },
             HostCommand::RecordStart { backing: None },
             HostCommand::RecordStop,
             HostCommand::RecordSave,
