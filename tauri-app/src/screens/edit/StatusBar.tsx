@@ -66,6 +66,10 @@ interface Props {
   wave?: string | null;
   /** Pending vim-style count prefix (M25-A); null/undefined = none typed. */
   count?: number | null;
+  /** Finger number of the note under the cursor (M27-B); null = none. */
+  finger?: number | null;
+  /** `f` was pressed and the next key picks the finger (M27-B). */
+  fingerPending?: boolean;
 }
 
 export function StatusBar(props: Props): JSX.Element {
@@ -169,6 +173,17 @@ export function StatusBar(props: Props): JSX.Element {
 
       <Show when={props.count}>
         {(n) => <Field label="count" value={`${n()}…`} />}
+      </Show>
+
+      <Show
+        when={props.fingerPending}
+        fallback={
+          <Show when={props.finger}>
+            {(n) => <Field label="finger" value={String(n())} />}
+          </Show>
+        }
+      >
+        <Field label="finger" value="1-5, 0 clears" />
       </Show>
 
       <Show when={props.dirty}>

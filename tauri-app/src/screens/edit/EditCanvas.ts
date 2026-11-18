@@ -27,6 +27,7 @@ import {
   tailGapPx,
   withAlpha,
 } from "../highway/utils";
+import { fingerPlacement } from "./finger";
 import { DEFAULT_SPLIT, handTint } from "./hand";
 import { gridTiming, Viewport } from "./viewport";
 import {
@@ -801,17 +802,40 @@ export class EditCanvas {
       // the onset, so exceptions to the split line are visible at a glance —
       // the tint alone can't distinguish "left because of the split" from
       // "left because the author said so".
+      // Finger number (M27-B): where its digit goes, if the note has one.
+      const finger =
+        n.finger == null ? ({ kind: "none" } as const) : fingerPlacement(w, h);
       if (tint.overridden) {
         ctx.globalAlpha = 1;
         ctx.strokeStyle = withAlpha("#ffffff", 0.85);
         ctx.lineWidth = 1;
         roundRect(ctx, x + pad + 0.5, y + 0.5, w - 1, h - 1, 3);
         ctx.stroke();
-        const r = Math.min(2.5, Math.max(1.25, w * 0.16));
-        ctx.fillStyle = "#ffffff";
-        ctx.beginPath();
-        ctx.arc(x + pad + w / 2, y + h - r - 1.5, r, 0, Math.PI * 2);
-        ctx.fill();
+        // The digit sits where the dot would; the outline alone then marks
+        // the override.
+        if (finger.kind !== "inside") {
+          const r = Math.min(2.5, Math.max(1.25, w * 0.16));
+          ctx.fillStyle = "#ffffff";
+          ctx.beginPath();
+          ctx.arc(x + pad + w / 2, y + h - r - 1.5, r, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+      if (finger.kind !== "none") {
+        ctx.globalAlpha = 1;
+        ctx.font = `700 ${finger.fontPx}px ${FONT_MONO}`;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "alphabetic";
+        const cx = x + pad + w / 2;
+        if (finger.kind === "inside") {
+          // Dark on the note, at the onset (lower) end.
+          ctx.fillStyle = "rgba(10,10,12,0.92)";
+          ctx.fillText(String(n.finger), cx, y + h - 3);
+        } else {
+          // Too short to hold the glyph: just past the tail, in the note's tint.
+          ctx.fillStyle = base;
+          ctx.fillText(String(n.finger), cx, y - 2);
+        }
       }
       ctx.restore();
     }
