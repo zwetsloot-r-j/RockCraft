@@ -3479,6 +3479,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rockcraft-export"
+version = "0.1.0"
+dependencies = [
+ "rockcraft-core",
+ "rockcraft-midi",
+]
+
+[[package]]
 name = "rockcraft-import"
 version = "0.1.0"
 dependencies = [
@@ -3525,6 +3533,7 @@ dependencies = [
  "rockcraft-audio",
  "rockcraft-control",
  "rockcraft-core",
+ "rockcraft-export",
  "rockcraft-import",
  "rockcraft-midi",
  "rockcraft-share",
@@ -3548,6 +3557,7 @@ dependencies = [
  "rockcraft-audio",
  "rockcraft-control",
  "rockcraft-core",
+ "rockcraft-export",
  "rockcraft-import",
  "rockcraft-midi",
  "rockcraft-share",

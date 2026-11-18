@@ -1,0 +1,15 @@
+[package]
+name = "rockcraft-export"
+description = "Sheet-music export: writes the core notation model as MusicXML (M22-B)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+rockcraft-core.workspace = true
+
+[dev-dependencies]
+# The export_bundle example reads a saved bundle's song.mid.
+rockcraft-midi.workspace = true

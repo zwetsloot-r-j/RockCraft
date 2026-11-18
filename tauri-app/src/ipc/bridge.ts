@@ -835,6 +835,23 @@ export function editClearVideo(): Promise<void> {
   return invoke<void>("edit_clear_video");
 }
 
+/**
+ * Write the open piece as MusicXML sheet music to `path` (M22-B, paired with
+ * the `export_score` host command). Resolves to the path written.
+ */
+export function editExportScore(path: string): Promise<string> {
+  return invoke<string>("edit_export_score", { path });
+}
+
+/** Save dialog for exporting sheet music; resolves to the path or null. */
+export async function saveScorePicker(defaultName: string): Promise<string | null> {
+  const chosen = await dialogSave({
+    defaultPath: `${defaultName}.musicxml`,
+    filters: [{ name: "MusicXML", extensions: ["musicxml", "xml"] }],
+  });
+  return chosen ?? null;
+}
+
 /** Return the currently attached background video, or `null` (M9-G). */
 export function editQueryVideo(): Promise<VideoRef | null> {
   return invoke<VideoRef | null>("edit_query_video");

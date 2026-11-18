@@ -695,6 +695,27 @@ impl EditScreen {
         Ok(dir)
     }
 
+    /// Write the piece as MusicXML sheet music to `path` (M22-B) and return
+    /// the path written. The same export the desktop app runs.
+    pub fn export_score(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<PathBuf, rockcraft_export::ExportError> {
+        let notes: Vec<Note> = self.timeline().notes().map(|(_, n)| *n).collect();
+        let title = rockcraft_export::title_from_bundle_dir(self.source_dir.as_deref());
+        rockcraft_export::export_score_file(
+            &rockcraft_export::ScoreSource {
+                notes: &notes,
+                grid: &self.grid,
+                bar_starts: self.composer.bar_starts(),
+                key: Some(self.key),
+                hand_split: self.composer.hand_split(),
+                title: &title,
+            },
+            path,
+        )
+    }
+
     /// The bundle this piece lives in (opened from, or last saved to).
     pub fn source_dir(&self) -> Option<&std::path::Path> {
         self.source_dir.as_deref()

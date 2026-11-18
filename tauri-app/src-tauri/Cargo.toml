@@ -27,6 +27,7 @@ rockcraft-audio = { workspace = true }
 rockcraft-import = { workspace = true }
 rockcraft-control = { workspace = true }
 rockcraft-share = { workspace = true }
+rockcraft-export = { workspace = true }
 tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2"
 # Guarantees a single running instance: a second launch focuses the existing

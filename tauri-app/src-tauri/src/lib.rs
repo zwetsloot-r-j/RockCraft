@@ -323,6 +323,14 @@ fn edit_clear_video(state: State<'_, AppState>) {
     state::clear_video(&state)
 }
 
+/// Write the open piece as MusicXML sheet music to `path` (M22-B). Returns the
+/// path written. Paired with
+/// [`HostCommand::ExportScore`](rockcraft_control::HostCommand::ExportScore).
+#[tauri::command]
+fn edit_export_score(state: State<'_, AppState>, path: String) -> Result<String, String> {
+    state::export_score(&state, &path)
+}
+
 /// Return the currently attached background video, or `null` (M9-G).
 #[tauri::command]
 fn edit_query_video(state: State<'_, AppState>) -> Option<VideoRef> {
@@ -760,6 +768,7 @@ pub fn run() {
             edit_set_video_offset,
             edit_clear_video,
             edit_query_video,
+            edit_export_score,
             edit_attach_background,
             edit_detach_background,
             edit_query_backgrounds,

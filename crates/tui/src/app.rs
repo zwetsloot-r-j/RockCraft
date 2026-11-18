@@ -1138,6 +1138,18 @@ impl Shell {
                 command: "export_song_file".into(),
                 detail: e.to_string(),
             }),
+            HostCommand::ExportScore { path } => {
+                let failed = |detail: String| HostError::Failed {
+                    command: "export_score".into(),
+                    detail,
+                };
+                let Screen::Edit(edit) = &self.screen else {
+                    return Err(failed("no piece is open in the editor".into()));
+                };
+                edit.export_score(std::path::Path::new(&path))
+                    .map(|p| json!({ "path": p.to_string_lossy() }))
+                    .map_err(|e| failed(e.to_string()))
+            }
             HostCommand::ImportSongFile {
                 path,
                 overwrite,
@@ -1945,6 +1957,9 @@ mod tests {
             HostCommand::ExportSongFile {
                 bundle: "does/not/exist".into(),
                 path: "does/not/exist/out.rcsong".into(),
+            },
+            HostCommand::ExportScore {
+                path: "does/not/exist/out.musicxml".into(),
             },
             HostCommand::ImportSongFile {
                 path: "does/not/exist.rcsong".into(),

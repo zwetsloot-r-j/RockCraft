@@ -8,7 +8,7 @@
 Let the user turn the piece open in the editor into printable sheet music.
 RockCraft writes a **MusicXML** file from the M22-A notation model, and the
 user opens it in MuseScore (free) or any other notation program to adjust the
-layout, add fingering and print or save a PDF. We don't build an engraver:
+layout and print or save a PDF (finger numbers come along since M27-F). We don't build an engraver:
 MusicXML is the format every notation program reads, and the M13 importer
 already reads it back.
 
