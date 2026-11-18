@@ -1903,6 +1903,7 @@ fn load_play_screen(
             if let Ok(meta) = RecordingMeta::from_json(&json) {
                 play = play
                     .with_hands(meta.split_or_default(), &meta.hand_overrides)
+                    .with_fingers(&meta.fingers)
                     .with_grid(meta.grid, &meta.bar_starts);
                 if let Some(backing) = meta.backing {
                     play = play.with_backing(dir.join(&backing.file), backing.audio_start_us);
@@ -4037,5 +4038,45 @@ mod tests {
                 finger: Finger::new(3).unwrap(),
             }]
         );
+    }
+
+    #[test]
+    fn loading_a_bundle_for_play_applies_its_hands_and_fingers() {
+        use rockcraft_core::{Finger, HandOverride};
+        let dir = std::env::temp_dir().join(format!(
+            "rockcraft_play_fingers_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut tl = Timeline::new();
+        tl.insert(make_note(60, 0, 400_000));
+        tl.insert(make_note(64, 500_000, 400_000));
+        std::fs::write(
+            dir.join("song.mid"),
+            rockcraft_midi::events_to_smf_bytes(&tl.to_events()),
+        )
+        .unwrap();
+        let mut meta = RecordingMeta::new_midi_only("song.mid");
+        meta.hand_overrides = vec![HandOverride {
+            pitch: 64,
+            start_us: 500_000,
+            hand: Hand::Left,
+        }];
+        meta.fingers = vec![NoteFinger {
+            pitch: 60,
+            start_us: 0,
+            finger: Finger::new(1).unwrap(),
+        }];
+        std::fs::write(dir.join("meta.json"), meta.to_json()).unwrap();
+
+        let play = load_play_screen(&dir.join("song.mid"), None).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(play.fingers(), &[Finger::new(1), None]);
+        assert_eq!(play.hands(), &[Hand::Right, Hand::Left]);
     }
 }

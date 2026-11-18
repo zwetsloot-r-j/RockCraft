@@ -43,6 +43,17 @@ describe("songFromInfo", () => {
     expect(song.notes.map((n) => n.hand)).toEqual(["R", "L"]);
   });
 
+  it("passes a finger number through and leaves it off when absent", () => {
+    const song = songFromInfo(
+      info([
+        { note: 60, start: 0, end: 100, hand: "right", finger: 1 },
+        { note: 64, start: 100, end: 200, hand: "right" },
+      ]),
+    );
+    expect(song.notes[0].finger).toBe(1);
+    expect("finger" in song.notes[1]).toBe(false);
+  });
+
   it("keeps the ms bounds and pitch untouched", () => {
     const song = songFromInfo(
       info([{ note: 60, start: 3500, end: 3700, hand: "right" }]),
