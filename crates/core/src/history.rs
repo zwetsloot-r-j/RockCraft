@@ -157,6 +157,7 @@ mod tests {
             dur_us: 1_000,
             velocity: Velocity::new(80).unwrap(),
             hand: None,
+            finger: None,
         }
     }
 

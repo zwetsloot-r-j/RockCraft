@@ -4,12 +4,14 @@
 //! `RecordingMeta` struct mirrors the `meta.json` inside a bundle directory;
 //! serialization is in-memory only (callers in `tui`/`audio` do the fs work).
 
+use crate::finger::deserialize_lenient_fingers;
 use crate::hand::DEFAULT_SPLIT;
 use crate::{BackgroundImage, Grid, Key};
 use serde::{Deserialize, Serialize};
 
 /// One persisted per-note hand exception. Defined in [`crate::hand`] and
 /// re-exported here because `meta.json` is what carries it.
+pub use crate::finger::NoteFinger;
 pub use crate::hand::HandOverride;
 
 /// Describes the backing audio track inside a recording bundle.
@@ -113,6 +115,13 @@ pub struct RecordingMeta {
     /// Empty for pieces with no exceptions, including every legacy bundle.
     #[serde(default)]
     pub hand_overrides: Vec<HandOverride>,
+    /// Per-note finger numbers (M27-A), keyed by `(pitch, start_us)` like
+    /// [`hand_overrides`](Self::hand_overrides). Empty for pieces with none,
+    /// including every bundle written before this field existed. An entry that
+    /// does not parse (a finger outside 1–5) is dropped on load rather than
+    /// failing the bundle.
+    #[serde(default, deserialize_with = "deserialize_lenient_fingers")]
+    pub fingers: Vec<NoteFinger>,
     /// Variable-tempo map (M-tempo): song-time (µs) of each bar's downbeat.
     /// Empty — every bundle written before this field existed — means a **uniform**
     /// grid, spaced by [`grid`](Self::grid)'s constant BPM. A populated map lets
@@ -155,6 +164,7 @@ impl RecordingMeta {
             backgrounds: Vec::new(),
             hand_split: None,
             hand_overrides: Vec::new(),
+            fingers: Vec::new(),
             bar_starts: Vec::new(),
             version: 1,
         }
@@ -229,6 +239,7 @@ mod tests {
             backgrounds: Vec::new(),
             hand_split: None,
             hand_overrides: Vec::new(),
+            fingers: Vec::new(),
             bar_starts: Vec::new(),
             version: 1,
         };
@@ -253,6 +264,7 @@ mod tests {
             backgrounds: Vec::new(),
             hand_split: None,
             hand_overrides: Vec::new(),
+            fingers: Vec::new(),
             bar_starts: Vec::new(),
             version: 1,
         };
@@ -277,6 +289,7 @@ mod tests {
             backgrounds: Vec::new(),
             hand_split: None,
             hand_overrides: Vec::new(),
+            fingers: Vec::new(),
             bar_starts: Vec::new(),
             version: 1,
         };
@@ -299,6 +312,7 @@ mod tests {
             backgrounds: Vec::new(),
             hand_split: None,
             hand_overrides: Vec::new(),
+            fingers: Vec::new(),
             bar_starts: Vec::new(),
             version: 1,
         };
@@ -354,6 +368,7 @@ mod tests {
             }),
             hand_split: None,
             hand_overrides: Vec::new(),
+            fingers: Vec::new(),
             bar_starts: Vec::new(),
             version: 1,
         };
@@ -386,6 +401,7 @@ mod tests {
             backgrounds: Vec::new(),
             hand_split: None,
             hand_overrides: Vec::new(),
+            fingers: Vec::new(),
             bar_starts: Vec::new(),
             version: 1,
         };
@@ -487,6 +503,54 @@ mod tests {
         assert_eq!(back.split_or_default(), 55);
         assert_eq!(back.hand_overrides.len(), 2);
         assert_eq!(back.hand_overrides[0].hand, Hand::Right);
+    }
+
+    // ── finger numbers (M27-A) ──────────────────────────────────────────────
+
+    #[test]
+    fn with_fingers_roundtrip() {
+        use crate::Finger;
+        let mut meta = RecordingMeta::new_midi_only("song.mid");
+        meta.fingers = vec![
+            NoteFinger {
+                pitch: 60,
+                start_us: 0,
+                finger: Finger::new(1).unwrap(),
+            },
+            NoteFinger {
+                pitch: 64,
+                start_us: 500_000,
+                finger: Finger::new(3).unwrap(),
+            },
+        ];
+        let back = RecordingMeta::from_json(&meta.to_json()).unwrap();
+        assert_eq!(meta, back);
+        assert_eq!(back.fingers[1].finger.get(), 3);
+    }
+
+    #[test]
+    fn pre_finger_bundle_parses_with_no_fingers() {
+        let pre = r#"{"midi_file":"song.mid","hand_overrides":[],"version":1}"#;
+        let meta = RecordingMeta::from_json(pre).unwrap();
+        assert!(meta.fingers.is_empty());
+        assert!(RecordingMeta::new_midi_only("song.mid").fingers.is_empty());
+    }
+
+    #[test]
+    fn a_bad_finger_entry_is_dropped_and_the_rest_kept() {
+        // One out-of-range finger must not stop the bundle from loading.
+        let json = r#"{"midi_file":"song.mid","fingers":[
+            {"pitch":60,"start_us":0,"finger":2},
+            {"pitch":62,"start_us":1000,"finger":9},
+            {"pitch":64,"start_us":2000,"finger":5}
+        ],"version":1}"#;
+        let meta = RecordingMeta::from_json(json).unwrap();
+        let kept: Vec<(u8, u8)> = meta
+            .fingers
+            .iter()
+            .map(|f| (f.pitch, f.finger.get()))
+            .collect();
+        assert_eq!(kept, vec![(60, 2), (64, 5)]);
     }
 
     #[test]

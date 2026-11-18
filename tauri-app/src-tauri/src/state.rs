@@ -14,9 +14,9 @@ use std::sync::Mutex;
 
 use rockcraft_core::{
     action_from_name, action_help, slice_segment, ActionError, BackgroundImage, BackgroundStack,
-    BackgroundVideo, BackingTrack, Composer, ComposerSnapshot, Effect, Grid, Hand, HandOverride,
-    Key, Keyframe, NoteView, RecordingMeta, Scale, Segment, Timeline, TrackOrigin, Transform,
-    DEFAULT_SPLIT,
+    BackgroundVideo, BackingTrack, Composer, ComposerSnapshot, Effect, Finger, Grid, Hand,
+    HandOverride, Key, Keyframe, NoteFinger, NoteView, RecordingMeta, Scale, Segment, Timeline,
+    TrackOrigin, Transform, DEFAULT_SPLIT,
 };
 use rockcraft_midi::{events_to_smf_bytes, smf_bytes_to_events};
 use serde::{Deserialize, Serialize};
@@ -217,6 +217,13 @@ fn hand_code(h: Option<Hand>) -> u64 {
     }
 }
 
+/// Encode a note's finger number (M27-A) for the fingerprint, for the same
+/// reason as [`hand_code`]: a finger edit changes no geometry. Shifted clear of
+/// the hand codes.
+fn finger_code(f: Option<Finger>) -> u64 {
+    f.map_or(0, |f| u64::from(f.get()) << 2)
+}
+
 /// Cheap timeline fingerprint: a sum of (id, pitch, start_us, dur_us, vel) for
 /// all notes. A content change (add/remove/modify) will change the result.
 fn timeline_fingerprint(timeline: &Timeline) -> u64 {
@@ -229,6 +236,7 @@ fn timeline_fingerprint(timeline: &Timeline) -> u64 {
                 .wrapping_add(n.dur_us)
                 .wrapping_add(n.velocity.value() as u64)
                 .wrapping_add(hand_code(n.hand))
+                .wrapping_add(finger_code(n.finger))
         })
         .fold(0u64, u64::wrapping_add)
 }
@@ -245,6 +253,7 @@ fn timeline_fingerprint_snapshot(notes: &[NoteView]) -> u64 {
                 .wrapping_add(n.dur_us)
                 .wrapping_add(n.velocity as u64)
                 .wrapping_add(hand_code(n.hand))
+                .wrapping_add(finger_code(n.finger))
         })
         .fold(0u64, u64::wrapping_add)
 }
@@ -429,6 +438,8 @@ fn write_bundle(
         // per-note exceptions, keyed by `(pitch, start_us)`.
         hand_split: Some(hand_split),
         hand_overrides,
+        // Finger numbers (M27-A), keyed the same way.
+        fingers: timeline.fingers(),
         bar_starts,
         version: 1,
     };
@@ -622,6 +633,8 @@ pub fn load_bundle(state: &AppState, dir: &str) -> Result<ComposerSnapshot, Stri
             Vec::new(),
         )
     };
+    // Finger numbers (M27-A); stays empty when there is no readable manifest.
+    let mut fingers: Vec<NoteFinger> = Vec::new();
     let (
         grid,
         key,
@@ -643,6 +656,7 @@ pub fn load_bundle(state: &AppState, dir: &str) -> Result<ComposerSnapshot, Stri
                 });
                 let origin = meta.origin.unwrap_or(TrackOrigin::Edited);
                 let hand_split = meta.split_or_default();
+                fingers = meta.fingers;
                 let (bpath, boffset) = meta
                     .backing
                     .map(|b| {
@@ -679,6 +693,8 @@ pub fn load_bundle(state: &AppState, dir: &str) -> Result<ComposerSnapshot, Stri
     // hand, so they are matched back onto the freshly built notes by their
     // `(pitch, start_us)` key.
     timeline.apply_hand_overrides(&hand_overrides);
+    // ...and the finger numbers (M27-A), by the same key.
+    timeline.apply_fingers(&fingers);
 
     // Replace the composer.
     {
@@ -1680,6 +1696,60 @@ mod tests {
             .expect("dragged note reloaded");
         assert_eq!(dragged.start_us, moved.1);
         assert_eq!(dragged.hand, Some(rockcraft_core::Hand::Left));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fingers_round_trip_through_a_saved_bundle() {
+        let dir = temp_dir("fingers");
+        let state = AppState::new();
+
+        run_action(&state, "add_note", &json!({})).expect("add_note");
+        let reply = run_action(&state, "set_note_finger", &json!({ "finger": 3 })).expect("finger");
+        assert!(
+            reply.notes_changed && reply.dirty,
+            "a finger edit must resend the notes and mark the piece dirty"
+        );
+        run_action(&state, "cursor_right", &json!({})).expect("cursor");
+        run_action(&state, "add_note", &json!({})).expect("add_note 2");
+
+        let bundle = dir.join("bundle");
+        save_bundle_into(&state, &bundle).expect("save");
+        let meta =
+            RecordingMeta::from_json(&std::fs::read_to_string(bundle.join("meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(meta.fingers.len(), 1, "only the fingered note");
+        assert_eq!(meta.fingers[0].pitch, 60);
+        assert_eq!(meta.fingers[0].finger.get(), 3);
+
+        let fresh = AppState::new();
+        let snap = load_bundle(&fresh, &bundle.to_string_lossy()).expect("load");
+        assert_eq!(snap.notes.len(), 2);
+        assert_eq!(snap.notes[0].finger.map(|f| f.get()), Some(3));
+        assert_eq!(snap.notes[1].finger, None);
+
+        // A moved note keeps its finger and is re-matched at its new position.
+        run_action(&fresh, "set_cursor", &json!({ "pitch": 60, "step": 0 })).expect("cursor");
+        run_action(&fresh, "toggle_grab", &json!({})).expect("grab");
+        run_action(&fresh, "cursor_right", &json!({})).expect("drag later");
+        run_action(&fresh, "cursor_up", &json!({})).expect("drag up");
+        run_action(&fresh, "toggle_grab", &json!({})).expect("drop");
+        let bundle2 = dir.join("bundle2");
+        save_bundle_into(&fresh, &bundle2).expect("re-save");
+        let again = AppState::new();
+        let snap2 = load_bundle(&again, &bundle2.to_string_lossy()).expect("reload");
+        let dragged = snap2
+            .notes
+            .iter()
+            .find(|n| n.pitch == 61)
+            .expect("dragged note reloaded");
+        assert_eq!(dragged.finger.map(|f| f.get()), Some(3));
+
+        // Clearing it is an edit too, and a bundle with none writes none.
+        run_action(&again, "set_cursor", &json!({ "pitch": 61, "step": 1 })).expect("cursor");
+        let cleared = run_action(&again, "clear_note_finger", &json!({})).expect("clear");
+        assert!(cleared.snapshot.notes.iter().all(|n| n.finger.is_none()));
 
         std::fs::remove_dir_all(&dir).ok();
     }

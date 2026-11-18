@@ -23,8 +23,8 @@ use ratatui::{
 use rockcraft_audio::{BackingOut, SynthHandle};
 use rockcraft_control::{QueryKind, RemoteCommand, Request, Response};
 use rockcraft_core::{
-    Grid, Hand, HandOverride, Key, Mixer, RecordingMeta, Scale, SongAudio, SynthBus, Timeline,
-    TrackOrigin, DEFAULT_SPLIT,
+    Grid, Hand, HandOverride, Key, Mixer, NoteFinger, RecordingMeta, Scale, SongAudio, SynthBus,
+    Timeline, TrackOrigin, DEFAULT_SPLIT,
 };
 use rockcraft_import::{fetch_command_configured, ImportInput};
 use rockcraft_midi::{smf_bytes_to_events, NoteSource};
@@ -485,8 +485,10 @@ impl Shell {
         // Re-attach the piece's hand assignment (M14-E): `song.mid` carries no
         // hand, so the exceptions come back from `meta.json` keyed by
         // `(pitch, start_us)`, and the split line with them.
-        let (hand_split, hand_overrides) = load_meta_hands(bundle_dir);
+        // Finger numbers (M27-A) come back the same way.
+        let (hand_split, hand_overrides, fingers) = load_meta_hands(bundle_dir);
         timeline.apply_hand_overrides(&hand_overrides);
+        timeline.apply_fingers(&fingers);
         let mut edit = EditScreen::from_timeline(timeline, grid);
         edit.set_key(key);
         edit.set_hand_split(hand_split);
@@ -1755,14 +1757,15 @@ fn load_meta_backing(bundle_dir: &std::path::Path) -> Option<(PathBuf, i64)> {
 /// Read a bundle's hand assignment from its `meta.json` (M14-E): the split
 /// pitch and the per-note exceptions. A missing/unparsable manifest — or one
 /// written before the fields existed — yields `(DEFAULT_SPLIT, [])`, which is
-/// exactly the pitch-only behaviour those bundles had.
-fn load_meta_hands(bundle_dir: &std::path::Path) -> (u8, Vec<HandOverride>) {
+/// exactly the pitch-only behaviour those bundles had. The per-note finger
+/// numbers (M27-A) ride along; they are empty in the same cases.
+fn load_meta_hands(bundle_dir: &std::path::Path) -> (u8, Vec<HandOverride>, Vec<NoteFinger>) {
     let Ok(json) = std::fs::read_to_string(bundle_dir.join("meta.json")) else {
-        return (DEFAULT_SPLIT, Vec::new());
+        return (DEFAULT_SPLIT, Vec::new(), Vec::new());
     };
     match RecordingMeta::from_json(&json) {
-        Ok(meta) => (meta.split_or_default(), meta.hand_overrides),
-        Err(_) => (DEFAULT_SPLIT, Vec::new()),
+        Ok(meta) => (meta.split_or_default(), meta.hand_overrides, meta.fingers),
+        Err(_) => (DEFAULT_SPLIT, Vec::new(), Vec::new()),
     }
 }
 
@@ -2465,6 +2468,7 @@ mod tests {
             dur_us: dur,
             velocity: Velocity::new(80).unwrap(),
             hand: None,
+            finger: None,
         }
     }
 
@@ -3507,6 +3511,7 @@ mod tests {
             backgrounds: Vec::new(),
             hand_split: None,
             hand_overrides: Vec::new(),
+            fingers: Vec::new(),
             bar_starts: Vec::new(),
             version: 1,
         };
@@ -3944,5 +3949,56 @@ mod tests {
         set(&mut shell, 0.4);
         assert!(shell.status.is_empty(), "reported only once");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fingers_round_trip_through_a_saved_bundle() {
+        use rockcraft_core::{Action, Finger};
+        let mut tl = Timeline::new();
+        for (pitch, start) in [(60u8, 0u64), (64, 500_000)] {
+            tl.insert(rockcraft_core::Note {
+                pitch: rockcraft_core::MidiNote::new(pitch).unwrap(),
+                start_us: start,
+                dur_us: 400_000,
+                velocity: rockcraft_core::Velocity::new(80).unwrap(),
+                hand: None,
+                finger: None,
+            });
+        }
+        let mut edit = EditScreen::from_timeline(tl, Grid::default_120());
+        // The cursor starts on the first note (middle C, step 0).
+        edit.composer_mut()
+            .apply(Action::SetNoteFinger {
+                finger: Finger::new(3).unwrap(),
+            })
+            .unwrap();
+
+        let base = std::env::temp_dir().join(format!(
+            "rockcraft_finger_rt_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        let bundle = edit.save_bundle(&base).expect("save_bundle failed");
+        let meta =
+            RecordingMeta::from_json(&std::fs::read_to_string(bundle.join("meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(meta.fingers.len(), 1, "only the fingered note is written");
+
+        let mut shell = make_shell();
+        shell.open_edit_from_midi(&bundle.join("song.mid"));
+        let reloaded = edit_screen(&shell).timeline().fingers();
+        std::fs::remove_dir_all(&base).ok();
+
+        assert_eq!(
+            reloaded,
+            vec![NoteFinger {
+                pitch: 60,
+                start_us: 0,
+                finger: Finger::new(3).unwrap(),
+            }]
+        );
     }
 }

@@ -41,6 +41,7 @@ pub fn chart_to_timeline(chart: &ExtractedChart) -> Result<Timeline, ImportError
             // Detected hands travel as the bundle's split line + overrides
             // (`hand_assignment`), editable in the composer (M14-E).
             hand: None,
+            finger: None,
         });
     }
     Ok(timeline)

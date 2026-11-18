@@ -20,6 +20,7 @@ fn make_bundle(root: &Path, name: &str, notes: u8) -> PathBuf {
             dur_us: 400_000,
             velocity: Velocity::new(80).unwrap(),
             hand: None,
+            finger: None,
         });
     }
     fs::write(

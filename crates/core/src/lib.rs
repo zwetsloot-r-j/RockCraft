@@ -18,6 +18,7 @@ pub mod chord;
 pub mod composer;
 pub mod drift;
 pub mod events;
+pub mod finger;
 pub mod grid;
 pub mod hand;
 pub mod history;
@@ -52,6 +53,7 @@ pub use drift::DriftGuard;
 pub use events::{
     interleave_by_time, InputEvent, MidiNote, NoteEvent, NoteEventKind, SustainEvent, Velocity,
 };
+pub use finger::{Finger, NoteFinger};
 pub use grid::{Grid, Subdivision, TimeSig};
 pub use hand::{hand_of, Hand, HandOverride, HandSetting, DEFAULT_SPLIT};
 pub use history::History;
