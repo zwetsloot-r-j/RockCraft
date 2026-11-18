@@ -638,7 +638,10 @@ impl Shell {
             self.on_mixer_key(code);
             return;
         }
-        if code == KeyCode::Char('x') && self.mixer_can_open() {
+        // While the editor's `f` waits for its finger key (M27-B), `x` is that
+        // key ("clear"), not the mixer.
+        let finger_pending = matches!(&self.screen, Screen::Edit(e) if e.finger_pending());
+        if code == KeyCode::Char('x') && self.mixer_can_open() && !finger_pending {
             self.mixer_ui = Some(MixerOverlay::new());
             return;
         }
@@ -811,6 +814,10 @@ impl Shell {
                     }
                 } else {
                     match code {
+                        // `f` is waiting for its finger key (M27-B): that key
+                        // is the editor's alone — not a shell shortcut, not a
+                        // mock-keyboard note.
+                        code if edit.finger_pending() => edit.on_key(code),
                         KeyCode::Esc if edit.in_chord_mode() => edit.on_key(KeyCode::Esc),
                         // Clear visual selection on Esc without leaving the editor.
                         KeyCode::Esc if edit.in_visual_mode() => edit.on_key(KeyCode::Esc),
@@ -2681,6 +2688,36 @@ mod tests {
         } else {
             panic!("expected edit screen");
         }
+    }
+
+    /// M27-B: the key after `f` belongs to the editor — it is neither played
+    /// as a mock note (record armed) nor taken as a shell shortcut.
+    #[test]
+    fn the_key_after_f_is_not_a_mock_note_or_a_shell_shortcut() {
+        use rockcraft_midi::MockKeyboard;
+
+        let mut shell = Shell::new(Box::new(MockKeyboard::new()), None, None);
+        shell.activate_edit();
+        shell.on_key(KeyCode::Char('R')); // arm record: digits now play notes
+
+        shell.on_key(KeyCode::Char('f'));
+        shell.on_key(KeyCode::Char('3'));
+        drain_input_into_edit(&mut shell);
+        assert_eq!(shell.edit_note_count(), Some(0), "`3` was not played");
+
+        shell.on_key(KeyCode::Char('f'));
+        shell.on_key(KeyCode::Char('x'));
+        assert!(
+            shell.mixer_ui.is_none(),
+            "`x` cleared, it did not open the mixer"
+        );
+
+        shell.on_key(KeyCode::Char('f'));
+        shell.on_key(KeyCode::Esc);
+        assert!(
+            matches!(&shell.screen, Screen::Edit(e) if !e.finger_pending()),
+            "Esc cancelled the finger entry and stayed in the editor"
+        );
     }
 
     /// Seeding a bundle then loading it via "Edit last recording" enters the

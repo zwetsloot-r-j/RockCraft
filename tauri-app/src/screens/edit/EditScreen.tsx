@@ -78,6 +78,7 @@ import {
   resolveKey,
 } from "./keymap";
 import { countAfterKey, keepsCount, repeatsFor } from "./count";
+import { cursorNoteFinger, fingerKey } from "./finger";
 import { IDENTITY_TRANSFORM, layerStyle } from "../highway/backgrounds";
 import { HIGHEST_MIDI, LOWEST_MIDI } from "./viewport";
 import {
@@ -315,6 +316,17 @@ export function EditScreen(props: Props): JSX.Element {
   >("none");
   // Vim-style count prefix (M25-A): digits typed before a move key.
   const [pendingCount, setPendingCount] = createSignal<number | null>(null);
+  // `f` was pressed; the next key picks the finger number (M27-B).
+  const [fingerPending, setFingerPending] = createSignal(false);
+  /** Finger of the note under the cursor, for the status bar; null = none. */
+  const cursorFinger = (snap: ComposerSnapshot): number | null => {
+    const cursorUs = cursorUsOf(snap);
+    const nextUs = cursorUsOf({
+      ...snap,
+      cursor: { ...snap.cursor, step: snap.cursor.step + 1 },
+    });
+    return cursorNoteFinger(snap.notes, snap.cursor.pitch, cursorUs, nextUs - cursorUs);
+  };
   const [waveMode, setWaveMode] = createSignal<WaveMode>(
     loadWaveMode(() => localStorage),
   );
@@ -1627,6 +1639,39 @@ export function EditScreen(props: Props): JSX.Element {
     // ── Normal / chord mode ─────────────────────────────────────────────
     if (!s) return;
 
+    // ── Finger entry (M27-B) ────────────────────────────────────────────
+    // `f` arms it; the next key resolves it (1-5 set, 0/x/Backspace/Delete
+    // clear, anything else cancels). That key is this handler's alone: it is
+    // stopped here so it neither starts a count nor reaches the Router, which
+    // would play a digit on the mock keyboard or act on Esc.
+    if (fingerPending()) {
+      if (keepsCount(e.key)) return; // a bare modifier: keep waiting
+      e.preventDefault();
+      e.stopPropagation();
+      setFingerPending(false);
+      const res = fingerKey(e.key);
+      if (res.kind === "set") {
+        void runAction("set_note_finger", { finger: res.finger }).then((reply) =>
+          setDirty(reply.dirty),
+        );
+      } else if (res.kind === "clear") {
+        void runAction("clear_note_finger").then((reply) => setDirty(reply.dirty));
+      }
+      return;
+    }
+    if (
+      e.key === "f" &&
+      s.chord_preview === null &&
+      !splitMode() &&
+      !bgMode() &&
+      !mixerOpen()
+    ) {
+      e.preventDefault();
+      setPendingCount(null);
+      setFingerPending(true);
+      return;
+    }
+
     // ── Count prefix (M25-A) ────────────────────────────────────────────
     // Digits build a count (`0` only extends one, so a bare `0` keeps its
     // lowest-pitch binding); the next key consumes it. Cursor moves repeat by
@@ -2168,6 +2213,8 @@ export function EditScreen(props: Props): JSX.Element {
                 wave={backingName() === null ? null : waveLabel()}
                 backingOff={backingName() !== null && !snap().backing_audio}
                 count={pendingCount()}
+                finger={cursorFinger(snap())}
+                fingerPending={fingerPending()}
               />
             )}
           </Show>
@@ -3120,8 +3167,10 @@ function HelpOverlay(props: { onClose: () => void }): JSX.Element {
       ],
     },
     {
-      title: "Hands",
+      title: "Hands & fingers",
       rows: [
+        "f then 1-5    Put a finger number on the cursor note / selection",
+        "f then 0      Remove it (also x, Backspace, Delete)",
         "n             Cycle the hand of the cursor note / selection",
         "              (auto → left → right → auto)",
         "Shift+← / →   Move the split line down / up a semitone",
