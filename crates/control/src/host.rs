@@ -106,6 +106,10 @@ pub enum HostCommand {
     /// (`.musicxml` appended when `path` has no extension); returns the
     /// written path (M22-B).
     ExportScore { path: String },
+    /// The piece open in the editor as a MusicXML document, as text — what
+    /// `export_score` would write, without touching the disk. The desktop
+    /// sheet view draws it (M22-C).
+    QueryScore,
     /// Unpack the `.rcsong` song file `path` into the library as
     /// `<library_root>/<slug>`, the slug taken from `name` when given (a
     /// "keep both" pick) else from the archive. An existing folder fails with
@@ -316,6 +320,7 @@ impl HostCommand {
             HostCommand::SplitBundle { .. } => "split_bundle",
             HostCommand::ExportSongFile { .. } => "export_song_file",
             HostCommand::ExportScore { .. } => "export_score",
+            HostCommand::QueryScore => "query_score",
             HostCommand::ImportSongFile { .. } => "import_song_file",
             HostCommand::PlayLoad { .. } => "play_load",
             HostCommand::PlaySetWait { .. } => "play_set_wait",
@@ -473,6 +478,7 @@ pub fn host_command_names() -> &'static [&'static str] {
         "split_bundle",
         "export_song_file",
         "export_score",
+        "query_score",
         "import_song_file",
         "play_load",
         "play_set_wait",
@@ -561,6 +567,7 @@ static HOST_HELP: &[HostCommandInfo] = {
         HostCommandInfo { name: "split_bundle", params: &[p("segments", "Vec<SegmentSpec>")], description: "Slice the loaded piece into the given kept parts, writing each as a new library bundle (subset MIDI + copied media + derived offsets, origin=Edited). Each segment is {start_us,end_us,name}; discarded parts are omitted (= trimming). Returns the created bundle directory paths; the source piece is left untouched." },
         HostCommandInfo { name: "export_song_file", params: &[p("bundle", "String"), p("path", "String")], description: "Pack the bundle folder `bundle` into one .rcsong song file at `path` (.rcsong appended when there is no extension): meta.json, song.mid, the media meta.json references and the app's sidecars — never backups. Returns {path}." },
         HostCommandInfo { name: "export_score", params: &[p("path", "String")], description: "Write the piece open in the editor as MusicXML sheet music to `path` (.musicxml appended when there is no extension): right hand on the treble staff, left hand on the bass, quantised to sixteenths, with finger numbers where set. Open the file in a notation program to print. Fails with `nothing to export` on an empty piece. Returns {path}." },
+        HostCommandInfo { name: "query_score", params: &[], description: "Return the piece open in the editor as a MusicXML sheet-music document, as text: the same document export_score writes, without touching the disk. Fails with `nothing to export` on an empty piece. Returns {musicxml, title}." },
         HostCommandInfo { name: "import_song_file", params: &[p("path", "String"), p("overwrite", "bool"), p("name", "String?")], description: "Unpack the .rcsong song file `path` into the library as <library>/<slug> (slug from `name` when given, else from the archive). Strict: flat names and only files the song accounts for. An existing folder fails with `exists:<slug>` unless overwrite (replaced only after the new copy unpacked). Returns {dir}." },
         // ── play ──────────────────────────────────────────────────────────
         HostCommandInfo { name: "play_load", params: &[p("dir", "String")], description: "Load a bundle directory as a play session. Returns play info." },
@@ -665,6 +672,7 @@ mod tests {
             HostCommand::ExportScore {
                 path: "out.musicxml".into(),
             },
+            HostCommand::QueryScore,
             HostCommand::ImportSongFile {
                 path: "in.rcsong".into(),
                 overwrite: false,

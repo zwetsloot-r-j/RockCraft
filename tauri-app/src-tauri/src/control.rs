@@ -335,6 +335,14 @@ impl HostServices for TauriHost<'_> {
                     Err(e) => failed("export_score", e),
                 }
             }
+            HostCommand::QueryScore => {
+                match crate::state::score_musicxml(&app.state::<AppState>()) {
+                    Ok(doc) => {
+                        Ok(serde_json::json!({ "musicxml": doc.musicxml, "title": doc.title }))
+                    }
+                    Err(e) => failed("query_score", e),
+                }
+            }
             HostCommand::ExportSongFile { bundle, path } => {
                 match crate::library::export_song(&bundle, &path) {
                     Ok(path) => Ok(serde_json::json!({ "path": path })),
