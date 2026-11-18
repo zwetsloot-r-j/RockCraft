@@ -18,6 +18,7 @@ import { visibleRange } from "../cull";
 import { mappedGridLines, uniformGridLines } from "./gridLines";
 import { dimmedByLoop, type LoopBand } from "./practiceLoop";
 import { nextPerLane } from "./laneGuides";
+import { noteLabels } from "./noteLabels";
 import { LiveClock } from "./liveClock";
 import {
   clamp,
@@ -703,14 +704,30 @@ export class HighwayCanvas {
     ctx.stroke();
     ctx.restore();
 
-    // label
-    if (c.labels && yBot - yTop > 16) {
+    // labels: the pitch name and, when the piece gives one, the finger
+    // number (M27-C). Placement rules live in noteLabels.ts.
+    const lab = noteLabels(yBot - yTop, !!c.labels, nt.finger);
+    if (lab.name !== null) {
       ctx.save();
       ctx.fillStyle = "rgba(10,10,12,0.9)";
       ctx.font = `600 ${Math.min(12, lane.w * 0.7)}px ${c.fontMono}`;
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
-      ctx.fillText(noteName(nt.note).replace(/-?\d+$/, ""), lane.cx, yBot - 9);
+      ctx.fillText(noteName(nt.note).replace(/-?\d+$/, ""), lane.cx, yBot - lab.name);
+      ctx.restore();
+    }
+    if (lab.finger !== null && nt.finger != null) {
+      ctx.save();
+      // Fades with its note outside a running practice loop.
+      if (dimmedByLoop(nt.start, this.loop)) ctx.globalAlpha *= 0.3;
+      // Bolder and a touch larger than the name so the two are not confused.
+      // On the note it is dark; past the tail of a very short note it takes
+      // the note's own colour (grey for an auto-played one).
+      ctx.fillStyle = lab.fingerOutside ? col : "rgba(10,10,12,0.95)";
+      ctx.font = `800 ${Math.min(14, Math.max(9, lane.w * 0.8))}px ${c.fontMono}`;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(String(nt.finger), lane.cx, yBot - lab.finger);
       ctx.restore();
     }
   }

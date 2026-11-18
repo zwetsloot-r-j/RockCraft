@@ -23,9 +23,10 @@ use rockcraft_audio::{
 };
 use rockcraft_core::{
     backing_position_us, hand::hand_of_pitch_value, order_triggers, score, BarMap, DriftGuard,
-    ExpectedNote, Gain, GateState, Grid, Hand, HandOverride, LiveScorer, LoopPhase, LoopStep,
-    MidiNote, NoteEvent, NoteEventKind, Pass, PlayClock, PracticeLoop, ScoreConfig, SongAudio,
-    SpanTrigger, Summary, SustainEvent, SynthBus, Velocity, WaitGate, DEFAULT_SPLIT,
+    ExpectedNote, Finger, Gain, GateState, Grid, Hand, HandOverride, LiveScorer, LoopPhase,
+    LoopStep, MidiNote, NoteEvent, NoteEventKind, NoteFinger, Pass, PlayClock, PracticeLoop,
+    ScoreConfig, SongAudio, SpanTrigger, Summary, SustainEvent, SynthBus, Velocity, WaitGate,
+    DEFAULT_SPLIT,
 };
 use rockcraft_midi::smf_bytes_to_events;
 
@@ -89,6 +90,9 @@ pub struct PlayScreen {
     /// The hand playing each span (parallel to `spans`): the piece's per-note
     /// override, else its split line. Drives the "hands" colouring.
     hands: Vec<Hand>,
+    /// Each span's finger number, if the piece gives it one (parallel to
+    /// `spans`, M27-C). Drawn on the note; never read for scoring.
+    fingers: Vec<Option<Finger>>,
     /// How the highway colours its notes (`c` cycles it).
     color_mode: ColorMode,
     /// How the highway scrolls (`v` toggles it).
@@ -344,7 +348,7 @@ impl PlayScreen {
         let wait = WaitGate::from_expected(&expected_steps(&spans));
         let mut by_start: Vec<usize> = (0..spans.len()).collect();
         by_start.sort_by_key(|&i| (spans[i].start_us, i));
-        let hands = spans
+        let hands: Vec<Hand> = spans
             .iter()
             .map(|s| hand_of_pitch_value(s.note, DEFAULT_SPLIT))
             .collect();
@@ -353,6 +357,7 @@ impl PlayScreen {
 
         Ok(Self {
             spans,
+            fingers: vec![None; hands.len()],
             hands,
             color_mode: ColorMode::default(),
             scroll_mode: ScrollMode::default(),
@@ -436,6 +441,25 @@ impl PlayScreen {
         self
     }
 
+    /// Give each note its finger number from the piece (`meta.json`, M27-C).
+    /// Keyed like the hand overrides: by the note's position in the *file*,
+    /// before the lead-in shift.
+    pub fn with_fingers(mut self, fingers: &[NoteFinger]) -> Self {
+        let shift = self.shift_us;
+        self.fingers = self
+            .spans
+            .iter()
+            .map(|s| {
+                let file_start = s.start_us.saturating_sub(shift);
+                fingers
+                    .iter()
+                    .find(|f| f.pitch == s.note && f.start_us == file_start)
+                    .map(|f| f.finger)
+            })
+            .collect();
+        self
+    }
+
     /// Adopt the piece's grid (tempo + metre) and tempo map (`meta.grid`,
     /// `meta.bar_starts`, in file µs) for the highway's bar and beat lines,
     /// shifted into play-clock time alongside the notes so they stay on them.
@@ -451,6 +475,11 @@ impl PlayScreen {
     /// The bar lookup for the highway grid.
     fn bar_map(&self) -> BarMap<'_> {
         BarMap::new(&self.bar_starts_us, self.bar_us).with_origin(self.bar_origin_us)
+    }
+
+    /// The finger number of each note, in span order (`None` = none shown).
+    pub fn fingers(&self) -> &[Option<Finger>] {
+        &self.fingers
     }
 
     /// The hand assigned to each note, in span order.
@@ -1986,7 +2015,7 @@ impl PlayScreen {
         //    the cell's background as the glyph, the note as the cell). The
         //    onset (bottom) edge is exact, so a note on a downbeat meets its
         //    bar line. Whether a note is *sounding* follows the real clock.
-        for (span, &hand) in self.spans.iter().zip(&self.hands) {
+        for ((span, &hand), &finger) in self.spans.iter().zip(&self.hands).zip(&self.fingers) {
             let (Some((top8, bottom8)), Some((col, cw))) = (
                 span_extent8(span, view, LEAD_US, area.height),
                 lane(span.note),
@@ -2007,7 +2036,21 @@ impl PlayScreen {
             } else {
                 style.color
             };
-            for (row, fill) in cells_of_extent(top8, bottom8) {
+            let cells = cells_of_extent(top8, bottom8);
+            // Finger number (M27-C): the digit goes in the note's onset cell —
+            // the lowest one on screen — in the lane's centre column, dark on
+            // the note's colour. A partial onset cell becomes a full one: a
+            // readable digit matters more than the sub-cell edge.
+            let digit_at = finger.and_then(|f| {
+                let x = col + cw / 2;
+                cells
+                    .iter()
+                    .rev()
+                    .map(|&(row, _)| area.y + row)
+                    .find(|&y| area.contains((x, y).into()))
+                    .map(|y| (x, y, f))
+            });
+            for (row, fill) in cells {
                 let y = area.y + row;
                 for x in col..col + cw {
                     if !area.contains((x, y).into()) {
@@ -2029,6 +2072,12 @@ impl PlayScreen {
                         }
                     }
                 }
+            }
+            if let Some((x, y, f)) = digit_at {
+                buf[(x, y)]
+                    .set_symbol(FINGER_DIGITS[usize::from(f.get())])
+                    .set_fg(Color::Black)
+                    .set_bg(color);
             }
         }
 
@@ -2184,6 +2233,9 @@ const LOOP_BADGE: Rgb = Rgb(0xff, 0xd1, 0x66);
 const LOOP_BAND: f32 = 0.08;
 /// How far notes outside a running loop fade toward the background.
 const OUTSIDE_LOOP_FADE: f32 = 0.65;
+
+/// The glyph for each finger number, indexed by the number (M27-C).
+const FINGER_DIGITS: [&str; 6] = [" ", "1", "2", "3", "4", "5"];
 
 /// The status-line song-audio label and colour for the `m` key: `bg` (the
 /// backing recording), `piano` (the synth replays the song) or `off`.
@@ -3856,5 +3908,100 @@ mod tests {
         assert_eq!(group_thousands(999), "999");
         assert_eq!(group_thousands(12_340), "12 340");
         assert_eq!(group_thousands(1_234_567), "1 234 567");
+    }
+
+    // ── finger numbers (M27-C) ───────────────────────────────────────────────
+
+    #[test]
+    fn with_fingers_keys_on_the_file_position() {
+        let play = two_note_screen();
+        assert_eq!(play.fingers(), &[None, None], "none by default");
+        let d_file_start = play.spans[1].start_us - play.shift_us;
+        let play = play.with_fingers(&[
+            NoteFinger {
+                pitch: 62,
+                start_us: d_file_start,
+                finger: Finger::new(3).unwrap(),
+            },
+            // No such note: ignored.
+            NoteFinger {
+                pitch: 90,
+                start_us: 0,
+                finger: Finger::new(1).unwrap(),
+            },
+        ]);
+        assert_eq!(play.fingers(), &[None, Finger::new(3)]);
+    }
+
+    /// The cells that differ between two renders, as `(x, y, symbol-in-b)`.
+    fn diff_cells(
+        a: &ratatui::buffer::Buffer,
+        b: &ratatui::buffer::Buffer,
+    ) -> Vec<(u16, u16, String)> {
+        let mut out = Vec::new();
+        for y in 0..a.area.height {
+            for x in 0..a.area.width {
+                if a[(x, y)] != b[(x, y)] {
+                    out.push((x, y, b[(x, y)].symbol().to_string()));
+                }
+            }
+        }
+        out
+    }
+
+    fn screen_of(pitch: u8) -> PlayScreen {
+        let n = MidiNote::new(pitch).unwrap();
+        let events = vec![
+            NoteEvent::on(n, Velocity::new(80).unwrap(), 0),
+            NoteEvent::off(n, 500_000),
+        ];
+        PlayScreen::from_smf_bytes("test".into(), &events_to_smf_bytes(&events), None).unwrap()
+    }
+
+    #[test]
+    fn a_fingered_note_shows_its_digit_and_only_that_changes() {
+        // White key (wide lane at this width) and black key (one column).
+        for pitch in [60u8, 61] {
+            let mut plain = screen_of(pitch);
+            let mut fingered = screen_of(pitch).with_fingers(&[NoteFinger {
+                pitch,
+                start_us: 0,
+                finger: Finger::new(4).unwrap(),
+            }]);
+            // Look while the note is still on its way down the highway.
+            let now = plain.spans[0].start_us - 600_000;
+            let a = render(&mut plain, now, 120, 30);
+            let b = render(&mut fingered, now, 120, 30);
+            let diff = diff_cells(&a, &b);
+            assert_eq!(diff.len(), 1, "pitch {pitch}: one cell changes: {diff:?}");
+            assert_eq!(diff[0].2, "4");
+            let (x, y) = (diff[0].0, diff[0].1);
+            assert_eq!(b[(x, y)].fg, Color::Black, "dark digit on the note colour");
+            assert_eq!(
+                b[(x, y)].bg,
+                note_style(ColorMode::Hands, pitch, Hand::Right, false).color,
+                "the note colour is the background"
+            );
+        }
+    }
+
+    #[test]
+    fn fingers_do_not_change_what_is_scored() {
+        let d_file_start = {
+            let p = two_note_screen();
+            p.spans[1].start_us - p.shift_us
+        };
+        let plain = two_note_screen();
+        let fingered = two_note_screen().with_fingers(&[NoteFinger {
+            pitch: 62,
+            start_us: d_file_start,
+            finger: Finger::new(2).unwrap(),
+        }]);
+        assert_eq!(plain.spans, fingered.spans);
+        assert_eq!(plain.hands(), fingered.hands());
+        assert_eq!(
+            plain.finish().total_expected,
+            fingered.finish().total_expected
+        );
     }
 }
