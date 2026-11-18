@@ -46,9 +46,9 @@ use rockcraft_control::SegmentSpec;
 use rockcraft_core::{
     backing_position_us, nudge_rate_permille, rate_to_permille, segments_from_splits,
     slice_segment, Action, BackgroundImage, BackgroundStack, BackgroundVideo, BackingTrack, Bpm,
-    BpmDelta, Composer, Cursor, Effect, Gain, Grid, InputMode, Key, MidiNote, Note, NoteEvent,
-    NoteId, RecordingMeta, Scale as MusicScale, Segment, Subdivision, Timeline, TrackOrigin,
-    Velocity, RATE_UNITY,
+    BpmDelta, Composer, Cursor, Effect, Finger, Gain, Grid, InputMode, Key, MidiNote, Note,
+    NoteEvent, NoteId, RecordingMeta, Scale as MusicScale, Segment, Subdivision, Timeline,
+    TrackOrigin, Velocity, RATE_UNITY,
 };
 use rockcraft_import::write_part_bundle;
 use rockcraft_midi::{events_to_smf_bytes, key_map as mock_key_map};
@@ -411,6 +411,9 @@ pub struct EditScreen {
     last_tick: Option<Instant>,
     /// Whether the help overlay is currently visible (view-only state).
     show_help: bool,
+    /// `f` was pressed and the next key picks the finger number (M27-B):
+    /// `1`-`5` set it, `0`/`x`/Backspace/Delete clear it, anything else cancels.
+    finger_pending: bool,
     /// Whether the timeline has changed since the last save (or since opening
     /// a fresh editor). Cleared by `mark_clean`; set by any mutating dispatch.
     dirty: bool,
@@ -517,6 +520,7 @@ impl EditScreen {
             auditioning_chord: Vec::new(),
             last_tick: None,
             show_help: false,
+            finger_pending: false,
             dirty: false,
             save_flash: None,
             exit_prompt: false,
@@ -1154,6 +1158,27 @@ impl EditScreen {
             _ => {}
         }
 
+        // Finger entry (M27-B): `f` arms it, the next key resolves it. The key
+        // after `f` is always consumed here, so a stray one never edits.
+        if self.finger_pending {
+            self.finger_pending = false;
+            match code {
+                KeyCode::Char(c @ '1'..='5') => {
+                    let finger = Finger::new(c as u8 - b'0').expect("1..=5 is a finger");
+                    self.dispatch(Action::SetNoteFinger { finger });
+                }
+                KeyCode::Char('0' | 'x') | KeyCode::Backspace | KeyCode::Delete => {
+                    self.dispatch(Action::ClearNoteFinger);
+                }
+                _ => {}
+            }
+            return;
+        }
+        if code == KeyCode::Char('f') && !self.composer.in_chord_mode() && !self.show_help {
+            self.finger_pending = true;
+            return;
+        }
+
         // While the chord selector is open it owns the keymap (digits pick a
         // degree, `[`/`]` cycle it, `s` toggles quality, Enter/Esc commit/cancel).
         let action = if self.composer.in_chord_mode() {
@@ -1171,6 +1196,13 @@ impl EditScreen {
         if let Some(action) = action {
             self.dispatch(action);
         }
+    }
+
+    /// Whether `f` is waiting for its finger key (M27-B). While true the shell
+    /// must hand the next key straight to [`EditScreen::on_key`] — not to its
+    /// own shortcuts and not to the mock keyboard.
+    pub fn finger_pending(&self) -> bool {
+        self.finger_pending
     }
 
     /// Mutable access to the underlying [`Composer`] — the control seam.
@@ -2059,6 +2091,28 @@ impl EditScreen {
             })
             .unwrap_or_else(|| Span::raw(""));
 
+        // Finger number (M27-B): the prompt while `f` waits for its key, else
+        // the cursor note's finger when it has one.
+        let finger_span = if self.finger_pending {
+            Span::styled(
+                "finger: 1-5, 0 clears  ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            self.note_under_cursor()
+                .and_then(|id| self.get_note(id))
+                .and_then(|n| n.finger)
+                .map(|f| {
+                    Span::styled(
+                        format!("finger {}  ", f.get()),
+                        Style::default().fg(CURSOR_COLOR),
+                    )
+                })
+                .unwrap_or_else(|| Span::raw(""))
+        };
+
         // Surface the backing track: when attached, name it with its alignment
         // offset + nudge keys; when not, show the `B` affordance so the relocated
         // entry point (M9-E) is discoverable on the edit screen itself.
@@ -2107,8 +2161,9 @@ impl EditScreen {
                 Style::default().fg(CURSOR_COLOR),
             ),
             vel_span,
+            finger_span,
             Span::styled(
-                "[a/d] add/del  [A/Z] insert/cut bar  [Q/W] bar -/+ step  [e/r] bar faster/slower  []/[] size  [+/-] vel  [(/)] tempo  [T] set BPM  [:/\"] origin  [I/O] origin±  [m] grab  [n] hand  [c] chord  [v] select  [y/p/D] yank/paste/del  [q] snap to grid  [u/U] undo/redo  [R] rec  [t] step/live  [C] count-in  [Space] play/stop  [P] play-start  [o] loop  [{/}] loop in/out  [M] metro  [>/<] subdiv  [hjkl] pitch/time  [H/L] bar  [w/b] oct  [g/G] timeline ends  [0/$] pitch ends  [s] save  [S] save to library  [E] play here  [X] split  [x] mix  [Tab] menu",
+                "[a/d] add/del  [A/Z] insert/cut bar  [Q/W] bar -/+ step  [e/r] bar faster/slower  []/[] size  [+/-] vel  [(/)] tempo  [T] set BPM  [:/\"] origin  [I/O] origin±  [m] grab  [n] hand  [f] finger  [c] chord  [v] select  [y/p/D] yank/paste/del  [q] snap to grid  [u/U] undo/redo  [R] rec  [t] step/live  [C] count-in  [Space] play/stop  [P] play-start  [o] loop  [{/}] loop in/out  [M] metro  [>/<] subdiv  [hjkl] pitch/time  [H/L] bar  [w/b] oct  [g/G] timeline ends  [0/$] pitch ends  [s] save  [S] save to library  [E] play here  [X] split  [x] mix  [Tab] menu",
                 Style::default().fg(Color::DarkGray),
             ),
         ]);
@@ -2229,6 +2284,46 @@ impl EditScreen {
             }
         }
 
+        // Finger numbers (M27-B): the digit replaces the glyph in the note's
+        // onset row, centre column, dark on the note's colour.
+        let mut cursor_finger = None;
+        for (_, n) in self.timeline().notes() {
+            let Some(finger) = n.finger else { continue };
+            let pitch = n.pitch.value();
+            if pitch == cursor.pitch && n.start_us == self.cursor_us() {
+                // Under the cursor cell, which is painted last: drawn there.
+                cursor_finger = Some(finger);
+                continue;
+            }
+            let span = NoteSpan {
+                note: pitch,
+                start_us: n.start_us,
+                end_us: n.start_us + n.dur_us,
+            };
+            let (Some(rs), Some(col)) = (project(&span, now, lead, area.height), note_col(pitch))
+            else {
+                continue;
+            };
+            let y = area.y + rs.bottom_row;
+            if y >= area.y + area.height {
+                continue;
+            }
+            let cell_w = if is_black_key(pitch) { 1 } else { w };
+            let selected = sel.is_some_and(|(pitch_lo, pitch_hi, us_lo, us_hi)| {
+                pitch >= pitch_lo && pitch <= pitch_hi && n.start_us >= us_lo && n.start_us < us_hi
+            });
+            let bg = if selected { SELECT_COLOR } else { NOTE_COLOR };
+            f.render_widget(
+                Paragraph::new(finger.get().to_string()).style(
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(bg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Rect::new(col + cell_w / 2, y, 1, 1),
+            );
+        }
+
         // The cursor cell, on top of everything.
         if let Some(col) = note_col(cursor.pitch) {
             let cur = NoteSpan {
@@ -2249,6 +2344,19 @@ impl EditScreen {
                     ),
                     rect,
                 );
+                // A fingered note starting in the cursor cell shows its digit
+                // on the cursor block instead of being hidden by it.
+                if let Some(finger) = cursor_finger {
+                    f.render_widget(
+                        Paragraph::new(finger.get().to_string()).style(
+                            Style::default()
+                                .fg(Color::White)
+                                .bg(CURSOR_CELL_BG)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Rect::new(col + cell_w / 2, y, 1, 1),
+                    );
+                }
             }
         }
     }
@@ -2479,6 +2587,10 @@ impl EditScreen {
                 "  I : Grid origin -250ms    O : Grid origin +250ms",
             )),
             Line::from(Span::raw("  m : Grab mode (move note with h/j/k/l)")),
+            Line::from(Span::raw("  n : Hand (auto / left / right)")),
+            Line::from(Span::raw(
+                "  f then 1-5 : Finger number   f then 0 : Clear it",
+            )),
             Line::from(Span::raw("")), // Empty line
             Line::from(Span::styled(
                 " Selection/Clipboard:",
@@ -5372,5 +5484,129 @@ mod tests {
         let mut e = EditScreen::from_timeline(tl, Grid::default_120());
         e.dispatch(Action::CycleNoteHand);
         assert!(e.is_dirty(), "changing a hand is an edit");
+    }
+
+    // ── finger entry + drawing (M27-B) ───────────────────────────────────────
+
+    fn cursor_finger(e: &EditScreen) -> Option<u8> {
+        e.note_under_cursor()
+            .and_then(|id| e.get_note(id))
+            .and_then(|n| n.finger)
+            .map(|f| f.get())
+    }
+
+    #[test]
+    fn f_then_a_digit_sets_the_finger_and_f_0_clears_it() {
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('a'));
+        e.on_key(KeyCode::Char('f'));
+        assert!(e.finger_pending());
+        e.on_key(KeyCode::Char('3'));
+        assert!(!e.finger_pending());
+        assert_eq!(cursor_finger(&e), Some(3));
+
+        for clear in [
+            KeyCode::Char('0'),
+            KeyCode::Char('x'),
+            KeyCode::Backspace,
+            KeyCode::Delete,
+        ] {
+            e.on_key(KeyCode::Char('f'));
+            e.on_key(KeyCode::Char('4'));
+            assert_eq!(cursor_finger(&e), Some(4));
+            e.on_key(KeyCode::Char('f'));
+            e.on_key(clear);
+            assert_eq!(cursor_finger(&e), None, "{clear:?} clears");
+            assert_eq!(e.note_count(), 1, "the note itself is untouched");
+        }
+    }
+
+    #[test]
+    fn f_then_another_key_cancels_without_acting_on_it() {
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('a'));
+        let before = e.composer.cursor();
+        for other in [KeyCode::Char('j'), KeyCode::Char('7'), KeyCode::Esc] {
+            e.on_key(KeyCode::Char('f'));
+            e.on_key(other);
+            assert!(!e.finger_pending());
+            assert_eq!(e.composer.cursor(), before, "{other:?} must not move");
+            assert_eq!(cursor_finger(&e), None);
+        }
+        // The key after the cancelled one works normally again.
+        e.on_key(KeyCode::Char('l'));
+        assert_ne!(e.composer.cursor(), before);
+    }
+
+    #[test]
+    fn f_is_inert_in_chord_mode() {
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('c'));
+        assert!(e.in_chord_mode());
+        e.on_key(KeyCode::Char('f'));
+        assert!(!e.finger_pending());
+    }
+
+    /// The symbols drawn on the highway, row by row, at `scale`-independent
+    /// 120x30 — enough to look for a digit.
+    fn rendered_symbols(e: &EditScreen, width: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
+        terminal.draw(|f| e.draw(f, f.area())).unwrap();
+        let buf = terminal.backend().buffer();
+        // Skip the status row (row 0), whose hint text contains digits.
+        (1..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_fingered_note_shows_its_digit_and_an_unfingered_one_does_not() {
+        for width in [120u16, 60] {
+            let mut tl = Timeline::new();
+            // Away from the cursor's column (60) so the cursor cell hides nothing.
+            let fingered = tl.insert(note(64, 0, 500_000));
+            tl.insert(note(67, 0, 500_000));
+            let plain = EditScreen::from_timeline(tl.clone(), Grid::default_120());
+            assert!(
+                !rendered_symbols(&plain, width)
+                    .iter()
+                    .any(|row| row.contains('4')),
+                "no finger, no digit (width {width})"
+            );
+
+            tl.set_finger(fingered, Finger::new(4));
+            let e = EditScreen::from_timeline(tl, Grid::default_120());
+            let rows = rendered_symbols(&e, width);
+            let digits: usize = rows.iter().map(|r| r.matches('4').count()).sum();
+            assert_eq!(
+                digits, 1,
+                "exactly one digit, on the fingered note (width {width})"
+            );
+        }
+    }
+
+    #[test]
+    fn the_cursor_notes_finger_shows_on_the_cursor_cell_and_in_the_status_bar() {
+        let mut e = EditScreen::new();
+        e.on_key(KeyCode::Char('a'));
+        e.on_key(KeyCode::Char('f'));
+        e.on_key(KeyCode::Char('5'));
+        let rows = rendered_symbols(&e, 120);
+        assert_eq!(
+            rows.iter().map(|r| r.matches('5').count()).sum::<usize>(),
+            1
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(200, 30)).unwrap();
+        terminal.draw(|f| e.draw(f, f.area())).unwrap();
+        let buf = terminal.backend().buffer();
+        let status: String = (0..buf.area.width)
+            .map(|x| buf[(x, 0)].symbol().to_string())
+            .collect();
+        assert!(status.contains("finger 5"), "status was: {status}");
     }
 }
