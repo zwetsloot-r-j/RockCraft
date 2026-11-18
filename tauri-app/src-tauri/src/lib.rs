@@ -331,6 +331,13 @@ fn edit_export_score(state: State<'_, AppState>, path: String) -> Result<String,
     state::export_score(&state, &path)
 }
 
+/// The open piece as a MusicXML document, for the sheet view (M22-C). Paired
+/// with [`HostCommand::QueryScore`](rockcraft_control::HostCommand::QueryScore).
+#[tauri::command]
+fn edit_query_score(state: State<'_, AppState>) -> Result<state::ScoreDoc, String> {
+    state::score_musicxml(&state)
+}
+
 /// Return the currently attached background video, or `null` (M9-G).
 #[tauri::command]
 fn edit_query_video(state: State<'_, AppState>) -> Option<VideoRef> {
@@ -769,6 +776,7 @@ pub fn run() {
             edit_clear_video,
             edit_query_video,
             edit_export_score,
+            edit_query_score,
             edit_attach_background,
             edit_detach_background,
             edit_query_backgrounds,

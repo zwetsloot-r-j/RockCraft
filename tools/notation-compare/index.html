@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Notation renderer comparison</title>
+<!--
+  Side-by-side render of one MusicXML file with OpenSheetMusicDisplay and
+  Verovio, to compare engraving quality before picking one for an in-app sheet
+  view. Open this file in a browser and drop a .musicxml on it; nothing is
+  uploaded. The two libraries load from the jsDelivr CDN, so it needs a network
+  connection the first time.
+-->
+<script src="https://cdn.jsdelivr.net/npm/opensheetmusicdisplay@2.3.1/build/opensheetmusicdisplay.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/verovio@6.4.1/dist/verovio-toolkit-wasm.js"></script>
+<style>
+  :root {
+    --bg: #f3f1ec; --panel: #ffffff; --ink: #1d1c1a; --muted: #6b675f;
+    --line: #d9d5cc; --accent: #2f6f6a; --bad: #a33a2a;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 14px/1.45 system-ui, "Segoe UI", sans-serif; }
+  header { position: sticky; top: 0; z-index: 5; background: var(--bg);
+           border-bottom: 1px solid var(--line); padding: 10px 16px;
+           display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center; }
+  header h1 { font-size: 15px; margin: 0 8px 0 0; font-weight: 650; }
+  label { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); }
+  input[type=number] { width: 5em; }
+  input, select, button { font: inherit; }
+  button, .filebtn { border: 1px solid var(--line); background: var(--panel);
+           border-radius: 6px; padding: 5px 10px; cursor: pointer; color: var(--ink); }
+  button:hover, .filebtn:hover { border-color: var(--accent); }
+  .filebtn input { display: none; }
+  #file-name { font-weight: 600; color: var(--ink); }
+  main { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; padding: 14px 16px 40px; }
+  main.stacked { grid-template-columns: 1fr; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+            min-width: 0; overflow: hidden; }
+  section > h2 { margin: 0; padding: 10px 14px; font-size: 14px;
+                 border-bottom: 1px solid var(--line); display: flex;
+                 flex-wrap: wrap; gap: 4px 12px; align-items: baseline; }
+  section > h2 small { font-weight: 400; color: var(--muted); }
+  .stats { padding: 6px 14px; color: var(--muted); border-bottom: 1px solid var(--line);
+           font-variant-numeric: tabular-nums; min-height: 2.2em; }
+  .stats.error { color: var(--bad); white-space: pre-wrap; }
+  .sheet { padding: 8px; overflow-x: auto; background: #fff; }
+  .sheet svg { max-width: none; }
+  #drop-hint { grid-column: 1 / -1; text-align: center; color: var(--muted);
+               border: 2px dashed var(--line); border-radius: 10px; padding: 48px 16px; }
+  body.dragging #drop-hint, body.dragging section { border-color: var(--accent); }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Notation renderer comparison</h1>
+  <label class="filebtn">Open MusicXML…<input id="file" type="file" accept=".musicxml,.xml"></label>
+  <span id="file-name"></span>
+  <label>Zoom <input id="zoom" type="range" min="40" max="140" value="80" step="5"><span id="zoom-out">80%</span></label>
+  <label title="Render only the first N measures. Long pieces are slow to lay out in full; 0 = everything.">
+    First <input id="measures" type="number" min="0" value="48" step="8"> measures</label>
+  <label><input id="stacked" type="checkbox"> Stack panels</label>
+  <button id="rerender">Render again</button>
+</header>
+
+<main id="main">
+  <div id="drop-hint">Drop a <b>.musicxml</b> file anywhere on this page, or use “Open MusicXML…”.<br>
+    RockCraft exports them with <code>N</code> in the desktop editor, or with
+    <code>cargo run -p rockcraft-export --example export_bundle -- &lt;bundle-dir&gt;</code>.</div>
+
+  <section>
+    <h2>OpenSheetMusicDisplay <small id="osmd-meta">2.3.1 · BSD-3-Clause · 1.5 MB script</small></h2>
+    <div class="stats" id="osmd-stats">waiting for a file</div>
+    <div class="sheet" id="osmd-sheet"></div>
+  </section>
+
+  <section>
+    <h2>Verovio <small id="vrv-meta">6.4.1 · LGPL-3.0 · 7.4 MB script</small></h2>
+    <div class="stats" id="vrv-stats">waiting for a file</div>
+    <div class="sheet" id="vrv-sheet"></div>
+  </section>
+</main>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+let xmlText = null;
+
+// Verovio's WebAssembly module initialises asynchronously.
+const verovioReady = new Promise((resolve, reject) => {
+  if (typeof verovio === "undefined") return reject(new Error("the Verovio script did not load"));
+  verovio.module.onRuntimeInitialized = () => resolve(new verovio.toolkit());
+});
+
+function setStats(id, text, isError) {
+  const el = $(id);
+  el.textContent = text;
+  el.classList.toggle("error", !!isError);
+}
+
+const zoom = () => Number($("zoom").value) / 100;
+const measureLimit = () => Math.max(0, Number($("measures").value) || 0);
+/** Let the browser paint the "rendering…" text before a long synchronous layout. */
+const nextFrame = () => new Promise((r) => setTimeout(r, 30));
+
+async function renderOsmd() {
+  const host = $("osmd-sheet");
+  host.innerHTML = "";
+  if (typeof opensheetmusicdisplay === "undefined") {
+    return setStats("osmd-stats", "the OpenSheetMusicDisplay script did not load", true);
+  }
+  setStats("osmd-stats", "rendering…");
+  await nextFrame();
+  try {
+    const limit = measureLimit();
+    const osmd = new opensheetmusicdisplay.OpenSheetMusicDisplay(host, {
+      backend: "svg",
+      autoResize: false,
+      drawTitle: true,
+      drawPartNames: false,
+      drawFingerings: true,
+      // `?beam=1` turns on OSMD's auto-beaming (our export writes no beams).
+      autoBeam: new URLSearchParams(location.search).get("beam") === "1",
+      drawMeasureNumbers: true,
+      // Like Verovio: a number per system, so they are not mistaken for fingerings.
+      drawMeasureNumbersOnlyAtSystemStart: true,
+      ...(limit > 0 ? { drawFromMeasureNumber: 1, drawUpToMeasureNumber: limit } : {}),
+    });
+    const t0 = performance.now();
+    await osmd.load(xmlText);
+    const t1 = performance.now();
+    osmd.zoom = zoom();
+    osmd.render();
+    const t2 = performance.now();
+    const svgs = host.querySelectorAll("svg").length;
+    setStats("osmd-stats",
+      `load ${(t1 - t0).toFixed(0)} ms · layout + draw ${(t2 - t1).toFixed(0)} ms · ${svgs} SVG page(s)`);
+  } catch (err) {
+    setStats("osmd-stats", "failed: " + (err && err.message ? err.message : err), true);
+  }
+}
+
+async function renderVerovio() {
+  const host = $("vrv-sheet");
+  host.innerHTML = "";
+  setStats("vrv-stats", "rendering…");
+  await nextFrame();
+  try {
+    const tk = await verovioReady;
+    // Verovio's page is in tenths of a millimetre at scale 100; size it so the
+    // SVG comes out as wide as the panel at the chosen zoom.
+    const scale = Math.round(zoom() * 50);
+    const widthPx = Math.max(400, host.clientWidth - 16);
+    tk.resetOptions();
+    tk.setOptions({
+      scale,
+      pageWidth: Math.round((widthPx * 100) / scale),
+      pageHeight: 60000,
+      adjustPageHeight: true,
+      breaks: "auto",
+      header: "auto",
+      footer: "none",
+      svgViewBox: false,
+    });
+    const t0 = performance.now();
+    if (!tk.loadData(xmlText)) throw new Error("Verovio could not read the file\n" + tk.getLog());
+    const limit = measureLimit();
+    if (limit > 0) {
+      try {
+        tk.select({ measureRange: `start-${limit}` });
+        tk.redoLayout();
+      } catch (_) { /* older builds: render everything */ }
+    }
+    const t1 = performance.now();
+    const pages = tk.getPageCount();
+    for (let p = 1; p <= pages; p++) {
+      const page = document.createElement("div");
+      page.innerHTML = tk.renderToSVG(p);
+      host.appendChild(page);
+    }
+    const t2 = performance.now();
+    const log = (tk.getLog() || "").trim();
+    setStats("vrv-stats",
+      `load + layout ${(t1 - t0).toFixed(0)} ms · draw ${(t2 - t1).toFixed(0)} ms · ${pages} SVG page(s)` +
+      (log ? " · warnings: " + log.slice(0, 300) : ""), false);
+  } catch (err) {
+    setStats("vrv-stats", "failed: " + (err && err.message ? err.message : err), true);
+  }
+}
+
+async function renderBoth() {
+  if (xmlText === null) return;
+  $("drop-hint").style.display = "none";
+  // One after the other, so each timing is measured on an idle main thread.
+  await renderOsmd();
+  await renderVerovio();
+}
+
+async function openFile(file) {
+  if (!file) return;
+  xmlText = await file.text();
+  $("file-name").textContent = file.name;
+  document.title = file.name + " — renderer comparison";
+  renderBoth();
+}
+
+$("file").addEventListener("change", (e) => openFile(e.target.files[0]));
+$("rerender").addEventListener("click", renderBoth);
+$("measures").addEventListener("change", renderBoth);
+$("zoom").addEventListener("input", () => { $("zoom-out").textContent = $("zoom").value + "%"; });
+$("zoom").addEventListener("change", renderBoth);
+$("stacked").addEventListener("change", (e) => {
+  $("main").classList.toggle("stacked", e.target.checked);
+  renderBoth(); // the panel width changed
+});
+
+// `?src=<url>` loads a file straight away (when the page is served over http,
+// or opened with file access allowed) — handy for scripted screenshots.
+const src = new URLSearchParams(location.search).get("src");
+if (src) {
+  fetch(src)
+    .then((r) => (r.ok ? r.text() : Promise.reject(new Error(`${r.status} ${r.statusText}`))))
+    .then((text) => {
+      xmlText = text;
+      $("file-name").textContent = src.split("/").pop();
+      return renderBoth();
+    })
+    .catch((err) => setStats("osmd-stats", `could not load ${src}: ${err.message}`, true));
+}
+
+window.addEventListener("dragover", (e) => { e.preventDefault(); document.body.classList.add("dragging"); });
+window.addEventListener("dragleave", () => document.body.classList.remove("dragging"));
+window.addEventListener("drop", (e) => {
+  e.preventDefault();
+  document.body.classList.remove("dragging");
+  openFile(e.dataTransfer.files[0]);
+});
+</script>
+</body>
+</html>

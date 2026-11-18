@@ -843,6 +843,23 @@ export function editExportScore(path: string): Promise<string> {
   return invoke<string>("edit_export_score", { path });
 }
 
+/** The open piece as sheet music — mirror of `state::ScoreDoc`. */
+export interface ScoreDoc {
+  /** The MusicXML document `export_score` would write. */
+  musicxml: string;
+  /** The piece's title (its bundle folder's name, else "Untitled"). */
+  title: string;
+}
+
+/**
+ * The open piece as a MusicXML document, for the sheet view (M22-C, paired
+ * with the `query_score` host command). Rejects with `nothing to export` when
+ * the piece has no notes.
+ */
+export function editQueryScore(): Promise<ScoreDoc> {
+  return invoke<ScoreDoc>("edit_query_score");
+}
+
 /** Save dialog for exporting sheet music; resolves to the path or null. */
 export async function saveScorePicker(defaultName: string): Promise<string | null> {
   const chosen = await dialogSave({

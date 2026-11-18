@@ -463,6 +463,40 @@ fn write_bundle(
 /// is appended when the path has no extension. Returns the path written.
 /// Paired with [`HostCommand::ExportScore`](rockcraft_control::HostCommand::ExportScore).
 pub fn export_score(state: &AppState, path: &str) -> Result<String, String> {
+    with_score_source(state, |piece| {
+        rockcraft_export::export_score_file(piece, std::path::Path::new(path))
+            .map(|p| p.to_string_lossy().into_owned())
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// The open piece as sheet music, for the editor's sheet view (M22-C).
+#[derive(Debug, Clone, Serialize)]
+pub struct ScoreDoc {
+    /// The MusicXML document `export_score` would write.
+    pub musicxml: String,
+    /// The piece's title: its bundle folder's name, else "Untitled".
+    pub title: String,
+}
+
+/// The open piece as a MusicXML document, without touching the disk (M22-C).
+/// Paired with [`HostCommand::QueryScore`](rockcraft_control::HostCommand::QueryScore).
+pub fn score_musicxml(state: &AppState) -> Result<ScoreDoc, String> {
+    with_score_source(state, |piece| {
+        rockcraft_export::score_musicxml(piece)
+            .map(|musicxml| ScoreDoc {
+                musicxml,
+                title: piece.title.to_string(),
+            })
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// Run `f` on the open piece as the sheet-music exporter sees it.
+fn with_score_source<T>(
+    state: &AppState,
+    f: impl FnOnce(&rockcraft_export::ScoreSource<'_>) -> T,
+) -> T {
     let composer = state.composer.lock().expect("composer mutex poisoned");
     let notes: Vec<rockcraft_core::Note> = composer.timeline().notes().map(|(_, n)| *n).collect();
     let grid = composer.grid();
@@ -477,19 +511,14 @@ pub fn export_score(state: &AppState, path: &str) -> Result<String, String> {
         .clone();
     let title = rockcraft_export::title_from_bundle_dir(current_dir.as_deref());
 
-    rockcraft_export::export_score_file(
-        &rockcraft_export::ScoreSource {
-            notes: &notes,
-            grid: &grid,
-            bar_starts: &bar_starts,
-            key: Some(key),
-            hand_split,
-            title: &title,
-        },
-        std::path::Path::new(path),
-    )
-    .map(|p| p.to_string_lossy().into_owned())
-    .map_err(|e| e.to_string())
+    f(&rockcraft_export::ScoreSource {
+        notes: &notes,
+        grid: &grid,
+        bar_starts: &bar_starts,
+        key: Some(key),
+        hand_split,
+        title: &title,
+    })
 }
 
 pub fn split_bundle(state: &AppState, segments: Vec<SplitSegment>) -> Result<Vec<String>, String> {
@@ -1743,6 +1772,7 @@ mod tests {
             export_score(&state, &target.to_string_lossy()).unwrap_err(),
             "nothing to export"
         );
+        assert_eq!(score_musicxml(&state).unwrap_err(), "nothing to export");
 
         run_action(&state, "add_note", &json!({})).expect("add_note");
         run_action(&state, "set_note_finger", &json!({ "finger": 2 })).expect("finger");
@@ -1756,6 +1786,11 @@ mod tests {
         assert!(doc.contains("<work-title>Untitled</work-title>"));
         assert_eq!(doc.matches("<step>C</step>").count(), 2);
         assert!(doc.contains("<fingering>2</fingering>"));
+
+        // The sheet view gets the very same document, as text.
+        let sheet = score_musicxml(&state).expect("query_score");
+        assert_eq!(sheet.musicxml, doc);
+        assert_eq!(sheet.title, "Untitled");
 
         std::fs::remove_dir_all(&dir).ok();
     }

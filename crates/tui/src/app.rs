@@ -1150,6 +1150,18 @@ impl Shell {
                     .map(|p| json!({ "path": p.to_string_lossy() }))
                     .map_err(|e| failed(e.to_string()))
             }
+            HostCommand::QueryScore => {
+                let failed = |detail: String| HostError::Failed {
+                    command: "query_score".into(),
+                    detail,
+                };
+                let Screen::Edit(edit) = &self.screen else {
+                    return Err(failed("no piece is open in the editor".into()));
+                };
+                edit.score_musicxml()
+                    .map(|(musicxml, title)| json!({ "musicxml": musicxml, "title": title }))
+                    .map_err(|e| failed(e.to_string()))
+            }
             HostCommand::ImportSongFile {
                 path,
                 overwrite,
@@ -1961,6 +1973,7 @@ mod tests {
             HostCommand::ExportScore {
                 path: "does/not/exist/out.musicxml".into(),
             },
+            HostCommand::QueryScore,
             HostCommand::ImportSongFile {
                 path: "does/not/exist.rcsong".into(),
                 overwrite: false,

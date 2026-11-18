@@ -99,10 +99,11 @@ One-time setup:
 
 ## Printing sheet music
 
-In the desktop editor press `N` and choose a file: RockCraft writes the piece as
-MusicXML. Open the `.musicxml` in MuseScore (free) or any other notation
-program, then File → Print or Export PDF. Agents use the `export_score` host
-command, which the TUI answers too.
+In the desktop editor press `N` for the sheet view: the piece drawn as notation,
+right there in the app (`+`/`-` zoom, `Esc` closes). From the view, `p` prints
+it and `e` writes a MusicXML file, which MuseScore (free) or any other notation
+program opens if you want to adjust the layout before printing. Agents use the
+`export_score` and `query_score` host commands, which the TUI answers too.
 
 The right hand goes on the treble staff and the left on the bass, with the key,
 time signature, tempo marks and any finger numbers. First-version limits: notes

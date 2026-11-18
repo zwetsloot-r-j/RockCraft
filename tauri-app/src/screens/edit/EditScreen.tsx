@@ -81,6 +81,8 @@ import {
 } from "./keymap";
 import { countAfterKey, keepsCount, repeatsFor } from "./count";
 import { cursorNoteFinger, fingerKey } from "./finger";
+import { SHEET_ZOOM_DEFAULT, nextSheetZoom, sheetKey } from "./sheet";
+import { SheetView } from "./SheetView";
 import { IDENTITY_TRANSFORM, layerStyle } from "../highway/backgrounds";
 import { HIGHEST_MIDI, LOWEST_MIDI } from "./viewport";
 import {
@@ -233,6 +235,8 @@ type Overlay =
   | "save-as"
   /** Numeric input for the absolute set-BPM (tempo) value. */
   | "set-bpm"
+  /** The piece drawn as sheet music (M22-C). */
+  | "sheet"
   /** Video-backdrop alignment: keyboard X, density/hit-line Y, time, speed. */
   | "calibrate";
 
@@ -320,6 +324,8 @@ export function EditScreen(props: Props): JSX.Element {
   const [pendingCount, setPendingCount] = createSignal<number | null>(null);
   // `f` was pressed; the next key picks the finger number (M27-B).
   const [fingerPending, setFingerPending] = createSignal(false);
+  // Zoom of the sheet view (M22-C); kept while the editor stays open.
+  const [sheetZoom, setSheetZoom] = createSignal(SHEET_ZOOM_DEFAULT);
   /** Finger of the note under the cursor, for the status bar; null = none. */
   const cursorFinger = (snap: ComposerSnapshot): number | null => {
     const cursorUs = cursorUsOf(snap);
@@ -1478,6 +1484,32 @@ export function EditScreen(props: Props): JSX.Element {
 
     const ov = overlay();
 
+    // ── Sheet view (M22-C) — owns every key while open ───────────────────
+    if (ov === "sheet") {
+      e.preventDefault();
+      e.stopPropagation();
+      switch (sheetKey(e.key)) {
+        case "close":
+          setOverlay("none");
+          break;
+        case "zoom-in":
+          setSheetZoom((z) => nextSheetZoom(z, 1));
+          break;
+        case "zoom-out":
+          setSheetZoom((z) => nextSheetZoom(z, -1));
+          break;
+        case "export":
+          exportScore();
+          break;
+        case "print":
+          window.print();
+          break;
+        case null:
+          break;
+      }
+      return;
+    }
+
     // ── Save-as overlay ─────────────────────────────────────────────────
     if (ov === "save-as") {
       e.preventDefault();
@@ -1935,11 +1967,11 @@ export function EditScreen(props: Props): JSX.Element {
       }
       return;
     }
-    // `N` exports the piece as sheet music — "notation" (M22-B). The spec's
-    // `Y` already toggles the backing audio.
+    // `N` opens the sheet view — "notation" (M22-C). Exporting the MusicXML
+    // file (M22-B) and printing are keys inside that view.
     if (e.key === "N" && s.chord_preview === null && !splitMode()) {
       e.preventDefault();
-      exportScore();
+      setOverlay("sheet");
       return;
     }
     if (e.key === "B" && s.chord_preview === null && !splitMode()) {
@@ -2448,6 +2480,11 @@ export function EditScreen(props: Props): JSX.Element {
       {/* Exit-prompt overlay */}
       <Show when={overlay() === "exit-prompt"}>
         <ExitPrompt />
+      </Show>
+
+      {/* Sheet view (M22-C) */}
+      <Show when={overlay() === "sheet"}>
+        <SheetView zoom={sheetZoom()} message={saveFlash()} />
       </Show>
 
       {/* Save-as overlay */}
@@ -3307,7 +3344,8 @@ function HelpOverlay(props: { onClose: () => void }): JSX.Element {
       rows: [
         "s             Save (over the opened bundle; new piece → recordings/)",
         "S             Save to library (named)",
-        "N             Export sheet music (MusicXML)",
+        "N             Sheet view (notation); inside it e exports the",
+        "              MusicXML file and p prints",
         "E             Save, then Play from the cursor's bar (paused)",
         "?             Toggle help",
         "Esc           Back to menu (save prompt if dirty)",

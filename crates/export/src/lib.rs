@@ -49,6 +49,16 @@ pub struct ScoreSource<'a> {
 /// frontends behave identically: default notation options (sixteenth
 /// quantisation), right hand on the treble staff, left on the bass.
 pub fn export_score_file(piece: &ScoreSource<'_>, path: &Path) -> Result<PathBuf, ExportError> {
+    let document = score_musicxml(piece)?;
+    let path = with_musicxml_extension(path);
+    std::fs::write(&path, document).map_err(ExportError::Io)?;
+    Ok(std::path::absolute(&path).unwrap_or(path))
+}
+
+/// `piece` as a MusicXML document, as text — exactly what
+/// [`export_score_file`] writes. Behind the `query_score` host command, which
+/// the desktop sheet view draws (M22-C). Pure.
+pub fn score_musicxml(piece: &ScoreSource<'_>) -> Result<String, ExportError> {
     if piece.notes.is_empty() {
         return Err(ExportError::NothingToExport);
     }
@@ -60,9 +70,7 @@ pub fn export_score_file(piece: &ScoreSource<'_>, path: &Path) -> Result<PathBuf
         piece.hand_split,
         NotationOptions::default(),
     );
-    let path = with_musicxml_extension(path);
-    std::fs::write(&path, to_musicxml(&score, piece.title)).map_err(ExportError::Io)?;
-    Ok(std::path::absolute(&path).unwrap_or(path))
+    Ok(to_musicxml(&score, piece.title))
 }
 
 /// The title a piece is exported under: its bundle directory's name, else
@@ -72,4 +80,58 @@ pub fn title_from_bundle_dir(dir: Option<&Path>) -> String {
         .map(|n| n.to_string_lossy().into_owned())
         .filter(|n| !n.is_empty())
         .unwrap_or_else(|| "Untitled".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rockcraft_core::{MidiNote, Velocity, DEFAULT_SPLIT};
+
+    fn piece<'a>(notes: &'a [Note], grid: &'a Grid) -> ScoreSource<'a> {
+        ScoreSource {
+            notes,
+            grid,
+            bar_starts: &[],
+            key: None,
+            hand_split: DEFAULT_SPLIT,
+            title: "Test",
+        }
+    }
+
+    #[test]
+    fn the_text_is_exactly_what_the_file_export_writes() {
+        let notes = [Note {
+            pitch: MidiNote::new(60).unwrap(),
+            start_us: 0,
+            dur_us: 500_000,
+            velocity: Velocity::new(80).unwrap(),
+            hand: None,
+            finger: None,
+        }];
+        let grid = Grid::default_120();
+        let text = score_musicxml(&piece(&notes, &grid)).unwrap();
+        assert!(text.contains("<work-title>Test</work-title>"));
+
+        let dir = std::env::temp_dir().join(format!(
+            "rockcraft-export-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let written = export_score_file(&piece(&notes, &grid), &dir.join("sheet")).unwrap();
+        assert_eq!(std::fs::read_to_string(&written).unwrap(), text);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_empty_piece_has_nothing_to_export() {
+        let grid = Grid::default_120();
+        assert!(matches!(
+            score_musicxml(&piece(&[], &grid)),
+            Err(ExportError::NothingToExport)
+        ));
+    }
 }

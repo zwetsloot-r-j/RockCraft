@@ -433,6 +433,7 @@ below is an at-a-glance convenience only.
 | `split_bundle` | `{ segments: [{ start_us, end_us, name }] }` | Slice the loaded piece into the kept parts, each a new library bundle (subset MIDI + copied media + derived offsets, `origin=Edited`). Discarded parts are omitted (= trimming). Returns the created bundle dirs; the source is untouched |
 | `export_song_file` | `{ bundle: String, path: String }` | Pack a bundle folder into one `.rcsong` song file (`.rcsong` appended without an extension): `meta.json`, `song.mid`, referenced media and sidecars — never backups. Returns `{ path }` |
 | `export_score` | `{ path: String }` | Write the piece open in the editor as MusicXML sheet music (`.musicxml` appended without an extension): right hand on the treble staff, left on the bass, quantised to sixteenths, finger numbers included. Fails with `nothing to export` on an empty piece. Returns `{ path }` |
+| `query_score` | none | The same sheet-music document `export_score` writes, returned as text instead of written to disk (the desktop sheet view draws it). Returns `{ musicxml, title }` |
 | `import_song_file` | `{ path: String, overwrite: bool, name: String? }` | Unpack a `.rcsong` into `<library>/<slug>` (slug from `name`, else the archive). Strict file checks. A taken slug fails with `exists:<slug>` unless `overwrite`. Returns `{ dir }` |
 | `play_load` | `{ dir: String }` | Load a bundle as a play session. Returns play info |
 | `play_set_wait` | `{ on: bool }` | Arm/disarm note-by-note wait mode |

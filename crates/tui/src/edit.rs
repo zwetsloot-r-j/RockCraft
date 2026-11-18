@@ -701,19 +701,28 @@ impl EditScreen {
         &self,
         path: &std::path::Path,
     ) -> Result<PathBuf, rockcraft_export::ExportError> {
+        self.with_score_source(|piece| rockcraft_export::export_score_file(piece, path))
+    }
+
+    /// The piece as a MusicXML document and its title (M22-C's `query_score`).
+    pub fn score_musicxml(&self) -> Result<(String, String), rockcraft_export::ExportError> {
+        self.with_score_source(|piece| {
+            rockcraft_export::score_musicxml(piece).map(|xml| (xml, piece.title.to_string()))
+        })
+    }
+
+    /// Run `f` on the piece as the sheet-music exporter sees it.
+    fn with_score_source<T>(&self, f: impl FnOnce(&rockcraft_export::ScoreSource<'_>) -> T) -> T {
         let notes: Vec<Note> = self.timeline().notes().map(|(_, n)| *n).collect();
         let title = rockcraft_export::title_from_bundle_dir(self.source_dir.as_deref());
-        rockcraft_export::export_score_file(
-            &rockcraft_export::ScoreSource {
-                notes: &notes,
-                grid: &self.grid,
-                bar_starts: self.composer.bar_starts(),
-                key: Some(self.key),
-                hand_split: self.composer.hand_split(),
-                title: &title,
-            },
-            path,
-        )
+        f(&rockcraft_export::ScoreSource {
+            notes: &notes,
+            grid: &self.grid,
+            bar_starts: self.composer.bar_starts(),
+            key: Some(self.key),
+            hand_split: self.composer.hand_split(),
+            title: &title,
+        })
     }
 
     /// The bundle this piece lives in (opened from, or last saved to).
