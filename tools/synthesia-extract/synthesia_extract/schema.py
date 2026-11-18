@@ -40,6 +40,7 @@ class ExtractedNote:
     hand: Hand = Hand.UNKNOWN
     velocity: Optional[int] = None  # None until M6-F audio-fusion fills it
     confidence: Optional[float] = None  # 0.0..=1.0, for the M6-E review step
+    finger: Optional[int] = None  # 1..5, only when the source clearly shows one (M27-D)
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -53,6 +54,8 @@ class ExtractedNote:
             out["velocity"] = int(self.velocity)
         if self.confidence is not None:
             out["confidence"] = float(self.confidence)
+        if self.finger is not None:
+            out["finger"] = int(self.finger)
         return out
 
 

@@ -144,6 +144,25 @@ def test_fuse_copies_velocity_and_nudges_within_uncertainty():
     assert n64.hand == Hand.LEFT
 
 
+def test_fusion_and_shifting_keep_the_finger():
+    # M27-D: a finger rides every step that rebuilds a note — matched,
+    # unmatched, and the whole-chart shift.
+    visual = [
+        ExtractedNote(pitch=60, start_us=100_000, dur_us=300_000, finger=1),
+        ExtractedNote(pitch=64, start_us=500_000, dur_us=300_000, finger=3),
+        ExtractedNote(pitch=67, start_us=900_000, dur_us=300_000),
+    ]
+    transcribed = [
+        audio.TranscribedNote(pitch=60, start_us=95_000, dur_us=305_000, velocity=101),
+    ]
+    fused = audio.fuse(
+        visual, transcribed, frame_uncertainty_us=33_000, match_tol_us=66_000
+    )
+    assert {n.pitch: n.finger for n in fused} == {60: 1, 64: 3, 67: None}
+    shifted = audio.shift_notes(fused, 250_000)
+    assert {n.pitch: n.finger for n in shifted} == {60: 1, 64: 3, 67: None}
+
+
 def test_fuse_clamps_onset_nudge_to_uncertainty():
     visual = [ExtractedNote(pitch=60, start_us=200_000, dur_us=300_000, hand=Hand.RIGHT)]
     # Audio onset 100 ms earlier, but we only allow a 33 ms nudge.

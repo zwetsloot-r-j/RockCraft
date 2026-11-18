@@ -44,7 +44,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from music21 import bar, chord, converter, key as m21key, note as m21note, repeat, stream, tempo
+from music21 import articulations, bar, chord, converter, key as m21key, note as m21note, repeat, stream, tempo
 from music21 import meter as m21meter
 
 from . import confidence as conf
@@ -158,6 +158,7 @@ def convert_input(
     hand_map: Optional[dict[int, Hand]] = None,
     title: Optional[str] = None,
     read_dynamics: bool = True,
+    read_fingering: bool = True,
     log: Callable[[str], None] = omr._log,
 ) -> tuple[ExtractedChart, ConversionReport]:
     """Convert any supported input — a score file, or a scan via OMR (M13-B).
@@ -172,7 +173,13 @@ def convert_input(
     confidence pass enabled and the engine recorded in ``extractor_version``.
     """
     if not omr.is_scan(path):
-        return convert_score(path, hand_map=hand_map, title=title, read_dynamics=read_dynamics)
+        return convert_score(
+            path,
+            hand_map=hand_map,
+            title=title,
+            read_dynamics=read_dynamics,
+            read_fingering=read_fingering,
+        )
 
     with tempfile.TemporaryDirectory(prefix="rockcraft-omr-") as work:
         musicxml = Path(work) / "transcribed.musicxml"
@@ -182,6 +189,7 @@ def convert_input(
             hand_map=hand_map,
             title=title,
             read_dynamics=read_dynamics,
+            read_fingering=read_fingering,
             confidence_check=True,
             extractor_version=engine.label(),
         )
@@ -193,6 +201,7 @@ def convert_score(
     hand_map: Optional[dict[int, Hand]] = None,
     title: Optional[str] = None,
     read_dynamics: bool = True,
+    read_fingering: bool = True,
     confidence_check: bool = False,
     extractor_version: str = EXTRACTOR_VERSION,
 ) -> tuple[ExtractedChart, ConversionReport]:
@@ -206,6 +215,10 @@ def convert_score(
     M13-A's behaviour wholesale — velocity only where the source states one
     outright — which is what ``--no-dynamics`` is for: an A/B against the flat
     default, and an escape hatch for a score whose markings resolve badly.
+
+    `read_fingering` reads the score's fingering marks onto the notes (M27-D):
+    a note gets a finger only where the score states exactly one, 1 to 5, for
+    it. ``--no-fingering`` turns it off.
 
     `confidence_check` swaps rule 9's exact ``confidence = 1.0`` for
     :mod:`score_import.confidence`'s structural per-note score, and fills in
@@ -234,7 +247,15 @@ def convert_score(
             dyn.read(part, warn=report.warn, drop=report.drop) if read_dynamics else dyn.SILENT
         )
         notes.extend(
-            _part_notes(part, hands[index], tempo_map, report, note_confidence, staff_dynamics)
+            _part_notes(
+                part,
+                hands[index],
+                tempo_map,
+                report,
+                note_confidence,
+                staff_dynamics,
+                read_fingering,
+            )
         )
     notes.sort(key=lambda n: (n.start_us, n.pitch))
 
@@ -395,6 +416,7 @@ def _part_notes(
     report: ConversionReport,
     note_confidence: Callable[[Any, int], float] = _exact_confidence,
     staff_dynamics: dyn.StaffDynamics = dyn.SILENT,
+    read_fingering: bool = True,
 ) -> list[ExtractedNote]:
     notes: list[ExtractedNote] = []
     for element in part.flatten().notes:
@@ -410,8 +432,9 @@ def _part_notes(
         end_us = _us(_seconds_at(offset + float(element.duration.quarterLength), tempo_map))
         dur_us = max(1, end_us - start_us)
         velocity = _velocity(element, staff_dynamics, offset)
+        fingers = _fingers(element, len(pitches)) if read_fingering else [None] * len(pitches)
 
-        for pitch in pitches:
+        for pitch, finger in zip(pitches, fingers):
             notes.append(
                 ExtractedNote(
                     pitch=pitch,
@@ -420,9 +443,39 @@ def _part_notes(
                     hand=hand,
                     velocity=velocity,
                     confidence=note_confidence(element, pitch),
+                    finger=finger,
                 )
             )
     return notes
+
+
+def _fingers(element: Any, count: int) -> list[Optional[int]]:
+    """The finger (1..5) the score states for each of `element`'s pitches.
+
+    One entry per pitch, in pitch order; ``None`` wherever the score is silent
+    or unclear. Never a guess (M27-D):
+
+    * a single note takes its fingering only when it has exactly one;
+    * a chord's fingerings are listed in the order of its notes, so they are
+      assigned one to one only when there are exactly as many as notes —
+      otherwise there is no telling which note each belongs to;
+    * a substitution (``2-1``) or an alternate fingering anywhere on the
+      element makes it unclear, and so does a number outside 1..5.
+
+    A tied note needs nothing special: ties are merged before this runs, and
+    the merged note keeps the marks of its first segment.
+    """
+    none: list[Optional[int]] = [None] * count
+    marks = [a for a in element.articulations if isinstance(a, articulations.Fingering)]
+    if len(marks) != count:
+        return none
+    if any(getattr(m, "substitution", False) or getattr(m, "alternate", False) for m in marks):
+        return none
+    out: list[Optional[int]] = []
+    for mark in marks:
+        number = mark.fingerNumber
+        out.append(number if isinstance(number, int) and 1 <= number <= 5 else None)
+    return out
 
 
 def _pitches(element: Any, report: ConversionReport) -> list[int]:

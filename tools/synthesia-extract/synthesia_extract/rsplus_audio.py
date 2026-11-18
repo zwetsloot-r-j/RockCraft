@@ -296,6 +296,7 @@ def _moved(n: ExtractedNote, start_us: int, end_us: int) -> ExtractedNote:
         hand=n.hand,
         velocity=n.velocity,
         confidence=n.confidence,
+        finger=n.finger,
     )
 
 

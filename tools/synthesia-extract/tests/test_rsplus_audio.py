@@ -233,6 +233,14 @@ def test_hands_are_kept():
     assert {n.pitch: n.hand for n in out} == {48: Hand.LEFT, 67: Hand.RIGHT}
 
 
+def test_fingers_are_kept():
+    # M27-D: moving a note back to its audio attack keeps its finger.
+    fingered = _note(48, 1050, 300)
+    fingered.finger = 2
+    out, _ = anchor_notes([fingered, _note(67, 1000, 300)], [_att(48, 1000), _att(67, 1000)])
+    assert {n.pitch: n.finger for n in out} == {48: 2, 67: None}
+
+
 def test_detect_attacks_names_the_pitches_of_a_chord():
     truth = [
         SynthNote(p, 300_000, 500_000, "Right", velocity=90) for p in (48, 55, 64)

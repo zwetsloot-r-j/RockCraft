@@ -53,6 +53,12 @@ pub struct ExtractedNote {
     /// Extractor confidence 0.0..=1.0. Used in the M6-E review step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence: Option<f32>,
+    /// Finger number the source states for this note, 1 (thumb) to 5 (M27-D).
+    /// `None` — the usual case — when the source gives none or is unclear.
+    /// Kept as a raw number so one odd value from a sidecar cannot fail a whole
+    /// import; values outside 1..=5 are ignored when the bundle is written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finger: Option<u8>,
 }
 
 /// Which hand played a note, as determined by the extractor.
