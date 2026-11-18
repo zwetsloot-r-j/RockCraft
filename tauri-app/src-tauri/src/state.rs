@@ -459,6 +459,39 @@ fn write_bundle(
 /// untouched — splitting is non-destructive.
 ///
 /// Returns the created bundle directory paths as strings.
+/// Write the open piece as MusicXML sheet music to `path` (M22-B); `.musicxml`
+/// is appended when the path has no extension. Returns the path written.
+/// Paired with [`HostCommand::ExportScore`](rockcraft_control::HostCommand::ExportScore).
+pub fn export_score(state: &AppState, path: &str) -> Result<String, String> {
+    let composer = state.composer.lock().expect("composer mutex poisoned");
+    let notes: Vec<rockcraft_core::Note> = composer.timeline().notes().map(|(_, n)| *n).collect();
+    let grid = composer.grid();
+    let hand_split = composer.hand_split();
+    let bar_starts = composer.bar_starts().to_vec();
+    drop(composer);
+    let key = *state.key.lock().expect("key mutex poisoned");
+    let current_dir = state
+        .current_dir
+        .lock()
+        .expect("current_dir mutex poisoned")
+        .clone();
+    let title = rockcraft_export::title_from_bundle_dir(current_dir.as_deref());
+
+    rockcraft_export::export_score_file(
+        &rockcraft_export::ScoreSource {
+            notes: &notes,
+            grid: &grid,
+            bar_starts: &bar_starts,
+            key: Some(key),
+            hand_split,
+            title: &title,
+        },
+        std::path::Path::new(path),
+    )
+    .map(|p| p.to_string_lossy().into_owned())
+    .map_err(|e| e.to_string())
+}
+
 pub fn split_bundle(state: &AppState, segments: Vec<SplitSegment>) -> Result<Vec<String>, String> {
     split_bundle_into(state, &rockcraft_midi::bundle::library_root(), segments)
 }
@@ -1696,6 +1729,33 @@ mod tests {
             .expect("dragged note reloaded");
         assert_eq!(dragged.start_us, moved.1);
         assert_eq!(dragged.hand, Some(rockcraft_core::Hand::Left));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn export_score_writes_musicxml_and_refuses_an_empty_piece() {
+        let dir = temp_dir("export-score");
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = AppState::new();
+        let target = dir.join("sheet");
+        assert_eq!(
+            export_score(&state, &target.to_string_lossy()).unwrap_err(),
+            "nothing to export"
+        );
+
+        run_action(&state, "add_note", &json!({})).expect("add_note");
+        run_action(&state, "set_note_finger", &json!({ "finger": 2 })).expect("finger");
+        run_action(&state, "cursor_right", &json!({})).expect("cursor");
+        run_action(&state, "add_note", &json!({})).expect("add_note 2");
+
+        let written = export_score(&state, &target.to_string_lossy()).expect("export");
+        assert!(written.ends_with("sheet.musicxml"), "got {written}");
+        let doc = std::fs::read_to_string(&written).unwrap();
+        assert!(doc.contains("<score-partwise"));
+        assert!(doc.contains("<work-title>Untitled</work-title>"));
+        assert_eq!(doc.matches("<step>C</step>").count(), 2);
+        assert!(doc.contains("<fingering>2</fingering>"));
 
         std::fs::remove_dir_all(&dir).ok();
     }

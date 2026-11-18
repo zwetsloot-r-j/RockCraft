@@ -36,6 +36,7 @@ import {
   editClearVideo,
   editQueryBackgrounds,
   editQueryBacking,
+  editExportScore,
   editQueryVideo,
   editSetBacking,
   editSetVideo,
@@ -53,6 +54,7 @@ import {
   queryState,
   runAction,
   saveBundle,
+  saveScorePicker,
   splitBundle,
   transcriptionLoad,
 } from "../../ipc/bridge";
@@ -1015,6 +1017,22 @@ export function EditScreen(props: Props): JSX.Element {
     flashTimeout = window.setTimeout(() => setSaveFlash(null), 2500);
   }
 
+  /**
+   * Export the piece as sheet music (M22-B): pick a file, write MusicXML.
+   * Named after the open bundle's folder; a cancelled dialog does nothing.
+   */
+  function exportScore(): void {
+    const name = props.dir?.split(/[\\/]/).filter(Boolean).pop() ?? "Untitled";
+    void saveScorePicker(name)
+      .then((path) => {
+        if (path === null) return;
+        return editExportScore(path).then((written) => {
+          showFlash(`exported → ${written.split(/[\\/]/).pop() ?? written}`);
+        });
+      })
+      .catch((err) => showFlash(`export failed: ${String(err)}`));
+  }
+
   let inferringTempo = false;
   function inferTempoMap(anchorUs: number): void {
     if (inferringTempo) return;
@@ -1915,6 +1933,13 @@ export function EditScreen(props: Props): JSX.Element {
           setDirty(reply.dirty);
         });
       }
+      return;
+    }
+    // `N` exports the piece as sheet music — "notation" (M22-B). The spec's
+    // `Y` already toggles the backing audio.
+    if (e.key === "N" && s.chord_preview === null && !splitMode()) {
+      e.preventDefault();
+      exportScore();
       return;
     }
     if (e.key === "B" && s.chord_preview === null && !splitMode()) {
@@ -3282,6 +3307,7 @@ function HelpOverlay(props: { onClose: () => void }): JSX.Element {
       rows: [
         "s             Save (over the opened bundle; new piece → recordings/)",
         "S             Save to library (named)",
+        "N             Export sheet music (MusicXML)",
         "E             Save, then Play from the cursor's bar (paused)",
         "?             Toggle help",
         "Esc           Back to menu (save prompt if dirty)",

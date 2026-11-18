@@ -27,6 +27,7 @@ rockcraft-audio.workspace = true
 rockcraft-control.workspace = true
 rockcraft-import.workspace = true
 rockcraft-share.workspace = true
+rockcraft-export.workspace = true
 # Host-command results are JSON values dispatched through the control seam.
 serde_json = { workspace = true }
 ratatui = "0.29"

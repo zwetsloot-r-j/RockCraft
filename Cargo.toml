@@ -8,6 +8,7 @@ members = [
     "crates/control",
     "crates/import",
     "crates/share",
+    "crates/export",
     "tauri-app/src-tauri",
 ]
 
@@ -28,6 +29,7 @@ rockcraft-audio = { path = "crates/audio" }
 rockcraft-control = { path = "crates/control" }
 rockcraft-import = { path = "crates/import" }
 rockcraft-share = { path = "crates/share" }
+rockcraft-export = { path = "crates/export" }
 
 # Serialization (core uses these for RecordingMeta / meta.json; no hardware dep)
 serde = { version = "1", features = ["derive"] }

@@ -97,6 +97,18 @@ One-time setup:
      your `PATH`. Without a configured hook, only **Import from video file…** is
      offered.
 
+## Printing sheet music
+
+In the desktop editor press `N` and choose a file: RockCraft writes the piece as
+MusicXML. Open the `.musicxml` in MuseScore (free) or any other notation
+program, then File → Print or Export PDF. Agents use the `export_score` host
+command, which the TUI answers too.
+
+The right hand goes on the treble staff and the left on the bass, with the key,
+time signature, tempo marks and any finger numbers. First-version limits: notes
+are rounded to sixteenths, each hand is a single voice (a held note under a
+moving line is cut short), and there are no triplets, pedal or dynamics.
+
 ## Agent control interface (drive it programmatically)
 
 A running RockCraft can expose a **localhost-only WebSocket** so an AI agent (or
