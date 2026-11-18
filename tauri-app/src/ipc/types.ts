@@ -415,6 +415,8 @@ export interface PlaySpan {
   start: number;
   /** End in milliseconds. */
   end: number;
+  /** Finger number 1–5 (M27-C); absent when the note has none. */
+  finger?: number;
   /**
    * The **effective** hand that plays this note (M14-E): the piece's per-note
    * override when it has one, else its split line. `core` resolves it, so the

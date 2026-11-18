@@ -13,6 +13,8 @@ export interface NoteSpan {
   start: number;
   end: number;
   hand: "L" | "R";
+  /** Finger number 1–5 (M27-C); absent when the note has none. */
+  finger?: number;
 }
 
 export interface SongData {

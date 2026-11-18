@@ -24,6 +24,8 @@ export function songFromInfo(info: PlayInfo): SongData {
       start: n.start,
       end: n.end,
       hand: (n.hand === "left" ? "L" : "R") as "L" | "R",
+      // Finger number (M27-C): passed through only when the piece gives one.
+      ...(n.finger != null ? { finger: n.finger } : {}),
     }))
     // Sort by start so the highway engine can binary-search the visible
     // window (viewport culling for dense charts). The engine also sorts

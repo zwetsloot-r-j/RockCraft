@@ -26,8 +26,8 @@ use std::sync::Mutex;
 
 use rockcraft_core::{
     backing_position_us, hand::hand_of_pitch_value, interleave_by_time, order_triggers, score,
-    song_shift_us, BackgroundImage, BarMap, Bpm, ExpectedNote, Feedback, GateState, Hand,
-    HandOverride, LiveScorer, LoopPhase, LoopStep, MidiNote, NoteEvent, NoteEventKind,
+    song_shift_us, BackgroundImage, BarMap, Bpm, ExpectedNote, Feedback, Finger, GateState, Hand,
+    HandOverride, LiveScorer, LoopPhase, LoopStep, MidiNote, NoteEvent, NoteEventKind, NoteFinger,
     NoteJudgment, Pass, PlayClock, PracticeLoop, RecordingMeta, ScoreConfig, ScoreReport,
     SongAudio, SpanTrigger, Summary, SustainEvent, SynthBus, Timing, Transform, WaitGate,
     DEFAULT_SPLIT,
@@ -81,6 +81,9 @@ pub struct NoteSpan {
     /// The piece's per-note hand exception (M14-E), read from `meta.json` at
     /// load. `None` — the common case — means the note follows the split line.
     pub hand: Option<Hand>,
+    /// The note's finger number (M27-C), read from `meta.json` at load. Shown on
+    /// the highway; nothing here reads it for scoring or practice.
+    pub finger: Option<Finger>,
 }
 
 impl NoteSpan {
@@ -198,6 +201,9 @@ pub struct SpanView {
     pub end: f64,
     /// `"left"` | `"right"` — `Hand`'s wire name.
     pub hand: Hand,
+    /// Finger number 1–5 (M27-C); absent on the wire when the note has none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finger: Option<Finger>,
 }
 
 /// One judged note, surfaced once so the webview can fire a decaying one-shot
@@ -431,6 +437,7 @@ fn build_spans(events: &[NoteEvent]) -> Vec<NoteSpan> {
                         start_us: start,
                         end_us: ev.timestamp_us,
                         hand: None,
+                        finger: None,
                     });
                 }
                 open.insert(pitch, ev.timestamp_us);
@@ -442,6 +449,7 @@ fn build_spans(events: &[NoteEvent]) -> Vec<NoteSpan> {
                         start_us: start,
                         end_us: ev.timestamp_us,
                         hand: None,
+                        finger: None,
                     });
                 }
             }
@@ -454,6 +462,7 @@ fn build_spans(events: &[NoteEvent]) -> Vec<NoteSpan> {
             start_us: start,
             end_us: last_us.max(start + 1),
             hand: None,
+            finger: None,
         });
     }
 
@@ -778,6 +787,21 @@ impl PlaySession {
         self
     }
 
+    /// Attach the piece's finger numbers (M27-C). Keyed and matched exactly like
+    /// the hand overrides in [`PlaySession::with_hands`]: by the note's original
+    /// `(pitch, start_us)`, before the pre-roll shift.
+    pub fn with_fingers(mut self, fingers: &[NoteFinger]) -> Self {
+        let shift_us = self.shift_us;
+        for span in &mut self.spans {
+            let original_start = span.start_us.saturating_sub(shift_us);
+            span.finger = fingers
+                .iter()
+                .find(|f| f.pitch == span.note && f.start_us == original_start)
+                .map(|f| f.finger);
+        }
+        self
+    }
+
     /// Attach a background video resolved from the bundle's `meta.json` (M9-G).
     pub fn with_video(mut self, path: PathBuf, offset_us: i64) -> Self {
         self.video = Some(BackgroundVideoSession { path, offset_us });
@@ -861,6 +885,7 @@ impl PlaySession {
                     start: s.start_us as f64 / 1000.0,
                     end: s.end_us as f64 / 1000.0,
                     hand: s.effective_hand(self.split_pitch),
+                    finger: s.finger,
                 })
                 .collect(),
             shift_us: self.shift_us,
@@ -1951,6 +1976,7 @@ fn load_session_from_dir(dir: &Path) -> Result<PlaySession, String> {
         // Hand assignment first: it sets `split_pitch`, and every later
         // hand-aware read (practice gate, scoring, colouring) goes through it.
         session = session.with_hands(&meta.hand_overrides, meta.split_or_default());
+        session = session.with_fingers(&meta.fingers);
         session = session.with_bar_starts(&meta.bar_starts);
         if let Some(backing) = meta.backing {
             session = session.with_backing(dir.join(&backing.file), backing.audio_start_us);
@@ -3422,6 +3448,81 @@ mod tests {
         let info = s.info();
         assert_eq!(info.notes[0].hand, Hand::Left, "override wins");
         assert_eq!(info.notes[1].hand, Hand::Right, "split rule for the rest");
+    }
+
+    // ── finger numbers (M27-C) ───────────────────────────────────────────────
+
+    /// The fixture with finger 2 on its first note (C4 = 60, file start 0).
+    fn fingered_session() -> PlaySession {
+        let fingers = [
+            NoteFinger {
+                pitch: 60,
+                start_us: 0,
+                finger: Finger::new(2).unwrap(),
+            },
+            // No note here: ignored.
+            NoteFinger {
+                pitch: 99,
+                start_us: 123,
+                finger: Finger::new(5).unwrap(),
+            },
+        ];
+        PlaySession::from_events("test".into(), &four_note_events()).with_fingers(&fingers)
+    }
+
+    #[test]
+    fn with_fingers_matches_the_pre_shift_position() {
+        let s = fingered_session();
+        let first = s.spans.first().expect("fixture has notes");
+        assert_eq!(first.start_us, SHIFT, "span is shifted by the pre-roll");
+        assert_eq!(first.finger, Finger::new(2));
+        assert!(s.spans[1..].iter().all(|s| s.finger.is_none()));
+    }
+
+    #[test]
+    fn play_info_carries_the_finger_and_omits_it_when_absent() {
+        let info = fingered_session().info();
+        assert_eq!(info.notes[0].finger, Finger::new(2));
+        let json = serde_json::to_value(&info.notes).unwrap();
+        assert_eq!(json[0]["finger"], 2);
+        assert!(
+            json[1].get("finger").is_none(),
+            "a note without a finger has no `finger` key on the wire"
+        );
+    }
+
+    #[test]
+    fn fingers_change_nothing_but_the_finger() {
+        // Same payload as a session without fingers once the finger is ignored:
+        // hands, timing and everything scoring reads are untouched.
+        let plain = PlaySession::from_events("test".into(), &four_note_events());
+        let fingered = fingered_session();
+        let strip = |s: &PlaySession| -> Vec<NoteSpan> {
+            s.spans
+                .iter()
+                .map(|sp| NoteSpan {
+                    finger: None,
+                    ..*sp
+                })
+                .collect()
+        };
+        assert_eq!(strip(&plain), strip(&fingered));
+        assert_eq!(
+            serde_json::to_value(plain.info().notes).unwrap(),
+            serde_json::to_value(
+                PlaySession::from_events("test".into(), &four_note_events())
+                    .with_fingers(&[])
+                    .info()
+                    .notes
+            )
+            .unwrap(),
+            "no fingers = the payload of today"
+        );
+        assert_eq!(
+            expected_notes_for(&plain.spans, None, DEFAULT_SPLIT),
+            expected_notes_for(&fingered.spans, None, DEFAULT_SPLIT),
+            "what is scored does not depend on fingers"
+        );
     }
 
     #[test]
