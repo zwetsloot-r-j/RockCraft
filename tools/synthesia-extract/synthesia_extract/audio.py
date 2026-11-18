@@ -295,6 +295,7 @@ def _fuse_with_stats(
                     hand=note.hand,
                     velocity=DEFAULT_VELOCITY,
                     confidence=note.confidence,
+                    finger=note.finger,
                 )
             )
             continue
@@ -317,6 +318,7 @@ def _fuse_with_stats(
                 hand=note.hand,
                 velocity=best.velocity,
                 confidence=round(min(1.0, base_conf + (1.0 - base_conf) * 0.5), 3),
+                finger=note.finger,
             )
         )
 
@@ -421,6 +423,7 @@ def shift_notes(notes: Sequence[ExtractedNote], delta_us: int) -> list[Extracted
             hand=n.hand,
             velocity=n.velocity,
             confidence=n.confidence,
+            finger=n.finger,
         )
         for n in notes
     ]

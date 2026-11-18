@@ -427,6 +427,14 @@ def test_hand_serialization():
     assert n.to_dict()["hand"] == "Unknown"
 
 
+def test_finger_is_written_only_when_set():
+    # M27-D: an optional 1..5, absent from the JSON unless the source shows one.
+    n = schema.ExtractedNote(pitch=60, start_us=0, dur_us=1)
+    assert "finger" not in n.to_dict()
+    n.finger = 3
+    assert n.to_dict()["finger"] == 3
+
+
 # --------------------------------------------------------------------------- #
 # CLI smoke test (frames directory -> JSON), hermetic (no video codec)
 # --------------------------------------------------------------------------- #

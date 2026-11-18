@@ -15,6 +15,7 @@ stderr.
 Usage:
     python convert.py --in <score-file|scan> --out <chart.json>|- [--title T]
                       [--hand-map 0=right,1=left] [--no-dynamics]
+                      [--no-fingering]
 
 **stdout carries only the JSON.** Warnings, dropped-element counts, engine
 output and the summary all go to stderr, because ``crates/import``'s
@@ -50,6 +51,10 @@ def main(argv: list[str] | None = None) -> int:
         help="do not read velocity from the notated dynamics; leave every note to "
         "the importer's default velocity, as before M13-D",
     )
+    parser.add_argument(
+        "--no-fingering", dest="read_fingering", action="store_false",
+        help="do not read finger numbers from the score's fingering marks",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -64,6 +69,7 @@ def main(argv: list[str] | None = None) -> int:
             hand_map=hand_map,
             title=args.title,
             read_dynamics=args.read_dynamics,
+            read_fingering=args.read_fingering,
         )
     except FileNotFoundError as e:
         print(f"error: {e}", file=sys.stderr)

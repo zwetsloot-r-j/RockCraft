@@ -117,6 +117,14 @@ ML and no inference on this path.
   has neither, so the synth is the only sound. `mf` maps to the parser's
   `DEFAULT_VELOCITY`, and a passage with no dynamic in effect stays `null`, so a
   score with no markings sounds exactly as it did before the pass existed.
+- **Finger numbers from fingering marks**: a note takes the finger (1–5) the
+  score prints for it, and only where that is unambiguous — exactly one
+  fingering on a single note, or a chord with one fingering per note. A finger
+  substitution, an alternate fingering, a partly fingered chord or a number
+  outside 1–5 leaves the note without one. They land in the bundle's
+  `meta.fingers` and show on the notes in edit and play. `--no-fingering` on the
+  sidecar skips the pass. The chart's optional per-note `finger` field is the
+  same on the video path, which does not fill it yet.
 - **Single-tempo limitation**: note times are absolute microseconds and stay
   correct across a tempo change, but `core::Grid` holds one BPM, so the editor's
   bar lines drift after the first change. Such a score imports with a loud

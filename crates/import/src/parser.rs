@@ -1,5 +1,6 @@
 use rockcraft_core::{
-    hand::hand_of_pitch_value, HandOverride, MidiNote, Note, Timeline, Velocity, DEFAULT_SPLIT,
+    hand::hand_of_pitch_value, Finger, HandOverride, MidiNote, Note, NoteFinger, Timeline,
+    Velocity, DEFAULT_SPLIT,
 };
 
 use crate::{
@@ -96,6 +97,38 @@ pub fn hand_assignment(chart: &ExtractedChart) -> Option<HandAssignment> {
     Some(HandAssignment { split, overrides })
 }
 
+/// The finger numbers a chart states (M27-D), ready for `meta.json`: one entry
+/// per note with a valid finger (1..=5), sorted by `(start_us, pitch)`.
+///
+/// Out-of-range values are dropped. So is any position where two chart notes
+/// share `(pitch, start_us)` but disagree — an unclear finger is no finger.
+pub fn finger_assignment(chart: &ExtractedChart) -> Vec<NoteFinger> {
+    use std::collections::BTreeMap;
+    // (start_us, pitch) -> the finger there, or None once two notes disagree.
+    let mut at: BTreeMap<(u64, u8), Option<Finger>> = BTreeMap::new();
+    for note in &chart.notes {
+        let Some(finger) = note.finger.and_then(Finger::new) else {
+            continue;
+        };
+        at.entry((note.start_us, note.pitch))
+            .and_modify(|seen| {
+                if *seen != Some(finger) {
+                    *seen = None;
+                }
+            })
+            .or_insert(Some(finger));
+    }
+    at.into_iter()
+        .filter_map(|((start_us, pitch), finger)| {
+            finger.map(|finger| NoteFinger {
+                pitch,
+                start_us,
+                finger,
+            })
+        })
+        .collect()
+}
+
 fn note_velocity(note: &ExtractedNote) -> Option<Velocity> {
     let raw = note.velocity.unwrap_or(DEFAULT_VELOCITY);
     Velocity::new(raw)
@@ -134,6 +167,7 @@ mod tests {
             hand: Hand::Right,
             velocity: None,
             confidence: None,
+            finger: None,
         }
     }
 
@@ -155,6 +189,7 @@ mod tests {
                 hand: Hand::Right,
                 velocity: Some(100),
                 confidence: None,
+                finger: None,
             },
             ExtractedNote {
                 pitch: 64,
@@ -163,6 +198,7 @@ mod tests {
                 hand: Hand::Right,
                 velocity: Some(90),
                 confidence: None,
+                finger: None,
             },
         ]);
         let timeline = chart_to_timeline(&chart).unwrap();
@@ -249,5 +285,80 @@ mod tests {
         n.hand = Hand::Unknown;
         let chart = chart_with_notes(vec![n]);
         assert!(chart_to_timeline(&chart).is_ok());
+    }
+
+    // ── finger numbers (M27-D) ───────────────────────────────────────────────
+
+    fn fingered(pitch: u8, start_us: u64, finger: Option<u8>) -> ExtractedNote {
+        ExtractedNote {
+            finger,
+            ..handed(pitch, start_us, Hand::Unknown)
+        }
+    }
+
+    fn chart_of(notes: Vec<ExtractedNote>) -> ExtractedChart {
+        chart_with_notes(notes)
+    }
+
+    #[test]
+    fn finger_assignment_keeps_valid_fingers_sorted() {
+        let chart = chart_of(vec![
+            fingered(64, 2_000, Some(5)),
+            fingered(60, 1_000, Some(1)),
+            fingered(62, 1_000, None),
+            fingered(55, 1_000, Some(3)),
+        ]);
+        let got: Vec<(u64, u8, u8)> = finger_assignment(&chart)
+            .iter()
+            .map(|f| (f.start_us, f.pitch, f.finger.get()))
+            .collect();
+        assert_eq!(got, vec![(1_000, 55, 3), (1_000, 60, 1), (2_000, 64, 5)]);
+    }
+
+    #[test]
+    fn finger_assignment_drops_out_of_range_values() {
+        let chart = chart_of(vec![
+            fingered(60, 0, Some(0)),
+            fingered(62, 0, Some(9)),
+            fingered(64, 0, Some(2)),
+        ]);
+        let got = finger_assignment(&chart);
+        assert_eq!(got.len(), 1);
+        assert_eq!((got[0].pitch, got[0].finger.get()), (64, 2));
+    }
+
+    #[test]
+    fn finger_assignment_drops_a_position_whose_notes_disagree() {
+        let chart = chart_of(vec![
+            fingered(60, 0, Some(1)),
+            fingered(60, 0, Some(2)),
+            // Agreeing duplicates are fine.
+            fingered(62, 0, Some(4)),
+            fingered(62, 0, Some(4)),
+        ]);
+        let got = finger_assignment(&chart);
+        assert_eq!(got.len(), 1);
+        assert_eq!((got[0].pitch, got[0].finger.get()), (62, 4));
+    }
+
+    #[test]
+    fn a_chart_without_fingers_assigns_none() {
+        let chart = chart_of(vec![fingered(60, 0, None)]);
+        assert!(finger_assignment(&chart).is_empty());
+    }
+
+    #[test]
+    fn finger_is_optional_on_the_wire() {
+        let without = r#"{"pitch":60,"start_us":0,"dur_us":10,"hand":"Unknown"}"#;
+        let note: ExtractedNote = serde_json::from_str(without).unwrap();
+        assert_eq!(note.finger, None);
+        assert!(!serde_json::to_string(&note).unwrap().contains("finger"));
+
+        let with = r#"{"pitch":60,"start_us":0,"dur_us":10,"hand":"Unknown","finger":3}"#;
+        let note: ExtractedNote = serde_json::from_str(with).unwrap();
+        assert_eq!(note.finger, Some(3));
+        assert!(serde_json::to_string(&note)
+            .unwrap()
+            .contains(r#""finger":3"#));
     }
 }

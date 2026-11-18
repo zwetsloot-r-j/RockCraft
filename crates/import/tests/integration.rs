@@ -17,6 +17,7 @@ fn c_major_scale() -> ExtractedChart {
             hand: Hand::Right,
             velocity: None,
             confidence: None,
+            finger: None,
         })
         .collect();
     ExtractedChart {

@@ -12,7 +12,7 @@ use serde::Serialize;
 
 use crate::{
     error::ImportError,
-    parser::{chart_to_timeline, hand_assignment},
+    parser::{chart_to_timeline, finger_assignment, hand_assignment},
     schema::{ExtractedChart, NotationMeta, SourceMeta},
 };
 
@@ -100,6 +100,8 @@ pub fn write_chart_bundle_full(
         meta.hand_split = Some(hands.split);
         meta.hand_overrides = hands.overrides;
     }
+    // Finger numbers the source stated (M27-D); empty for most imports.
+    meta.fingers = finger_assignment(chart);
     std::fs::write(dir.join("meta.json"), meta.to_json())?;
 
     // When the bundle carries a source movie and the extractor measured the
@@ -356,6 +358,7 @@ mod tests {
                 hand: Hand::Right,
                 velocity: Some(80),
                 confidence: None,
+                finger: None,
             }],
             source,
             notation: None,
@@ -514,6 +517,7 @@ mod tests {
             hand,
             velocity: None,
             confidence: None,
+            finger: None,
         };
         chart.notes = vec![
             note(41, 1_000, Hand::Left),
@@ -540,6 +544,58 @@ mod tests {
         let mut timeline = rockcraft_core::Timeline::from_events(&smf_events(&smf));
         timeline.apply_hand_overrides(&meta.hand_overrides);
         assert_eq!(timeline.hand_overrides(), pinned);
+    }
+
+    /// Finger numbers the chart states land in `meta.json`, keyed so the
+    /// reloaded `song.mid` gets them back on the right notes (M27-D).
+    #[test]
+    fn stated_fingers_are_written_and_reapply_to_the_reloaded_notes() {
+        let tmp = TempDir::new().unwrap();
+        let mut chart = chart_with_source(geometry_source());
+        let note = |pitch, start_us, finger| ExtractedNote {
+            pitch,
+            start_us,
+            dur_us: 200_000,
+            hand: Hand::Unknown,
+            velocity: None,
+            confidence: None,
+            finger,
+        };
+        chart.notes = vec![
+            note(60, 1_000, Some(1)),
+            note(64, 250_000, None),
+            note(67, 500_000, Some(5)),
+            note(72, 750_000, Some(7)), // not a finger: ignored
+        ];
+        write_chart_bundle(&chart, tmp.path()).unwrap();
+        let meta = RecordingMeta::from_json(
+            &std::fs::read_to_string(tmp.path().join("meta.json")).unwrap(),
+        )
+        .unwrap();
+        let got: Vec<(u8, u64, u8)> = meta
+            .fingers
+            .iter()
+            .map(|f| (f.pitch, f.start_us, f.finger.get()))
+            .collect();
+        assert_eq!(got, vec![(60, 1_000, 1), (67, 500_000, 5)]);
+
+        let smf = std::fs::read(tmp.path().join("song.mid")).unwrap();
+        let mut timeline = rockcraft_core::Timeline::from_events(&smf_events(&smf));
+        timeline.apply_fingers(&meta.fingers);
+        assert_eq!(timeline.fingers(), meta.fingers);
+    }
+
+    /// A chart with no fingers writes an empty list.
+    #[test]
+    fn a_chart_without_fingers_writes_none() {
+        let tmp = TempDir::new().unwrap();
+        let chart = chart_with_source(geometry_source());
+        write_chart_bundle(&chart, tmp.path()).unwrap();
+        let meta = RecordingMeta::from_json(
+            &std::fs::read_to_string(tmp.path().join("meta.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(meta.fingers.is_empty());
     }
 
     /// `song.mid` back to note events (1 tick = 1 µs, as written).

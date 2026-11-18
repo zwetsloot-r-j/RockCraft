@@ -52,6 +52,7 @@ class ExtractedNote:
     hand: Hand = Hand.UNKNOWN
     velocity: Optional[int] = None  # only when the source states one
     confidence: Optional[float] = None  # 1.0 for a score: the transform is exact
+    finger: Optional[int] = None  # 1..5, only when the score states one clearly
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -65,6 +66,8 @@ class ExtractedNote:
             out["velocity"] = int(self.velocity)
         if self.confidence is not None:
             out["confidence"] = float(self.confidence)
+        if self.finger is not None:
+            out["finger"] = int(self.finger)
         return out
 
 
