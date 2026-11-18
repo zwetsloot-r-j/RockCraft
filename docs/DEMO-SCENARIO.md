@@ -87,6 +87,7 @@ Before driving anything, learn the vocabulary live.
 | 5 | `set_cursor {pitch:60, step:0}` → `add_note {}` | navigate, then `a` | root C4 at step 0: dur 125 000, velocity 80 |
 | 6 | `resize_note {delta_steps:1}` | `]` (`[` shortens) | C4 duration → 2 steps (250 000) |
 | 7 | `adjust_velocity {delta:8}` | `+` / `=` (`-` lowers) | C4 velocity → 88 |
+| 7b | `set_note_finger {finger:1}` → `clear_note_finger {}` | — (edit keys arrive with M27-B) | C4 shows finger 1, then none again |
 
 ## Act 3 — Navigate every which way
 

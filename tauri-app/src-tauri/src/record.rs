@@ -135,6 +135,7 @@ impl RecordSession {
             backgrounds: Vec::new(),
             hand_split: None,
             hand_overrides: Vec::new(),
+            fingers: Vec::new(),
             bar_starts: Vec::new(),
             version: 1,
         };
@@ -517,6 +518,7 @@ mod tests {
             backgrounds: Vec::new(),
             hand_split: None,
             hand_overrides: Vec::new(),
+            fingers: Vec::new(),
             bar_starts: Vec::new(),
             version: 1,
         };

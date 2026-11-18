@@ -185,6 +185,7 @@ mod tests {
             dur_us: 500_000,
             velocity: Velocity::new(80).unwrap(),
             hand: None,
+            finger: None,
         });
         let mut edit = EditScreen::from_timeline(tl, Grid::default_120());
         let dir = edit.save_to_library(&root, name).expect("save");
@@ -231,6 +232,7 @@ mod tests {
                 dur_us: 500_000,
                 velocity: Velocity::new(80).unwrap(),
                 hand: None,
+                finger: None,
             });
             crate::edit::EditScreen::from_timeline(tl, Grid::default_120())
                 .save_to_library(&root, &format!("song{i:02}"))

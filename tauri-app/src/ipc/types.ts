@@ -63,6 +63,11 @@ export interface NoteView {
    * {@link ComposerSnapshot.hand_split} — see `screens/edit/hand.ts`.
    */
   hand?: Hand | null;
+  /**
+   * The note's finger number (M27-A), 1 (thumb) to 5 (little finger);
+   * `null`/absent means it has none. Display only.
+   */
+  finger?: number | null;
 }
 
 /** The active selection rectangle — mirror of `composer::SelectionView`. */
@@ -357,6 +362,9 @@ export type ActionName =
   | "set_hand_split"
   | "set_note_hand"
   | "cycle_note_hand"
+  // ── finger numbers (M27-A) ──────────────────────────────────────────
+  | "set_note_finger"
+  | "clear_note_finger"
   // ── time / structure (ripple insert & cut) ──────────────────────────
   | "insert_bar"
   | "remove_bar"

@@ -16,6 +16,7 @@
 use std::collections::BTreeMap;
 
 use crate::events::{MidiNote, NoteEvent, NoteEventKind, Velocity};
+use crate::finger::{Finger, NoteFinger};
 use crate::hand::{hand_of, Hand, HandOverride};
 
 /// Opaque, stable handle to a note inside a [`Timeline`].
@@ -45,6 +46,10 @@ pub struct Note {
     /// where the split sits. Never written to `song.mid`: it round-trips
     /// through `meta.json` (see [`crate::HandOverride`]).
     pub hand: Option<Hand>,
+    /// Which finger plays the note (M27-A). `None` — the default — shows no
+    /// number. A reading aid only; like `hand` it never reaches `song.mid` and
+    /// round-trips through `meta.json` (see [`crate::NoteFinger`]).
+    pub finger: Option<Finger>,
 }
 
 impl Note {
@@ -311,6 +316,47 @@ impl Timeline {
         }
     }
 
+    /// Set (or clear, with `None`) a note's finger number. Returns false if
+    /// `id` is unknown.
+    pub fn set_finger(&mut self, id: NoteId, finger: Option<Finger>) -> bool {
+        match self.notes.get_mut(&id.0) {
+            Some(note) => {
+                note.finger = finger;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Every fingered note as a persistable [`NoteFinger`], sorted by
+    /// `(start_us, pitch)` so a saved `meta.json` is stable across re-saves.
+    pub fn fingers(&self) -> Vec<NoteFinger> {
+        let mut out: Vec<NoteFinger> = self
+            .notes
+            .values()
+            .filter_map(|note| {
+                note.finger.map(|finger| NoteFinger {
+                    pitch: note.pitch.value(),
+                    start_us: note.start_us,
+                    finger,
+                })
+            })
+            .collect();
+        out.sort_by_key(|f| (f.start_us, f.pitch));
+        out
+    }
+
+    /// Re-apply persisted finger numbers after a reload, matching each entry to
+    /// the note at exactly `(pitch, start_us)`. Entries with no matching note
+    /// are silently ignored, as in [`Timeline::apply_hand_overrides`].
+    pub fn apply_fingers(&mut self, fingers: &[NoteFinger]) {
+        for f in fingers {
+            if let Some(id) = self.find_starting_at(f.pitch, f.start_us) {
+                self.set_finger(id, Some(f.finger));
+            }
+        }
+    }
+
     /// The note *starting* exactly at `(pitch, start_us)`, if any — the key
     /// persisted overrides are matched on. On overlap the highest-id (most
     /// recently inserted) note wins, mirroring [`Timeline::find_at`].
@@ -458,6 +504,8 @@ impl Timeline {
                 // `song.mid` carries no per-note hand; overrides are re-applied
                 // from `meta.json` via `apply_hand_overrides`.
                 hand: None,
+                // Likewise the finger, via `apply_fingers`.
+                finger: None,
             });
         };
 
@@ -507,6 +555,7 @@ mod tests {
             dur_us,
             velocity: Velocity::new(vel).unwrap(),
             hand: None,
+            finger: None,
         }
     }
 
@@ -772,6 +821,7 @@ mod tests {
             dur_us: 100,
             velocity: v,
             hand: None,
+            finger: None,
         };
         // Inside region [60..=64] × [1000..5000)
         let a = tl.insert(mk(60, 1_000)); // pitch_lo, us_lo — inclusive
@@ -801,6 +851,7 @@ mod tests {
                 dur_us: 100,
                 velocity: v,
                 hand: None,
+                finger: None,
             },
             Note {
                 pitch: MidiNote::new(60).unwrap(),
@@ -808,6 +859,7 @@ mod tests {
                 dur_us: 100,
                 velocity: v,
                 hand: None,
+                finger: None,
             },
             Note {
                 pitch: MidiNote::new(127).unwrap(),
@@ -815,6 +867,7 @@ mod tests {
                 dur_us: 100,
                 velocity: v,
                 hand: None,
+                finger: None,
             },
         ];
         // Shift +2 semitones, +1000 µs: 0→2, 60→62, 127→129 (out of range, dropped).
@@ -840,6 +893,7 @@ mod tests {
             dur_us: 100,
             velocity: v,
             hand: None,
+            finger: None,
         };
         let ids2 = tl.insert_shifted(&[low], -3, 0);
         assert_eq!(ids2.len(), 0, "pitch 2-3=-1 must be dropped");
@@ -994,5 +1048,108 @@ mod tests {
         let ids = tl.insert_shifted(&[src], 0, 4_000);
         assert_eq!(ids.len(), 1);
         assert_eq!(tl.get(ids[0]).unwrap().hand, Some(Hand::Right));
+    }
+
+    // ── per-note finger (M27-A) ──────────────────────────────────────────────
+
+    fn finger(n: u8) -> Finger {
+        Finger::new(n).unwrap()
+    }
+
+    #[test]
+    fn set_finger_sets_clears_and_reports_whether_the_id_existed() {
+        let mut tl = Timeline::new();
+        let id = tl.insert(note(60, 0, 500, 100));
+        assert_eq!(tl.get(id).unwrap().finger, None, "a fresh note has none");
+        assert!(tl.set_finger(id, Some(finger(3))));
+        assert_eq!(tl.get(id).unwrap().finger, Some(finger(3)));
+        assert!(tl.set_finger(id, None));
+        assert_eq!(tl.get(id).unwrap().finger, None);
+        tl.remove(id);
+        assert!(!tl.set_finger(id, Some(finger(1))));
+    }
+
+    #[test]
+    fn fingers_lists_only_fingered_notes_sorted() {
+        let mut tl = Timeline::new();
+        let a = tl.insert(note(72, 2_000, 500, 100));
+        let b = tl.insert(note(64, 1_000, 500, 100));
+        let c = tl.insert(note(60, 1_000, 500, 100));
+        let _plain = tl.insert(note(50, 0, 500, 100));
+        tl.set_finger(a, Some(finger(5)));
+        tl.set_finger(b, Some(finger(3)));
+        tl.set_finger(c, Some(finger(1)));
+        assert_eq!(
+            tl.fingers(),
+            vec![
+                NoteFinger {
+                    pitch: 60,
+                    start_us: 1_000,
+                    finger: finger(1)
+                },
+                NoteFinger {
+                    pitch: 64,
+                    start_us: 1_000,
+                    finger: finger(3)
+                },
+                NoteFinger {
+                    pitch: 72,
+                    start_us: 2_000,
+                    finger: finger(5)
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_fingers_matches_by_pitch_and_start_and_ignores_stale_entries() {
+        let mut tl = Timeline::new();
+        let target = tl.insert(note(60, 1_000, 500, 100));
+        let other_time = tl.insert(note(60, 2_000, 500, 100));
+        let other_pitch = tl.insert(note(62, 1_000, 500, 100));
+        tl.apply_fingers(&[
+            NoteFinger {
+                pitch: 60,
+                start_us: 1_000,
+                finger: finger(2),
+            },
+            // No note here any more: ignored.
+            NoteFinger {
+                pitch: 90,
+                start_us: 9_000,
+                finger: finger(4),
+            },
+        ]);
+        assert_eq!(tl.get(target).unwrap().finger, Some(finger(2)));
+        assert_eq!(tl.get(other_time).unwrap().finger, None);
+        assert_eq!(tl.get(other_pitch).unwrap().finger, None);
+        assert_eq!(tl.len(), 3);
+    }
+
+    #[test]
+    fn fingers_round_trip_through_events_plus_meta() {
+        let mut tl = Timeline::new();
+        let id = tl.insert(note(60, 1_000, 500, 100));
+        tl.insert(note(64, 2_000, 500, 100));
+        tl.set_finger(id, Some(finger(1)));
+        let saved = tl.fingers();
+        let mut reloaded = Timeline::from_events(&tl.to_events());
+        assert!(
+            reloaded.notes().all(|(_, n)| n.finger.is_none()),
+            "song.mid carries no finger"
+        );
+        reloaded.apply_fingers(&saved);
+        assert_eq!(reloaded.fingers(), saved);
+    }
+
+    #[test]
+    fn insert_shifted_carries_the_finger_to_the_copy() {
+        let mut tl = Timeline::new();
+        let src = Note {
+            finger: Some(finger(4)),
+            ..note(48, 0, 500, 100)
+        };
+        let ids = tl.insert_shifted(&[src], 0, 4_000);
+        assert_eq!(tl.get(ids[0]).unwrap().finger, Some(finger(4)));
     }
 }

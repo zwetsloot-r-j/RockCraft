@@ -78,6 +78,7 @@ pub fn slice_segment(
             velocity: note.velocity,
             // A part keeps the exceptions the author marked on its notes.
             hand: note.hand,
+            finger: note.finger,
         });
     }
 
@@ -144,6 +145,7 @@ mod tests {
             dur_us,
             velocity: Velocity::new(80).unwrap(),
             hand: None,
+            finger: None,
         }
     }
 
@@ -181,6 +183,35 @@ mod tests {
         assert_eq!(
             rows(&out.timeline),
             vec![(62, 0, 100_000), (64, 1_000_000, 100_000)]
+        );
+    }
+
+    #[test]
+    fn a_part_keeps_the_fingers_of_its_notes_rebased() {
+        use crate::finger::{Finger, NoteFinger};
+        let mut tl = Timeline::new();
+        tl.insert(note(60, 0, 100_000));
+        let id = tl.insert(note(62, 1_500_000, 100_000));
+        tl.set_finger(id, Finger::new(4));
+
+        let out = slice_segment(
+            &tl,
+            Segment {
+                start_us: 1_000_000,
+                end_us: 3_000_000,
+            },
+            None,
+            None,
+            &[],
+        );
+
+        assert_eq!(
+            out.timeline.fingers(),
+            vec![NoteFinger {
+                pitch: 62,
+                start_us: 500_000,
+                finger: Finger::new(4).unwrap(),
+            }]
         );
     }
 

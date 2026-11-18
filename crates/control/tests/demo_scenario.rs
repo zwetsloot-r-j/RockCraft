@@ -212,6 +212,13 @@ async fn full_vocabulary_demo_scenario() {
     let r = run(&mut ws, "adjust_velocity", json!({ "delta": 8 })).await;
     assert_eq!(find_pitch(&r, 60).unwrap()["velocity"], 88);
 
+    // Beat 7b — set_note_finger / clear_note_finger: thumb on the root, then
+    // take it off again.
+    let r = run(&mut ws, "set_note_finger", json!({ "finger": 1 })).await;
+    assert_eq!(find_pitch(&r, 60).unwrap()["finger"], 1);
+    let r = run(&mut ws, "clear_note_finger", json!({})).await;
+    assert!(find_pitch(&r, 60).unwrap()["finger"].is_null());
+
     // ════════════════════════════════════════════════════════════════════
     // ACT 3 — Navigate every which way
     // ════════════════════════════════════════════════════════════════════

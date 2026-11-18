@@ -255,6 +255,7 @@ pub fn write_part_bundle(
         // and the exceptions on the notes it kept (M14-E).
         hand_split: Some(hand_split),
         hand_overrides: sliced.timeline.hand_overrides(),
+        fingers: sliced.timeline.fingers(),
         bar_starts: Vec::new(),
         version: 1,
     };

@@ -789,6 +789,7 @@ impl EditScreen {
             // The piece's authored hand assignment (M14-E).
             hand_split: Some(self.composer.hand_split()),
             hand_overrides: self.composer.timeline().hand_overrides(),
+            fingers: self.composer.timeline().fingers(),
             bar_starts: self.composer.bar_starts().to_vec(),
             version: 1,
         };
@@ -1229,7 +1230,8 @@ impl EditScreen {
     }
 
     /// A cheap content fingerprint of the timeline: changes whenever any note
-    /// is added, removed, moved, resized, or has its velocity adjusted.
+    /// is added, removed, moved, resized, has its velocity adjusted, or has its
+    /// hand or finger changed.
     fn timeline_fingerprint(&self) -> u64 {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
@@ -1240,6 +1242,8 @@ impl EditScreen {
             n.start_us.hash(&mut h);
             n.dur_us.hash(&mut h);
             n.velocity.value().hash(&mut h);
+            n.hand.hash(&mut h);
+            n.finger.hash(&mut h);
         }
         h.finish()
     }
@@ -2919,6 +2923,7 @@ mod tests {
             dur_us,
             velocity: Velocity::new(80).unwrap(),
             hand: None,
+            finger: None,
         }
     }
 
@@ -5347,5 +5352,25 @@ mod tests {
         // Esc closes the panel.
         assert_eq!(e.on_split_key(KeyCode::Esc), SplitOutcome::Left);
         assert!(!e.in_split_mode());
+    }
+
+    // ── finger numbers (M27-A) ───────────────────────────────────────────────
+
+    #[test]
+    fn a_finger_or_hand_edit_marks_the_piece_dirty() {
+        use rockcraft_core::Finger;
+        let mut tl = Timeline::new();
+        tl.insert(note(60, 0, 500_000));
+
+        let mut e = EditScreen::from_timeline(tl.clone(), Grid::default_120());
+        assert!(!e.is_dirty());
+        e.dispatch(Action::SetNoteFinger {
+            finger: Finger::new(2).unwrap(),
+        });
+        assert!(e.is_dirty(), "setting a finger is an edit");
+
+        let mut e = EditScreen::from_timeline(tl, Grid::default_120());
+        e.dispatch(Action::CycleNoteHand);
+        assert!(e.is_dirty(), "changing a hand is an edit");
     }
 }

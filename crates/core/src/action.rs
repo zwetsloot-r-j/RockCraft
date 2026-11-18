@@ -15,6 +15,7 @@
 
 use crate::background::Easing;
 use crate::bpm::{Bpm, BpmDelta};
+use crate::finger::Finger;
 use crate::hand::HandSetting;
 use serde::{Deserialize, Serialize};
 
@@ -268,6 +269,17 @@ pub enum Action {
     /// note's, or the first selected note's) to decide the next one.
     CycleNoteHand,
 
+    // ── finger numbers (M27-A) ──────────────────────────────────────────
+    /// Put a finger number (1 = thumb … 5 = little finger) on the target
+    /// notes. Same target as [`Action::SetNoteHand`]: the selection when one is
+    /// active, else the note under the cursor; with neither it is a no-op.
+    /// Display only — it never affects scoring.
+    SetNoteFinger {
+        finger: Finger,
+    },
+    /// Remove the finger number from the same target.
+    ClearNoteFinger,
+
     // ── time / structure (ripple insert & cut) ──────────────────────────
     /// Insert one empty bar at the cursor's bar boundary, sliding every note at
     /// or after it one bar later. Ripple edit: opens a silent bar without
@@ -408,6 +420,8 @@ impl Action {
             Action::SetHandSplit { .. } => "set_hand_split",
             Action::SetNoteHand { .. } => "set_note_hand",
             Action::CycleNoteHand => "cycle_note_hand",
+            Action::SetNoteFinger { .. } => "set_note_finger",
+            Action::ClearNoteFinger => "clear_note_finger",
             Action::InsertBar => "insert_bar",
             Action::RemoveBar => "remove_bar",
             Action::NudgeTail { .. } => "nudge_tail",
@@ -577,6 +591,8 @@ pub fn action_names() -> &'static [&'static str] {
         "set_hand_split",
         "set_note_hand",
         "cycle_note_hand",
+        "set_note_finger",
+        "clear_note_finger",
         "insert_bar",
         "remove_bar",
         "nudge_tail",
@@ -712,6 +728,9 @@ static ACTION_HELP: &[ActionInfo] = {
         ActionInfo { name: "set_hand_split", params: &[p("pitch", "u8")], description: "Set the piece's left/right hand split line: notes below `pitch` default to the left hand, at/above it to the right. Per-note overrides win over it." },
         ActionInfo { name: "set_note_hand", params: &[p("hand", "HandSetting")], description: "Pin the target notes to a hand: \"left\", \"right\", or \"auto\" to follow the split line. Targets the selection when one is active, else the note under the cursor; a no-op with neither." },
         ActionInfo { name: "cycle_note_hand", params: &[], description: "Cycle the target notes' hand setting auto -> left -> right -> auto. Same target as set_note_hand (selection, else the cursor note)." },
+        // ── finger numbers (M27-A) ──────────────────────────────────────
+        ActionInfo { name: "set_note_finger", params: &[p("finger", "Finger")], description: "Put a finger number on the target notes: 1 (thumb) to 5 (little finger). Targets the selection when one is active, else the note under the cursor; a no-op with neither. Shown on the note in edit and play; never affects scoring." },
+        ActionInfo { name: "clear_note_finger", params: &[], description: "Remove the finger number from the target notes. Same target as set_note_finger." },
         ActionInfo { name: "insert_bar", params: &[], description: "Insert one empty bar at the cursor's bar boundary, sliding every note at or after it one bar later (ripple). Opens a silent bar to make room; the tail keeps its internal timing." },
         ActionInfo { name: "remove_bar", params: &[], description: "Cut the bar the cursor sits in: delete the notes starting in it and slide everything after one bar earlier so no gap is left (ripple)." },
         ActionInfo { name: "nudge_tail", params: &[p("delta_steps", "i32")], description: "Ripple-shift every note at or after the cursor by delta_steps grid steps (signed) — re-phases the rest of the song in one move to fix a constant timing offset that starts at a point. Notes before the cursor are untouched." },
@@ -833,6 +852,10 @@ mod tests {
                 hand: HandSetting::Left,
             },
             Action::CycleNoteHand,
+            Action::SetNoteFinger {
+                finger: Finger::new(3).unwrap(),
+            },
+            Action::ClearNoteFinger,
             Action::InsertBar,
             Action::RemoveBar,
             Action::NudgeTail { delta_steps: -2 },
@@ -914,6 +937,7 @@ mod tests {
                     "bool" => json!(true),
                     "Easing" => json!("linear"),
                     "HandSetting" => json!("auto"),
+                    "Finger" => json!(1),
                     "Vec<u64>" => json!([0, 1_000_000]),
                     _ => json!(1), // small in-range value for every numeric type
                 };
@@ -1190,6 +1214,29 @@ mod tests {
             action_from_name("set_note_hand", &json!({ "hand": "both" })).unwrap_err(),
             ActionError::BadParams { .. }
         ));
+    }
+
+    #[test]
+    fn finger_actions_round_trip_via_name() {
+        for n in 1..=5u8 {
+            assert_eq!(
+                action_from_name("set_note_finger", &json!({ "finger": n })).unwrap(),
+                Action::SetNoteFinger {
+                    finger: Finger::new(n).unwrap()
+                }
+            );
+        }
+        assert_eq!(
+            action_from_name("clear_note_finger", &json!({})).unwrap(),
+            Action::ClearNoteFinger
+        );
+        // A missing or out-of-range finger is rejected, never defaulted.
+        for bad in [json!({}), json!({ "finger": 0 }), json!({ "finger": 6 })] {
+            assert!(matches!(
+                action_from_name("set_note_finger", &bad).unwrap_err(),
+                ActionError::BadParams { .. }
+            ));
+        }
     }
 
     #[test]

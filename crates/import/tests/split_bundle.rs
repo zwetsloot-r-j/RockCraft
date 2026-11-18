@@ -18,6 +18,7 @@ fn note(pitch: u8, start_us: u64, dur_us: u64) -> Note {
         dur_us,
         velocity: Velocity::new(80).unwrap(),
         hand: None,
+        finger: None,
     }
 }
 
@@ -203,4 +204,49 @@ fn split_midi_only_piece_writes_media_less_bundles() {
     assert!(!dir.join("backing.wav").exists());
     assert!(!dir.join("background.mp4").exists());
     assert!(meta.backgrounds.is_empty());
+}
+
+#[test]
+fn a_part_bundle_keeps_its_notes_fingers_rebased_to_the_part() {
+    use rockcraft_core::{Finger, NoteFinger};
+    let root = tempfile::tempdir().unwrap();
+
+    let mut tl = Timeline::new();
+    tl.insert(note(60, 500_000, 200_000));
+    let inside = tl.insert(note(64, 2_250_000, 200_000));
+    tl.set_finger(inside, Finger::new(2));
+
+    let sliced = slice_segment(
+        &tl,
+        Segment {
+            start_us: 2_000_000,
+            end_us: 3_000_000,
+        },
+        None,
+        None,
+        &[],
+    );
+    let dir = root.path().join("part");
+    write_part_bundle(
+        &dir,
+        &sliced,
+        Grid::default_120(),
+        test_key(),
+        None,
+        None,
+        &[],
+        DEFAULT_SPLIT,
+    )
+    .unwrap();
+
+    let meta =
+        RecordingMeta::from_json(&fs::read_to_string(dir.join("meta.json")).unwrap()).unwrap();
+    assert_eq!(
+        meta.fingers,
+        vec![NoteFinger {
+            pitch: 64,
+            start_us: 250_000,
+            finger: Finger::new(2).unwrap(),
+        }]
+    );
 }

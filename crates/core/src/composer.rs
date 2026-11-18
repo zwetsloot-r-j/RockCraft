@@ -34,6 +34,7 @@ use crate::bars::BarMap;
 use crate::bpm::Bpm;
 use crate::chord::{ChordKind, Key, Scale};
 use crate::events::{MidiNote, NoteEvent, NoteEventKind, Velocity};
+use crate::finger::Finger;
 use crate::grid::{Grid, Subdivision, TimeSig};
 use crate::hand::{Hand, HandSetting, DEFAULT_SPLIT};
 use crate::history::History;
@@ -65,6 +66,7 @@ struct ClipNote {
     end: i128,
     velocity: Velocity,
     hand: Option<Hand>,
+    finger: Option<Finger>,
 }
 /// MIDI note value used for metronome clicks (E5 — a bright piano tone).
 const CLICK_MIDI_VALUE: u8 = 76;
@@ -338,6 +340,21 @@ impl Composer {
         Vec::new()
     }
 
+    /// Set (`Some`) or remove (`None`) the finger number on every target note
+    /// — the same targets as the hand actions. One undo step; a no-op with no
+    /// target.
+    fn set_note_finger(&mut self, finger: Option<Finger>) -> Vec<Effect> {
+        let ids = self.hand_target_ids();
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        self.history.checkpoint();
+        for id in ids {
+            self.history.current_mut().set_finger(id, finger);
+        }
+        Vec::new()
+    }
+
     /// Set the key used to voice diatonic chords.
     pub fn set_key(&mut self, key: Key) {
         self.key = key;
@@ -567,6 +584,10 @@ impl Composer {
                     .unwrap_or(HandSetting::Auto);
                 self.set_note_hand(current.next().override_value())
             }
+
+            // ── finger numbers (M27-A) ───────────────────────────────────
+            Action::SetNoteFinger { finger } => self.set_note_finger(Some(finger)),
+            Action::ClearNoteFinger => self.set_note_finger(None),
 
             // ── time / structure (ripple insert & cut) ──────────────────
             Action::InsertBar => self.insert_bar(),
@@ -904,6 +925,7 @@ impl Composer {
                 dur_us: n.dur_us,
                 velocity: n.velocity.value(),
                 hand: n.hand,
+                finger: n.finger,
             })
             .collect();
         let selection = self
@@ -1368,6 +1390,7 @@ impl Composer {
             dur_us,
             velocity,
             hand: None,
+            finger: None,
         });
         vec![Effect::AuditionNote {
             pitch: pitch.value(),
@@ -1417,6 +1440,7 @@ impl Composer {
                 dur_us,
                 velocity: vel,
                 hand: None,
+                finger: None,
             });
         }
         vec![Effect::AuditionNote {
@@ -1671,6 +1695,7 @@ impl Composer {
                     dur_us: dur,
                     velocity,
                     hand: None,
+                    finger: None,
                 })
             })
             .collect();
@@ -1752,6 +1777,7 @@ impl Composer {
             dur_us,
             velocity,
             hand: None,
+            finger: None,
         });
         self.cursor.step += 1;
     }
@@ -1780,6 +1806,7 @@ impl Composer {
                         dur_us: end - start,
                         velocity,
                         hand: None,
+                        finger: None,
                     });
                 }
             }
@@ -2057,6 +2084,7 @@ impl Composer {
                 end: self.bar_pos(n.start_us + n.dur_us) - origin,
                 velocity: n.velocity,
                 hand: n.hand,
+                finger: n.finger,
             })
             .collect();
         self.selection_anchor = None;
@@ -2084,6 +2112,7 @@ impl Composer {
                     dur_us: end_us - start_us,
                     velocity: c.velocity,
                     hand: c.hand,
+                    finger: c.finger,
                 })
             })
             .collect();
@@ -2475,6 +2504,10 @@ pub struct NoteView {
     /// [`ComposerSnapshot::hand_split`], and mark the overridden ones.
     #[serde(default)]
     pub hand: Option<Hand>,
+    /// The note's finger number (M27-A), `None` when it has none. Shown on the
+    /// note; never affects scoring.
+    #[serde(default)]
+    pub finger: Option<Finger>,
 }
 
 /// The active selection rectangle in a [`ComposerSnapshot`].
@@ -2664,6 +2697,7 @@ mod tests {
             dur_us,
             velocity: Velocity::new(80).unwrap(),
             hand: None,
+            finger: None,
         }
     }
 
@@ -5522,5 +5556,141 @@ mod tests {
         assert_eq!(snap.notes.len(), 2);
         assert_eq!(snap.notes[0].hand, Some(Hand::Left));
         assert_eq!(snap.notes[1].hand, None);
+    }
+
+    // ── finger numbers (M27-A) ───────────────────────────────────────────────
+
+    fn finger(n: u8) -> Finger {
+        Finger::new(n).unwrap()
+    }
+
+    fn set_finger(c: &mut Composer, n: u8) {
+        apply(c, Action::SetNoteFinger { finger: finger(n) });
+    }
+
+    fn cursor_finger(c: &Composer) -> Option<Finger> {
+        c.note_under_cursor()
+            .and_then(|id| c.get_note(id))
+            .and_then(|n| n.finger)
+    }
+
+    #[test]
+    fn finger_actions_without_a_target_are_no_ops() {
+        let mut c = Composer::new();
+        set_finger(&mut c, 2);
+        apply(&mut c, Action::ClearNoteFinger);
+        assert!(c.snapshot().notes.is_empty());
+        // Nothing was checkpointed, so there is nothing to undo into.
+        apply(&mut c, Action::AddNote);
+        apply(&mut c, Action::Undo);
+        assert!(c.snapshot().notes.is_empty());
+    }
+
+    #[test]
+    fn set_and_clear_the_cursor_notes_finger() {
+        let mut c = Composer::new();
+        apply(&mut c, Action::AddNote);
+        assert_eq!(cursor_finger(&c), None, "a new note has no finger");
+        set_finger(&mut c, 3);
+        assert_eq!(cursor_finger(&c), Some(finger(3)));
+        assert_eq!(c.snapshot().notes[0].finger, Some(finger(3)));
+        set_finger(&mut c, 5);
+        assert_eq!(cursor_finger(&c), Some(finger(5)));
+        apply(&mut c, Action::ClearNoteFinger);
+        assert_eq!(cursor_finger(&c), None);
+    }
+
+    #[test]
+    fn set_note_finger_applies_to_the_whole_selection() {
+        let mut c = Composer::new();
+        apply(&mut c, Action::AddNote);
+        apply(&mut c, Action::CursorRight);
+        apply(&mut c, Action::AddNote);
+        apply(&mut c, Action::SetCursor { pitch: 60, step: 0 });
+        apply(&mut c, Action::StartSelection);
+        apply(&mut c, Action::CursorRight);
+        set_finger(&mut c, 2);
+        let fingers: Vec<Option<Finger>> = c.snapshot().notes.iter().map(|n| n.finger).collect();
+        assert_eq!(fingers, vec![Some(finger(2)), Some(finger(2))]);
+    }
+
+    #[test]
+    fn a_finger_edit_undoes_as_one_step() {
+        let mut c = Composer::new();
+        apply(&mut c, Action::AddNote);
+        set_finger(&mut c, 4);
+        apply(&mut c, Action::Undo);
+        assert_eq!(cursor_finger(&c), None);
+        apply(&mut c, Action::Redo);
+        assert_eq!(cursor_finger(&c), Some(finger(4)));
+    }
+
+    #[test]
+    fn the_finger_rides_a_move_and_a_pitch_change() {
+        let mut c = Composer::new();
+        apply(&mut c, Action::AddNote);
+        set_finger(&mut c, 1);
+        let id = c.note_under_cursor().unwrap();
+        apply(&mut c, Action::ToggleGrab);
+        apply(&mut c, Action::CursorRight);
+        apply(&mut c, Action::CursorUp);
+        apply(&mut c, Action::ToggleGrab);
+
+        let moved = c.get_note(id).expect("same id after the drag");
+        assert_eq!(moved.pitch.value(), 61);
+        assert_eq!(
+            c.timeline().fingers(),
+            vec![crate::NoteFinger {
+                pitch: 61,
+                start_us: moved.start_us,
+                finger: finger(1),
+            }]
+        );
+    }
+
+    #[test]
+    fn yank_and_paste_keep_the_finger() {
+        let mut c = Composer::new();
+        apply(&mut c, Action::AddNote);
+        set_finger(&mut c, 2);
+        apply(&mut c, Action::StartSelection);
+        apply(&mut c, Action::YankSelection);
+        apply(&mut c, Action::SetCursor { pitch: 60, step: 8 });
+        apply(&mut c, Action::PasteClipboard);
+        let fingers: Vec<Option<Finger>> = c.snapshot().notes.iter().map(|n| n.finger).collect();
+        assert_eq!(fingers, vec![Some(finger(2)), Some(finger(2))]);
+    }
+
+    #[test]
+    fn a_note_entered_over_a_fingered_one_starts_without_a_finger() {
+        let mut c = Composer::new();
+        apply(&mut c, Action::AddNote);
+        set_finger(&mut c, 3);
+        apply(&mut c, Action::AddNote); // replaces the note in this cell
+        assert_eq!(c.snapshot().notes.len(), 1);
+        assert_eq!(cursor_finger(&c), None);
+    }
+
+    #[test]
+    fn fingers_survive_a_save_load_round_trip() {
+        let mut c = Composer::new();
+        apply(&mut c, Action::AddNote);
+        set_finger(&mut c, 5);
+        apply(&mut c, Action::CursorRight);
+        apply(&mut c, Action::AddNote); // no finger
+
+        let events = c.timeline().to_events();
+        let saved = c.timeline().fingers();
+        assert_eq!(saved.len(), 1);
+
+        let mut reloaded = Timeline::from_events(&events);
+        reloaded.apply_fingers(&saved);
+        let c2 = Composer::from_timeline(reloaded, c.grid());
+        let snap = c2.snapshot();
+        assert_eq!(snap.notes[0].finger, Some(finger(5)));
+        assert_eq!(snap.notes[1].finger, None);
+        // The snapshot carries it over the wire as a bare number.
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["notes"][0]["finger"], 5);
     }
 }
