@@ -24,6 +24,7 @@ pub mod hand;
 pub mod history;
 pub mod live_score;
 pub mod mixer;
+pub mod notation;
 pub mod play_clock;
 pub mod practice_loop;
 pub mod scoring;
