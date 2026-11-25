@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Run the Tauri desktop app on the Windows host, from a WSL checkout.
 #
-#   ./run-tauri.sh              # run (window opens on Windows)
-#   ./run-tauri.sh --release    # run the optimised build
+#   ./run-tauri.sh              # run the optimised (release) build — the default
+#   ./run-tauri.sh --debug      # run the debug build (./build-tauri.sh --debug)
 #   ./run-tauri.sh --fg         # stay in the foreground (Ctrl-C to quit)
 #
 # Anything after those flags is passed straight to the app.
@@ -19,12 +19,13 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-PROFILE="debug"
+PROFILE="release"
 FOREGROUND=0
 ARGS=()
 for arg in "$@"; do
   case "$arg" in
-    --release) PROFILE="release" ;;
+    --release) PROFILE="release" ;;  # the default; still accepted
+    --debug) PROFILE="debug" ;;
     --fg|--foreground) FOREGROUND=1 ;;
     *) ARGS+=("$arg") ;;
   esac
@@ -33,7 +34,7 @@ done
 EXE="target-win/$PROFILE/rockcraft-tauri.exe"
 if [[ ! -x "$EXE" ]]; then
   echo "error: $EXE not found — build it first:" >&2
-  echo "         ./build-tauri.sh$([[ $PROFILE == release ]] && echo ' --release')" >&2
+  echo "         ./build-tauri.sh$([[ $PROFILE == debug ]] && echo ' --debug')" >&2
   exit 1
 fi
 

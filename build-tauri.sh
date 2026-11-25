@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Build the Tauri desktop app as a **Windows** binary, from a WSL checkout.
 #
-#   ./build-tauri.sh            # build
-#   ./build-tauri.sh --release  # optimised build
+#   ./build-tauri.sh            # optimised (release) build — the default
+#   ./build-tauri.sh --debug    # debug build: faster to compile, slower to run
+#
+# `--release` is still accepted and means the default.
 #
 # Output: target-win/<profile>/rockcraft-tauri.exe  (run it with ./run-tauri.sh)
 #
@@ -25,14 +27,16 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-PROFILE="debug"
+PROFILE="release"
 CARGO_ARGS=()
 for arg in "$@"; do
   case "$arg" in
-    --release) PROFILE="release"; CARGO_ARGS+=("--release") ;;
+    --release) PROFILE="release" ;;
+    --debug) PROFILE="debug" ;;
     *) CARGO_ARGS+=("$arg") ;;
   esac
 done
+[[ $PROFILE == release ]] && CARGO_ARGS+=("--release")
 
 # Windows cargo — the Linux one would produce an ELF binary that WSLg runs
 # without a native webview. $CARGO_EXE overrides if yours lives elsewhere.

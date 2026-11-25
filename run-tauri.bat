@@ -1,8 +1,10 @@
 @echo off
 REM Run the Tauri desktop app (Windows). Run from a normal cmd prompt.
 REM
-REM   run-tauri.bat            run
-REM   run-tauri.bat --release  run the optimised build
+REM   run-tauri.bat            run the optimised (release) build - the default
+REM   run-tauri.bat --debug    run the debug build (from build-tauri.bat --debug)
+REM
+REM `--release` is still accepted and means the default.
 REM
 REM Anything after those flags is passed straight to the app.
 REM
@@ -12,7 +14,7 @@ REM to move it, or NO_CONTROL=1 to start without it.
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
-set "PROFILE=debug"
+set "PROFILE=release"
 set "APP_ARGS="
 REM Collect the args with shift, not `for %%a in (%*)`: a for block is
 REM expanded once, so accumulating into a variable there keeps only the last
@@ -21,6 +23,8 @@ REM argument.
 if "%~1"=="" goto args_done
 if "%~1"=="--release" (
   set "PROFILE=release"
+) else if "%~1"=="--debug" (
+  set "PROFILE=debug"
 ) else (
   set "APP_ARGS=!APP_ARGS! %1"
 )
@@ -31,7 +35,11 @@ goto args
 set "EXE=target-win\%PROFILE%\rockcraft-tauri.exe"
 if not exist "%EXE%" (
   echo error: %EXE% not found - build it first:
-  echo          build-tauri.bat
+  if "%PROFILE%"=="release" (
+    echo          build-tauri.bat
+  ) else (
+    echo          build-tauri.bat --debug
+  )
   exit /b 1
 )
 

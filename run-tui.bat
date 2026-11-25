@@ -7,21 +7,24 @@ REM   run-tui.bat --mock                   no piano: play with the number row 1-
 REM   run-tui.bat --edit                   open straight in the composer
 REM   run-tui.bat --control                start the agent control socket
 REM   run-tui.bat casio song.wav           piano + a backing track while recording
-REM   run-tui.bat --release ...            run the optimised build
+REM   run-tui.bat --debug ...              run the debug build (build-tui.bat --debug)
 REM
-REM Everything except --release is passed to the app in order. Order matters:
+REM The optimised (release) build is the default; `--release` is still accepted.
+REM Everything except --release/--debug is passed to the app in order. Order matters:
 REM the first non-flag argument is the MIDI port name, and a backing track must
 REM be the SECOND argument overall - so don't put a flag before it; to use
 REM the control socket with a backing track, set ROCKCRAFT_CONTROL_ADDR instead.
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
-set "PROFILE=debug"
+set "PROFILE=release"
 set "APP_ARGS="
 :args
 if "%~1"=="" goto args_done
 if "%~1"=="--release" (
   set "PROFILE=release"
+) else if "%~1"=="--debug" (
+  set "PROFILE=debug"
 ) else (
   set "APP_ARGS=!APP_ARGS! %1"
 )
@@ -32,7 +35,11 @@ goto args
 set "EXE=target-win\%PROFILE%\rockcraft.exe"
 if not exist "%EXE%" (
   echo error: %EXE% not found - build it first:
-  echo          build-tui.bat
+  if "%PROFILE%"=="release" (
+    echo          build-tui.bat
+  ) else (
+    echo          build-tui.bat --debug
+  )
   exit /b 1
 )
 
