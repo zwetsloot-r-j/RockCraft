@@ -1,8 +1,10 @@
 @echo off
 REM Build the Tauri desktop app (Windows). Run from a normal cmd prompt.
 REM
-REM   build-tauri.bat            build
-REM   build-tauri.bat --release  optimised build
+REM   build-tauri.bat            optimised (release) build - the default
+REM   build-tauri.bat --debug    debug build: faster to compile, slower to run
+REM
+REM `--release` is still accepted and means the default.
 REM
 REM Output: target-win\<profile>\rockcraft-tauri.exe  (run it with run-tauri.bat)
 REM
@@ -19,7 +21,7 @@ REM     connect".
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
-set "PROFILE=debug"
+set "PROFILE=release"
 set "CARGO_ARGS="
 REM Collect the args with shift, not `for %%a in (%*)`: a for block is
 REM expanded once, so accumulating into a variable there loses all but the
@@ -27,11 +29,17 @@ REM last argument (or, before delayed expansion is on, keeps a literal
 REM "!CARGO_ARGS!").
 :args
 if "%~1"=="" goto args_done
-if "%~1"=="--release" set "PROFILE=release"
-set "CARGO_ARGS=!CARGO_ARGS! %1"
+if "%~1"=="--release" (
+  set "PROFILE=release"
+) else if "%~1"=="--debug" (
+  set "PROFILE=debug"
+) else (
+  set "CARGO_ARGS=!CARGO_ARGS! %1"
+)
 shift
 goto args
 :args_done
+if "%PROFILE%"=="release" set "CARGO_ARGS=!CARGO_ARGS! --release"
 
 where cargo >nul 2>&1
 if errorlevel 1 (
@@ -64,5 +72,9 @@ if errorlevel 1 (
 
 echo.
 echo Built target-win\%PROFILE%\rockcraft-tauri.exe
-echo Run it with:  run-tauri.bat
+if "%PROFILE%"=="release" (
+  echo Run it with:  run-tauri.bat
+) else (
+  echo Run it with:  run-tauri.bat --debug
+)
 endlocal

@@ -1,8 +1,10 @@
 @echo off
 REM Build the terminal (TUI) app (Windows). Run from a normal cmd prompt.
 REM
-REM   build-tui.bat            build
-REM   build-tui.bat --release  optimised build
+REM   build-tui.bat            optimised (release) build - the default
+REM   build-tui.bat --debug    debug build: faster to compile, slower to run
+REM
+REM `--release` is still accepted and means the default.
 REM
 REM Anything else is passed straight to cargo.
 REM
@@ -13,15 +15,21 @@ REM Linux/WSL one, and vice versa.
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
-set "PROFILE=debug"
+set "PROFILE=release"
 set "CARGO_ARGS="
 :args
 if "%~1"=="" goto args_done
-if "%~1"=="--release" set "PROFILE=release"
-set "CARGO_ARGS=!CARGO_ARGS! %1"
+if "%~1"=="--release" (
+  set "PROFILE=release"
+) else if "%~1"=="--debug" (
+  set "PROFILE=debug"
+) else (
+  set "CARGO_ARGS=!CARGO_ARGS! %1"
+)
 shift
 goto args
 :args_done
+if "%PROFILE%"=="release" set "CARGO_ARGS=!CARGO_ARGS! --release"
 
 where cargo >nul 2>&1
 if errorlevel 1 (
@@ -39,5 +47,9 @@ if errorlevel 1 (
 
 echo.
 echo Built target-win\%PROFILE%\rockcraft.exe
-echo Run it with:  run-tui.bat
+if "%PROFILE%"=="release" (
+  echo Run it with:  run-tui.bat
+) else (
+  echo Run it with:  run-tui.bat --debug
+)
 endlocal

@@ -164,7 +164,9 @@ On Windows, both apps have build/run scripts at the repo root (native builds
 into `target-win\`, so they never clobber the WSL `target/`):
 `build-tauri.bat` / `run-tauri.bat` for the desktop app, and `build-tui.bat` /
 `run-tui.bat` for the TUI (`run-tui.bat` passes its arguments through to
-`rockcraft.exe` in order; `--release` picks the optimised build).
+`rockcraft.exe` in order). All of them build/run the optimised **release**
+build by default; pass `--debug` for the debug build (faster to compile, slower
+to run).
 
 ### Agent-control API: single source of truth
 
