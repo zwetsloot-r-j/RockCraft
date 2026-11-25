@@ -24,6 +24,13 @@ impl Ramp {
         step: 0.0,
     };
 
+    /// Steady at silence: the other resting state (e.g. a pedal that is up).
+    pub(crate) const SILENT: Ramp = Ramp {
+        level: 0.0,
+        target: 0.0,
+        step: 0.0,
+    };
+
     /// Head for silence (`out`) or full level over `steps` ticks for a full
     /// swing; `steps == 0` jumps straight there.
     pub(crate) fn fade(&mut self, out: bool, steps: u32) {

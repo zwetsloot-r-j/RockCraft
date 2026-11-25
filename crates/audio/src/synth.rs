@@ -44,6 +44,25 @@ const CC_CHANNEL_VOLUME_LSB: i32 = 39;
 /// Controller 64: the sustain (hold) pedal; `rustysynth` keeps a released
 /// note ringing while it reads ≥ 64.
 const CC_SUSTAIN: i32 = 64;
+/// Controller 91: reverb send — how much of a channel goes to the shared reverb.
+const CC_REVERB_SEND: i32 = 91;
+/// The reverb send a channel rests at: the General MIDI default, and what
+/// `rustysynth` resets every channel to.
+const REVERB_SEND_REST: u8 = 40;
+/// The reverb send while the sustain pedal is down. A real piano's raised
+/// dampers let every string ring in sympathy, so a held pedal sounds bigger
+/// and more open than the same notes held by the fingers; `rustysynth` has no
+/// string model, so a wetter reverb stands in for that bloom.
+const REVERB_SEND_PEDAL: u8 = 80;
+/// How long the reverb send takes to glide between rest and pedal, so a press
+/// swells in rather than switching the room on with a step.
+const PEDAL_REVERB_GLIDE_MS: u32 = 150;
+/// Voices the synthesizer may sound at once. `rustysynth` defaults to 64, and a
+/// stereo piano spends two voices per note — so with the pedal down only ~32
+/// notes could ring before the oldest were cut off, which is what made the
+/// pedal sound weak. 256 leaves room for a full pedalled passage at a modest
+/// CPU cost (only voices that are actually sounding are rendered).
+const MAX_POLYPHONY: usize = 256;
 /// MIDI channels a synth has; per-channel fade state is kept for each.
 const CHANNELS: usize = 16;
 /// The synthesizer's own initial channel volume (the MIDI default), until a
@@ -261,6 +280,9 @@ pub struct SynthSource {
     volume: [u8; CHANNELS],
     // Each channel's fade, stepped once per rendered block.
     fade: [Ramp; CHANNELS],
+    // Each channel's pedal resonance (0 = pedal up, 1 = down), gliding the
+    // reverb send between rest and pedal; stepped once per rendered block.
+    pedal: [Ramp; CHANNELS],
 }
 
 impl SynthSource {
@@ -286,6 +308,11 @@ impl SynthSource {
                         CC_SUSTAIN,
                         if down { 127 } else { 0 },
                     );
+                    let steps = steps_for(PEDAL_REVERB_GLIDE_MS, self.block_rate());
+                    if let Some(p) = self.pedal.get_mut(channel as usize) {
+                        // `fade(out = false)` heads for full level: pedal down.
+                        p.fade(!down, steps);
+                    }
                 }
                 Ok(SynthCommand::AllOff) => {
                     // Lift the pedals first: a released note under a held
@@ -295,11 +322,16 @@ impl SynthSource {
                             .process_midi_message(ch as i32, CONTROL_CHANGE, CC_SUSTAIN, 0);
                     }
                     self.synth.note_off_all(false);
-                    // A clean slate: nothing stays faded out.
+                    // A clean slate: nothing stays faded out, and the room
+                    // drops back to dry with the pedals.
                     for ch in 0..CHANNELS {
                         if self.fade[ch] != Ramp::FULL {
                             self.fade[ch] = Ramp::FULL;
                             self.apply_volume(ch);
+                        }
+                        if self.pedal[ch] != PEDAL_UP {
+                            self.pedal[ch] = PEDAL_UP;
+                            self.apply_reverb_send(ch);
                         }
                     }
                 }
@@ -318,7 +350,7 @@ impl SynthSource {
                     }
                 }
                 Ok(SynthCommand::Fade { channel, out, ms }) => {
-                    let rate = self.sample_rate as f64 / self.left.len().max(1) as f64;
+                    let rate = self.block_rate();
                     let ch = channel as usize;
                     if let Some(f) = self.fade.get_mut(ch) {
                         // Back in from full silence: the voices were cut, so
@@ -343,6 +375,7 @@ impl SynthSource {
             }
         }
         self.step_fades();
+        self.step_pedals();
         self.synth.render(&mut self.left, &mut self.right);
         interleave(&self.left, &self.right, &mut self.frame);
         self.pos = 0;
@@ -364,6 +397,29 @@ impl SynthSource {
         }
     }
 
+    /// Rendered blocks per second — the rate fades and pedal glides tick at.
+    fn block_rate(&self) -> f64 {
+        self.sample_rate as f64 / self.left.len().max(1) as f64
+    }
+
+    /// Advance every gliding pedal resonance by one block.
+    fn step_pedals(&mut self) {
+        for ch in 0..CHANNELS {
+            if self.pedal[ch].is_steady() {
+                continue;
+            }
+            self.pedal[ch].tick();
+            self.apply_reverb_send(ch);
+        }
+    }
+
+    /// Push channel `ch`'s reverb send (controller 91) for its pedal level.
+    fn apply_reverb_send(&mut self, ch: usize) {
+        let send = pedal_reverb_send(self.pedal[ch].level());
+        self.synth
+            .process_midi_message(ch as i32, CONTROL_CHANGE, CC_REVERB_SEND, send as i32);
+    }
+
     /// Push channel `ch`'s effective volume — its level scaled by its fade — to
     /// the synth as a 14-bit CC7/CC39 pair. At full fade this is exactly the
     /// plain CC7 level.
@@ -382,6 +438,16 @@ impl SynthSource {
             (v14 & 0x7F) as i32,
         );
     }
+}
+
+/// A pedal ramp at rest: pedal up, reverb send at [`REVERB_SEND_REST`].
+const PEDAL_UP: Ramp = Ramp::SILENT;
+
+/// The reverb send (controller 91) for a pedal resonance `level` (`0.0` = pedal
+/// up, `1.0` = down): a straight line from rest to pedal.
+fn pedal_reverb_send(level: f32) -> u8 {
+    let span = (REVERB_SEND_PEDAL - REVERB_SEND_REST) as f32;
+    (REVERB_SEND_REST as f32 + span * level.clamp(0.0, 1.0)).round() as u8
 }
 
 /// A CC7 `volume` scaled by a fade `level` (`0.0..=1.0`), as a 14-bit channel
@@ -446,7 +512,8 @@ pub fn synth_from_sf2_bytes(
     let mut reader = bytes;
     let sound_font =
         Arc::new(SoundFont::new(&mut reader).map_err(|e| SynthError::SoundFont(e.to_string()))?);
-    let settings = SynthesizerSettings::new(sample_rate as i32);
+    let mut settings = SynthesizerSettings::new(sample_rate as i32);
+    settings.maximum_polyphony = MAX_POLYPHONY;
     let mut synth =
         Synthesizer::new(&sound_font, &settings).map_err(|e| SynthError::Synth(e.to_string()))?;
     // Optional distinct instrument: set `ROCKCRAFT_SYNTH_PROGRAM` to a General
@@ -475,6 +542,7 @@ pub fn synth_from_sf2_bytes(
         pos: 0, // empty `frame` forces a render on the first `next()`
         volume: [DEFAULT_VOLUME; CHANNELS],
         fade: [Ramp::FULL; CHANNELS],
+        pedal: [PEDAL_UP; CHANNELS],
     };
     Ok((
         source,
@@ -737,6 +805,70 @@ mod tests {
             peak(&mut source, rate as usize / 4) > 0.01,
             "song bus stayed silent after fading back in"
         );
+    }
+
+    /// The SoundFont the opt-in synth tests render with, or `None` (logged) where
+    /// `assets/piano.sf2` is absent — as in CI.
+    fn local_sf2() -> Option<Vec<u8>> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/piano.sf2");
+        if !path.exists() {
+            eprintln!("skipped: no SoundFont at {}", path.display());
+            return None;
+        }
+        Some(std::fs::read(&path).unwrap())
+    }
+
+    #[test]
+    fn pedal_reverb_send_spans_rest_to_pedal() {
+        assert_eq!(pedal_reverb_send(0.0), REVERB_SEND_REST);
+        assert_eq!(pedal_reverb_send(1.0), REVERB_SEND_PEDAL);
+        assert_eq!(pedal_reverb_send(0.5), 60);
+        // Out-of-range levels clamp rather than wrapping the 7-bit controller.
+        assert_eq!(pedal_reverb_send(-1.0), REVERB_SEND_REST);
+        assert_eq!(pedal_reverb_send(2.0), REVERB_SEND_PEDAL);
+    }
+
+    /// The synth is built with room for a pedalled passage, not `rustysynth`'s
+    /// default 64 voices (32 stereo notes). Opt-in: needs `assets/piano.sf2`.
+    #[test]
+    fn synth_allows_max_polyphony() {
+        let Some(bytes) = local_sf2() else { return };
+        let (source, _) = synth_from_sf2_bytes(&bytes, 48_000).unwrap();
+        assert_eq!(source.synth.get_maximum_polyphony(), MAX_POLYPHONY);
+    }
+
+    /// Pressing the pedal glides that bus's reverb send up over
+    /// [`PEDAL_REVERB_GLIDE_MS`] (no step), lifting glides it back, and all-off
+    /// drops it to rest at once. Opt-in: needs `assets/piano.sf2`.
+    #[test]
+    fn the_pedal_glides_its_bus_reverb_send() {
+        let Some(bytes) = local_sf2() else { return };
+        let rate = 48_000;
+        let (mut source, player) = synth_from_sf2_bytes(&bytes, rate).unwrap();
+        let ch = SynthBus::Player.midi_channel() as usize;
+        let other = SynthBus::Song.midi_channel() as usize;
+        // `peak` counts interleaved samples: two per stereo frame.
+        let block = source.left.len() * 2;
+        let glide_samples = 2 * rate as usize * PEDAL_REVERB_GLIDE_MS as usize / 1000;
+
+        player.sustain(true);
+        peak(&mut source, block * 2); // a couple of blocks in: still rising
+        let early = source.pedal[ch].level();
+        assert!(early > 0.0 && early < 1.0, "glides, no step: {early}");
+        assert_eq!(source.pedal[other], PEDAL_UP, "only the pressed bus");
+
+        peak(&mut source, glide_samples + block * 2);
+        assert_eq!(source.pedal[ch].level(), 1.0);
+
+        player.sustain(false);
+        peak(&mut source, glide_samples + block * 2);
+        assert_eq!(source.pedal[ch].level(), 0.0);
+
+        player.sustain(true);
+        peak(&mut source, glide_samples + block * 2);
+        player.all_off();
+        peak(&mut source, block * 2);
+        assert_eq!(source.pedal[ch], PEDAL_UP, "all-off resets the room");
     }
 
     #[test]
