@@ -13,8 +13,10 @@ import {
   midiStatus,
   mockKey,
   MOCK_KEY_SET,
+  onMidiEvent,
   type MidiStatus,
 } from "../ipc/midi";
+import { isTyping, menuNavStep } from "./menuNav";
 import {
   onFullscreen,
   onNavigate,
@@ -55,6 +57,8 @@ interface RouterProps {
 export function Router(props: RouterProps): JSX.Element {
   const [screen, setScreen] = createSignal<Screen>({ kind: "menu" });
   const [midi, setMidi] = createSignal<MidiStatus | null>(null);
+  /** Piano free play (A0 toggles): menu keys play notes instead of navigating. */
+  const [freePlay, setFreePlay] = createSignal(false);
 
   function navigate(s: Screen): void {
     setScreen(s);
@@ -137,6 +141,24 @@ export function Router(props: RouterProps): JSX.Element {
     });
     if (readFullscreen()) void setFullscreen(true);
 
+    // Piano menu keys (C confirm · C# cancel · D up · E down): replay each as
+    // the keyboard key it stands for, so every menu screen's own key handling
+    // serves the piano unchanged. A0 toggles free play, which pauses that.
+    // Play / edit never navigate (see menuNav.ts).
+    let unlistenMidi: UnlistenFn | undefined;
+    void onMidiEvent((ev) => {
+      if (isTyping(document.activeElement)) return;
+      const step = menuNavStep(screen().kind, ev.menu_nav, freePlay());
+      setFreePlay(step.freePlay);
+      const key = step.key;
+      if (key === null) return;
+      window.dispatchEvent(
+        new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }),
+      );
+    }).then((fn) => {
+      unlistenMidi = fn;
+    });
+
     let unlistenNav: UnlistenFn | undefined;
     void onNavigate((next) => {
       const cur = screen();
@@ -153,6 +175,7 @@ export function Router(props: RouterProps): JSX.Element {
       window.removeEventListener("keydown", onKeydown);
       window.removeEventListener("keyup", onKeyup);
       unlistenNav?.();
+      unlistenMidi?.();
       unlistenFullscreen?.();
     });
   });
@@ -160,7 +183,7 @@ export function Router(props: RouterProps): JSX.Element {
   return (
     <RouterCtx.Provider value={{ screen, navigate }}>
       {props.children}
-      <MidiStatusChip status={midi()} />
+      <MidiStatusChip status={midi()} freePlay={freePlay()} />
     </RouterCtx.Provider>
   );
 }
@@ -173,7 +196,10 @@ export function Router(props: RouterProps): JSX.Element {
  * when running on the computer-keyboard mock. Hidden while the status is
  * loading.
  */
-function MidiStatusChip(props: { status: MidiStatus | null }): JSX.Element {
+function MidiStatusChip(props: {
+  status: MidiStatus | null;
+  freePlay: boolean;
+}): JSX.Element {
   return (
     <Show when={props.status !== null}>
       <div
@@ -224,6 +250,23 @@ function MidiStatusChip(props: { status: MidiStatus | null }): JSX.Element {
             }}
           />
           <span>{props.status?.port ?? "MIDI"}</span>
+        </Show>
+        {/* Piano free play (A0): menu keys play instead of navigating. */}
+        <Show when={props.freePlay}>
+          <span
+            title="Free play — piano keys don't navigate menus. Press A0 (lowest key) to navigate again."
+            style={{
+              background: "#9b4dca",
+              color: "#fff",
+              "border-radius": "4px",
+              padding: "0 5px",
+              "font-size": "10px",
+              "font-weight": "600",
+              "letter-spacing": "0.05em",
+            }}
+          >
+            FREE PLAY · A0
+          </span>
         </Show>
       </div>
     </Show>

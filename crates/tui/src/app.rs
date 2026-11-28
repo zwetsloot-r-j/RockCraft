@@ -110,6 +110,8 @@ pub struct Shell {
     echo: Option<Arc<AtomicBool>>,
     pub(crate) screen: Screen,
     menu_state: ListState,
+    /// Piano menu navigation (C / C# / D / E) and its A0 free-play switch.
+    menu_nav: rockcraft_core::MenuNavigator,
     status: String,
     should_quit: bool,
     /// Optional backing track path forwarded into a new capture+edit session.
@@ -175,6 +177,7 @@ impl Shell {
             echo: None,
             screen: Screen::Menu,
             menu_state,
+            menu_nav: rockcraft_core::MenuNavigator::new(),
             status: String::new(),
             should_quit: false,
             backing_path,
@@ -625,6 +628,70 @@ impl Shell {
                 self.screen = Screen::UrlInput(UrlInput::new());
             }
             _ => self.should_quit = true,
+        }
+    }
+
+    /// Whether piano menu keys act on the current screen at all.
+    ///
+    /// Only browsing screens navigate — on Play and Edit every key is music
+    /// (A0 included: there it never toggles free play). The text-entry URL box
+    /// is left to the keyboard.
+    fn screen_takes_menu_keys(&self) -> bool {
+        match &self.screen {
+            Screen::Menu
+            | Screen::Library(_)
+            | Screen::BackingPicker { .. }
+            | Screen::SourcePicker(_)
+            | Screen::Importing(_) => true,
+            Screen::Play(_) | Screen::Edit(_) | Screen::UrlInput(_) => false,
+        }
+    }
+
+    /// The keypress a piano navigation key stands for on the current screen.
+    /// Cancel does nothing on the main menu (Esc there quits, which a stray C#
+    /// must never do).
+    fn menu_nav_key(&self, nav: rockcraft_core::MenuNav) -> Option<KeyCode> {
+        use rockcraft_core::MenuNav;
+        match nav {
+            MenuNav::Confirm => Some(KeyCode::Enter),
+            MenuNav::Cancel if matches!(self.screen, Screen::Menu) => None,
+            MenuNav::Cancel => Some(KeyCode::Esc),
+            MenuNav::Up => Some(KeyCode::Up),
+            MenuNav::Down => Some(KeyCode::Down),
+            MenuNav::ToggleFreePlay => None,
+        }
+    }
+
+    /// Whether piano free play is on (A0 toggles it on a menu screen): while
+    /// on, C / C# / D / E are just notes.
+    pub fn is_free_play(&self) -> bool {
+        self.menu_nav.is_free_play()
+    }
+
+    /// Navigate from the piano: toggle free play (A0), or apply the keypress a
+    /// navigation key stands for here. Returns whether anything changed.
+    pub(crate) fn on_menu_nav(&mut self, nav: rockcraft_core::MenuNav) -> bool {
+        if !self.screen_takes_menu_keys() {
+            return false;
+        }
+        let was_free = self.menu_nav.is_free_play();
+        let Some(nav) = self.menu_nav.press(nav) else {
+            if self.menu_nav.is_free_play() != was_free {
+                self.status = if self.menu_nav.is_free_play() {
+                    "free play on — piano keys won't navigate (A0 to navigate again)".into()
+                } else {
+                    "free play off — piano keys navigate again".into()
+                };
+                return true;
+            }
+            return false;
+        };
+        match self.menu_nav_key(nav) {
+            Some(code) => {
+                self.on_key(code);
+                true
+            }
+            None => false,
         }
     }
 
@@ -1536,6 +1603,7 @@ pub fn run_loop<B: ratatui::backend::Backend>(
         let synth = if echoed { None } else { shell.synth.clone() };
         let notes = shell.input.events();
         let sustain = shell.input.sustain_events();
+        let mut menu_navs: Vec<rockcraft_core::MenuNav> = Vec::new();
         // Keys and pedal in played order: the pedal decides which released
         // notes ring on, so it must land between the right note events.
         for input in rockcraft_core::interleave_by_time(&notes, &sustain) {
@@ -1568,8 +1636,9 @@ pub fn run_loop<B: ratatui::backend::Backend>(
                         s.apply(&ev);
                     }
                 }
-                // These screens ignore live MIDI input, but still sound it so
-                // the piano is never mute while you browse.
+                // These screens don't record or score live MIDI input, but
+                // still sound it so the piano is never mute while you browse —
+                // and the menu keys (C / C# / D / E) navigate them.
                 Screen::Menu
                 | Screen::BackingPicker { .. }
                 | Screen::SourcePicker(_)
@@ -1579,7 +1648,17 @@ pub fn run_loop<B: ratatui::backend::Backend>(
                     if let Some(s) = &synth {
                         s.apply(&ev);
                     }
+                    if let Some(nav) = rockcraft_core::MenuNav::from_event(&ev) {
+                        menu_navs.push(nav);
+                    }
                 }
+            }
+        }
+        // Applied after the drain: a step can change the screen, and the
+        // notes after it belong to the screen it lands on next pass.
+        for nav in menu_navs {
+            if shell.on_menu_nav(nav) {
+                needs_draw = true;
             }
         }
 
@@ -1722,7 +1801,15 @@ fn draw_menu(f: &mut Frame, area: Rect, shell: &Shell) {
         "RockCraft — {}  (↑/↓ select, Enter, q quit)",
         shell.input.port_name()
     ));
-    f.render_widget(Paragraph::new(title), chunks[0]);
+    // The piano's own menu keys (rockcraft_core::MenuNav), any octave.
+    let piano = if shell.is_free_play() {
+        Line::from("Piano: FREE PLAY — keys only play · A0 to navigate again")
+            .style(Style::default().fg(Color::Magenta))
+    } else {
+        Line::from("Piano: D/E move · C select · C# back · A0 free play")
+            .style(Style::default().fg(Color::DarkGray))
+    };
+    f.render_widget(Paragraph::new(vec![title, piano]), chunks[0]);
 
     let items: Vec<ListItem> = shell
         .menu_items()
@@ -2510,6 +2597,95 @@ mod tests {
 
     fn make_shell() -> Shell {
         Shell::new(Box::new(ScriptedSource::new(vec![])), None, None)
+    }
+
+    /// Piano menu keys (C confirm · C# cancel · D up · E down) drive the main
+    /// menu exactly like Enter / Esc / ↑ / ↓ — except C#, which must never
+    /// quit the app from the main menu.
+    #[test]
+    fn piano_menu_keys_drive_the_main_menu() {
+        use rockcraft_core::MenuNav;
+        let mut shell = make_shell();
+        shell.set_has_fetch_cmd(false);
+
+        assert!(shell.on_menu_nav(MenuNav::Down));
+        assert!(shell.on_menu_nav(MenuNav::Down));
+        assert_eq!(shell.menu_state.selected(), Some(2));
+        assert!(shell.on_menu_nav(MenuNav::Up));
+        assert_eq!(shell.menu_state.selected(), Some(1));
+
+        assert!(
+            !shell.on_menu_nav(MenuNav::Cancel),
+            "C# is inert on the main menu"
+        );
+        assert!(!shell.is_quit());
+        assert_eq!(shell.screen_name(), "menu");
+
+        shell.menu_state.select(Some(0));
+        assert!(shell.on_menu_nav(MenuNav::Confirm)); // "New piece"
+        assert_eq!(shell.screen_name(), "edit");
+    }
+
+    /// On Play and Edit every key is music: menu keys navigate nothing there.
+    #[test]
+    fn piano_menu_keys_are_music_on_edit() {
+        use rockcraft_core::MenuNav;
+        let mut shell = make_shell();
+        shell.on_key(KeyCode::Enter); // New piece → edit
+        assert_eq!(shell.screen_name(), "edit");
+        for nav in MenuNav::ALL {
+            assert!(!shell.on_menu_nav(nav), "{nav:?} must not navigate in edit");
+        }
+        assert_eq!(shell.screen_name(), "edit");
+    }
+
+    /// A0 turns free play on: C / C# / D / E stop navigating until A0 again.
+    #[test]
+    fn piano_a0_toggles_free_play() {
+        use rockcraft_core::MenuNav;
+        let mut shell = make_shell();
+        shell.set_has_fetch_cmd(false);
+
+        assert!(shell.on_menu_nav(MenuNav::ToggleFreePlay));
+        assert!(shell.is_free_play());
+        assert!(shell.render_to_string(80, 24).contains("FREE PLAY"));
+        for nav in [MenuNav::Down, MenuNav::Down, MenuNav::Confirm] {
+            assert!(
+                !shell.on_menu_nav(nav),
+                "{nav:?} must not navigate in free play"
+            );
+        }
+        assert_eq!(shell.menu_state.selected(), Some(0));
+        assert_eq!(shell.screen_name(), "menu");
+
+        assert!(shell.on_menu_nav(MenuNav::ToggleFreePlay));
+        assert!(!shell.is_free_play());
+        assert!(shell.on_menu_nav(MenuNav::Down));
+        assert_eq!(shell.menu_state.selected(), Some(1));
+    }
+
+    /// On Edit, A0 is a note like any other: it never flips free play.
+    #[test]
+    fn piano_a0_is_music_on_edit() {
+        use rockcraft_core::MenuNav;
+        let mut shell = make_shell();
+        shell.on_key(KeyCode::Enter); // New piece → edit
+        assert!(!shell.on_menu_nav(MenuNav::ToggleFreePlay));
+        assert!(!shell.is_free_play());
+    }
+
+    /// C# backs out of a picker to the main menu, like Esc.
+    #[test]
+    fn piano_cancel_backs_out_of_source_picker() {
+        use rockcraft_core::MenuNav;
+        let mut shell = make_shell();
+        shell.set_has_fetch_cmd(false);
+        shell.menu_state.select(Some(3)); // "Import from video file…"
+        assert!(shell.on_menu_nav(MenuNav::Confirm));
+        assert!(matches!(shell.screen, Screen::SourcePicker(_)));
+        assert!(shell.on_menu_nav(MenuNav::Cancel));
+        assert_eq!(shell.screen_name(), "menu");
+        assert!(!shell.is_quit());
     }
 
     /// "New piece" (index 0) enters the unified capture+edit screen with an

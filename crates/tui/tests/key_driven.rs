@@ -195,3 +195,79 @@ fn vim_keys_navigate_menu() {
     run_loop(&mut terminal, &mut shell, &mut keys).unwrap();
     assert!(shell.is_quit());
 }
+
+// ---------------------------------------------------------------------------
+// Piano menu navigation: C confirm · C# cancel · D up · E down
+// ---------------------------------------------------------------------------
+
+/// Yields one batch of note events per `events()` call, like a piano played
+/// over several frames.
+struct BatchedNotes {
+    batches: VecDeque<Vec<NoteEvent>>,
+}
+
+impl NoteSource for BatchedNotes {
+    fn events(&mut self) -> Vec<NoteEvent> {
+        self.batches.pop_front().unwrap_or_default()
+    }
+
+    fn port_name(&self) -> &str {
+        "test piano"
+    }
+}
+
+/// Never presses a key — until a safety limit, so a broken wiring fails the
+/// test instead of hanging it.
+struct NoKeys {
+    polls: u32,
+}
+
+const NO_KEYS_LIMIT: u32 = 10_000;
+
+impl rockcraft_tui::key_source::KeySource for NoKeys {
+    fn poll_key(&mut self, _timeout: std::time::Duration) -> std::io::Result<Option<KeyCode>> {
+        self.polls += 1;
+        Ok((self.polls >= NO_KEYS_LIMIT).then_some(KeyCode::Char('q')))
+    }
+}
+
+fn press(note: u8, t: u64) -> Vec<NoteEvent> {
+    use rockcraft_core::{MidiNote, Velocity};
+    let n = MidiNote::new(note).unwrap();
+    vec![
+        NoteEvent::on(n, Velocity::new(90).unwrap(), t),
+        NoteEvent::off(n, t + 100_000),
+    ]
+}
+
+/// The whole menu is drivable from the piano alone: down into the video
+/// importer, C# back out, C# again does *not* quit from the main menu, then up
+/// (wrapping to "Quit") and C to confirm — in a low octave, to show any octave
+/// works.
+#[test]
+fn piano_keys_navigate_menu_without_computer_keyboard() {
+    const C: u8 = 36; // C2
+    const CS: u8 = 37;
+    const D: u8 = 38;
+    const E: u8 = 40;
+    let mut batches: VecDeque<Vec<NoteEvent>> = VecDeque::new();
+    let mut t = 0;
+    for note in [E, E, E, C, CS, CS, D, D, D, D, C] {
+        batches.push_back(press(note, t));
+        batches.push_back(Vec::new()); // an idle frame between presses
+        t += 500_000;
+    }
+    let mut shell = Shell::new(Box::new(BatchedNotes { batches }), None, None);
+    shell.set_has_fetch_cmd(false); // fixed menu: 6 items + Quit
+    let mut terminal = make_terminal();
+    let mut keys = NoKeys { polls: 0 };
+
+    run_loop(&mut terminal, &mut shell, &mut keys).unwrap();
+
+    assert!(
+        keys.polls < NO_KEYS_LIMIT,
+        "the piano's C on \"Quit\" should have ended the loop"
+    );
+    assert!(shell.is_quit());
+    assert_eq!(shell.screen_name(), "menu");
+}

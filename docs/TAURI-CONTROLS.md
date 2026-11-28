@@ -54,6 +54,17 @@ Every item routes to a real action (`navigate` / `latestRecording` /
 hidden unless a fetch command is configured (`import_url_available`). No no-op
 controls.
 
+**Piano navigation** (both frontends): on the menu, library, pickers and
+import screens, piano **C** = confirm (Enter), **D** = up, **E** = down,
+**C#** = cancel (Esc) — in any octave, key-downs only. C# does nothing on the
+main menu (so a stray note never quits). **A0** — the lowest key of an 88-key
+piano — toggles *free play*: while on, those keys only play notes (a
+`FREE PLAY · A0` badge shows by the MIDI chip; the TUI menu's hint line turns
+magenta); press A0 again to navigate. Play and Edit never navigate, and A0 is
+an ordinary note there: every key is music. The mapping is `rockcraft_core::MenuNav` (free play: `MenuNavigator`); the TUI applies
+it in `Shell::menu_nav_key`, the webview in `shell/menuNav.ts` (each
+`midi_event` carries its `menu_nav`).
+
 ## Edit / compose media (`screens/edit/`)
 
 Backing audio and the background video are **independent** piece attributes;
