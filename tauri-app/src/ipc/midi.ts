@@ -33,7 +33,16 @@ export interface NoteEventPayload {
   velocity: number;
   /** Engine timestamp in microseconds (preserved from the source). */
   timestamp_us: number;
+  /**
+   * The menu key this press stands for — piano C / C# / D / E (any octave) →
+   * `"confirm"` / `"cancel"` / `"up"` / `"down"` — or `null`. Key-downs only.
+   * Mirror of `rockcraft_core::MenuNav::name`.
+   */
+  menu_nav: MenuNav | null;
 }
+
+/** A menu-navigation key played on the piano (`rockcraft_core::MenuNav`). */
+export type MenuNav = "confirm" | "cancel" | "up" | "down";
 
 // ── Key map ───────────────────────────────────────────────────────────────────
 

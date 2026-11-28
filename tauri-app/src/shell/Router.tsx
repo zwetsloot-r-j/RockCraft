@@ -13,8 +13,10 @@ import {
   midiStatus,
   mockKey,
   MOCK_KEY_SET,
+  onMidiEvent,
   type MidiStatus,
 } from "../ipc/midi";
+import { isTyping, menuNavKey } from "./menuNav";
 import {
   onFullscreen,
   onNavigate,
@@ -137,6 +139,20 @@ export function Router(props: RouterProps): JSX.Element {
     });
     if (readFullscreen()) void setFullscreen(true);
 
+    // Piano menu keys (C confirm · C# cancel · D up · E down): replay each as
+    // the keyboard key it stands for, so every menu screen's own key handling
+    // serves the piano unchanged. Play / edit never navigate (see menuNav.ts).
+    let unlistenMidi: UnlistenFn | undefined;
+    void onMidiEvent((ev) => {
+      const key = menuNavKey(screen().kind, ev.menu_nav);
+      if (key === null || isTyping(document.activeElement)) return;
+      window.dispatchEvent(
+        new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }),
+      );
+    }).then((fn) => {
+      unlistenMidi = fn;
+    });
+
     let unlistenNav: UnlistenFn | undefined;
     void onNavigate((next) => {
       const cur = screen();
@@ -153,6 +169,7 @@ export function Router(props: RouterProps): JSX.Element {
       window.removeEventListener("keydown", onKeydown);
       window.removeEventListener("keyup", onKeyup);
       unlistenNav?.();
+      unlistenMidi?.();
       unlistenFullscreen?.();
     });
   });

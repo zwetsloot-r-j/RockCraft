@@ -23,6 +23,7 @@ pub mod grid;
 pub mod hand;
 pub mod history;
 pub mod live_score;
+pub mod menu_nav;
 pub mod mixer;
 pub mod notation;
 pub mod play_clock;
@@ -59,6 +60,7 @@ pub use grid::{Grid, Subdivision, TimeSig};
 pub use hand::{hand_of, Hand, HandOverride, HandSetting, DEFAULT_SPLIT};
 pub use history::History;
 pub use live_score::{award, LiveScorer, LiveTally, NoteKey};
+pub use menu_nav::MenuNav;
 pub use mixer::{
     default_instrument, instrument, instruments, BusMix, Gain, Instrument, Mixer, MixerBus,
     MixerError, MixerReport, SynthBus, DEFAULT_INSTRUMENT,

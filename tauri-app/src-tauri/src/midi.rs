@@ -11,7 +11,7 @@
 
 use std::sync::Mutex;
 
-use rockcraft_core::{Composer, NoteEvent, NoteEventKind, SustainEvent};
+use rockcraft_core::{Composer, MenuNav, NoteEvent, NoteEventKind, SustainEvent};
 use rockcraft_midi::{LiveInput, MockKeyboard, NoteSource};
 use serde::Serialize;
 
@@ -112,6 +112,10 @@ pub struct NoteEventPayload {
     pub velocity: u8,
     /// Engine timestamp in microseconds.
     pub timestamp_us: u64,
+    /// The menu key this press stands for (`"confirm"` / `"cancel"` / `"up"` /
+    /// `"down"`, from [`MenuNav`]: piano C / C# / D / E, any octave), or
+    /// `null`. Key-downs only. The webview decides which screens navigate.
+    pub menu_nav: Option<&'static str>,
 }
 
 impl From<NoteEvent> for NoteEventPayload {
@@ -125,6 +129,7 @@ impl From<NoteEvent> for NoteEventPayload {
             on,
             velocity,
             timestamp_us: ev.timestamp_us,
+            menu_nav: MenuNav::from_event(&ev).map(MenuNav::name),
         }
     }
 }
@@ -294,6 +299,26 @@ mod tests {
         let status = midi_status(&state);
         assert_eq!(status.kind, "mock");
         assert!(status.port.is_none());
+    }
+
+    /// Piano C / C# / D / E presses carry their menu key; releases and other
+    /// keys carry none.
+    #[test]
+    fn payload_carries_menu_nav_for_key_downs() {
+        let vel = Velocity::new(80).unwrap();
+        let nav = |n: u8| {
+            NoteEventPayload::from(NoteEvent::on(MidiNote::new(n).unwrap(), vel, 0)).menu_nav
+        };
+        assert_eq!(nav(60), Some("confirm"));
+        assert_eq!(nav(61), Some("cancel"));
+        assert_eq!(nav(62), Some("up"));
+        assert_eq!(nav(64), Some("down"));
+        assert_eq!(nav(36), Some("confirm"), "any octave");
+        assert_eq!(nav(65), None);
+        let off = NoteEventPayload::from(NoteEvent::off(MidiNote::new(60).unwrap(), 0));
+        assert_eq!(off.menu_nav, None, "a release never navigates");
+        let json = serde_json::to_value(off).unwrap();
+        assert!(json["menu_nav"].is_null());
     }
 
     #[test]

@@ -628,6 +628,41 @@ impl Shell {
         }
     }
 
+    /// The keypress a piano menu key stands for on the current screen, if any.
+    ///
+    /// Only browsing screens navigate — on Play and Edit every key is music.
+    /// The text-entry URL box is left to the keyboard, and Cancel does nothing
+    /// on the main menu (Esc there quits, which a stray C# must never do).
+    fn menu_nav_key(&self, nav: rockcraft_core::MenuNav) -> Option<KeyCode> {
+        use rockcraft_core::MenuNav;
+        let browsing = match &self.screen {
+            Screen::Menu => nav != MenuNav::Cancel,
+            Screen::Library(_)
+            | Screen::BackingPicker { .. }
+            | Screen::SourcePicker(_)
+            | Screen::Importing(_) => true,
+            Screen::Play(_) | Screen::Edit(_) | Screen::UrlInput(_) => false,
+        };
+        browsing.then_some(match nav {
+            MenuNav::Confirm => KeyCode::Enter,
+            MenuNav::Cancel => KeyCode::Esc,
+            MenuNav::Up => KeyCode::Up,
+            MenuNav::Down => KeyCode::Down,
+        })
+    }
+
+    /// Navigate from the piano: apply the keypress `nav` stands for here.
+    /// Returns whether it did anything (i.e. this screen is a menu).
+    pub(crate) fn on_menu_nav(&mut self, nav: rockcraft_core::MenuNav) -> bool {
+        match self.menu_nav_key(nav) {
+            Some(code) => {
+                self.on_key(code);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Handle a key press; returns to the menu on Tab/Esc from a screen.
     pub(crate) fn on_key(&mut self, code: KeyCode) {
         self.persisting(|shell| shell.handle_key(code));
@@ -1536,6 +1571,7 @@ pub fn run_loop<B: ratatui::backend::Backend>(
         let synth = if echoed { None } else { shell.synth.clone() };
         let notes = shell.input.events();
         let sustain = shell.input.sustain_events();
+        let mut menu_navs: Vec<rockcraft_core::MenuNav> = Vec::new();
         // Keys and pedal in played order: the pedal decides which released
         // notes ring on, so it must land between the right note events.
         for input in rockcraft_core::interleave_by_time(&notes, &sustain) {
@@ -1568,8 +1604,9 @@ pub fn run_loop<B: ratatui::backend::Backend>(
                         s.apply(&ev);
                     }
                 }
-                // These screens ignore live MIDI input, but still sound it so
-                // the piano is never mute while you browse.
+                // These screens don't record or score live MIDI input, but
+                // still sound it so the piano is never mute while you browse —
+                // and the menu keys (C / C# / D / E) navigate them.
                 Screen::Menu
                 | Screen::BackingPicker { .. }
                 | Screen::SourcePicker(_)
@@ -1579,7 +1616,17 @@ pub fn run_loop<B: ratatui::backend::Backend>(
                     if let Some(s) = &synth {
                         s.apply(&ev);
                     }
+                    if let Some(nav) = rockcraft_core::MenuNav::from_event(&ev) {
+                        menu_navs.push(nav);
+                    }
                 }
+            }
+        }
+        // Applied after the drain: a step can change the screen, and the
+        // notes after it belong to the screen it lands on next pass.
+        for nav in menu_navs {
+            if shell.on_menu_nav(nav) {
+                needs_draw = true;
             }
         }
 
@@ -1722,7 +1769,10 @@ fn draw_menu(f: &mut Frame, area: Rect, shell: &Shell) {
         "RockCraft — {}  (↑/↓ select, Enter, q quit)",
         shell.input.port_name()
     ));
-    f.render_widget(Paragraph::new(title), chunks[0]);
+    // The piano's own menu keys (rockcraft_core::MenuNav), any octave.
+    let piano = Line::from("Piano: D/E move · C select · C# back")
+        .style(Style::default().fg(Color::DarkGray));
+    f.render_widget(Paragraph::new(vec![title, piano]), chunks[0]);
 
     let items: Vec<ListItem> = shell
         .menu_items()
@@ -2510,6 +2560,60 @@ mod tests {
 
     fn make_shell() -> Shell {
         Shell::new(Box::new(ScriptedSource::new(vec![])), None, None)
+    }
+
+    /// Piano menu keys (C confirm · C# cancel · D up · E down) drive the main
+    /// menu exactly like Enter / Esc / ↑ / ↓ — except C#, which must never
+    /// quit the app from the main menu.
+    #[test]
+    fn piano_menu_keys_drive_the_main_menu() {
+        use rockcraft_core::MenuNav;
+        let mut shell = make_shell();
+        shell.set_has_fetch_cmd(false);
+
+        assert!(shell.on_menu_nav(MenuNav::Down));
+        assert!(shell.on_menu_nav(MenuNav::Down));
+        assert_eq!(shell.menu_state.selected(), Some(2));
+        assert!(shell.on_menu_nav(MenuNav::Up));
+        assert_eq!(shell.menu_state.selected(), Some(1));
+
+        assert!(
+            !shell.on_menu_nav(MenuNav::Cancel),
+            "C# is inert on the main menu"
+        );
+        assert!(!shell.is_quit());
+        assert_eq!(shell.screen_name(), "menu");
+
+        shell.menu_state.select(Some(0));
+        assert!(shell.on_menu_nav(MenuNav::Confirm)); // "New piece"
+        assert_eq!(shell.screen_name(), "edit");
+    }
+
+    /// On Play and Edit every key is music: menu keys navigate nothing there.
+    #[test]
+    fn piano_menu_keys_are_music_on_edit() {
+        use rockcraft_core::MenuNav;
+        let mut shell = make_shell();
+        shell.on_key(KeyCode::Enter); // New piece → edit
+        assert_eq!(shell.screen_name(), "edit");
+        for nav in MenuNav::ALL {
+            assert!(!shell.on_menu_nav(nav), "{nav:?} must not navigate in edit");
+        }
+        assert_eq!(shell.screen_name(), "edit");
+    }
+
+    /// C# backs out of a picker to the main menu, like Esc.
+    #[test]
+    fn piano_cancel_backs_out_of_source_picker() {
+        use rockcraft_core::MenuNav;
+        let mut shell = make_shell();
+        shell.set_has_fetch_cmd(false);
+        shell.menu_state.select(Some(3)); // "Import from video file…"
+        assert!(shell.on_menu_nav(MenuNav::Confirm));
+        assert!(matches!(shell.screen, Screen::SourcePicker(_)));
+        assert!(shell.on_menu_nav(MenuNav::Cancel));
+        assert_eq!(shell.screen_name(), "menu");
+        assert!(!shell.is_quit());
     }
 
     /// "New piece" (index 0) enters the unified capture+edit screen with an
