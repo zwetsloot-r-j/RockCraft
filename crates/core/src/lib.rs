@@ -60,7 +60,7 @@ pub use grid::{Grid, Subdivision, TimeSig};
 pub use hand::{hand_of, Hand, HandOverride, HandSetting, DEFAULT_SPLIT};
 pub use history::History;
 pub use live_score::{award, LiveScorer, LiveTally, NoteKey};
-pub use menu_nav::MenuNav;
+pub use menu_nav::{MenuNav, MenuNavigator, FREE_PLAY_NOTE};
 pub use mixer::{
     default_instrument, instrument, instruments, BusMix, Gain, Instrument, Mixer, MixerBus,
     MixerError, MixerReport, SynthBus, DEFAULT_INSTRUMENT,

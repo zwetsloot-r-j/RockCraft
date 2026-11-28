@@ -35,14 +35,18 @@ export interface NoteEventPayload {
   timestamp_us: number;
   /**
    * The menu key this press stands for — piano C / C# / D / E (any octave) →
-   * `"confirm"` / `"cancel"` / `"up"` / `"down"` — or `null`. Key-downs only.
+   * `"confirm"` / `"cancel"` / `"up"` / `"down"`, or `"free_play"` for A0 (the
+   * lowest key) — or `null`. Key-downs only.
    * Mirror of `rockcraft_core::MenuNav::name`.
    */
   menu_nav: MenuNav | null;
 }
 
-/** A menu-navigation key played on the piano (`rockcraft_core::MenuNav`). */
-export type MenuNav = "confirm" | "cancel" | "up" | "down";
+/**
+ * A menu key played on the piano (`rockcraft_core::MenuNav`). `"free_play"` is
+ * A0 — the lowest key of an 88-key piano — which toggles free play.
+ */
+export type MenuNav = "confirm" | "cancel" | "up" | "down" | "free_play";
 
 // ── Key map ───────────────────────────────────────────────────────────────────
 

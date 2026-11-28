@@ -113,8 +113,8 @@ pub struct NoteEventPayload {
     /// Engine timestamp in microseconds.
     pub timestamp_us: u64,
     /// The menu key this press stands for (`"confirm"` / `"cancel"` / `"up"` /
-    /// `"down"`, from [`MenuNav`]: piano C / C# / D / E, any octave), or
-    /// `null`. Key-downs only. The webview decides which screens navigate.
+    /// `"down"`, from [`MenuNav`]: piano C / C# / D / E, any octave; or
+    /// `"free_play"` for A0, the lowest key), or `null`. Key-downs only. The webview decides which screens navigate.
     pub menu_nav: Option<&'static str>,
 }
 
@@ -315,6 +315,11 @@ mod tests {
         assert_eq!(nav(64), Some("down"));
         assert_eq!(nav(36), Some("confirm"), "any octave");
         assert_eq!(nav(65), None);
+        assert_eq!(
+            nav(21),
+            Some("free_play"),
+            "A0, the lowest key, toggles free play"
+        );
         let off = NoteEventPayload::from(NoteEvent::off(MidiNote::new(60).unwrap(), 0));
         assert_eq!(off.menu_nav, None, "a release never navigates");
         let json = serde_json::to_value(off).unwrap();

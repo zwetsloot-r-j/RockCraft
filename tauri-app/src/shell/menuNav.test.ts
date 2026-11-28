@@ -1,36 +1,56 @@
 import { describe, expect, it } from "vitest";
-import { isTyping, menuNavKey } from "./menuNav";
+import { isTyping, menuNavStep } from "./menuNav";
 
-describe("menuNavKey", () => {
+const key = (...args: Parameters<typeof menuNavStep>) => menuNavStep(...args).key;
+
+describe("menuNavStep", () => {
   it("maps C / D / E to Enter / ↑ / ↓ on the main menu", () => {
-    expect(menuNavKey("menu", "confirm")).toBe("Enter");
-    expect(menuNavKey("menu", "up")).toBe("ArrowUp");
-    expect(menuNavKey("menu", "down")).toBe("ArrowDown");
+    expect(key("menu", "confirm", false)).toBe("Enter");
+    expect(key("menu", "up", false)).toBe("ArrowUp");
+    expect(key("menu", "down", false)).toBe("ArrowDown");
   });
 
   it("leaves C# inert on the main menu", () => {
-    expect(menuNavKey("menu", "cancel")).toBeNull();
+    expect(key("menu", "cancel", false)).toBeNull();
   });
 
   it("maps all four keys on the library and importing screens", () => {
     for (const s of ["library", "importing"] as const) {
-      expect(menuNavKey(s, "confirm")).toBe("Enter");
-      expect(menuNavKey(s, "cancel")).toBe("Escape");
-      expect(menuNavKey(s, "up")).toBe("ArrowUp");
-      expect(menuNavKey(s, "down")).toBe("ArrowDown");
+      expect(key(s, "confirm", false)).toBe("Enter");
+      expect(key(s, "cancel", false)).toBe("Escape");
+      expect(key(s, "up", false)).toBe("ArrowUp");
+      expect(key(s, "down", false)).toBe("ArrowDown");
     }
   });
 
   it("never navigates where keys are music or text", () => {
     for (const s of ["play", "edit", "url-input", "video-picker"] as const) {
       for (const n of ["confirm", "cancel", "up", "down"] as const) {
-        expect(menuNavKey(s, n)).toBeNull();
+        expect(key(s, n, false)).toBeNull();
       }
     }
   });
 
   it("ignores notes that are not menu keys", () => {
-    expect(menuNavKey("menu", null)).toBeNull();
+    expect(menuNavStep("menu", null, false)).toEqual({ key: null, freePlay: false });
+    expect(menuNavStep("menu", null, true)).toEqual({ key: null, freePlay: true });
+  });
+
+  it("A0 toggles free play on menu screens", () => {
+    expect(menuNavStep("menu", "free_play", false)).toEqual({ key: null, freePlay: true });
+    expect(menuNavStep("library", "free_play", true)).toEqual({ key: null, freePlay: false });
+  });
+
+  it("free play swallows navigation", () => {
+    for (const n of ["confirm", "cancel", "up", "down"] as const) {
+      expect(menuNavStep("library", n, true)).toEqual({ key: null, freePlay: true });
+    }
+  });
+
+  it("A0 is just a note on play and edit", () => {
+    for (const s of ["play", "edit"] as const) {
+      expect(menuNavStep(s, "free_play", false)).toEqual({ key: null, freePlay: false });
+    }
   });
 });
 
