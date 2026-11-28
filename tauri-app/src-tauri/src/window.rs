@@ -6,6 +6,13 @@
 //! agent reaches the same functions over the control socket. Every change is
 //! announced as a [`FULLSCREEN_EVENT`], so the webview can remember the state
 //! for the next launch whichever way it changed.
+//!
+//! The commands are `async` on purpose. A synchronous Tauri command runs on
+//! the main thread *inside* WebView2's message callback — here, while the F11
+//! keydown is still being delivered — and resizing the window from there left
+//! the webview ignoring the mouse until it left full screen again. An async
+//! command runs off the main thread, so the window change is queued to the
+//! event loop and happens after WebView2 has finished with the key.
 
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -33,12 +40,12 @@ pub fn flip_fullscreen(app: &AppHandle) -> Result<bool, String> {
 
 /// Enter or leave full screen (`set_fullscreen`).
 #[tauri::command]
-pub fn set_fullscreen(app: AppHandle, on: bool) -> Result<bool, String> {
+pub async fn set_fullscreen(app: AppHandle, on: bool) -> Result<bool, String> {
     apply_fullscreen(&app, on)
 }
 
 /// Toggle full screen: F11 / Alt+Enter (`toggle_fullscreen`).
 #[tauri::command]
-pub fn toggle_fullscreen(app: AppHandle) -> Result<bool, String> {
+pub async fn toggle_fullscreen(app: AppHandle) -> Result<bool, String> {
     flip_fullscreen(&app)
 }
