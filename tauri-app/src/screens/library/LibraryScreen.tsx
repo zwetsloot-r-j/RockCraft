@@ -37,6 +37,7 @@ import {
   scanLibrary,
 } from "../../ipc/bridge";
 import { baseName, existsSlug, freeSlug } from "./songFiles";
+import { HoverGate } from "./hoverGate";
 import {
   NetworkPanel,
   TransferStrip,
@@ -73,6 +74,10 @@ function originBadge(origin: string | null): string {
   }
 }
 
+/** The song selected when the library was last left (its bundle dir), so
+ * coming back from Play/Edit lands on it rather than the top of the list. */
+let lastSelectedDir: string | null = null;
+
 // ── component ─────────────────────────────────────────────────────────────
 
 export function LibraryScreen(): JSX.Element {
@@ -89,6 +94,8 @@ export function LibraryScreen(): JSX.Element {
   const [focus, setFocus] = createSignal<"local" | NetFocus>("local");
   /** The scrollable list panel; its element children are the rows, in order. */
   let listEl: HTMLDivElement | undefined;
+  /** Hover selects only on real mouse movement, not rows scrolling past. */
+  const hover = new HoverGate();
   let flashTimer: number | undefined;
 
   function showFlash(msg: string): void {
@@ -99,6 +106,17 @@ export function LibraryScreen(): JSX.Element {
   onCleanup(() => window.clearTimeout(flashTimer));
 
   /** Re-read the library; select the bundle at `dir` when given. */
+  /** Select row `idx` and scroll it into view. */
+  function select(idx: number, block: ScrollLogicalPosition = "nearest"): void {
+    setSelected(idx);
+    listEl?.children[idx]?.scrollIntoView({ block });
+  }
+
+  // Remember the selection for the next visit.
+  onCleanup(() => {
+    lastSelectedDir = entries()[selected()]?.dir ?? lastSelectedDir;
+  });
+
   function rescan(dir?: string): Promise<void> {
     return scanLibrary()
       .then((list) => {
@@ -109,10 +127,10 @@ export function LibraryScreen(): JSX.Element {
           const idx = list.findIndex(
             (e) => e.name === baseName(dir) && norm(e.dir).endsWith(norm(dir)),
           );
-          if (idx >= 0) {
-            setSelected(idx);
-            listEl?.children[idx]?.scrollIntoView({ block: "nearest" });
-          }
+          if (idx >= 0) select(idx);
+        } else if (lastSelectedDir !== null) {
+          const idx = list.findIndex((e) => e.dir === lastSelectedDir);
+          if (idx >= 0) select(idx, "center");
         }
       })
       .catch(() => {
@@ -223,11 +241,12 @@ export function LibraryScreen(): JSX.Element {
 
   /** Keyboard move: select, then scroll the row into view. ↑/↓ suppress the
    * panel's native scrolling, so without this the highlight walks off-screen.
-   * (Hover/click selection never scrolls — the row is already under the mouse.) */
+   * (Hover/click selection never scrolls — the row is already under the mouse.)
+   * The scroll slides rows under a resting mouse, so `hover` ignores the
+   * pointer until it really moves. */
   function moveSelection(delta: number): void {
-    const next = clampSel(selected() + delta);
-    setSelected(next);
-    listEl?.children[next]?.scrollIntoView({ block: "nearest" });
+    hover.keyMoved();
+    select(clampSel(selected() + delta));
   }
 
   function openPlay(idx: number): void {
@@ -499,7 +518,11 @@ export function LibraryScreen(): JSX.Element {
                       transition: "background 0.1s",
                       "user-select": "none",
                     }}
-                    onMouseEnter={() => setSelected(idx())}
+                    onMouseMove={(ev) => {
+                      if (hover.shouldSelect(ev) && selected() !== idx()) {
+                        setSelected(idx());
+                      }
+                    }}
                     onClick={() => {
                       setSelected(idx());
                       setFocus("local");
